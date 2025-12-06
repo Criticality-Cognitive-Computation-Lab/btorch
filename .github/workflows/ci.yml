@@ -5,12 +5,34 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Set to true to run CI"
+        type: boolean
+        required: true
 
 permissions:
   contents: read
 
 jobs:
   build-test:
+    # Push: always run.
+    # PR: auto-run unless the author is new (first-timer/none); new authors require the `run-ci` label.
+    # Manual dispatch: requires confirm=true.
+    if: >-
+      ${{
+        github.event_name == 'push' ||
+        (
+          github.event_name == 'pull_request' &&
+          (
+            !contains(fromJson('["FIRST_TIMER","FIRST_TIME_CONTRIBUTOR","NONE"]'), github.event.pull_request.author_association)
+            || contains(github.event.pull_request.labels.*.name, 'run-ci')
+          )
+        ) ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.confirm == 'true')
+      }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
