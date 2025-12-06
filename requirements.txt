@@ -1,0 +1,9 @@
+torch>=2.1
+numpy>=1.24
+pandas>=2
+scipy>=1.10
+jaxtyping>=0.2.20
+typing-extensions>=4.5
+spikingjelly
+omegaconf
+hdf5plugin

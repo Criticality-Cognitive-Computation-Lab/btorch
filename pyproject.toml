@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "btorch"
+version = "0.1.0"
+description = "Brain-inspired torch utilities and models for neuromorphic research."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "Btorch contributors" }]
+dependencies = [
+  "torch>=2.1",
+  "numpy>=1.24",
+  "pandas>=1.5",
+  "scipy>=1.10",
+  "jaxtyping>=0.2.20",
+  "typing-extensions>=4.5",
+  "omegaconf",
+]
+
+[project.optional-dependencies]
+docs = [
+  "mkdocs>=1.5",
+  "mkdocs-material>=9.5",
+]
+test = [
+  "pytest>=8.2",
+  "pytest-cov>=5.0",
+  "matplotlib>=3.7",
+]
+dev = [
+  "btorch[docs,test]",
+  "pre-commit>=3.7",
+  "ruff>=0.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/btorch"
+Repository = "https://github.com/your-org/btorch"
+Documentation = "https://github.com/your-org/btorch/docs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["btorch"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/btorch",
+  "/README.md",
+  "/LICENSE",
+  "/requirements.txt",
+  "/requirements-dev.txt",
+  "/docs",
+  "/mkdocs.yml",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I001"]
+ignore = ["E721", "E731", "F722", "F821"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+lines-after-imports = 2
+extra-standard-library = ["typing_extensions"]
+order-by-type = false

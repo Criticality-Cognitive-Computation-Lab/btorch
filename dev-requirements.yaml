@@ -1,0 +1,31 @@
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pytorch-gpu>=2
+  - torchvision
+  - spikingjelly
+  - pip
+  - pip:
+    # profiling
+    - tensorboard_plugin_profile
+  - tqdm
+  - matplotlib
+  - scipy
+  - h5py
+  - hdf5plugin
+  - pandas >= 2 # assume CoW
+  - numba
+  - seaborn
+  # dev
+  - ipykernel
+  # tensorboard
+  - tensorboard
+  - etils
+  # lint and type checking
+  - pre-commit
+  - ruff
+  - docformatter
+  - jaxtyping
+  - beartype
+  - mypy

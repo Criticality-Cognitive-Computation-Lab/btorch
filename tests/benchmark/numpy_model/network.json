@@ -1,0 +1,51 @@
+{
+  "neuron": {
+    "n_neuron": 200,
+    "v_th": 22.64723777770996,
+    "E_L": -71.58819580078125,
+    "C": 81.5009765625,
+    "tau": 6.49079704284668,
+    "v_reset": -71.58819580078125,
+    "fm": [
+      0.3333333432674408
+    ],
+    "delta_Im": [
+      [
+        -10.862661361694336
+      ]
+    ],
+    "refractory_count": 4.0,
+    "hard_reset": false
+  },
+  "synapse": {
+    "E": {
+      "n_neuron": 200,
+      "tau_syn": 5.0,
+      "linear": {
+        "weight": "synapse/E.csv.gz",
+        "shape": [
+          200,
+          200
+        ]
+      }
+    },
+    "I": {
+      "n_neuron": 200,
+      "tau_syn": 5.0,
+      "linear": {
+        "weight": "synapse/I.csv.gz",
+        "shape": [
+          200,
+          200
+        ]
+      }
+    }
+  },
+  "w_in": {
+    "weight": "w_in.csv.gz",
+    "shape": [
+      100,
+      200
+    ]
+  }
+}

@@ -1,0 +1,30 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Ruff version.
+    rev: v0.7.4
+    hooks:
+      - id: ruff-format # formatter
+        types_or: [python, pyi, jupyter]
+      - id: ruff # linter
+        types_or: [python, pyi, jupyter]
+        args: [--fix]
+
+  - repo: https://github.com/srstevenson/nb-clean
+    rev: 4.0.1
+    hooks:
+      - id: nb-clean
+        args:
+          - --remove-empty-cells
+          - --preserve-cell-outputs
+          - --preserve-cell-metadata
+          - tags
+          - slideshow
+          - --
+
+  - repo: https://github.com/PyCQA/docformatter
+    rev: 06907d0
+    hooks:
+      - id: docformatter
+        additional_dependencies: [tomli]
+        types_or: [python, pyi]
+        args: [--in-place, --config, ./pyproject.toml]

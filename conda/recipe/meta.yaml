@@ -1,0 +1,38 @@
+package:
+  name: btorch
+  version: "0.1.0"
+
+source:
+  path: ../..
+
+build:
+  number: 0
+  script: python -m pip install . --no-deps -vv
+
+requirements:
+  host:
+    - python >=3.10
+    - pip
+  run:
+    - python >=3.10
+    - torch >=2.1
+    - numpy >=1.24
+    - pandas >=1.5
+    - scipy >=1.10
+    - jaxtyping >=0.2.20
+    - typing-extensions >=4.5
+
+test:
+  requires:
+    - pytest
+  commands:
+    - python -c "import btorch; print(btorch.__version__)"
+    - pytest -q tests/models --disable-warnings --maxfail=1
+
+about:
+  license: see LICENSE
+  summary: Brain-inspired torch utilities and models for neuromorphic research.
+
+extra:
+  recipe-maintainers:
+    - neuromorphic-research
