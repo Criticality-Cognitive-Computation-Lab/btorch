@@ -229,7 +229,6 @@ class MemoryModule(base.MemoryModule):
         skip_mem_name: tuple[str, ...] = (),
     ):
         skip_mem_name_set = set(skip_mem_name)
-        self.to(device=device, dtype=dtype)
         for key, reset_val in self._memories_rv.items():
             if key in skip_mem_name_set:
                 continue
@@ -257,7 +256,6 @@ class MemoryModule(base.MemoryModule):
         skip_mem_name: tuple[str, ...] = (),
     ):
         skip_mem_name_set = set(skip_mem_name)
-        self.to(device=device, dtype=dtype)
         for key, reset_val in self._memories_rv.items():
             if key in skip_mem_name_set:
                 continue

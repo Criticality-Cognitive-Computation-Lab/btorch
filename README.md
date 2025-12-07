@@ -37,7 +37,7 @@ micromamba env create -n ml-py312 -f dev-requirements.yaml
 3) Install in editable mode so local changes are importable right away:
 
 ```bash
-pip install -e .
+pip install -e . --config-settings editable_mode=strict
 ```
 
 ## Development

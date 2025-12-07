@@ -23,6 +23,7 @@ def init_net_state(net: nn.Module, batch_size: int | None = None, **kwargs):
                 )
             m.init_state(batch_size, **kwargs)
 
+    net.to(device=kwargs.get("device"), dtype=kwargs.get("dtype"))
     for m in net.modules():
         fn(m)
 
@@ -65,6 +66,7 @@ def reset_net(net: nn.Module, batch_size: int | None = None, **kwargs):
                 )
             m.reset(batch_size, **kwargs)
 
+    net.to(device=kwargs.get("device"), dtype=kwargs.get("dtype"))
     for m in net.modules():
         fn(m)
 

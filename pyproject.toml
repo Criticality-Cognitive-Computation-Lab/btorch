@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.21.0"]
+requires = ["hatchling>=1.21.0", "hatch-requirements-txt"]
 build-backend = "hatchling.build"
 
 [project]
@@ -33,7 +33,7 @@ Homepage = "https://github.com/your-org/btorch"
 Repository = "https://github.com/your-org/btorch"
 Documentation = "https://github.com/your-org/btorch/docs"
 
-[tool.hatch.metadata.hooks.requirements]
+[tool.hatch.metadata.hooks.requirements_txt]
 files = ["requirements.txt"]
 
 [tool.hatch.build.targets.wheel]
@@ -49,6 +49,7 @@ include = [
   "/docs",
   "/mkdocs.yml",
 ]
+allow-direct-references = true
 
 [tool.ruff.lint]
 select = ["E", "F", "I001"]
