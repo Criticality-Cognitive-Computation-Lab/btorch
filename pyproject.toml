@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.21.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -10,15 +10,7 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [{ name = "Btorch contributors" }]
-dependencies = [
-  "torch>=2.1",
-  "numpy>=1.24",
-  "pandas>=1.5",
-  "scipy>=1.10",
-  "jaxtyping>=0.2.20",
-  "typing-extensions>=4.5",
-  "omegaconf",
-]
+dynamic = ["dependencies"]
 
 [project.optional-dependencies]
 docs = [
@@ -40,6 +32,9 @@ dev = [
 Homepage = "https://github.com/your-org/btorch"
 Repository = "https://github.com/your-org/btorch"
 Documentation = "https://github.com/your-org/btorch/docs"
+
+[tool.hatch.metadata.hooks.requirements]
+files = ["requirements.txt"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["btorch"]
