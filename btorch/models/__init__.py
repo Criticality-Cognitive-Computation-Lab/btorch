@@ -1,4 +1,4 @@
-from . import (  # noqa: F401
+from . import (
     base,
     constrain,
     conv,
@@ -6,7 +6,23 @@ from . import (  # noqa: F401
     functional,
     glif,
     init,
+    lif,
     linear,
     ode,
     rnn,
 )
+
+
+__all__ = [
+    "base",
+    "constrain",
+    "conv",
+    "environ",
+    "functional",
+    "glif",
+    "lif",
+    "init",
+    "linear",
+    "ode",
+    "rnn",
+]
