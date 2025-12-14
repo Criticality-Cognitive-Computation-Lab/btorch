@@ -3,7 +3,6 @@ from typing import Any, Literal
 
 import torch
 from jaxtyping import Float
-from spikingjelly.activation_based import surrogate
 from torch import Tensor
 
 from . import environ
@@ -11,6 +10,7 @@ from .base import BaseNode
 from .ode import exp_euler_step_auto
 from .scale import SupportScaleState
 from .shape import expand_trailing_dims
+from .surrogate import ATan
 from .types import TensorLike
 
 
@@ -51,7 +51,7 @@ class GLIF3(BaseNode, SupportScaleState):
         | Float[TensorLike, "{self.n_neuron} {self.n_Iasc}"] = [0.0],  # pA
         tau_ref: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,  # ms
         trainable_param: set[str] = set(),
-        surrogate_function: Callable = surrogate.ATan(),
+        surrogate_function: Callable = ATan(),
         detach_reset: bool = False,
         hard_reset: bool = False,
         pre_spike_v: bool = False,

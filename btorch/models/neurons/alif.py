@@ -3,12 +3,12 @@ from typing import Any, Literal
 
 import torch
 from jaxtyping import Float
-from spikingjelly.activation_based import surrogate
 from torch import Tensor
 
 from .. import environ
 from ..base import BaseNode
 from ..ode import exp_euler_step_auto
+from ..surrogate import Sigmoid
 from ..types import TensorLike
 
 
@@ -48,7 +48,7 @@ class ALIF(BaseNode):
         dg_k: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
         tau_ref: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
         trainable_param: set[str] = set(),
-        surrogate_function: Callable = surrogate.Sigmoid(),
+        surrogate_function: Callable = Sigmoid(),
         detach_reset: bool = False,
         hard_reset: bool = False,
         pre_spike_v: bool = False,
@@ -185,7 +185,7 @@ class ELIF(ALIF):
         delta_T: float | Float[TensorLike, "{self.n_neuron}"] = 1.0,
         v_T: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
         trainable_param: set[str] = set(),
-        surrogate_function: Callable = surrogate.Sigmoid(),
+        surrogate_function: Callable = Sigmoid(),
         detach_reset: bool = False,
         hard_reset: bool = False,
         pre_spike_v: bool = False,

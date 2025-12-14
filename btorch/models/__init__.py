@@ -9,6 +9,7 @@ from . import (
     linear,
     ode,
     rnn,
+    surrogate,
 )
 from .neurons import alif, lif
 
@@ -26,4 +27,5 @@ __all__ = [
     "linear",
     "ode",
     "rnn",
+    "surrogate",
 ]

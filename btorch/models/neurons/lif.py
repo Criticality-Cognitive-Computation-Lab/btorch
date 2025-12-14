@@ -3,13 +3,13 @@ from typing import Any, Literal
 
 import torch
 from jaxtyping import Float
-from spikingjelly.activation_based import surrogate
 from torch import Tensor
 
 from .. import environ
 from ..base import BaseNode
 from ..ode import euler_step, exp_euler_step_auto
 from ..scale import SupportScaleState
+from ..surrogate import Sigmoid
 from ..types import TensorLike
 
 
@@ -31,7 +31,7 @@ class LIF(BaseNode, SupportScaleState):
         tau: float | Float[TensorLike, "{self.n_neuron}"] = 20.0,
         tau_ref: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
         trainable_param: set[str] = set(),
-        surrogate_function: Callable = surrogate.Sigmoid(),
+        surrogate_function: Callable = Sigmoid(),
         detach_reset: bool = False,
         hard_reset: bool = False,
         pre_spike_v: bool = False,

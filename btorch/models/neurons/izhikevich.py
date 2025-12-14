@@ -3,12 +3,12 @@ from typing import Any, Literal
 
 import torch
 from jaxtyping import Float
-from spikingjelly.activation_based import surrogate
 from torch import Tensor
 
 from .. import environ
 from ..base import BaseNode
 from ..ode import euler_step
+from ..surrogate import Sigmoid
 from ..types import TensorLike
 
 
@@ -53,7 +53,7 @@ class Izhikevich(BaseNode):
         b: float | Float[TensorLike, "{self.n_neuron}"] = -2.0,
         d: float | Float[TensorLike, "{self.n_neuron}"] = 100.0,
         trainable_param: set[str] = set(),
-        surrogate_function: Callable = surrogate.Sigmoid(),
+        surrogate_function: Callable = Sigmoid(),
         detach_reset: bool = False,
         hard_reset: bool = False,
         pre_spike: bool = False,

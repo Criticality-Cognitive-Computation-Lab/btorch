@@ -7,10 +7,11 @@ from typing import Any
 import numpy as np
 import torch
 from jaxtyping import Float
-from spikingjelly.activation_based import base, surrogate
+from spikingjelly.activation_based import base
 from torch import Tensor
 
 from .shape import expand_leading_dims
+from .surrogate import Sigmoid
 from .types import TensorLike
 
 
@@ -347,7 +348,7 @@ class BaseNode(MemoryModule):
         v_threshold: float | Float[TensorLike, "{self.n_neuron}"] = 1.0,
         v_reset: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
         trainable_param: set[str] = set(),
-        surrogate_function: Callable = surrogate.Sigmoid(),
+        surrogate_function: Callable = Sigmoid(),
         detach_reset: bool = False,
         hard_reset: bool = False,
         pre_spike_v: bool = False,
