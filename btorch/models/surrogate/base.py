@@ -3,8 +3,14 @@ import torch
 from btorch import jit
 
 
-_heaviside = jit.script(lambda x: (x >= 0).to(x))
-_damp = jit.script(lambda g, d: g * d)
+@jit.script
+def _heaviside(x: torch.Tensor) -> torch.Tensor:
+    return (x >= 0).to(x)
+
+
+@jit.script
+def _damp(grad: torch.Tensor, damping: float) -> torch.Tensor:
+    return grad * damping
 
 
 class _SurrogateAutograd(torch.autograd.Function):

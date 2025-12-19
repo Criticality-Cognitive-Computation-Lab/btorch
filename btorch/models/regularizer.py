@@ -11,6 +11,9 @@ from .types import TensorLike
 class VoltageRegularizer(nn.Module):
     """Voltage regularization loss for spiking neurons."""
 
+    v_offset: torch.Tensor
+    v_scale: torch.Tensor
+
     def __init__(
         self,
         v_threshold: float | TensorLike = 1.0,

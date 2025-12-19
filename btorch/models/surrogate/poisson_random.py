@@ -70,3 +70,22 @@ class PoissonRandomSpike(SurrogateFunctionBase):
         return _PoissonRandomSpikeFn.apply(
             x, self.tau, self.rho, self.leak, self.k, self.damping_factor, self.spiking
         )
+
+
+def poisson_random_spike(
+    x: torch.Tensor,
+    spiking: bool = True,
+    tau: float = 1.0,
+    rho: float = 1.0,
+    leak: float = 0.0,
+    k: float = 1.0,
+    damping_factor: float = 1.0,
+) -> torch.Tensor:
+    return PoissonRandomSpike(
+        spiking=spiking,
+        tau=tau,
+        rho=rho,
+        leak=leak,
+        k=k,
+        damping_factor=damping_factor,
+    )(x)

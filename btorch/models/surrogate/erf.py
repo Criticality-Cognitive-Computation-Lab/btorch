@@ -7,14 +7,15 @@ from btorch import jit
 from .base import SurrogateFunctionBase
 
 
-_erf_primitive = jit.script(
-    lambda x, alpha, variance: 0.5
-    * (1 + torch.erf(alpha * x / math.sqrt(2 * variance)))
-)
-_erf_derivative = jit.script(
-    lambda x, alpha, variance: (alpha / math.sqrt(2 * math.pi * variance))
-    * torch.exp(-0.5 * (alpha * x) ** 2 / variance)
-)
+@jit.script
+def _erf_primitive(x: torch.Tensor, alpha: float) -> torch.Tensor:
+    return torch.special.erfc(-alpha * x) / 2.0
+
+
+@jit.script
+def _erf_derivative(x: torch.Tensor, alpha: float) -> torch.Tensor:
+    scale = alpha / math.sqrt(math.pi)
+    return scale * torch.exp(-((alpha * x) ** 2))
 
 
 class Erf(SurrogateFunctionBase):
@@ -22,16 +23,32 @@ class Erf(SurrogateFunctionBase):
 
     def __init__(
         self,
-        alpha: float = 1.0,
-        variance: float = 1.0,
+        alpha: float = 2.0,
+        variance: float | None = None,
         damping_factor: float = 1.0,
         spiking: bool = True,
     ):
+        if variance is not None:
+            alpha = 1.0 / math.sqrt(variance)
         super().__init__(alpha=alpha, damping_factor=damping_factor, spiking=spiking)
-        self.variance = variance
 
     def primitive(self, x: torch.Tensor) -> torch.Tensor:
-        return _erf_primitive(x, self.alpha, self.variance)
+        return _erf_primitive(x, self.alpha)
 
     def derivative(self, x: torch.Tensor) -> torch.Tensor:
-        return _erf_derivative(x, self.alpha, self.variance)
+        return _erf_derivative(x, self.alpha)
+
+
+def erf(
+    x: torch.Tensor,
+    alpha: float = 2.0,
+    variance: float | None = None,
+    damping_factor: float = 1.0,
+    spiking: bool = True,
+) -> torch.Tensor:
+    return Erf(
+        alpha=alpha,
+        variance=variance,
+        damping_factor=damping_factor,
+        spiking=spiking,
+    )(x)
