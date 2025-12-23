@@ -8,3 +8,4 @@ spikingjelly
 omegaconf
 hdf5plugin
 plotly
+nolds
