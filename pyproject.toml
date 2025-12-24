@@ -53,7 +53,7 @@ allow-direct-references = true
 
 [tool.ruff.lint]
 select = ["E", "F", "I001"]
-ignore = ["E721", "E731", "F722", "F821"]
+ignore = ["E731", "F722"]
 
 [tool.ruff.lint.isort]
 combine-as-imports = true

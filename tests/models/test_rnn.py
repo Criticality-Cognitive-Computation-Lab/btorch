@@ -1,3 +1,5 @@
+import platform
+
 import pytest
 import torch
 from torch import nn
@@ -280,6 +282,9 @@ class TestGradientCorrectness:
             rnn_no_chkpt.rnn_cell.W_h.grad, rnn_chkpt.rnn_cell.W_h.grad, atol=1e-5
         ), "W_h gradients should match"
 
+    @pytest.mark.skipif(
+        not platform.system() == "Linux", reason="Only Linux supports torch.compile"
+    )
     def test_compiled_checkpoint_vs_eager_checkpoint(self):
         """Test compiled checkpointed matches eager checkpointed."""
         if not hasattr(torch, "compile"):
