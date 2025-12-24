@@ -4,8 +4,8 @@ import torch
 
 from btorch.models import environ
 from btorch.models.functional import init_net_state
-from btorch.models.glif import GLIF3
 from btorch.models.neurons.alif import ALIF, ELIF
+from btorch.models.neurons.glif import GLIF3
 
 from ...utils.file import save_fig
 
@@ -123,7 +123,6 @@ def _plot(time, traces, v_threshold: float, title: str, adapt_label: str, name: 
                 n_neuron=1,
                 v_threshold=-50.0,
                 v_reset=-65.0,
-                v_rest=-65.0,
                 c_m=1.0,
                 g_leak=0.05,
                 E_leak=-70.0,
@@ -148,7 +147,6 @@ def _plot(time, traces, v_threshold: float, title: str, adapt_label: str, name: 
                 n_neuron=1,
                 v_threshold=-48.0,
                 v_reset=-65.0,
-                v_rest=-65.0,
                 c_m=1.0,
                 g_leak=0.05,
                 E_leak=-70.0,

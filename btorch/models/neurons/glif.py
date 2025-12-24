@@ -5,13 +5,13 @@ import torch
 from jaxtyping import Float
 from torch import Tensor
 
-from . import environ
-from .base import BaseNode
-from .ode import exp_euler_step_auto
-from .scale import SupportScaleState
-from .shape import expand_trailing_dims
-from .surrogate import ATan
-from .types import TensorLike
+from .. import environ
+from ..base import BaseNode
+from ..ode import exp_euler_step_auto
+from ..scale import SupportScaleState
+from ..shape import expand_trailing_dims
+from ..surrogate import ATan
+from ..types import TensorLike
 
 
 class GLIF3(BaseNode, SupportScaleState):
@@ -37,19 +37,19 @@ class GLIF3(BaseNode, SupportScaleState):
 
     def __init__(
         self,
-        n_neuron: int,
-        v_threshold: float | Float[TensorLike, "{self.n_neuron}"] = -50.0,  # mV
-        v_reset: float | Float[TensorLike, "{self.n_neuron}"] = -70.0,  # mV
-        v_rest: None | float | Float[TensorLike, "{self.n_neuron}"] = None,
-        c_m: float | Float[TensorLike, "{self.n_neuron}"] = 0.05,  # 1/20 pfarad
-        tau: float | Float[TensorLike, "{self.n_neuron}"] = 20.0,  # ms
-        k: float
-        | Sequence[float]
-        | Float[TensorLike, "{self.n_neuron} {self.n_Iasc}"] = [0.2],  # ms^-1
+        n_neuron: int | Sequence[int],
+        v_threshold: float | Float[TensorLike, " n_neuron"] = -50.0,  # mV
+        v_reset: float | Float[TensorLike, " n_neuron"] = -70.0,  # mV
+        v_rest: None | float | Float[TensorLike, " n_neuron"] = None,
+        c_m: float | Float[TensorLike, " n_neuron"] = 0.05,  # 1/20 pfarad
+        tau: float | Float[TensorLike, " n_neuron"] = 20.0,  # ms
+        k: float | Sequence[float] | Float[TensorLike, "n_neuron {self.n_Iasc}"] = [
+            0.2
+        ],  # ms^-1
         asc_amps: float
         | Sequence[float]
-        | Float[TensorLike, "{self.n_neuron} {self.n_Iasc}"] = [0.0],  # pA
-        tau_ref: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,  # ms
+        | Float[TensorLike, "n_neuron {self.n_Iasc}"] = [0.0],  # pA
+        tau_ref: float | Float[TensorLike, " n_neuron"] = 0.0,  # ms
         trainable_param: set[str] = set(),
         surrogate_function: Callable = ATan(),
         detach_reset: bool = False,
@@ -90,8 +90,10 @@ class GLIF3(BaseNode, SupportScaleState):
         if isinstance(k, float):
             k = [k]
 
-        self._def_param("k", k, **_factory_kwargs)
-        self._def_param("asc_amps", asc_amps, **_factory_kwargs)
+        self._def_param("k", k, allow_trailing_dims=True, **_factory_kwargs)
+        self._def_param(
+            "asc_amps", asc_amps, allow_trailing_dims=True, **_factory_kwargs
+        )
 
         self.n_Iasc: int = self.asc_amps.shape[-1]
 
@@ -101,7 +103,7 @@ class GLIF3(BaseNode, SupportScaleState):
                 0.0,
             ]
             * self.n_Iasc,
-            (self.n_neuron, self.n_Iasc),
+            self.n_neuron + (self.n_Iasc,),
         )
         self.register_memory("refractory", 0.0, self.n_neuron)
 
@@ -117,14 +119,14 @@ class GLIF3(BaseNode, SupportScaleState):
         if self._v_rest is not None:
             self._v_rest = v_rest
 
-    def dIasc(self, Iasc: Float[Tensor, "*batch {self.n_neuron} {self.n_Iasc}"]):
+    def dIasc(self, Iasc: Float[Tensor, "*batch n_neuron {self.n_Iasc}"]):
         return -self.k * Iasc
 
     def dV(
         self,
-        v: Float[Tensor, "*batch {self.n_neuron}"],
-        Iasc: Float[Tensor, "*batch {self.n_neuron} {self.n_Iasc}"],
-        x: Float[Tensor, "*batch {self.n_neuron}"],
+        v: Float[Tensor, "*batch n_neuron"],
+        Iasc: Float[Tensor, "*batch n_neuron {self.n_Iasc}"],
+        x: Float[Tensor, "*batch n_neuron"],
     ):
         Isum = x
         # torch.autocast will cast half to float32 for sum op
@@ -135,7 +137,7 @@ class GLIF3(BaseNode, SupportScaleState):
             + (Isum + Iasc.sum(-1, dtype=Iasc.dtype)) / self.c_m
         )
 
-    def neuronal_charge(self, x: Float[Tensor, "*batch {self.n_neuron}"]):
+    def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]):
         v = exp_euler_step_auto(self.dV, self.v, self.Iasc, x, dt=environ.get("dt"))
         self.v = v
 
