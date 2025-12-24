@@ -4,14 +4,13 @@ from . import (
     conv,
     environ,
     functional,
-    glif,
     init,
     linear,
     ode,
     rnn,
     surrogate,
 )
-from .neurons import alif, lif
+from .neurons import alif, glif, lif
 
 
 __all__ = [

@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, Literal
 
 import torch
@@ -35,18 +35,17 @@ class ALIF(BaseNode):
 
     def __init__(
         self,
-        n_neuron: int,
-        v_threshold: float | Float[TensorLike, "{self.n_neuron}"] = 1.0,
-        v_reset: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
-        v_rest: None | float | Float[TensorLike, "{self.n_neuron}"] = None,
-        c_m: float | Float[TensorLike, "{self.n_neuron}"] = 1.0,
-        g_leak: float | Float[TensorLike, "{self.n_neuron}"] = 1.0,
-        E_leak: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
-        E_k: float | Float[TensorLike, "{self.n_neuron}"] = -70.0,
-        g_k_init: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
-        tau_adapt: float | Float[TensorLike, "{self.n_neuron}"] = 20.0,
-        dg_k: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
-        tau_ref: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
+        n_neuron: int | Sequence[int],
+        v_threshold: float | Float[TensorLike, " n_neuron"] = 1.0,
+        v_reset: float | Float[TensorLike, " n_neuron"] = 0.0,
+        c_m: float | Float[TensorLike, " n_neuron"] = 1.0,
+        g_leak: float | Float[TensorLike, " n_neuron"] = 1.0,
+        E_leak: float | Float[TensorLike, " n_neuron"] = 0.0,
+        E_k: float | Float[TensorLike, " n_neuron"] = -70.0,
+        g_k_init: float | Float[TensorLike, " n_neuron"] = 0.0,
+        tau_adapt: float | Float[TensorLike, " n_neuron"] = 20.0,
+        dg_k: float | Float[TensorLike, " n_neuron"] = 0.0,
+        tau_ref: float | Float[TensorLike, " n_neuron"] = 0.0,
         trainable_param: set[str] = set(),
         surrogate_function: Callable = Sigmoid(),
         detach_reset: bool = False,
@@ -60,7 +59,7 @@ class ALIF(BaseNode):
         super().__init__(
             n_neuron=n_neuron,
             v_threshold=v_threshold,
-            v_reset=v_reset if v_rest is None else v_rest,
+            v_reset=v_reset,
             trainable_param=trainable_param,
             surrogate_function=surrogate_function,
             detach_reset=detach_reset,
@@ -79,11 +78,6 @@ class ALIF(BaseNode):
         self._def_param("tau_adapt", tau_adapt, **_factory_kwargs)
         self._def_param("dg_k", dg_k, **_factory_kwargs)
         self._def_param("tau_ref", tau_ref, **_factory_kwargs)
-
-        if v_rest is not None:
-            self._def_param("_v_rest", v_rest, **_factory_kwargs)
-        else:
-            self._v_rest = None
 
         self.register_memory("g_k", g_k_init, self.n_neuron)
         self.register_memory("refractory", 0.0, self.n_neuron)
@@ -109,20 +103,20 @@ class ALIF(BaseNode):
 
     def dV(
         self,
-        v: Float[Tensor, "*batch {self.n_neuron}"],
-        g_k: Float[Tensor, "*batch {self.n_neuron}"],
-        x: Float[Tensor, "*batch {self.n_neuron}"],
+        v: Float[Tensor, "*batch n_neuron"],
+        g_k: Float[Tensor, "*batch n_neuron"],
+        x: Float[Tensor, "*batch n_neuron"],
     ):
         leak_term = -self.g_leak * (v - self.E_leak)
         adapt_term = -g_k * (v - self.E_k)
         return (leak_term + adapt_term + x) / self.c_m
 
     def dgk(
-        self, g_k: Float[Tensor, "*batch {self.n_neuron}"]
-    ) -> Float[Tensor, "*batch {self.n_neuron}"]:
+        self, g_k: Float[Tensor, "*batch n_neuron"]
+    ) -> Float[Tensor, "*batch n_neuron"]:
         return -g_k / self.tau_adapt
 
-    def neuronal_charge(self, x: Float[Tensor, "*batch {self.n_neuron}"]):
+    def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]):
         dt = environ.get("dt")
         self.v = exp_euler_step_auto(self.dV, self.v, self.g_k, x, dt=dt)
 
@@ -170,20 +164,20 @@ class ELIF(ALIF):
 
     def __init__(
         self,
-        n_neuron: int,
-        v_threshold: float | Float[TensorLike, "{self.n_neuron}"] = 1.0,
-        v_reset: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
-        v_rest: None | float | Float[TensorLike, "{self.n_neuron}"] = None,
-        c_m: float | Float[TensorLike, "{self.n_neuron}"] = 1.0,
-        g_leak: float | Float[TensorLike, "{self.n_neuron}"] = 1.0,
-        E_leak: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
-        E_k: float | Float[TensorLike, "{self.n_neuron}"] = -70.0,
-        g_k_init: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
-        tau_adapt: float | Float[TensorLike, "{self.n_neuron}"] = 20.0,
-        dg_k: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
-        tau_ref: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
-        delta_T: float | Float[TensorLike, "{self.n_neuron}"] = 1.0,
-        v_T: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
+        n_neuron: int | Sequence[int],
+        v_threshold: float | Float[TensorLike, " n_neuron"] = 1.0,
+        v_reset: float | Float[TensorLike, " n_neuron"] = 0.0,
+        v_rest: None | float | Float[TensorLike, " n_neuron"] = None,
+        c_m: float | Float[TensorLike, " n_neuron"] = 1.0,
+        g_leak: float | Float[TensorLike, " n_neuron"] = 1.0,
+        E_leak: float | Float[TensorLike, " n_neuron"] = 0.0,
+        E_k: float | Float[TensorLike, " n_neuron"] = -70.0,
+        g_k_init: float | Float[TensorLike, " n_neuron"] = 0.0,
+        tau_adapt: float | Float[TensorLike, " n_neuron"] = 20.0,
+        dg_k: float | Float[TensorLike, " n_neuron"] = 0.0,
+        tau_ref: float | Float[TensorLike, " n_neuron"] = 0.0,
+        delta_T: float | Float[TensorLike, " n_neuron"] = 1.0,
+        v_T: float | Float[TensorLike, " n_neuron"] = 0.0,
         trainable_param: set[str] = set(),
         surrogate_function: Callable = Sigmoid(),
         detach_reset: bool = False,
@@ -198,7 +192,6 @@ class ELIF(ALIF):
             n_neuron=n_neuron,
             v_threshold=v_threshold,
             v_reset=v_reset,
-            v_rest=v_rest,
             c_m=c_m,
             g_leak=g_leak,
             E_leak=E_leak,
@@ -223,16 +216,16 @@ class ELIF(ALIF):
 
     def dV(
         self,
-        v: Float[Tensor, "*batch {self.n_neuron}"],
-        g_k: Float[Tensor, "*batch {self.n_neuron}"],
-        x: Float[Tensor, "*batch {self.n_neuron}"],
+        v: Float[Tensor, "*batch n_neuron"],
+        g_k: Float[Tensor, "*batch n_neuron"],
+        x: Float[Tensor, "*batch n_neuron"],
     ):
         leak_term = -self.g_leak * (v - self.E_leak)
         adapt_term = -g_k * (v - self.E_k)
         exp_term = self.g_leak * self.delta_T * torch.exp((v - self.v_T) / self.delta_T)
         return (leak_term + adapt_term + exp_term + x) / self.c_m
 
-    def neuronal_charge(self, x: Float[Tensor, "*batch {self.n_neuron}"]):
+    def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]):
         dt = environ.get("dt")
         self.v = exp_euler_step_auto(self.dV, self.v, self.g_k, x, dt=dt)
 

@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, Literal
 
 import torch
@@ -42,16 +42,16 @@ class Izhikevich(BaseNode):
 
     def __init__(
         self,
-        n_neuron: int,
-        v_threshold: float | Float[TensorLike, "{self.n_neuron}"] = 30.0,
-        v_reset: float | Float[TensorLike, "{self.n_neuron}"] = -65.0,
-        v_rest: float | Float[TensorLike, "{self.n_neuron}"] = -65.0,
-        v_peak: float | Float[TensorLike, "{self.n_neuron}"] = -40.0,
-        c_m: float | Float[TensorLike, "{self.n_neuron}"] = 100.0,
-        k: float | Float[TensorLike, "{self.n_neuron}"] = 0.7,
-        a: float | Float[TensorLike, "{self.n_neuron}"] = 0.03,
-        b: float | Float[TensorLike, "{self.n_neuron}"] = -2.0,
-        d: float | Float[TensorLike, "{self.n_neuron}"] = 100.0,
+        n_neuron: int | Sequence[int],
+        v_threshold: float | Float[TensorLike, " n_neuron"] = 30.0,
+        v_reset: float | Float[TensorLike, " n_neuron"] = -65.0,
+        v_rest: float | Float[TensorLike, " n_neuron"] = -65.0,
+        v_peak: float | Float[TensorLike, " n_neuron"] = -40.0,
+        c_m: float | Float[TensorLike, " n_neuron"] = 100.0,
+        k: float | Float[TensorLike, " n_neuron"] = 0.7,
+        a: float | Float[TensorLike, " n_neuron"] = 0.03,
+        b: float | Float[TensorLike, " n_neuron"] = -2.0,
+        d: float | Float[TensorLike, " n_neuron"] = 100.0,
         trainable_param: set[str] = set(),
         surrogate_function: Callable = Sigmoid(),
         detach_reset: bool = False,
@@ -91,7 +91,18 @@ class Izhikevich(BaseNode):
 
     @classmethod
     def from_hippocampome(
-        cls, n_neuron: int, k, a, b, d, C, vr, vt, vpeak, vmin, **kwargs
+        cls,
+        n_neuron: int | Sequence[int],
+        k,
+        a,
+        b,
+        d,
+        C,
+        vr,
+        vt,
+        vpeak,
+        vmin,
+        **kwargs,
     ):
         """
         Build an :class:`Izhikevich` neuron using parameter names from
@@ -129,9 +140,10 @@ class Izhikevich(BaseNode):
     @classmethod
     def from_canonical_quadratic(
         cls,
-        n_neuron: int,
+        n_neuron: int | Sequence[int],
         p1: float = 0.04,
         p2: float = 5.0,
+        # TODO: p3: float = 0.0, adjust equation
         v_rest: float = -65.0,
         c_m: float = 1.0,
         v_peak: float = 30.0,
@@ -163,21 +175,21 @@ class Izhikevich(BaseNode):
 
     def dV(
         self,
-        v: Float[Tensor, "*batch {self.n_neuron}"],
-        u: Float[Tensor, "*batch {self.n_neuron}"],
-        x: Float[Tensor, "*batch {self.n_neuron}"],
+        v: Float[Tensor, "*batch n_neuron"],
+        u: Float[Tensor, "*batch n_neuron"],
+        x: Float[Tensor, "*batch n_neuron"],
     ):
         quadratic = self.k * (v - self.v_rest) * (v - self.v_threshold)
         return (x + quadratic - u) / self.c_m
 
     def dU(
         self,
-        u: Float[Tensor, "*batch {self.n_neuron}"],
-        v: Float[Tensor, "*batch {self.n_neuron}"],
+        u: Float[Tensor, "*batch n_neuron"],
+        v: Float[Tensor, "*batch n_neuron"],
     ):
         return self.a * (self.b * (v - self.v_rest) - u)
 
-    def neuronal_charge(self, x: Float[Tensor, "*batch {self.n_neuron}"]):
+    def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]):
         dt = environ.get("dt")
         self.v = euler_step(self.dV, self.v, self.u, x, dt=dt)
 

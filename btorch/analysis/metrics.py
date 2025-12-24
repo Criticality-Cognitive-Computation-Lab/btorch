@@ -4,14 +4,23 @@ import numpy as np
 
 
 def indices_to_mask(indices: np.ndarray, shape=None, array=None) -> np.ndarray:
-    """Convert an array of indices to a boolean mask."""
+    """Convert an array of indices to a boolean mask.
+
+    For multi-dimensional masks, a 1D index array is treated as
+    flattened indices. Provide a tuple of index arrays for per-axis
+    indexing.
+    """
     assert not (shape is None and array is None)
     mask = (
         np.zeros(shape, dtype=bool)
         if shape is not None
         else np.zeros_like(array, dtype=bool)
     )
-    mask[indices] = True
+    indices_arr = np.asarray(indices)
+    if mask.ndim > 1 and indices_arr.ndim == 1 and not isinstance(indices, tuple):
+        mask.flat[indices_arr] = True
+    else:
+        mask[indices] = True
     return mask
 
 

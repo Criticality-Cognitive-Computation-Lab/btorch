@@ -9,7 +9,11 @@ from . import base
 from .scale import SupportScaleState
 
 
-def init_net_state(net: nn.Module, batch_size: int | None = None, **kwargs):
+def init_net_state(
+    net: nn.Module,
+    batch_size: int | Sequence[int] | None = None,
+    **kwargs,
+):
     def fn(m: nn.Module):
         if hasattr(m, "init_state") and callable(m.init_state):
             # can be a torch.compiled module
@@ -28,7 +32,11 @@ def init_net_state(net: nn.Module, batch_size: int | None = None, **kwargs):
         fn(m)
 
 
-def reset_net(net: nn.Module, batch_size: int | None = None, **kwargs):
+def reset_net(
+    net: nn.Module,
+    batch_size: int | Sequence[int] | None = None,
+    **kwargs,
+):
     """
     * :ref:`API in English <reset_net-en>`
 

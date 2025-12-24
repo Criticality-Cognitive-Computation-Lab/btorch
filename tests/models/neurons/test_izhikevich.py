@@ -157,10 +157,10 @@ def _plot_grid(results):
 
 def test_izhikevich_2003_phenotypes():
     base_kwargs = {
-        "n_neuron": 1,
+        " n_neuron": 1,
         "p1": 0.04,
         "p2": 5.0,
-        "p3": 140.0,
+        # "p3": 140.0,
         "v_rest": -65.0,
         "v_peak": 30.0,
         "c_m": 1.0,
