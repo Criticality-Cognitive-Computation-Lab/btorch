@@ -23,6 +23,19 @@ def is_broadcastable(shape_from, shape_to):
         return False
 
 
+def normalize_n_neuron(
+    n_neuron: int | Sequence[int],
+) -> tuple[tuple[int, ...], int]:
+    if isinstance(n_neuron, int):
+        n_neuron = (n_neuron,)
+    else:
+        n_neuron = tuple(n_neuron)
+    if len(n_neuron) == 0:
+        raise ValueError("n_neuron must contain at least one dimension.")
+    size = int(np.prod(n_neuron))
+    return n_neuron, size
+
+
 ResetValueType = Callable | np.ndarray | torch.Tensor | None
 
 
@@ -65,6 +78,7 @@ def _validate_has_batch(reset_val: ResetValue | dict) -> None:
     value = reset_val["value"]
     has_batch = reset_val["has_batch"]
     sizes = reset_val["sizes"]
+    sizes_str = ", ".join(str(s) for s in sizes)
 
     # Callable values are always valid
     if isinstance(value, Callable):
@@ -77,14 +91,14 @@ def _validate_has_batch(reset_val: ResetValue | dict) -> None:
         if value is None:
             raise ValueError(
                 f"has_batch=True requires an array value, but got None. "
-                f"Expected (*batch_dims, {','.join(sizes)})\n"
+                f"Expected (*batch_dims, {sizes_str})\n"
             )
 
         ndim_value = len(value.shape)
         if ndim_value <= ndim_sizes:
             raise ValueError(
                 f"has_batch=True but array lacks batch dimensions. "
-                f"Expected (*batch_dims, {','.join(sizes)}) but got {value.shape}\n"
+                f"Expected (*batch_dims, {sizes_str}) but got {value.shape}\n"
             )
 
     else:
@@ -337,6 +351,8 @@ class MemoryModule(base.MemoryModule):
 
 
 class BaseNode(MemoryModule):
+    n_neuron: tuple[int, ...]
+    size: int
     v: torch.Tensor
     v_pre_spike: torch.Tensor
     v_threshold: torch.Tensor | torch.nn.Parameter
@@ -344,9 +360,9 @@ class BaseNode(MemoryModule):
 
     def __init__(
         self,
-        n_neuron: int,
-        v_threshold: float | Float[TensorLike, "{self.n_neuron}"] = 1.0,
-        v_reset: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
+        n_neuron: int | Sequence[int],
+        v_threshold: float | Float[TensorLike, " n_neuron"] = 1.0,
+        v_reset: float | Float[TensorLike, " n_neuron"] = 0.0,
         trainable_param: set[str] = set(),
         surrogate_function: Callable = Sigmoid(),
         detach_reset: bool = False,
@@ -368,13 +384,15 @@ class BaseNode(MemoryModule):
         # call neuron.BaseNode's parent MemoryModule directly
         super().__init__()
 
-        self.n_neuron = n_neuron
-        self.register_memory("v", v_reset, n_neuron)
+        self.n_neuron, self.size = normalize_n_neuron(n_neuron)
+        self.register_memory("v", v_reset, self.n_neuron)
         self.pre_spike_v = pre_spike_v
 
         _factory_kwargs: dict[str, Any] = {"device": device, "dtype": dtype}
         if pre_spike_v:
-            self.register_memory("v_pre_spike", v_reset, n_neuron, persistent=False)
+            self.register_memory(
+                "v_pre_spike", v_reset, self.n_neuron, persistent=False
+            )
 
         self.trainable_param = set(trainable_param)
         self._def_param("v_threshold", v_threshold, **_factory_kwargs)
@@ -388,13 +406,26 @@ class BaseNode(MemoryModule):
         self.backend = backend
 
     # TODO: improve
-    def _def_param(self, name, val, **kwargs):
+    def _def_param(self, name, val, *, allow_trailing_dims: bool = False, **kwargs):
         val = torch.as_tensor(val, **kwargs)
         if hasattr(self, name):
             delattr(self, name)
+        neuron_shape = self.n_neuron
+        if val.ndim == 0:
+            val = expand_leading_dims(val, neuron_shape, match_full_shape=True)
+        elif val.shape[: len(neuron_shape)] != neuron_shape:
+            if val.ndim == 1 and val.numel() == self.size:
+                val = val.reshape(neuron_shape)
+            elif allow_trailing_dims:
+                val = expand_leading_dims(val, neuron_shape)
+            elif is_broadcastable(val.shape, neuron_shape):
+                val = expand_leading_dims(val, neuron_shape, match_full_shape=True)
+            else:
+                raise ValueError(
+                    f"{name} shape {tuple(val.shape)} is not broadcastable to "
+                    f"{neuron_shape}."
+                )
         if name in self.trainable_param:
-            if val.ndim == 0 or val.shape[0] != self.n_neuron:
-                val = expand_leading_dims(val, self.n_neuron)
             self.register_parameter(name, torch.nn.Parameter(val))
         else:
             self.register_buffer(name, val, persistent=True)
@@ -470,7 +501,7 @@ class BaseNode(MemoryModule):
     def neuronal_adaptation(self):
         raise NotImplementedError()
 
-    def single_step_forward(self, x: Float[Tensor, "*batch {self.n_neuron}"]):
+    def single_step_forward(self, x: Float[Tensor, "*batch n_neuron"]):
         """
         * :ref:`API in English <BaseNode.single_step_forward-en>`
         """
@@ -480,7 +511,7 @@ class BaseNode(MemoryModule):
         self.neuronal_reset(spike)
         return spike
 
-    def multi_step_forward(self, x_seq: Float[Tensor, "T *batch {self.n_neuron}"]):
+    def multi_step_forward(self, x_seq: Float[Tensor, "T *batch n_neuron"]):
         s_seq = []
         for t, x in enumerate(x_seq):
             s = self.single_step_forward(x)

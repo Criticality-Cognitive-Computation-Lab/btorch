@@ -160,7 +160,7 @@ def test_izhikevich_2003_phenotypes():
         "n_neuron": 1,
         "p1": 0.04,
         "p2": 5.0,
-        "p3": 140.0,
+        # "p3": 140.0,
         "v_rest": -65.0,
         "v_peak": 30.0,
         "c_m": 1.0,

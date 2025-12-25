@@ -1,11 +1,11 @@
 import matplotlib.pyplot as plt
 import torch
+
 from btorch.models import environ, linear, rnn, synapse
 from btorch.models.functional import init_net_state
-from btorch.models.glif import GLIF3
 from btorch.models.init import build_sparse_mat, uniform_v_
+from btorch.models.neurons.glif import GLIF3
 from btorch.models.scale import scale_state_
-
 from tests.utils.file import save_fig
 
 

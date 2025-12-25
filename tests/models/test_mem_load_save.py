@@ -1,5 +1,6 @@
 import pytest
 import torch
+
 from btorch.models import environ, linear, rnn, synapse
 from btorch.models.functional import (
     init_net_state,
@@ -8,8 +9,8 @@ from btorch.models.functional import (
     set_hidden_states,
     set_memory_reset_values,
 )
-from btorch.models.glif import GLIF3
 from btorch.models.init import build_sparse_mat, uniform_v_
+from btorch.models.neurons.glif import GLIF3
 
 
 # --- Fixtures and helpers --- #
@@ -80,7 +81,7 @@ def def_model(neuron_params, device, dtype):
 def run_sim(module, device, dtype):
     dt = 1
     T = 50  # shorter sim for test speed
-    x = torch.ones([T, module.neuron.n_neuron]) * 2
+    x = torch.ones([T, *module.neuron.n_neuron]) * 2
     x = x.to(device=device, dtype=dtype)
 
     # reset_net_state(module)

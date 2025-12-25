@@ -1,13 +1,13 @@
 import os
 
 import torch
-from btorch.models import environ, linear, rnn, synapse
-from btorch.models.functional import init_net_state
-from btorch.models.glif import GLIF3
-from btorch.models.init import build_dense_mat, uniform_v_
 from torchview import draw_graph
 from torchviz import make_dot
 
+from btorch.models import environ, linear, rnn, synapse
+from btorch.models.functional import init_net_state
+from btorch.models.init import build_dense_mat, uniform_v_
+from btorch.models.neurons.glif import GLIF3
 from tests.utils.file import fig_path
 
 

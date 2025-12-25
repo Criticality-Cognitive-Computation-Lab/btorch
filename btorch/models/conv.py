@@ -136,8 +136,8 @@ class Conv1dSpatial(nn.Conv1d):
         )
 
     def forward(
-        self, x: Float[torch.Tensor, "... {self.in_channels} {self.n_neuron}"]
-    ) -> Float[torch.Tensor, "... {self.out_channels} {self.n_neuron}"]:
+        self, x: Float[torch.Tensor, "... {self.in_channels} n_neuron"]
+    ) -> Float[torch.Tensor, "... {self.out_channels} n_neuron"]:
         """
         Forward pass:
         1. Gather neighbors for each neuron: (..., in_channels, n_neurons, kernel_size)

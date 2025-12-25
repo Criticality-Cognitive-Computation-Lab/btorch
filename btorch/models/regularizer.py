@@ -163,7 +163,7 @@ class FiringRateLoss(nn.Module):
 
         self.register_buffer("target", target_tensor)
 
-    def forward(self, x: Float[torch.Tensor, "... {self.n_neuron}"]):
+    def forward(self, x: Float[torch.Tensor, "... n_neuron"]):
         if self.input_type == "spike":
             x = x.mean(0)
 

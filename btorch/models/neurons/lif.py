@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, Literal
 
 import torch
@@ -23,13 +23,13 @@ class LIF(BaseNode, SupportScaleState):
 
     def __init__(
         self,
-        n_neuron: int,
-        v_threshold: float | Float[TensorLike, "{self.n_neuron}"] = 1.0,
-        v_reset: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
-        v_rest: None | float | Float[TensorLike, "{self.n_neuron}"] = None,
-        c_m: float | Float[TensorLike, "{self.n_neuron}"] = 1.0,
-        tau: float | Float[TensorLike, "{self.n_neuron}"] = 20.0,
-        tau_ref: float | Float[TensorLike, "{self.n_neuron}"] = 0.0,
+        n_neuron: int | Sequence[int],
+        v_threshold: float | Float[TensorLike, " n_neuron"] = 1.0,
+        v_reset: float | Float[TensorLike, " n_neuron"] = 0.0,
+        v_rest: None | float | Float[TensorLike, " n_neuron"] = None,
+        c_m: float | Float[TensorLike, " n_neuron"] = 1.0,
+        tau: float | Float[TensorLike, " n_neuron"] = 20.0,
+        tau_ref: float | Float[TensorLike, " n_neuron"] = 0.0,
         trainable_param: set[str] = set(),
         surrogate_function: Callable = Sigmoid(),
         detach_reset: bool = False,
@@ -79,12 +79,12 @@ class LIF(BaseNode, SupportScaleState):
 
     def dV(
         self,
-        v: Float[Tensor, "*batch {self.n_neuron}"],
-        x: Float[Tensor, "*batch {self.n_neuron}"],
+        v: Float[Tensor, "*batch n_neuron"],
+        x: Float[Tensor, "*batch n_neuron"],
     ):
         return -(v - self.v_rest) / self.tau + x / self.c_m
 
-    def neuronal_charge(self, x: Float[Tensor, "*batch {self.n_neuron}"]):
+    def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]):
         v = exp_euler_step_auto(self.dV, self.v, x, dt=environ.get("dt"))
         self.v = v
 
@@ -126,10 +126,10 @@ class IF(LIF):
 
     def dV(
         self,
-        x: Float[Tensor, "*batch {self.n_neuron}"],
+        x: Float[Tensor, "*batch n_neuron"],
     ):
         return x / self.c_m
 
-    def neuronal_charge(self, x: Float[Tensor, "*batch {self.n_neuron}"]):
+    def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]):
         v = euler_step(self.dV, x, dt=environ.get("dt"))
         self.v = v

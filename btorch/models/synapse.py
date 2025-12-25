@@ -1,9 +1,10 @@
+from collections.abc import Sequence
 from typing import Protocol
 
 import torch
 
 from . import environ
-from .base import MemoryModule
+from .base import MemoryModule, normalize_n_neuron
 from .ode import exp_euler_step_auto
 from .types import TensorLike
 
@@ -19,11 +20,13 @@ class Synapse(Protocol):
 
 
 class BasePSC(MemoryModule):
+    n_neuron: tuple[int, ...]
+    size: int
     psc: torch.Tensor
 
     def __init__(
         self,
-        n_neuron: int,
+        n_neuron: int | Sequence[int],
         linear: torch.nn.Module,
         latency: float = 0.0,
         step_mode="s",
@@ -31,13 +34,13 @@ class BasePSC(MemoryModule):
     ):
         super().__init__()
 
-        self.n_neuron = n_neuron
+        self.n_neuron, self.size = normalize_n_neuron(n_neuron)
         self.step_mode = step_mode
         self.backend = backend
         self.latency = latency
         self.linear = linear
 
-        self.register_memory("psc", 0.0, n_neuron)
+        self.register_memory("psc", 0.0, self.n_neuron)
 
         # TODO: delay should have its own class
         if latency > 0:
@@ -45,7 +48,7 @@ class BasePSC(MemoryModule):
             self.register_memory(
                 "delay_buffer",
                 0,
-                (self.latency_steps + 1, n_neuron),
+                (self.latency_steps + 1, *self.n_neuron),
             )
             self.register_memory("delay_ptr", 0, 1)
 
@@ -68,10 +71,12 @@ class BasePSC(MemoryModule):
         if self.latency > 0:
             delay_buffer_sizes = self._memories_rv["delay_buffer"].sizes
             if batch_size is not None:
+                if isinstance(batch_size, int):
+                    batch_size = (batch_size,)
                 delay_buffer_sizes = (
                     delay_buffer_sizes[0],
-                    batch_size,
-                    delay_buffer_sizes[1],
+                    *batch_size,
+                    *delay_buffer_sizes[1:],
                 )
             self.register_buffer(
                 "delay_buffer",
@@ -99,15 +104,18 @@ class BasePSC(MemoryModule):
             skip_mem_name=("delay_ptr", "delay_buffer") + skip_mem_name,
         )
         if self.latency > 0:
-            if batch_size is None and self.delay_buffer.ndim > 2:
-                # TODO: what if batch_size or n_neuron are not one dimensional?
-                batch_size = self.delay_buffer.shape[1]
+            if batch_size is None and self.delay_buffer.ndim > 1 + len(self.n_neuron):
+                batch_size = self.delay_buffer.shape[1 : -len(self.n_neuron)]
+                if len(batch_size) == 0:
+                    batch_size = None
             delay_buffer_sizes = self._memories_rv["delay_buffer"].sizes
             if batch_size is not None:
+                if isinstance(batch_size, int):
+                    batch_size = (batch_size,)
                 delay_buffer_sizes = (
                     delay_buffer_sizes[0],
-                    batch_size,
-                    delay_buffer_sizes[1],
+                    *batch_size,
+                    *delay_buffer_sizes[1:],
                 )
             self.delay_buffer = torch.zeros(
                 delay_buffer_sizes, dtype=dtype, device=device
@@ -116,6 +124,19 @@ class BasePSC(MemoryModule):
 
     def extra_repr(self):
         return f" step_mode={self.step_mode}, backend={self.backend}"
+
+    def _flatten_neuron(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
+        if len(self.n_neuron) == 1:
+            return x, x.shape[:-1]
+        leading = x.shape[: -len(self.n_neuron)]
+        return x.reshape(*leading, self.size), leading
+
+    def _unflatten_neuron(
+        self, x: torch.Tensor, leading_shape: tuple[int, ...]
+    ) -> torch.Tensor:
+        if len(self.n_neuron) == 1:
+            return x
+        return x.reshape(*leading_shape, *self.n_neuron)
 
     def conductance_charge(self):
         raise NotImplementedError()
@@ -167,7 +188,7 @@ class ExponentialPSC(BasePSC):
 
     def __init__(
         self,
-        n_neuron,
+        n_neuron: int | Sequence[int],
         tau_syn: float | TensorLike,
         linear,
         step_mode="s",
@@ -184,17 +205,21 @@ class ExponentialPSC(BasePSC):
         return exp_euler_step_auto(self.dpsc, self.psc, dt=environ.get("dt"))
 
     def adaptation_charge(self, z: torch.Tensor):
-        wz = self.linear(z)
+        z_flat, leading = self._flatten_neuron(z)
+        wz = self.linear(z_flat)
+        wz = self._unflatten_neuron(wz, leading)
         self.psc = self.psc + wz
 
 
 class _Adaptive2VarPSC(BasePSC):
     h: torch.Tensor
 
-    def __init__(self, n_neuron, linear, step_mode="s", backend="torch"):
+    def __init__(
+        self, n_neuron: int | Sequence[int], linear, step_mode="s", backend="torch"
+    ):
         super().__init__(n_neuron, linear, step_mode=step_mode, backend=backend)
 
-        self.register_memory("h", 0.0, n_neuron)
+        self.register_memory("h", 0.0, self.n_neuron)
 
 
 class AlphaPSCBilleh(_Adaptive2VarPSC):
@@ -203,7 +228,7 @@ class AlphaPSCBilleh(_Adaptive2VarPSC):
 
     def __init__(
         self,
-        n_neuron: int,
+        n_neuron: int | Sequence[int],
         tau_syn: float | TensorLike,
         linear: torch.nn.Module,
         step_mode="s",
@@ -242,7 +267,9 @@ class AlphaPSCBilleh(_Adaptive2VarPSC):
         return self.psc
 
     def adaptation_charge(self, z: torch.Tensor):
-        wz = self.linear(z)
+        z_flat, leading = self._flatten_neuron(z)
+        wz = self.linear(z_flat)
+        wz = self._unflatten_neuron(wz, leading)
         self.h = self.syn_decay * self.h + torch.e / self.tau_syn * wz
 
 
@@ -252,7 +279,7 @@ class AlphaPSC(_Adaptive2VarPSC):
 
     def __init__(
         self,
-        n_neuron: int,
+        n_neuron: int | Sequence[int],
         tau_syn: float | TensorLike,
         linear: torch.nn.Module,
         g_max=1.0,
@@ -276,7 +303,9 @@ class AlphaPSC(_Adaptive2VarPSC):
         self.psc = exp_euler_step_auto(self.dg, self.psc, self.h, dt=environ.get("dt"))
 
     def adaptation_charge(self, z: torch.Tensor):
-        wz = self.g_max * self.linear(z)
+        z_flat, leading = self._flatten_neuron(z)
+        wz = self.g_max * self.linear(z_flat)
+        wz = self._unflatten_neuron(wz, leading)
         self.h = exp_euler_step_auto(self.dh, self.h, dt=environ.get("dt")) + wz
 
 
@@ -289,7 +318,7 @@ class DualExponentialPSC(BasePSC):
 
     def __init__(
         self,
-        n_neuron: int,
+        n_neuron: int | Sequence[int],
         tau_decay: float | TensorLike,
         tau_rise: float | TensorLike,
         linear: torch.nn.Module,
@@ -322,9 +351,9 @@ class DualExponentialPSC(BasePSC):
         a = (self.tau_decay - self.tau_rise) / self.tau_rise / self.tau_decay * A
         self.register_buffer("a", a, persistent=False)
 
-        self.register_memory("g_rise", 0.0, n_neuron)
-        self.register_memory("g_decay", 0.0, n_neuron)
-        self.register_memory("psc", 0.0, n_neuron)
+        self.register_memory("g_rise", 0.0, self.n_neuron)
+        self.register_memory("g_decay", 0.0, self.n_neuron)
+        self.register_memory("psc", 0.0, self.n_neuron)
 
     def dg_rise(self, g_rise):
         return -g_rise / self.tau_rise
@@ -341,7 +370,9 @@ class DualExponentialPSC(BasePSC):
         )
 
     def adaptation_charge(self, z: torch.Tensor):
-        wz = self.linear(z)
+        z_flat, leading = self._flatten_neuron(z)
+        wz = self.linear(z_flat)
+        wz = self._unflatten_neuron(wz, leading)
         self.g_rise = self.g_rise + wz
         self.g_decay = self.g_decay + wz
         self.psc = self.a * (self.g_decay - self.g_rise)
@@ -350,7 +381,7 @@ class DualExponentialPSC(BasePSC):
 class HeterSynapsePSC(BasePSC):
     def __init__(
         self,
-        n_neuron: int,
+        n_neuron: int | Sequence[int],
         n_receptor: int,
         linear: torch.nn.Module,
         base_psc: type[BasePSC] = AlphaPSC,
@@ -363,16 +394,16 @@ class HeterSynapsePSC(BasePSC):
         )
 
         self.base_psc = base_psc(
-            n_neuron=n_neuron * n_receptor,
+            n_neuron=self.size * n_receptor,
             linear=linear,
             step_mode=step_mode,
             backend=backend,
             **kwargs,
         )
         self.n_receptor = n_receptor
-        self.register_memory("psc", 0.0, n_neuron)
 
     def single_step_forward(self, z: torch.Tensor):
-        psc = self.base_psc.single_step_forward(z)
-        self.psc = psc.view(*psc.shape[:-1], self.n_neuron, self.n_receptor).sum(-1)
+        z_flat, leading = self._flatten_neuron(z)
+        psc = self.base_psc.single_step_forward(z_flat)
+        self.psc = psc.view(*psc.shape[:-1], *self.n_neuron, self.n_receptor).sum(-1)
         return self.psc
