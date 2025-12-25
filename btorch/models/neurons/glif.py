@@ -7,7 +7,7 @@ from torch import Tensor
 
 from .. import environ
 from ..base import BaseNode
-from ..ode import exp_euler_step_auto
+from ..ode import exp_euler_step
 from ..scale import SupportScaleState
 from ..shape import expand_trailing_dims
 from ..surrogate import ATan
@@ -120,7 +120,7 @@ class GLIF3(BaseNode, SupportScaleState):
             self._v_rest = v_rest
 
     def dIasc(self, Iasc: Float[Tensor, "*batch n_neuron {self.n_Iasc}"]):
-        return -self.k * Iasc
+        return -self.k * Iasc, -self.k
 
     def dV(
         self,
@@ -134,15 +134,16 @@ class GLIF3(BaseNode, SupportScaleState):
         # here Iasc generally only have <4 modes, so no overflow guaranteed
         return (
             -(v - self.v_rest) / self.tau
-            + (Isum + Iasc.sum(-1, dtype=Iasc.dtype)) / self.c_m
+            + (Isum + Iasc.sum(-1, dtype=Iasc.dtype)) / self.c_m,
+            -1.0 / self.tau,
         )
 
     def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]):
-        v = exp_euler_step_auto(self.dV, self.v, self.Iasc, x, dt=environ.get("dt"))
+        v = exp_euler_step(self.dV, self.v, self.Iasc, x, dt=environ.get("dt"))
         self.v = v
 
     def neuronal_adaptation(self):
-        self.Iasc = exp_euler_step_auto(self.dIasc, self.Iasc, dt=environ.get("dt"))
+        self.Iasc = exp_euler_step(self.dIasc, self.Iasc, dt=environ.get("dt"))
 
     def neuronal_fire(self):
         # Check if voltage exceeds threshold and not in refractory period

@@ -7,7 +7,7 @@ from torch import Tensor
 
 from .. import environ
 from ..base import BaseNode
-from ..ode import euler_step, exp_euler_step_auto
+from ..ode import euler_step
 from ..scale import SupportScaleState
 from ..surrogate import Sigmoid
 from ..types import TensorLike
@@ -82,10 +82,11 @@ class LIF(BaseNode, SupportScaleState):
         v: Float[Tensor, "*batch n_neuron"],
         x: Float[Tensor, "*batch n_neuron"],
     ):
-        return -(v - self.v_rest) / self.tau + x / self.c_m
+        derivative = -(v - self.v_rest) / self.tau + x / self.c_m
+        return derivative
 
     def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]):
-        v = exp_euler_step_auto(self.dV, self.v, x, dt=environ.get("dt"))
+        v = euler_step(self.dV, self.v, x, dt=environ.get("dt"))
         self.v = v
 
     def neuronal_adaptation(self):
@@ -128,7 +129,8 @@ class IF(LIF):
         self,
         x: Float[Tensor, "*batch n_neuron"],
     ):
-        return x / self.c_m
+        derivative = x / self.c_m
+        return derivative
 
     def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]):
         v = euler_step(self.dV, x, dt=environ.get("dt"))

@@ -7,7 +7,7 @@ from torch import Tensor
 
 from .. import environ
 from ..base import BaseNode
-from ..ode import exp_euler_step_auto
+from ..ode import exp_euler_step
 from ..surrogate import Sigmoid
 from ..types import TensorLike
 
@@ -109,20 +109,24 @@ class ALIF(BaseNode):
     ):
         leak_term = -self.g_leak * (v - self.E_leak)
         adapt_term = -g_k * (v - self.E_k)
-        return (leak_term + adapt_term + x) / self.c_m
+        derivative = (leak_term + adapt_term + x) / self.c_m
+        linear = (-self.g_leak - g_k) / self.c_m
+        return derivative, linear
 
     def dgk(
         self, g_k: Float[Tensor, "*batch n_neuron"]
     ) -> Float[Tensor, "*batch n_neuron"]:
-        return -g_k / self.tau_adapt
+        derivative = -g_k / self.tau_adapt
+        linear = -1.0 / self.tau_adapt
+        return derivative, linear
 
     def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]):
         dt = environ.get("dt")
-        self.v = exp_euler_step_auto(self.dV, self.v, self.g_k, x, dt=dt)
+        self.v = exp_euler_step(self.dV, self.v, self.g_k, x, dt=dt)
 
     def neuronal_adaptation(self):
         dt = environ.get("dt")
-        self.g_k = exp_euler_step_auto(self.dgk, self.g_k, dt=dt)
+        self.g_k = exp_euler_step(self.dgk, self.g_k, dt=dt)
 
     def neuronal_fire(self):
         not_in_refractory = self.refractory == 0
@@ -167,7 +171,6 @@ class ELIF(ALIF):
         n_neuron: int | Sequence[int],
         v_threshold: float | Float[TensorLike, " n_neuron"] = 1.0,
         v_reset: float | Float[TensorLike, " n_neuron"] = 0.0,
-        v_rest: None | float | Float[TensorLike, " n_neuron"] = None,
         c_m: float | Float[TensorLike, " n_neuron"] = 1.0,
         g_leak: float | Float[TensorLike, " n_neuron"] = 1.0,
         E_leak: float | Float[TensorLike, " n_neuron"] = 0.0,
@@ -223,11 +226,13 @@ class ELIF(ALIF):
         leak_term = -self.g_leak * (v - self.E_leak)
         adapt_term = -g_k * (v - self.E_k)
         exp_term = self.g_leak * self.delta_T * torch.exp((v - self.v_T) / self.delta_T)
-        return (leak_term + adapt_term + exp_term + x) / self.c_m
+        derivative = (leak_term + adapt_term + exp_term + x) / self.c_m
+        linear = (-self.g_leak - g_k + exp_term / self.delta_T) / self.c_m
+        return derivative, linear
 
     def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]):
         dt = environ.get("dt")
-        self.v = exp_euler_step_auto(self.dV, self.v, self.g_k, x, dt=dt)
+        self.v = exp_euler_step(self.dV, self.v, self.g_k, x, dt=dt)
 
     def extra_repr(self):
         return super().extra_repr()

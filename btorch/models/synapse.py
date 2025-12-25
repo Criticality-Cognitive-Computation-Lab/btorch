@@ -5,7 +5,7 @@ import torch
 
 from . import environ
 from .base import MemoryModule, normalize_n_neuron
-from .ode import exp_euler_step_auto
+from .ode import exp_euler_step
 from .types import TensorLike
 
 
@@ -199,10 +199,12 @@ class ExponentialPSC(BasePSC):
         self.register_buffer("tau_syn", torch.as_tensor(tau_syn), persistent=False)
 
     def dpsc(self, psc):
-        return -psc / self.tau_syn
+        derivative = -psc / self.tau_syn
+        linear = -1.0 / self.tau_syn
+        return derivative, linear
 
     def conductance_charge(self):
-        return exp_euler_step_auto(self.dpsc, self.psc, dt=environ.get("dt"))
+        return exp_euler_step(self.dpsc, self.psc, dt=environ.get("dt"))
 
     def adaptation_charge(self, z: torch.Tensor):
         z_flat, leading = self._flatten_neuron(z)
@@ -294,19 +296,23 @@ class AlphaPSC(_Adaptive2VarPSC):
         self.register_buffer("g_max", torch.as_tensor(g_max), persistent=False)
 
     def dg(self, psc, h):
-        return -psc / self.tau_syn + h / self.tau_syn
+        derivative = -psc / self.tau_syn + h / self.tau_syn
+        linear = -1.0 / self.tau_syn
+        return derivative, linear
 
     def dh(self, h):
-        return -h / self.tau_syn
+        derivative = -h / self.tau_syn
+        linear = -1.0 / self.tau_syn
+        return derivative, linear
 
     def conductance_charge(self):
-        self.psc = exp_euler_step_auto(self.dg, self.psc, self.h, dt=environ.get("dt"))
+        self.psc = exp_euler_step(self.dg, self.psc, self.h, dt=environ.get("dt"))
 
     def adaptation_charge(self, z: torch.Tensor):
         z_flat, leading = self._flatten_neuron(z)
         wz = self.g_max * self.linear(z_flat)
         wz = self._unflatten_neuron(wz, leading)
-        self.h = exp_euler_step_auto(self.dh, self.h, dt=environ.get("dt")) + wz
+        self.h = exp_euler_step(self.dh, self.h, dt=environ.get("dt")) + wz
 
 
 class DualExponentialPSC(BasePSC):
@@ -356,18 +362,18 @@ class DualExponentialPSC(BasePSC):
         self.register_memory("psc", 0.0, self.n_neuron)
 
     def dg_rise(self, g_rise):
-        return -g_rise / self.tau_rise
+        derivative = -g_rise / self.tau_rise
+        linear = -1.0 / self.tau_rise
+        return derivative, linear
 
     def dg_decay(self, g_decay):
-        return -g_decay / self.tau_decay
+        derivative = -g_decay / self.tau_decay
+        linear = -1.0 / self.tau_decay
+        return derivative, linear
 
     def conductance_charge(self):
-        self.g_rise = exp_euler_step_auto(
-            self.dg_rise, self.g_rise, dt=environ.get("dt")
-        )
-        self.g_decay = exp_euler_step_auto(
-            self.dg_decay, self.g_decay, dt=environ.get("dt")
-        )
+        self.g_rise = exp_euler_step(self.dg_rise, self.g_rise, dt=environ.get("dt"))
+        self.g_decay = exp_euler_step(self.dg_decay, self.g_decay, dt=environ.get("dt"))
 
     def adaptation_charge(self, z: torch.Tensor):
         z_flat, leading = self._flatten_neuron(z)
