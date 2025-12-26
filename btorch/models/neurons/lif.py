@@ -26,7 +26,6 @@ class LIF(BaseNode, SupportScaleState):
         n_neuron: int | Sequence[int],
         v_threshold: float | Float[TensorLike, " n_neuron"] = 1.0,
         v_reset: float | Float[TensorLike, " n_neuron"] = 0.0,
-        v_rest: None | float | Float[TensorLike, " n_neuron"] = None,
         c_m: float | Float[TensorLike, " n_neuron"] = 1.0,
         tau: float | Float[TensorLike, " n_neuron"] = 20.0,
         tau_ref: float | Float[TensorLike, " n_neuron"] | None = None,
@@ -64,28 +63,12 @@ class LIF(BaseNode, SupportScaleState):
         else:
             self.tau_ref = None
 
-        if v_rest is not None:
-            self._def_param("_v_rest", v_rest, **_factory_kwargs)
-        else:
-            self._v_rest = None
-
-    @property
-    def v_rest(self):
-        if self._v_rest is None:
-            return self.v_reset
-        return self._v_rest
-
-    @v_rest.setter
-    def v_rest(self, v_rest):
-        if self._v_rest is not None:
-            self._v_rest = v_rest
-
     def dV(
         self,
         v: Float[Tensor, "*batch n_neuron"],
         x: Float[Tensor, "*batch n_neuron"],
     ):
-        derivative = -(v - self.v_rest) / self.tau + x / self.c_m
+        derivative = -(v - self.v_reset) / self.tau + x / self.c_m
         return derivative
 
     def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]):
@@ -132,9 +115,6 @@ class LIF(BaseNode, SupportScaleState):
             f"tau_ref={self._format_repr_value(self.tau_ref)}"
             if self._use_refractory
             else "tau_ref=None",
-            "v_rest=auto"
-            if self._v_rest is None
-            else f"v_rest={self._format_repr_value(self._v_rest)}",
         ]
         base = super().extra_repr()
         if base:
