@@ -7,6 +7,7 @@ from torch import nn
 from btorch.models.base import MemoryModule
 from btorch.models.functional import reset_net_state
 from btorch.models.rnn import make_rnn
+from tests.utils.compile import compile_or_skip
 
 
 class SimpleRNNCell(MemoryModule):
@@ -287,9 +288,6 @@ class TestGradientCorrectness:
     )
     def test_compiled_checkpoint_vs_eager_checkpoint(self):
         """Test compiled checkpointed matches eager checkpointed."""
-        if not hasattr(torch, "compile"):
-            pytest.skip("torch.compile is not available")
-
         torch.manual_seed(42)
 
         T, batch_size, input_size, hidden_size = 10, 2, 4, 8
@@ -305,7 +303,7 @@ class TestGradientCorrectness:
         rnn_compiled.rnn_cell.W_h.data = rnn_eager.rnn_cell.W_h.data.clone()
         rnn_compiled.rnn_cell.b.data = rnn_eager.rnn_cell.b.data.clone()
 
-        compiled = torch.compile(rnn_compiled)
+        compiled = compile_or_skip(rnn_compiled)
 
         x = torch.randn(T, batch_size, input_size, requires_grad=True)
         x_compiled = x.clone().detach().requires_grad_(True)

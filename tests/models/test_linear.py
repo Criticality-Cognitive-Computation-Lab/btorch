@@ -9,15 +9,7 @@ from btorch.models.linear import (
     SparseConn,
     SparseConstrainedConn,
 )
-
-
-def _compile_or_skip(model: torch.nn.Module) -> torch.nn.Module:
-    if not hasattr(torch, "compile"):
-        pytest.skip("torch.compile is not available in this PyTorch build.")
-    try:
-        return torch.compile(model)
-    except Exception as exc:  # pragma: no cover - backend dependent
-        pytest.skip(f"torch.compile failed: {exc}")
+from tests.utils.compile import compile_or_skip
 
 
 @pytest.mark.parametrize("backend", available_sparse_backends())
@@ -174,7 +166,7 @@ def test_compile_matches_eager(backend: str):
     x_batch = x[None, :]
 
     eager = model(x)
-    compiled_model = _compile_or_skip(model)
+    compiled_model = compile_or_skip(model)
     compiled = compiled_model(x)
 
     torch.testing.assert_close(eager, compiled, atol=1e-6, rtol=0.0)

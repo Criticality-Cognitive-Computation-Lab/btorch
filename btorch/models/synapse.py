@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Protocol
 
 import torch
@@ -13,7 +13,8 @@ class Synapse(Protocol):
     """Minimum Synapse interface."""
 
     # TODO: rework spikingjelly's synapse abstraction
-
+    n_neuron: tuple[int, ...]
+    size: int
     psc: torch.Tensor
 
     def __call__(self, x): ...
@@ -37,29 +38,26 @@ class BasePSC(MemoryModule):
         self.n_neuron, self.size = normalize_n_neuron(n_neuron)
         self.step_mode = step_mode
         self.backend = backend
+        self.latency_steps = round(latency / environ.get("dt"))
         self.latency = latency
         self.linear = linear
 
         self.register_memory("psc", 0.0, self.n_neuron)
 
-        # TODO: delay should have its own class
         if latency > 0:
-            self.latency_steps = round(latency / environ.get("dt"))
             self.register_memory(
                 "delay_buffer",
                 0,
                 (self.latency_steps + 1, *self.n_neuron),
             )
-            self.register_memory("delay_ptr", 0, 1)
 
-    @torch.no_grad()
     def init_state(
         self,
         batch_size=None,
         dtype=None,
         device=None,
         persistent=True,
-        skip_mem_name: tuple[str, ...] = (),
+        skip_mem_name: Iterable[str] = (),
     ):
         super().init_state(
             batch_size,
@@ -81,34 +79,27 @@ class BasePSC(MemoryModule):
             self.register_buffer(
                 "delay_buffer",
                 torch.zeros(delay_buffer_sizes, dtype=dtype, device=device),
-                persistent=persistent,
-            )
-            self.register_buffer(
-                "delay_ptr",
-                torch.tensor([0], dtype=torch.long, device=device),
-                persistent=persistent,
             )
 
-    @torch.no_grad()
     def reset(
         self,
         batch_size=None,
         dtype=None,
         device=None,
-        skip_mem_name: tuple[str, ...] = (),
+        skip_mem_name: Iterable[str] = (),
     ):
         super().reset(
             batch_size,
             dtype,
             device,
-            skip_mem_name=("delay_ptr", "delay_buffer") + skip_mem_name,
+            skip_mem_name=("delay_buffer",) + skip_mem_name,
         )
         if self.latency > 0:
-            if batch_size is None and self.delay_buffer.ndim > 1 + len(self.n_neuron):
-                batch_size = self.delay_buffer.shape[1 : -len(self.n_neuron)]
-                if len(batch_size) == 0:
-                    batch_size = None
             delay_buffer_sizes = self._memories_rv["delay_buffer"].sizes
+            if batch_size is None:
+                extra_dims = self.delay_buffer.ndim - len(delay_buffer_sizes)
+                if extra_dims > 0:
+                    batch_size = self.delay_buffer.shape[1 : 1 + extra_dims]
             if batch_size is not None:
                 if isinstance(batch_size, int):
                     batch_size = (batch_size,)
@@ -120,7 +111,6 @@ class BasePSC(MemoryModule):
             self.delay_buffer = torch.zeros(
                 delay_buffer_sizes, dtype=dtype, device=device
             )
-            self.delay_ptr = torch.tensor(0, dtype=torch.long, device=device)
 
     def extra_repr(self):
         return f" step_mode={self.step_mode}, backend={self.backend}"
@@ -156,15 +146,10 @@ class BasePSC(MemoryModule):
 
     def single_step_forward(self, z: torch.Tensor):
         if self.latency > 0.0:
-            self.delay_ptr += 1
-            idx = self.delay_ptr % self.delay_buffer.shape[0]
-            self.delay_buffer[idx] = z
-
-            spike = self.delay_buffer[
-                (self.delay_ptr - self.latency_steps) % self.delay_buffer.shape[0]
-            ]
-            print(spike)
-
+            self.delay_buffer = torch.cat(
+                (z.unsqueeze(dim=0), self.delay_buffer[:-1].clone()), dim=0
+            )
+            spike = self.delay_buffer[-1]
         else:
             spike = z
 
@@ -191,10 +176,17 @@ class ExponentialPSC(BasePSC):
         n_neuron: int | Sequence[int],
         tau_syn: float | TensorLike,
         linear,
+        latency: float = 0.0,
         step_mode="s",
         backend="torch",
     ):
-        super().__init__(n_neuron, linear, step_mode=step_mode, backend=backend)
+        super().__init__(
+            n_neuron,
+            linear,
+            latency=latency,
+            step_mode=step_mode,
+            backend=backend,
+        )
 
         self.register_buffer("tau_syn", torch.as_tensor(tau_syn), persistent=False)
 
@@ -204,7 +196,8 @@ class ExponentialPSC(BasePSC):
         return derivative, linear
 
     def conductance_charge(self):
-        return exp_euler_step(self.dpsc, self.psc, dt=environ.get("dt"))
+        self.psc = exp_euler_step(self.dpsc, self.psc, dt=environ.get("dt"))
+        return self.psc
 
     def adaptation_charge(self, z: torch.Tensor):
         z_flat, leading = self._flatten_neuron(z)
@@ -359,7 +352,6 @@ class DualExponentialPSC(BasePSC):
 
         self.register_memory("g_rise", 0.0, self.n_neuron)
         self.register_memory("g_decay", 0.0, self.n_neuron)
-        self.register_memory("psc", 0.0, self.n_neuron)
 
     def dg_rise(self, g_rise):
         derivative = -g_rise / self.tau_rise
