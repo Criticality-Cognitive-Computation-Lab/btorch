@@ -109,7 +109,7 @@ def test_exponential_psc_latency_grad_matches_compile():
 
     dt = 1.0
     tau_syn = 3.0
-    latency = 1.0
+    latency = 3.0
     n_neuron = 4
     steps = 6
 

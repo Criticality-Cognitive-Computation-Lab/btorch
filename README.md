@@ -83,6 +83,7 @@ mkdocs serve
 - [ ] verify numerical accuracy. align with Neuron and Brainstate
 - [ ] support automatic conversion between stateful and pure functions
   - similar to make_functional in [torchopt](https://github.com/metaopt/torchopt)
+  - [ ] consider migrate to pure memory states instead of register_memory. gradient checkpointing + torch.compile struggles with mutating self
 - [ ] integrate large-scale training support with [torchtitan](https://github.com/pytorch/torchtitan.git)
 - [ ] compat with [neurobench](https://github.com/NeuroBench/neurobench.git), [Tonic](https://tonic.readthedocs.io/en/latest/)
 - [ ] [NIR](https://github.com/neuromorphs/NIR.git) import and export
