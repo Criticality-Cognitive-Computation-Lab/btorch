@@ -52,11 +52,11 @@ include = [
 allow-direct-references = true
 
 [tool.ruff.lint]
-select = ["E", "F", "I001"]
+select = ["E", "F", "I", "I001"]
 ignore = ["E731", "F722"]
 
 [tool.ruff.lint.isort]
 combine-as-imports = true
 lines-after-imports = 2
 extra-standard-library = ["typing_extensions"]
-order-by-type = false
+order-by-type = true
