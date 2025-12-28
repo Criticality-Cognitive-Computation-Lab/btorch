@@ -4,7 +4,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from btorch.backend import coo_spmm
+# Import specific backends for comparison
+from btorch.backend.triton.sparse import coo_spmm as coo_spmm_triton
+from btorch.backend.warp.sparse import coo_spmm_warp
 from btorch.utils.file import fig_path
 
 
@@ -31,6 +33,10 @@ def benchmark_op():
     results = {
         "triton_fwd": [],
         "triton_bwd": [],
+        "warp_fwd": [],
+        "warp_bwd": [],
+        "warp_bool_fwd": [],
+        "warp_bool_bwd": [],
         "torch_fwd": [],
         "torch_bwd": [],
         "torch_sparse_fwd": [],
@@ -64,20 +70,20 @@ def benchmark_op():
 
             # 1. Triton
             # Warmup
-            out = coo_spmm(indices_sorted, values_sorted, B)
+            out = coo_spmm_triton(indices_sorted, values_sorted, B)
             out.sum().backward()
 
             torch.cuda.synchronize()
             start = time.time()
             for _ in range(10):
-                out = coo_spmm(indices_sorted, values_sorted, B)
+                out = coo_spmm_triton(indices_sorted, values_sorted, B)
             torch.cuda.synchronize()
             results["triton_fwd"].append((time.time() - start) / 10)
 
             torch.cuda.synchronize()
             start = time.time()
             for _ in range(10):
-                out = coo_spmm(indices_sorted, values_sorted, B)
+                out = coo_spmm_triton(indices_sorted, values_sorted, B)
                 out.sum().backward()
             torch.cuda.synchronize()
             results["triton_bwd"].append(
@@ -86,33 +92,77 @@ def benchmark_op():
 
             # 1b. Triton Bool
             # Warmup
-            out = coo_spmm(indices_sorted, values_sorted, B, is_bool_float=True)
+            out = coo_spmm_triton(indices_sorted, values_sorted, B, is_bool_float=True)
             out.sum().backward()
 
             torch.cuda.synchronize()
             start = time.time()
             for _ in range(10):
-                out = coo_spmm(indices_sorted, values_sorted, B, is_bool_float=True)
+                out = coo_spmm_triton(
+                    indices_sorted, values_sorted, B, is_bool_float=True
+                )
             torch.cuda.synchronize()
             results["triton_bool_fwd"].append((time.time() - start) / 10)
 
             torch.cuda.synchronize()
             start = time.time()
             for _ in range(10):
-                out = coo_spmm(indices_sorted, values_sorted, B, is_bool_float=True)
+                out = coo_spmm_triton(
+                    indices_sorted, values_sorted, B, is_bool_float=True
+                )
                 out.sum().backward()
             torch.cuda.synchronize()
             results["triton_bool_bwd"].append((time.time() - start) / 10)
 
-            # 2. Torch
+            # 2. Warp
+            # Warmup
+            out = coo_spmm_warp(indices_sorted, values_sorted, B)
+            out.sum().backward()
+
+            torch.cuda.synchronize()
+            start = time.time()
+            for _ in range(10):
+                out = coo_spmm_warp(indices_sorted, values_sorted, B)
+            torch.cuda.synchronize()
+            results["warp_fwd"].append((time.time() - start) / 10)
+
+            torch.cuda.synchronize()
+            start = time.time()
+            for _ in range(10):
+                out = coo_spmm_warp(indices_sorted, values_sorted, B)
+                out.sum().backward()
+            torch.cuda.synchronize()
+            results["warp_bwd"].append((time.time() - start) / 10)
+
+            # 2b. Warp Bool
+            # Warmup
+            out = coo_spmm_warp(indices_sorted, values_sorted, B, is_bool_float=True)
+            out.sum().backward()
+
+            torch.cuda.synchronize()
+            start = time.time()
+            for _ in range(10):
+                out = coo_spmm_warp(
+                    indices_sorted, values_sorted, B, is_bool_float=True
+                )
+            torch.cuda.synchronize()
+            results["warp_bool_fwd"].append((time.time() - start) / 10)
+
+            torch.cuda.synchronize()
+            start = time.time()
+            for _ in range(10):
+                out = coo_spmm_warp(
+                    indices_sorted, values_sorted, B, is_bool_float=True
+                )
+                out.sum().backward()
+            torch.cuda.synchronize()
+            results["warp_bool_bwd"].append((time.time() - start) / 10)
+
+            # 3. Torch native
             if N <= max_torch_size:
                 # Torch sparse only supports spmm (Sparse x Dense -> Dense)
                 # Warmup
                 out_t = torch.sparse.mm(A_torch, B)
-                # A_torch typically doesn't support grad on values nicely for all
-                # versions?
-                # Actually standard torch.sparse.mm supports bp to values?
-                # Let's check.
 
                 torch.cuda.synchronize()
                 start = time.time()
@@ -121,27 +171,10 @@ def benchmark_op():
                 torch.cuda.synchronize()
                 results["torch_fwd"].append((time.time() - start) / 10)
 
-                # Backward
-                # Re-create A_torch with grad enabled values
-                # Typically `torch.sparse.mm` backward might be slow or dense-ish?
-                # Requires coalesced.
-
-                # Note: We can't simply reuse A_torch if we didn't retain graph or if
-                # values don't track grad well.
-                # SparseTensor construct might break graph.
-                # Let's use functional if possible, but torch.sparse is mostly Tensor
-                # method.
-
                 # Benchmarking full fwd+bwd
                 torch.cuda.synchronize()
                 start = time.time()
                 for _ in range(10):
-                    # Need to reconstruct to ensure grad flow if strictly testing
-                    # autograd
-                    # But here we assume A_torch carries grad?
-                    # Actually A_torch.values() requires_grad=True?
-                    # torch.sparse_coo_tensor docs say values must require grad.
-                    # Let's ensure it does.
                     vals = values_sorted.clone().detach().requires_grad_(True)
                     A_t = torch.sparse_coo_tensor(
                         indices_sorted, vals, (N, N)
@@ -155,7 +188,7 @@ def benchmark_op():
                 results["torch_fwd"].append(float("nan"))
                 results["torch_bwd"].append(float("nan"))
 
-            # 3. TorchSparse
+            # 4. TorchSparse
             if HAS_TORCH_SPARSE and N <= max_torch_sparse_size:
                 # torch_sparse.spmm(index, value, m, n, matrix)
                 row, col = indices_sorted
@@ -187,78 +220,79 @@ def benchmark_op():
             print(f"OOM or Error at size {N}: {e}")
             break
 
-    # Plotting
-    plt.figure(figsize=(10, 5))
+    # -- Professional Plotting --
+    # Use a clean style
+    try:
+        plt.style.use("seaborn-v0_8-paper")
+    except OSError:
+        pass  # Fallback to default if style not available
 
-    # Forward
-    plt.subplot(1, 2, 1)
-    plt.plot(
-        valid_sizes,
-        [t * 1000 for t in results["triton_fwd"]],
-        label="Triton",
-        marker="o",
-    )
-    plt.plot(
-        valid_sizes,
-        [t * 1000 for t in results["triton_bool_fwd"]],
-        label="Triton Bool",
-        marker="^",
-    )
-    plt.plot(
-        valid_sizes,
-        [t * 1000 for t in results["torch_fwd"]],
-        label="Torch Native",
-        marker="x",
-    )
-    if HAS_TORCH_SPARSE:
-        plt.plot(
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # Define styles for consistency
+    styles = {
+        "Triton": {"color": "#1f77b4", "marker": "o", "ls": "-"},
+        "Triton Bool": {"color": "#1f77b4", "marker": "o", "ls": "--", "mfc": "white"},
+        "Warp": {"color": "#d62728", "marker": "s", "ls": "-"},
+        "Warp Bool": {"color": "#d62728", "marker": "s", "ls": "--", "mfc": "white"},
+        "Torch Native": {"color": "#2ca02c", "marker": "^", "ls": "-"},
+        "TorchSparse": {"color": "#9467bd", "marker": "x", "ls": "-"},
+    }
+
+    def plot_line(ax, data_key, label_key):
+        if not results[data_key]:
+            return
+        style = styles.get(label_key, {})
+        ax.plot(
             valid_sizes,
-            [t * 1000 for t in results["torch_sparse_fwd"]],
-            label="TorchSparse",
-            marker="s",
+            [t * 1000 for t in results[data_key]],
+            label=label_key,
+            linewidth=2,
+            **style,
         )
 
-    plt.title(f"SpMM Forward (Density={density})")
-    plt.xlabel("Matrix Size N")
-    plt.ylabel("Time (ms)")
-    plt.legend()
-    plt.grid(True)
-
-    # Backward
-    plt.subplot(1, 2, 2)
-    plt.plot(
-        valid_sizes,
-        [t * 1000 for t in results["triton_bwd"]],
-        label="Triton (Fwd+Bwd)",
-        marker="o",
-    )
-    plt.plot(
-        valid_sizes,
-        [t * 1000 for t in results["triton_bool_bwd"]],
-        label="Triton Bool (Fwd+Bwd)",
-        marker="^",
-    )
-    plt.plot(
-        valid_sizes,
-        [t * 1000 for t in results["torch_bwd"]],
-        label="Torch Native (Fwd+Bwd)",
-        marker="x",
-    )
+    # 1. Forward Plot
+    ax = axes[0]
+    plot_line(ax, "triton_fwd", "Triton")
+    plot_line(ax, "triton_bool_fwd", "Triton Bool")
+    plot_line(ax, "warp_fwd", "Warp")
+    plot_line(ax, "warp_bool_fwd", "Warp Bool")
+    plot_line(ax, "torch_fwd", "Torch Native")
     if HAS_TORCH_SPARSE:
-        plt.plot(
-            valid_sizes,
-            [t * 1000 for t in results["torch_sparse_bwd"]],
-            label="TorchSparse (Fwd+Bwd)",
-            marker="s",
-        )
+        plot_line(ax, "torch_sparse_fwd", "TorchSparse")
 
-    plt.title("SpMM Backward")
-    plt.xlabel("Matrix Size N")
-    plt.grid(True)
+    ax.set_title(f"SpMM Forward (Density={density})", fontsize=12, fontweight="bold")
+    ax.set_xlabel("Matrix Size N", fontsize=10)
+    ax.set_ylabel("Time (ms)", fontsize=10)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.legend(frameon=True, fontsize=9)
+    ax.grid(True, which="both", ls="-", alpha=0.2)
+    ax.grid(True, which="major", ls="-", alpha=0.5)
 
+    # 2. Backward Plot
+    ax = axes[1]
+    plot_line(ax, "triton_bwd", "Triton")
+    plot_line(ax, "triton_bool_bwd", "Triton Bool")
+    plot_line(ax, "warp_bwd", "Warp")
+    plot_line(ax, "warp_bool_bwd", "Warp Bool")
+    plot_line(ax, "torch_bwd", "Torch Native")
+    if HAS_TORCH_SPARSE:
+        plot_line(ax, "torch_sparse_bwd", "TorchSparse")
+
+    ax.set_title("SpMM Backward (Fwd+Bwd)", fontsize=12, fontweight="bold")
+    ax.set_xlabel("Matrix Size N", fontsize=10)
+    ax.set_xscale("log")
+    ax.set_yscale("log")  # Log scale for y is usually better for benchmarks
+    ax.legend(frameon=True, fontsize=9)
+    ax.grid(True, which="both", ls="-", alpha=0.2)
+    ax.grid(True, which="major", ls="-", alpha=0.5)
+
+    plt.tight_layout()
     fig_path_v = fig_path()
-    plt.savefig(fig_path_v / "sparse_benchmark.png")
-    print(f"Benchmark plot saved to {fig_path_v / 'sparse_benchmark.png'}")
+    out_file = fig_path_v / "sparse_benchmark.png"
+    plt.savefig(out_file, dpi=300)
+    print(f"Benchmark plot saved to {out_file}")
 
 
 if __name__ == "__main__":
