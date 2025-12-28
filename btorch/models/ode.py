@@ -18,10 +18,18 @@ def _derivative_only(out):
 
 
 def exp_euler_step(f: Callable, *args, dt=1.0, linear: Tensor | None = None):
-    """One integation step applying exponential euler method.
+    """One integration step applying the exponential Euler method.
 
-    dx/dt = f(x), f(x) = Ax + B, where A is linear term and f is
-    derivative
+    .. math::
+        \frac{dx}{dt} = f(x) = Ax + B
+
+    where :math:`A` is the linear term and :math:`f(x)` is the derivative.
+
+    The update rule is:
+
+    .. math::
+        x_{n+1} = x_n + \frac{e^{dt A} - 1}{A} f(x_n) \\
+        &= e^{dt A}x_n + \frac{e^{dt A} - 1}{A} B
     """
     out = f(*args)
     derivative, linear_from_f = _split_derivative_linear(out)

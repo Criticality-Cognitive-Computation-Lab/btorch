@@ -100,7 +100,11 @@ def _collect_memory_vars(
         for name, mod in mod.named_modules():
             if allow_buffer or isinstance(mod, base.MemoryModule):
                 mems = getattr(mod, target_attr)
-                mems = {f"{name}.{k}": v for k, v in mems.items()}
+                mems = (
+                    {k: v for k, v in mems.items()}
+                    if name == ""
+                    else {f"{name}.{k}": v for k, v in mems.items()}
+                )
                 ret.update(mems)
         return ret
     else:
