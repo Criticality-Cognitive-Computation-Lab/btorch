@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from btorch.backend.triton_utils import coo_spmm_kernel
+from btorch.backend.triton.kernels import coo_spmm_kernel
 
 
 def get_ptx(kernel, *args, **kwargs):
