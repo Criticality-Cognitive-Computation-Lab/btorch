@@ -42,6 +42,41 @@ def coo_spmm_kernel(
 
 
 @wp.kernel
+def coo_spmm_kernel_tiled(
+    A_indices_rows: wp.array(dtype=wp.int64),
+    A_indices_cols: wp.array(dtype=wp.int64),
+    A_values: wp.array(dtype=wp.float32),
+    B: wp.array(dtype=wp.float32, ndim=2),
+    C: wp.array(dtype=wp.float32, ndim=2),
+    is_bool_float: int,
+):
+    tid = wp.tid()
+    # One thread per NNZ
+    # Loop over N inside
+
+    row = A_indices_rows[tid]
+    col = A_indices_cols[tid]
+    val = A_values[tid]
+
+    N = B.shape[1]
+
+    # Loop over columns of B (Dense dimension)
+    for n in range(N):
+        b_val = B[col, n]
+
+        res = float(0.0)
+        if is_bool_float != 0:
+            if b_val > 0.5:
+                res = val
+            else:
+                res = 0.0
+        else:
+            res = val * b_val
+
+        wp.atomic_add(C, row, n, res)
+
+
+@wp.kernel
 def sddmm_kernel(
     A_indices_rows: wp.array(dtype=wp.int64),
     A_indices_cols: wp.array(dtype=wp.int64),
@@ -130,6 +165,53 @@ def coo_spmm_driver(
         device=f"cuda:{device.index}" if device.type == "cuda" else "cpu",
     )
     return out
+
+    return out
+
+
+@torch.library.custom_op("btorch_warp::coo_spmm_driver_tiled", mutates_args=())
+def coo_spmm_driver_tiled(
+    indices: torch.Tensor,
+    values: torch.Tensor,
+    dense: torch.Tensor,
+    M: int,
+    is_bool_float: bool,
+) -> torch.Tensor:
+    K, N = dense.shape
+    device = dense.device
+    out = torch.zeros((M, N), device=device, dtype=dense.dtype)
+
+    nnz = values.numel()
+    if nnz == 0:
+        return out
+
+    w_indices_rows = wp.from_torch(indices[0], dtype=wp.int64)
+    w_indices_cols = wp.from_torch(indices[1], dtype=wp.int64)
+    w_values = wp.from_torch(values, dtype=wp.float32)
+    w_dense = wp.from_torch(dense, dtype=wp.float32)
+    w_out = wp.from_torch(out, dtype=wp.float32)
+
+    # Launch configuration: One thread per NNZ
+    wp.launch(
+        kernel=coo_spmm_kernel_tiled,
+        dim=nnz,
+        inputs=[
+            w_indices_rows,
+            w_indices_cols,
+            w_values,
+            w_dense,
+            w_out,
+            1 if is_bool_float else 0,
+        ],
+        device=f"cuda:{device.index}" if device.type == "cuda" else "cpu",
+    )
+    return out
+
+
+@coo_spmm_driver_tiled.register_fake
+def _(indices, values, dense, M, is_bool_float):
+    K, N = dense.shape
+    return torch.empty((M, N), device=dense.device, dtype=dense.dtype)
 
 
 @coo_spmm_driver.register_fake
@@ -248,5 +330,80 @@ def coo_spmm_warp(indices, values, mat, is_bool_float=False, size_m=None):
     return SparseCOOMatMulWarp.apply(indices, values, mat, is_bool_float, size_m)
 
 
-def coo_spmv_warp(indices, values, vec, is_bool_float=False, size_m=None):
-    return SparseCOOMatMulWarp.apply(indices, values, vec, is_bool_float, size_m)
+def coo_spmm_warp_tiled(indices, values, mat, is_bool_float=False, size_m=None):
+    # We can create a new Autograd function or reuse the existing one with a
+    # flag? For cleanliness, new autograd function or just modify the existing
+    # one to take a flag? Actually, let's just make a new autograd function for
+    # correct graph behavior if we want to test grad too. But for now, let's
+    # just define it assuming forward only benchmarking or full impl? The task
+    # asks for implementation.
+    return SparseCOOMatMulWarpTiled.apply(indices, values, mat, is_bool_float, size_m)
+
+
+class SparseCOOMatMulWarpTiled(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, indices, values, dense, is_bool_float=False, size_m=None):
+        indices = indices.contiguous()
+        values = values.contiguous()
+        dense = dense.contiguous()
+
+        is_vec = dense.dim() == 1
+        if is_vec:
+            dense = dense.unsqueeze(1)
+
+        K, N = dense.shape
+        if size_m is not None:
+            M = size_m
+        elif indices.numel() > 0:
+            M = int(indices[0].max().item()) + 1
+        else:
+            M = 0
+
+        # Use custom op TILED
+        out = torch.ops.btorch_warp.coo_spmm_driver_tiled(
+            indices, values, dense, M, is_bool_float
+        )
+
+        ctx.save_for_backward(indices, values, dense)
+        ctx.is_bool_float = is_bool_float
+        ctx.is_vec = is_vec
+        ctx.M = M
+
+        return out.squeeze(1) if is_vec else out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        # Re-use the existing backward logic? The backward for spmm wrt dense is
+        # spmm(A.T, grad_out). We can use the tiled version for backward too if
+        # efficient. But backward wrt values is SDDMM. We haven't optimized
+        # SDDMM yet. So let's fall back to standard backward logic but using
+        # tiled driver for the spmm part.
+
+        grad_out = grad_out.contiguous()
+        indices, values, dense = ctx.saved_tensors
+        is_bool_float = ctx.is_bool_float
+        is_vec = ctx.is_vec
+
+        if is_vec:
+            grad_out = grad_out.unsqueeze(1)
+
+        K, N = dense.shape
+
+        # 1. grad_dense (grad_B) = A.T @ grad_out
+        indices_T = torch.stack([indices[1], indices[0]], dim=0).contiguous()
+
+        # Use TILED driver for backward too!
+        grad_dense = torch.ops.btorch_warp.coo_spmm_driver_tiled(
+            indices_T, values, grad_out, K, False
+        )
+
+        # 2. grad_values
+        # SDDMM is not yet tiled-optimized.
+        grad_values = torch.ops.btorch_warp.sddmm_driver(
+            indices, dense, grad_out, is_bool_float
+        )
+
+        if is_vec:
+            grad_dense = grad_dense.squeeze(1)
+
+        return None, grad_values, grad_dense, None, None

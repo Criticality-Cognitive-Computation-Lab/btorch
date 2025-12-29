@@ -6,7 +6,7 @@ import torch
 
 # Import specific backends for comparison
 from btorch.backend.triton.sparse import coo_spmm as coo_spmm_triton
-from btorch.backend.warp.sparse import coo_spmm_warp
+from btorch.backend.warp.sparse import coo_spmm_warp, coo_spmm_warp_tiled
 from btorch.utils.file import fig_path
 
 
@@ -43,6 +43,10 @@ def benchmark_op():
         "torch_sparse_bwd": [],
         "triton_bool_fwd": [],
         "triton_bool_bwd": [],
+        "warp_tiled_fwd": [],
+        "warp_tiled_bwd": [],
+        "warp_tiled_bool_fwd": [],
+        "warp_tiled_bool_bwd": [],
     }
 
     valid_sizes = []
@@ -158,6 +162,52 @@ def benchmark_op():
             torch.cuda.synchronize()
             results["warp_bool_bwd"].append((time.time() - start) / 10)
 
+            # 2c. Warp Tiled
+            # Warmup
+            out = coo_spmm_warp_tiled(indices_sorted, values_sorted, B)
+            out.sum().backward()
+
+            torch.cuda.synchronize()
+            start = time.time()
+            for _ in range(10):
+                out = coo_spmm_warp_tiled(indices_sorted, values_sorted, B)
+            torch.cuda.synchronize()
+            results["warp_tiled_fwd"].append((time.time() - start) / 10)
+
+            torch.cuda.synchronize()
+            start = time.time()
+            for _ in range(10):
+                out = coo_spmm_warp_tiled(indices_sorted, values_sorted, B)
+                out.sum().backward()
+            torch.cuda.synchronize()
+            results["warp_tiled_bwd"].append((time.time() - start) / 10)
+
+            # 2d. Warp Tiled Bool
+            # Warmup
+            out = coo_spmm_warp_tiled(
+                indices_sorted, values_sorted, B, is_bool_float=True
+            )
+            out.sum().backward()
+
+            torch.cuda.synchronize()
+            start = time.time()
+            for _ in range(10):
+                out = coo_spmm_warp_tiled(
+                    indices_sorted, values_sorted, B, is_bool_float=True
+                )
+            torch.cuda.synchronize()
+            results["warp_tiled_bool_fwd"].append((time.time() - start) / 10)
+
+            torch.cuda.synchronize()
+            start = time.time()
+            for _ in range(10):
+                out = coo_spmm_warp_tiled(
+                    indices_sorted, values_sorted, B, is_bool_float=True
+                )
+                out.sum().backward()
+            torch.cuda.synchronize()
+            results["warp_tiled_bool_bwd"].append((time.time() - start) / 10)
+
             # 3. Torch native
             if N <= max_torch_size:
                 # Torch sparse only supports spmm (Sparse x Dense -> Dense)
@@ -237,6 +287,13 @@ def benchmark_op():
         "Warp Bool": {"color": "#d62728", "marker": "s", "ls": "--", "mfc": "white"},
         "Torch Native": {"color": "#2ca02c", "marker": "^", "ls": "-"},
         "TorchSparse": {"color": "#9467bd", "marker": "x", "ls": "-"},
+        "Warp Tiled": {"color": "#ff7f0e", "marker": "D", "ls": "-"},
+        "Warp Tiled Bool": {
+            "color": "#ff7f0e",
+            "marker": "D",
+            "ls": "--",
+            "mfc": "white",
+        },
     }
 
     def plot_line(ax, data_key, label_key):
@@ -258,6 +315,8 @@ def benchmark_op():
     plot_line(ax, "warp_fwd", "Warp")
     plot_line(ax, "warp_bool_fwd", "Warp Bool")
     plot_line(ax, "torch_fwd", "Torch Native")
+    plot_line(ax, "warp_tiled_fwd", "Warp Tiled")
+    plot_line(ax, "warp_tiled_bool_fwd", "Warp Tiled Bool")
     if HAS_TORCH_SPARSE:
         plot_line(ax, "torch_sparse_fwd", "TorchSparse")
 
@@ -277,6 +336,8 @@ def benchmark_op():
     plot_line(ax, "warp_bwd", "Warp")
     plot_line(ax, "warp_bool_bwd", "Warp Bool")
     plot_line(ax, "torch_bwd", "Torch Native")
+    plot_line(ax, "warp_tiled_bwd", "Warp Tiled")
+    plot_line(ax, "warp_tiled_bool_bwd", "Warp Tiled Bool")
     if HAS_TORCH_SPARSE:
         plot_line(ax, "torch_sparse_bwd", "TorchSparse")
 
