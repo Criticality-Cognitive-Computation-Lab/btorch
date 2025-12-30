@@ -117,10 +117,11 @@ class BaseSparseConn(nn.Module):
         if not isinstance(conn, scipy.sparse.coo_array):
             conn = conn.tocoo()
         # transpose A to compute x @ A via A^T @ x^T.
+        self.in_features, self.out_features = conn.shape
+        self.shape = (self.in_features, self.out_features)
         conn = conn.T
         # also sort it
         conn.sum_duplicates()
-        self.in_features, self.out_features = conn.shape
         indices = torch.stack(
             [
                 torch.tensor(conn.row, dtype=torch.long, device=device),
@@ -130,9 +131,7 @@ class BaseSparseConn(nn.Module):
         )
         self.register_buffer("indices", indices)
         value = torch.tensor(conn.data, dtype=dtype, device=device)
-        shape = (self.out_features, self.in_features)
 
-        self.shape = shape
         # TODO: should update at each time of mod.load_state
         #       maybe a source of checkpoint loading bug!!
         self.sparse_tensor = None
@@ -142,7 +141,7 @@ class BaseSparseConn(nn.Module):
             native_sparse = torch.sparse_coo_tensor(
                 indices=indices,
                 values=value,
-                size=self.shape,
+                size=conn.shape,
                 device=device,
                 dtype=dtype,
                 is_coalesced=True,
@@ -153,9 +152,9 @@ class BaseSparseConn(nn.Module):
                 row=self.indices[0],
                 col=self.indices[1],
                 value=None,
-                sparse_sizes=self.shape,
+                sparse_sizes=conn.shape,
                 is_sorted=True,
-                trust_data=True,
+                trust_data=False,
             ).to(device=device, dtype=dtype)  # type: ignore
         self.bias = nn.Parameter(bias) if bias is not None else None
         self._init_weights(value)
@@ -203,7 +202,7 @@ class BaseSparseConn(nn.Module):
             sp = torch.sparse_coo_tensor(
                 indices=sp.indices(),
                 values=effective_value,
-                size=self.shape,
+                size=sp.shape,
                 is_coalesced=True,
             )
             # (A^T @ x^T)^T == x @ A

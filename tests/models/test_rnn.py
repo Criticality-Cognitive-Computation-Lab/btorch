@@ -10,21 +10,30 @@ from btorch.models.rnn import make_rnn
 from tests.utils.compile import compile_or_skip
 
 
+# Global dtype switch for all tests in this file
+# Change this to torch.float64 for double precision testing
+DTYPE = torch.float32
+
+
 class SimpleRNNCell(MemoryModule):
     """Simple RNN cell: h_t = tanh(W_x @ x_t + W_h @ h_{t-1} + b)"""
 
-    def __init__(self, input_size: int, hidden_size: int):
+    def __init__(self, input_size: int, hidden_size: int, dtype=None):
         super().__init__()
+        if dtype is None:
+            dtype = DTYPE
         self.input_size = input_size
         self.hidden_size = hidden_size
 
-        self.W_x = nn.Parameter(torch.randn(hidden_size, input_size) * 0.1)
+        self.W_x = nn.Parameter(torch.randn(hidden_size, input_size, dtype=dtype) * 0.1)
         self.W_h = nn.Parameter(
-            torch.eye(hidden_size) + 0.02 * torch.diag(torch.rand(hidden_size)) - 0.01
+            torch.eye(hidden_size, dtype=dtype)
+            + 0.02 * torch.diag(torch.rand(hidden_size, dtype=dtype))
+            - 0.01
         )
-        self.b = nn.Parameter(torch.zeros(hidden_size))
+        self.b = nn.Parameter(torch.zeros(hidden_size, dtype=dtype))
 
-        self.register_memory("h", torch.zeros(1), hidden_size)
+        self.register_memory("h", torch.zeros(1, dtype=dtype), hidden_size)
         self.init_state()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -47,9 +56,7 @@ def last_step_sum(out: torch.Tensor) -> torch.Tensor:
 
 def native_forward(cell: nn.RNNCell, x_in: torch.Tensor) -> torch.Tensor:
     """Unroll a native RNNCell over time."""
-    h = torch.zeros(
-        x_in.shape[1], cell.hidden_size, device=x_in.device, dtype=x_in.dtype
-    )
+    h = torch.zeros(x_in.shape[1], cell.hidden_size, device=x_in.device, dtype=DTYPE)
     outputs = []
     for t in range(x_in.shape[0]):
         h = cell(x_in[t], h)
@@ -82,7 +89,7 @@ class TestGradientCorrectness:
         torch.manual_seed(42)
 
         # Create input
-        x = torch.randn(2, 4, requires_grad=True)  # (batch, input_size)
+        x = torch.randn(2, 4, dtype=DTYPE, requires_grad=True)  # (batch, input_size)
         reset_net_state(rnn_no_checkpoint, batch_size=2)
 
         # Forward pass
@@ -117,7 +124,7 @@ class TestGradientCorrectness:
 
         # Long sequence - 25 timesteps
         T = 100
-        x = torch.randn(T, 2, 4, requires_grad=True)
+        x = torch.randn(T, 2, 4, dtype=DTYPE, requires_grad=True)
 
         reset_net_state(rnn, batch_size=2)
         out, _ = rnn(x)
@@ -155,7 +162,7 @@ class TestGradientCorrectness:
         native_cell.bias_hh.data.zero_()
 
         T, batch_size, input_size = 5, 2, 3
-        x = torch.randn(T, batch_size, input_size, requires_grad=True)
+        x = torch.randn(T, batch_size, input_size, dtype=DTYPE, requires_grad=True)
         x_native = x.detach().clone().requires_grad_(True)
 
         reset_net_state(rnn, batch_size=batch_size)
@@ -186,7 +193,7 @@ class TestGradientCorrectness:
         torch.manual_seed(42)
 
         T, batch_size, input_size = 10, 2, 4
-        x = torch.randn(T, batch_size, input_size, requires_grad=True)
+        x = torch.randn(T, batch_size, input_size, dtype=DTYPE, requires_grad=True)
 
         reset_net_state(rnn_no_checkpoint, batch_size=batch_size)
         # Forward pass
@@ -211,7 +218,7 @@ class TestGradientCorrectness:
         torch.manual_seed(42)
 
         T, batch_size, input_size = 10, 2, 4
-        x = torch.randn(T, batch_size, input_size, requires_grad=True)
+        x = torch.randn(T, batch_size, input_size, dtype=DTYPE, requires_grad=True)
         reset_net_state(rnn_with_checkpoint, batch_size=batch_size)
         # Forward pass
         out, states = rnn_with_checkpoint(x)
@@ -251,7 +258,7 @@ class TestGradientCorrectness:
         rnn_chkpt.rnn_cell.b.data = rnn_no_chkpt.rnn_cell.b.data.clone()
 
         # Same input
-        x = torch.randn(T, batch_size, input_size, requires_grad=True)
+        x = torch.randn(T, batch_size, input_size, dtype=DTYPE, requires_grad=True)
         x_chkpt = x.clone().detach().requires_grad_(True)
 
         # Forward passes
@@ -305,7 +312,7 @@ class TestGradientCorrectness:
 
         compiled = compile_or_skip(rnn_compiled)
 
-        x = torch.randn(T, batch_size, input_size, requires_grad=True)
+        x = torch.randn(T, batch_size, input_size, dtype=DTYPE, requires_grad=True)
         x_compiled = x.clone().detach().requires_grad_(True)
 
         reset_net_state(rnn_eager, batch_size=batch_size)
@@ -345,7 +352,7 @@ class TestGradientCorrectness:
 
         # Use T=9 to have full blocks (0-3, 4-7) and remainder (8)
         T, batch_size = 9, 2
-        x = torch.randn(T, batch_size, 4, requires_grad=True)
+        x = torch.randn(T, batch_size, 4, dtype=DTYPE, requires_grad=True)
 
         # Forward and backward
         reset_net_state(rnn, batch_size=batch_size)
@@ -370,7 +377,7 @@ class TestGradientCorrectness:
         )
 
         T, batch_size = 20, 2
-        x = torch.randn(T, batch_size, 4, requires_grad=True)
+        x = torch.randn(T, batch_size, 4, dtype=DTYPE, requires_grad=True)
 
         reset_net_state(rnn, batch_size=batch_size)
         out, _ = rnn(x)
@@ -399,7 +406,7 @@ class TestGradientCorrectness:
         T, batch_size = 5, 2
 
         # First backward pass
-        x1 = torch.randn(T, batch_size, 4, requires_grad=True)
+        x1 = torch.randn(T, batch_size, 4, dtype=DTYPE, requires_grad=True)
         reset_net_state(rnn, batch_size=batch_size)
         out1, _ = rnn(x1)
         loss1 = out1[-1].sum()
@@ -408,7 +415,7 @@ class TestGradientCorrectness:
         grad_W_x_first = rnn.rnn_cell.W_x.grad.clone()
 
         # Second backward pass (accumulate)
-        x2 = torch.randn(T, batch_size, 4, requires_grad=True)
+        x2 = torch.randn(T, batch_size, 4, dtype=DTYPE, requires_grad=True)
         rnn.rnn_cell.h = rnn.rnn_cell.h.detach()
         out2, _ = rnn(x2)
         loss2 = out2[-1].sum()

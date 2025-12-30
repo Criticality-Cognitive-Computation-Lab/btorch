@@ -4,10 +4,10 @@ import torch
 
 from btorch.models.constrain import constrain_net
 from btorch.models.linear import (
-    available_sparse_backends,
     DenseConn,
     SparseConn,
     SparseConstrainedConn,
+    available_sparse_backends,
 )
 from tests.utils.compile import compile_or_skip
 
@@ -174,3 +174,146 @@ def test_compile_matches_eager(backend: str):
     eager_batch = model(x_batch)
     compiled_batch = compiled_model(x_batch)
     torch.testing.assert_close(eager_batch, compiled_batch, atol=1e-6, rtol=0.0)
+
+
+@pytest.mark.parametrize("backend", available_sparse_backends())
+def test_non_square_matrix(backend: str):
+    """Test that sparse connections work correctly with non-square weight
+    matrices."""
+    torch.manual_seed(42)
+
+    # Case 1: Wide matrix (more inputs than outputs): 4x2 matrix
+    # Maps 4 input features to 2 output features (x @ W where W is 4x2)
+    W_wide = torch.tensor(
+        [[1.0, 0.0], [2.0, 3.0], [0.0, -1.0], [-1.0, 2.0]]
+    )  # (4, 2) = (in_features, out_features)
+
+    x_wide = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    x_wide_batch = torch.stack([x_wide, x_wide + 1.0], dim=0)
+
+    # Dense connection
+    dense_wide = DenseConn(4, 2, weight=W_wide, bias=None)
+
+    # Sparse COO connection
+    W_wide_sparse = scipy.sparse.coo_array(W_wide.numpy())
+    sparse_wide = SparseConn(
+        W_wide_sparse, bias=None, enforce_dale=False, sparse_backend=backend
+    )
+
+    # Constrained sparse connection
+    constraint_data = []
+    constraint_rows = []
+    constraint_cols = []
+    group_id = 1
+    for i in range(W_wide.shape[0]):
+        for j in range(W_wide.shape[1]):
+            if W_wide[i, j] != 0:
+                constraint_data.append(group_id)
+                constraint_rows.append(i)
+                constraint_cols.append(j)
+                group_id += 1
+
+    constraint_wide = scipy.sparse.coo_array(
+        (constraint_data, (constraint_rows, constraint_cols)), shape=W_wide.shape
+    )
+    constrained_wide = SparseConstrainedConn(
+        W_wide_sparse,
+        constraint_wide,
+        enforce_dale=False,
+        bias=None,
+        sparse_backend=backend,
+    )
+
+    # Test wide matrix forward passes
+    out_dense_wide = dense_wide(x_wide)
+    out_sparse_wide = sparse_wide(x_wide)
+    out_constrained_wide = constrained_wide(x_wide)
+
+    assert out_dense_wide.shape == (2,), f"Expected (2,), got {out_dense_wide.shape}"
+    torch.testing.assert_close(out_dense_wide, out_sparse_wide, atol=1e-6, rtol=0.0)
+    torch.testing.assert_close(
+        out_dense_wide, out_constrained_wide, atol=1e-6, rtol=0.0
+    )
+
+    # Batched forward passes for wide matrix
+    out_dense_wide_batch = dense_wide(x_wide_batch)
+    out_sparse_wide_batch = sparse_wide(x_wide_batch)
+    out_constrained_wide_batch = constrained_wide(x_wide_batch)
+
+    assert out_dense_wide_batch.shape == (
+        2,
+        2,
+    ), f"Expected (2, 2), got {out_dense_wide_batch.shape}"
+    torch.testing.assert_close(
+        out_dense_wide_batch, out_sparse_wide_batch, atol=1e-6, rtol=0.0
+    )
+    torch.testing.assert_close(
+        out_dense_wide_batch, out_constrained_wide_batch, atol=1e-6, rtol=0.0
+    )
+
+    # Case 2: Tall matrix (more outputs than inputs): 2x4 matrix
+    # Maps 2 input features to 4 output features (x @ W where W is 2x4)
+    W_tall = torch.tensor([[1.0, 0.0, -1.0, 2.0], [2.0, 3.0, 0.0, -1.0]])  # (2, 4)
+
+    x_tall = torch.tensor([1.0, 2.0])
+    x_tall_batch = torch.stack([x_tall, x_tall + 1.0], dim=0)
+
+    # Dense connection
+    dense_tall = DenseConn(2, 4, weight=W_tall, bias=None)
+
+    # Sparse COO connection
+    W_tall_sparse = scipy.sparse.coo_array(W_tall.numpy())
+    sparse_tall = SparseConn(
+        W_tall_sparse, bias=None, enforce_dale=False, sparse_backend=backend
+    )
+
+    # Constrained sparse connection
+    constraint_data = []
+    constraint_rows = []
+    constraint_cols = []
+    group_id = 1
+    for i in range(W_tall.shape[0]):
+        for j in range(W_tall.shape[1]):
+            if W_tall[i, j] != 0:
+                constraint_data.append(group_id)
+                constraint_rows.append(i)
+                constraint_cols.append(j)
+                group_id += 1
+
+    constraint_tall = scipy.sparse.coo_array(
+        (constraint_data, (constraint_rows, constraint_cols)), shape=W_tall.shape
+    )
+    constrained_tall = SparseConstrainedConn(
+        W_tall_sparse,
+        constraint_tall,
+        enforce_dale=False,
+        bias=None,
+        sparse_backend=backend,
+    )
+
+    # Test tall matrix forward passes
+    out_dense_tall = dense_tall(x_tall)
+    out_sparse_tall = sparse_tall(x_tall)
+    out_constrained_tall = constrained_tall(x_tall)
+
+    assert out_dense_tall.shape == (4,), f"Expected (4,), got {out_dense_tall.shape}"
+    torch.testing.assert_close(out_dense_tall, out_sparse_tall, atol=1e-6, rtol=0.0)
+    torch.testing.assert_close(
+        out_dense_tall, out_constrained_tall, atol=1e-6, rtol=0.0
+    )
+
+    # Batched forward passes for tall matrix
+    out_dense_tall_batch = dense_tall(x_tall_batch)
+    out_sparse_tall_batch = sparse_tall(x_tall_batch)
+    out_constrained_tall_batch = constrained_tall(x_tall_batch)
+
+    assert out_dense_tall_batch.shape == (
+        2,
+        4,
+    ), f"Expected (2, 4), got {out_dense_tall_batch.shape}"
+    torch.testing.assert_close(
+        out_dense_tall_batch, out_sparse_tall_batch, atol=1e-6, rtol=0.0
+    )
+    torch.testing.assert_close(
+        out_dense_tall_batch, out_constrained_tall_batch, atol=1e-6, rtol=0.0
+    )
