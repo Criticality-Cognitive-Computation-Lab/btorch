@@ -171,13 +171,13 @@ class GLIF3(BaseNode, SupportScaleState):
 
         if self.hard_reset:
             # hard reset
-            self.v -= (self.v - self.v_reset) * spike_d
+            self.v = self.v - (self.v - self.v_reset) * spike_d
         else:
             # soft reset
-            self.v -= (self.v_threshold - self.v_reset) * spike_d
+            self.v = self.v - (self.v_threshold - self.v_reset) * spike_d
 
         # Add after-spike currents
-        self.Iasc += self.asc_amps * spike_d[..., None]
+        self.Iasc = self.Iasc + self.asc_amps * spike_d[..., None]
 
         if self._use_refractory:
             # Set refractory period

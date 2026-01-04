@@ -216,11 +216,11 @@ class Izhikevich(BaseNode):
             self.u_pre_spike = self.u.clone()
 
         if self.hard_reset:
-            self.v -= (self.v - self.v_reset) * spike_d
+            self.v = self.v - (self.v - self.v_reset) * spike_d
         else:
-            self.v -= (self.v_peak - self.v_reset) * spike_d
+            self.v = self.v - (self.v_peak - self.v_reset) * spike_d
 
-        self.u += self.d * spike_d
+        self.u = self.u + self.d * spike_d
 
     def extra_repr(self):
         parts = [

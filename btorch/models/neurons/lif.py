@@ -99,9 +99,9 @@ class LIF(BaseNode, SupportScaleState):
             self.v_pre_spike = self.v.clone()
 
         if self.hard_reset:
-            self.v -= (self.v - self.v_reset) * spike_d
+            self.v = self.v - (self.v - self.v_reset) * spike_d
         else:
-            self.v -= (self.v_threshold - self.v_reset) * spike_d
+            self.v = self.v - (self.v_threshold - self.v_reset) * spike_d
 
         if self._use_refractory:
             self.refractory = torch.relu(

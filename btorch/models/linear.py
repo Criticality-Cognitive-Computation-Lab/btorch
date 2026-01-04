@@ -216,7 +216,7 @@ class BaseSparseConn(nn.Module):
             out = out[0, :]
 
         if self.bias is not None:
-            out += self.bias
+            out = out + self.bias
 
         return out
 

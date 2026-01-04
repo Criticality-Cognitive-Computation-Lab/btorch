@@ -556,10 +556,10 @@ class BaseNode(MemoryModule):
 
         if self.hard_reset:
             # hard reset
-            self.v -= (self.v - self.v_reset) * spike_d
+            self.v = self.v - (self.v - self.v_reset) * spike_d
         else:
             # soft reset
-            self.v -= (self.v_threshold - self.v_reset) * spike_d
+            self.v = self.v - (self.v_threshold - self.v_reset) * spike_d
 
     def neuronal_adaptation(self):
         raise NotImplementedError()
