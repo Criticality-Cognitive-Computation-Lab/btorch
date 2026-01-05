@@ -11,3 +11,4 @@ plotly
 # dynamic tools
 nolds
 powerlaw
+pytorch_sparse

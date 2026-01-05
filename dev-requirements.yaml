@@ -5,6 +5,7 @@ dependencies:
   - pytorch-gpu>=2
   - torchvision
   - spikingjelly
+  - pytorch_sparse
   - pip
   - pip:
     # profiling
