@@ -75,7 +75,7 @@ mkdocs serve
 
 ## TODO List
 
-- [ ] support multi-dim batch size and neuron
+- [x] support multi-dim batch size and neuron
 - [ ] cleaner connectome import, network param management and manipulation lib
   - [ ] compat with bmtk
   - [ ] support full SONATA format (both [BlueBrain](https://github.com/openbraininstitute/libsonata.git) and [AIBS](https://github.com/AllenInstitute/sonata) variants)
