@@ -13,9 +13,12 @@ def _erf_primitive(x: torch.Tensor, alpha: float) -> torch.Tensor:
 
 
 @jit.script
-def _erf_derivative(x: torch.Tensor, alpha: float, damping: float) -> torch.Tensor:
+def _erf_derivative(
+    x: torch.Tensor, grad_output: torch.Tensor, alpha: float, damping: float
+) -> torch.Tensor:
     scale = alpha / math.sqrt(math.pi)
-    return damping * scale * torch.exp(-((alpha * x) ** 2))
+    grad = damping * scale * torch.exp(-((alpha * x) ** 2))
+    return grad_output * grad
 
 
 class Erf(SurrogateFunctionBase):
@@ -35,8 +38,13 @@ class Erf(SurrogateFunctionBase):
     def primitive(self, x: torch.Tensor) -> torch.Tensor:
         return _erf_primitive(x, self.alpha)
 
-    def derivative(self, x: torch.Tensor, damping_factor: float = 1.0) -> torch.Tensor:
-        return _erf_derivative(x, self.alpha, damping_factor)
+    def derivative(
+        self,
+        x: torch.Tensor,
+        grad_output: torch.Tensor,
+        damping_factor: float = 1.0,
+    ) -> torch.Tensor:
+        return _erf_derivative(x, grad_output, self.alpha, damping_factor)
 
 
 def erf(

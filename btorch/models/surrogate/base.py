@@ -21,8 +21,8 @@ class _SurrogateAutograd(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         (x,) = ctx.saved_tensors
         module: SurrogateFunctionBase = ctx.module
-        grad = module.derivative(x, module.damping_factor)
-        return grad_output * grad, None
+        grad_input = module.derivative(x, grad_output, module.damping_factor)
+        return grad_input, None
 
 
 class SurrogateFunctionBase(torch.nn.Module):
@@ -50,7 +50,12 @@ class SurrogateFunctionBase(torch.nn.Module):
     def primitive(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
-    def derivative(self, x: torch.Tensor, damping_factor: float = 1.0) -> torch.Tensor:
+    def derivative(
+        self,
+        x: torch.Tensor,
+        grad_output: torch.Tensor,
+        damping_factor: float = 1.0,
+    ) -> torch.Tensor:
         raise NotImplementedError
 
     def forward(self, x: torch.Tensor):
