@@ -12,13 +12,15 @@ from ..utils.pandas_utils import groupby_to_dict
 from . import simple_id_to_root_id
 
 
-def make_sparse_mat(connections: pd.DataFrame, shape) -> scipy.sparse.sparray:
+def make_sparse_mat(
+    connections: pd.DataFrame, shape, field="syn_count"
+) -> scipy.sparse.sparray:
     # Important: Connections can have duplicated pre and post neuron pairs
     #            if they innervate between different neuropils.
-    tmp_connections = connections[["syn_count", "pre_simple_id", "post_simple_id"]]
+    tmp_connections = connections[[field, "pre_simple_id", "post_simple_id"]]
     tmp_connections = tmp_connections.groupby(
         ["pre_simple_id", "post_simple_id"], as_index=False
-    ).agg({"syn_count": "sum"})
+    ).agg({field: "sum"})
 
     # Note: this .T has nothing to do with transposing the full weight matrix.
     #       it only makes (N, 2) to (2, N) where the 2 rows correspond to pre and post
@@ -28,7 +30,7 @@ def make_sparse_mat(connections: pd.DataFrame, shape) -> scipy.sparse.sparray:
 
     ret = scipy.sparse.coo_array(
         (
-            tmp_connections[["syn_count"]].to_numpy().flatten(),
+            tmp_connections[[field]].to_numpy().flatten(),
             (pre, post),
         ),
         shape=shape,

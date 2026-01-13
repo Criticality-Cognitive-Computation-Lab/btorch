@@ -100,7 +100,11 @@ def fano_factor_from_spikes(
     mean_counts = counts.mean(axis=0)
     var_counts = counts.var(axis=0, ddof=1)
 
-    fano = np.where(mean_counts > 0, var_counts / mean_counts, 0.0)
+    # Safely compute Fano: only divide where mean_counts is finite and > 0
+    fano = np.zeros_like(var_counts, dtype=float)
+    valid = np.isfinite(mean_counts) & (mean_counts > 0) & np.isfinite(var_counts)
+    if np.any(valid):
+        fano[valid] = var_counts[valid] / mean_counts[valid]
     return fano
 
 

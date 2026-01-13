@@ -1,8 +1,15 @@
 import warnings
 
-import nolds
 import numpy as np
 import powerlaw
+
+
+try:
+    import nolds
+
+    HAS_NOLDS = True
+except ImportError:
+    HAS_NOLDS = False
 from scipy.optimize import curve_fit
 
 
@@ -202,6 +209,12 @@ def calculate_dfa(spike_train: np.ndarray, bin_size: int = 1):
     Returns:
         float: The DFA exponent alpha.
     """
+    if not HAS_NOLDS:
+        raise ImportError(
+            "nolds package is required for DFA analysis. "
+            "Install with: pip install nolds"
+        )
+
     # Ensure input is numpy array
     spike_train = np.array(spike_train)
 

@@ -1,86 +1,847 @@
+"""Multiscale dynamics visualization with unified dual interface.
+
+This module provides plotting functions for multiscale dynamics analysis
+including Fano factor, DFA, and ISI CV across different time scales and
+aggregation levels.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import torch
+from matplotlib.figure import Figure
 
-from ..analysis.spiking import cv_from_spikes
+from ..analysis.aggregation import agg_by_neuron, agg_by_neuropil
+from ..analysis.dynamic_tools.micro_scale import calculate_cv_isi
+from ..analysis.spiking import fano_factor_from_spikes
 
 
-def plot_cv_distribution(result, model_param, args, root_id_converter):
-    """Plot CV distribution and statistics."""
-    import matplotlib.pyplot as plt
+def _to_numpy(data) -> np.ndarray:
+    """Convert torch.Tensor to numpy array."""
+    if isinstance(data, torch.Tensor):
+        return data.detach().cpu().numpy()
+    return np.asarray(data)
 
-    spike_data = result["neuron"]["spike"]
-    dt_ms = model_param["dt"]
 
-    # Calculate CV values
-    cv_values, isi_stats = cv_from_spikes(spike_data, dt_ms)
+@dataclass
+class DynamicsData:
+    """Container for dynamics analysis data and configs.
 
-    # Filter out NaN values for plotting
-    valid_cv = cv_values[~np.isnan(cv_values)]
+    Attributes:
+        spikes: Spike trains (time, neurons)
+        dt: Simulation timestep in ms
+        neurons_df: DataFrame with neuron metadata
+        connections_df: DataFrame with connection metadata
+    """
 
-    if len(valid_cv) == 0:
-        print("No valid CV values found (need at least 2 spikes per neuron)")
-        return None
+    spikes: np.ndarray | torch.Tensor
+    dt: float = 1.0
+    neurons_df: pd.DataFrame | None = None
+    connections_df: pd.DataFrame | None = None
 
-    # Create figure
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
-    # Plot CV distribution histogram
-    ax1.hist(valid_cv, bins=50, alpha=0.7, edgecolor="black")
-    ax1.set_xlabel("Coefficient of Variation (CV)")
-    ax1.set_ylabel("Number of Neurons")
-    ax1.set_title(f"CV Distribution (n={len(valid_cv)} neurons)")
-    ax1.axvline(
-        np.mean(valid_cv),
-        color="red",
-        linestyle="--",
-        label=f"Mean CV = {np.mean(valid_cv):.3f}",
+@dataclass
+class DynamicsPlotFormat:
+    """Figure formatting for dynamics plots.
+
+    Attributes:
+        mode: Visualization mode - individual neurons, grouped, or distribution
+        group_by: Grouping method for aggregation
+        neuron_type_column: Column name for neuron classification
+        neuron_indices: Specific neurons for individual mode
+        colors: Color mapping
+        figsize: Figure size
+    """
+
+    mode: Literal["individual", "grouped", "distribution"] = "individual"
+    group_by: Literal["neuropil", "neuron_type", None] = None
+    neuron_type_column: str = "cell_type"
+    neuron_indices: list[int] | None = None
+    colors: dict | None = None
+    figsize: tuple[float, float] | None = None
+
+
+@dataclass
+class FanoFactorConfig:
+    """Configuration for Fano factor analysis.
+
+    Attributes:
+        windows: Time windows in timesteps for multiscale analysis
+        overlap: Overlap between windows in timesteps
+    """
+
+    windows: list[int] | None = None
+    overlap: int = 0
+
+
+@dataclass
+class DFAConfig:
+    """Configuration for DFA analysis.
+
+    Attributes:
+        min_window: Minimum window size for DFA
+        max_window: Maximum window size for DFA
+        bin_size: Bin size for spike binning
+    """
+
+    min_window: int = 4
+    max_window: int | None = None
+    bin_size: int = 1
+
+
+def plot_multiscale_fano(
+    # Dataclass interface
+    data: DynamicsData | None = None,
+    config: FanoFactorConfig | None = None,
+    format: DynamicsPlotFormat | None = None,
+    # Plain args interface
+    spikes: np.ndarray | torch.Tensor | None = None,
+    dt: float = 1.0,
+    windows: list[int] | None = None,
+    overlap: int = 0,
+    mode: Literal["individual", "grouped", "distribution"] = "individual",
+    neurons_df: pd.DataFrame | None = None,
+    connections_df: pd.DataFrame | None = None,
+    group_by: Literal["neuropil", "neuron_type", None] = None,
+    neuron_type_column: str = "cell_type",
+    neuron_indices: list[int] | None = None,
+    **kwargs,
+) -> Figure:
+    """Plot multiscale Fano factor analysis.
+
+    Computes and visualizes Fano factor across multiple time windows,
+    supporting individual neurons, grouped aggregations, and distributions.
+
+    Args:
+        data: DynamicsData dataclass
+        config: FanoFactorConfig dataclass
+        format: DynamicsPlotFormat dataclass
+        spikes: Spike trains (time, neurons)
+        dt: Timestep in ms
+        windows: Time windows in timesteps
+        overlap: Window overlap in timesteps
+        mode: Visualization mode
+        neurons_df: Neuron metadata
+        connections_df: Connection metadata
+        group_by: Grouping method
+        neuron_type_column: Column for neuron types
+        neuron_indices: Specific neurons to plot
+
+    Returns:
+        Figure with Fano factor plots
+    """
+    # Resolve dataclass vs plain args
+    if data is not None:
+        spikes = data.spikes if spikes is None else spikes
+        dt = data.dt if dt == 1.0 else dt
+        neurons_df = data.neurons_df if neurons_df is None else neurons_df
+        connections_df = (
+            data.connections_df if connections_df is None else connections_df
+        )
+
+    if config is not None:
+        windows = config.windows if windows is None else windows
+        overlap = config.overlap if overlap == 0 else overlap
+
+    if format is not None:
+        mode = format.mode
+        group_by = format.group_by if group_by is None else group_by
+        neuron_type_column = format.neuron_type_column
+        neuron_indices = (
+            format.neuron_indices if neuron_indices is None else neuron_indices
+        )
+
+    # Validate
+    if spikes is None:
+        raise ValueError("spikes is required")
+
+    spikes = _to_numpy(spikes)
+    n_time, n_neurons = spikes.shape
+
+    # Default windows: logarithmically spaced
+    if windows is None:
+        windows = [int(w) for w in np.logspace(1, np.log10(n_time // 4), 10)]
+
+    # Reshape for fano_factor_from_spikes: (time, batch=1, neurons)
+    spikes_3d = spikes[:, np.newaxis, :]
+
+    # Compute Fano factor for each window
+    fano_results = {}
+    for w in windows:
+        fano = fano_factor_from_spikes(spikes_3d, window=w, overlap=overlap)
+        fano_results[w] = fano.squeeze(0)  # Remove batch dim: (neurons,)
+
+    # Create figure based on mode
+    if mode == "individual":
+        return _plot_fano_individual(
+            fano_results, windows, dt, neuron_indices, n_neurons
+        )
+    elif mode == "grouped":
+        if group_by is None:
+            raise ValueError("group_by must be specified for grouped mode")
+        return _plot_fano_grouped(
+            fano_results,
+            windows,
+            dt,
+            spikes,
+            neurons_df,
+            connections_df,
+            group_by,
+            neuron_type_column,
+        )
+    elif mode == "distribution":
+        return _plot_fano_distribution(fano_results, windows, dt)
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+
+def _plot_fano_individual(fano_results, windows, dt, neuron_indices, n_neurons):
+    """Plot Fano factor for individual neurons."""
+    if neuron_indices is None:
+        neuron_indices = list(range(min(10, n_neurons)))
+
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+
+    for neuron_idx in neuron_indices:
+        fano_values = [fano_results[w][neuron_idx] for w in windows]
+        ax.plot(
+            np.array(windows) * dt,
+            fano_values,
+            marker="o",
+            label=f"N{neuron_idx}",
+            alpha=0.7,
+        )
+
+    ax.set_xlabel("Time Window (ms)")
+    ax.set_ylabel("Fano Factor")
+    ax.set_title("Multiscale Fano Factor - Individual Neurons")
+    ax.set_xscale("log")
+    ax.grid(alpha=0.3)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+    plt.tight_layout()
+    return fig
+
+
+def _plot_fano_grouped(
+    fano_results,
+    windows,
+    dt,
+    spikes,
+    neurons_df,
+    connections_df,
+    group_by,
+    neuron_type_column,
+):
+    """Plot Fano factor grouped by neuropil or neuron type."""
+    if neurons_df is None and group_by == "neuron_type":
+        raise ValueError("neurons_df required for neuron_type grouping")
+    if connections_df is None and group_by == "neuropil":
+        raise ValueError("connections_df required for neuropil grouping")
+
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+
+    # Organize data by group first: {group_name: [val_w1, val_w2, ...]}
+    group_data = {}
+
+    # Initialize groups from first window to ensure consistency
+    first_window_data = fano_results[windows[0]]
+    if group_by == "neuron_type":
+        grouped_init = agg_by_neuron(
+            first_window_data,
+            neurons_df,
+            agg="mean",
+            neuron_type_column=neuron_type_column,
+        )
+    elif group_by == "neuropil":
+        grouped_init, _ = agg_by_neuropil(
+            first_window_data,
+            neurons=neurons_df,
+            connections=connections_df,
+            mode="top_innervated",
+            agg="mean",
+        )
+        grouped_init = grouped_init if grouped_init else {}
+
+    if grouped_init:
+        for group_name in grouped_init.keys():
+            group_data[group_name] = []
+
+        # Collect data for all windows
+        for w in windows:
+            fano_arr = fano_results[w]
+
+            if group_by == "neuron_type":
+                grouped = agg_by_neuron(
+                    fano_arr,
+                    neurons_df,
+                    agg="mean",
+                    neuron_type_column=neuron_type_column,
+                )
+            elif group_by == "neuropil":
+                pre_grouped, _ = agg_by_neuropil(
+                    fano_arr,
+                    neurons=neurons_df,
+                    connections=connections_df,
+                    mode="top_innervated",
+                    agg="mean",
+                )
+                grouped = pre_grouped
+
+            for group_name in group_data:
+                if group_name in grouped:
+                    group_data[group_name].append(grouped[group_name])
+                else:
+                    group_data[group_name].append(np.nan)
+
+        # Plot lines for each group
+        times = np.array(windows) * dt
+        for group_name, values in group_data.items():
+            ax.plot(times, values, marker="o", label=group_name)
+    else:
+        # Fallback if no groups found
+        pass
+
+    ax.set_xlabel("Time Window (ms)")
+    ax.set_ylabel("Fano Factor (mean)")
+    ax.set_title(f"Multiscale Fano Factor - Grouped by {group_by}")
+    ax.set_xscale("log")
+    ax.grid(alpha=0.3, which="both")
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+    plt.tight_layout()
+    return fig
+
+
+def _plot_fano_distribution(fano_results, windows, dt):
+    """Plot Fano factor distribution across neurons."""
+    fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+
+    # Use ordinal positions for violins to avoid log-scale width artifacts
+    positions = np.arange(len(windows))
+    data_list = [fano_results[w] for w in windows]
+
+    ax.violinplot(
+        data_list,
+        positions=positions,
+        widths=0.7,
+        showmeans=True,
+        showmedians=True,
     )
-    ax1.axvline(1.1, color="green", linestyle="--", label="Target CV = 1.1")
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
 
-    # Plot CV vs firing rate scatter
-    firing_rates = np.mean(spike_data, axis=0) * (1000.0 / dt_ms)  # Convert to Hz
-    valid_mask = ~np.isnan(cv_values)
-    valid_fr = firing_rates[valid_mask]
-    valid_cv_for_scatter = cv_values[valid_mask]
+    # Set x-ticks to show actual time windows
+    ax.set_xticks(positions)
+    # Format labels: integer if whole number, else 1 decimal
+    labels = [f"{w * dt:.1f}" if (w * dt) % 1 else f"{int(w * dt)}" for w in windows]
+    ax.set_xticklabels(labels, rotation=45, ha="right")
 
-    ax2.scatter(valid_fr, valid_cv_for_scatter, alpha=0.6)
-    ax2.set_xlabel("Firing Rate (Hz)")
-    ax2.set_ylabel("Coefficient of Variation (CV)")
-    ax2.set_title("CV vs Firing Rate")
-    ax2.axhline(1.1, color="green", linestyle="--", label="Target CV = 1.1")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+    ax.set_xlabel("Time Window (ms)")
+    ax.set_ylabel("Fano Factor")
+    ax.set_title("Multiscale Fano Factor - Distribution")
+    ax.grid(alpha=0.3, axis="y")
+    plt.tight_layout()
+    return fig
+
+
+def plot_dfa_analysis(
+    # Dataclass interface
+    data: DynamicsData | None = None,
+    config: DFAConfig | None = None,
+    format: DynamicsPlotFormat | None = None,
+    # Plain args interface
+    spikes: np.ndarray | torch.Tensor | None = None,
+    dt: float = 1.0,
+    min_window: int = 4,
+    max_window: int | None = None,
+    bin_size: int = 1,
+    mode: Literal["individual", "grouped", "distribution"] = "individual",
+    neurons_df: pd.DataFrame | None = None,
+    **kwargs,
+) -> Figure:
+    """Plot DFA (Detrended Fluctuation Analysis) results.
+
+    Args:
+        data: DynamicsData dataclass
+        config: DFAConfig dataclass
+        format: DynamicsPlotFormat dataclass
+        spikes: Spike trains
+        dt: Timestep in ms
+        min_window: Minimum window size
+        max_window: Maximum window size
+        bin_size: Bin size for spike binning
+        mode: Visualization mode
+        neurons_df: Neuron metadata
+
+    Returns:
+        Figure with DFA analysis
+    """
+    # Resolve dataclass vs plain args
+    if data is not None:
+        spikes = data.spikes if spikes is None else spikes
+        dt = data.dt if dt == 1.0 else dt
+        neurons_df = data.neurons_df if neurons_df is None else neurons_df
+
+    if config is not None:
+        max_window = config.max_window if max_window is None else max_window
+        bin_size = config.bin_size
+
+    # Validate
+    if spikes is None:
+        raise ValueError("spikes is required")
+
+    spikes = _to_numpy(spikes)
+
+    # Compute DFA
+    from ..analysis.dynamic_tools.criticality import calculate_dfa
+
+    alpha = calculate_dfa(spikes, bin_size=bin_size)
+
+    # Create simple plot showing the result
+    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+    ax.text(
+        0.5,
+        0.5,
+        f"DFA Exponent (α): {alpha:.3f}",
+        ha="center",
+        va="center",
+        fontsize=16,
+        transform=ax.transAxes,
+    )
+    ax.text(
+        0.5,
+        0.4,
+        "α ≈ 0.5: uncorrelated\n"
+        "α > 0.5: long-range correlations\n"
+        "α < 0.5: anti-correlations",
+        ha="center",
+        va="center",
+        fontsize=10,
+        transform=ax.transAxes,
+    )
+    ax.set_title("Detrended Fluctuation Analysis")
+    ax.axis("off")
+    return fig
+
+
+def plot_isi_cv(
+    # Dataclass interface
+    data: DynamicsData | None = None,
+    format: DynamicsPlotFormat | None = None,
+    # Plain args interface
+    spikes: np.ndarray | torch.Tensor | None = None,
+    dt: float = 1.0,
+    mode: Literal["individual", "grouped", "distribution"] = "individual",
+    neurons_df: pd.DataFrame | None = None,
+    group_by: Literal["neuropil", "neuron_type", None] = None,
+    neuron_type_column: str = "cell_type",
+    **kwargs,
+) -> Figure:
+    """Plot ISI CV (Coefficient of Variation) distribution.
+
+    Args:
+        data: DynamicsData dataclass
+        format: DynamicsPlotFormat dataclass
+        spikes: Spike trains
+        dt: Timestep in ms
+        mode: Visualization mode
+        neurons_df: Neuron metadata
+        group_by: Grouping method
+        neuron_type_column: Column for neuron types
+
+    Returns:
+        Figure with ISI CV plots
+    """
+    # Resolve dataclass vs plain args
+    if data is not None:
+        spikes = data.spikes if spikes is None else spikes
+        dt = data.dt if dt == 1.0 else dt
+        neurons_df = data.neurons_df if neurons_df is None else neurons_df
+
+    if format is not None:
+        mode = format.mode
+        group_by = format.group_by if group_by is None else group_by
+        neuron_type_column = format.neuron_type_column
+
+    # Validate
+    if spikes is None:
+        raise ValueError("spikes is required")
+
+    spikes = _to_numpy(spikes)
+
+    # Compute ISI CV
+    cv_results = calculate_cv_isi(spikes, dt=dt)
+    cv_values = cv_results["cv_isi"]
+
+    # Create figure based on mode
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+
+    if mode == "distribution" or mode == "individual":
+        # Histogram
+        valid_cv = cv_values[~np.isnan(cv_values)]
+        ax.hist(valid_cv, bins=30, color="skyblue", edgecolor="black", alpha=0.7)
+        ax.axvline(
+            cv_results["mean"],
+            color="red",
+            linestyle="--",
+            label=f"Mean={cv_results['mean']:.2f}",
+        )
+        ax.set_xlabel("ISI CV")
+        ax.set_ylabel("Count")
+        ax.set_title("ISI Coefficient of Variation Distribution")
+        ax.legend()
+        ax.grid(alpha=0.3)
+
+    elif mode == "grouped":
+        if group_by is None or neurons_df is None:
+            raise ValueError("group_by and neurons_df required for grouped mode")
+
+        # Group by neuron type
+        grouped = agg_by_neuron(
+            cv_values, neurons_df, agg="mean", neuron_type_column=neuron_type_column
+        )
+
+        # Bar plot
+        names = list(grouped.keys())
+        values = list(grouped.values())
+        ax.bar(names, values, color="teal", alpha=0.7, edgecolor="black")
+        ax.set_xlabel("Neuron Type")
+        ax.set_ylabel("Mean ISI CV")
+        ax.set_title(f"ISI CV by {neuron_type_column}")
+        ax.grid(axis="y", alpha=0.3)
+        plt.xticks(rotation=45, ha="right")
 
     plt.tight_layout()
-    fig.savefig(f"{args.figure_dir}/cv_distribution.pdf", bbox_inches="tight")
+    return fig
 
-    # Save CV statistics to CSV
-    cv_df = pd.DataFrame(
-        {
-            "neuron_idx": np.arange(len(cv_values)),
-            "cv": cv_values,
-            "firing_rate_hz": firing_rates,
-            "n_spikes": [isi_stats[i]["n_spikes"] for i in range(len(cv_values))],
-            "mean_isi_ms": [isi_stats[i]["mean_isi"] for i in range(len(cv_values))],
-            "std_isi_ms": [isi_stats[i]["std_isi"] for i in range(len(cv_values))],
-        }
+
+# --- Ported from legacy dynamics.py ---
+
+
+def plot_avalanche_analysis(
+    spikes: np.ndarray | torch.Tensor,
+    bin_size: int = 1,
+    dt: float = 1.0,  # Added for consistency
+) -> tuple[Figure, dict]:
+    """Plot avalanche size and duration distributions to analyze criticality.
+
+    Args:
+        spikes: Spike matrix of shape (Time, Neurons).
+        bin_size: Bin size for avalanche detection.
+        dt: Timestep in ms (unused for checking, but kept for interface).
+
+    Returns:
+        fig: The matplotlib figure containing 3 panels.
+        results: The statistics returned by compute_avalanche_statistics.
+    """
+    from ..analysis.dynamic_tools.criticality import compute_avalanche_statistics
+
+    spikes = _to_numpy(spikes)
+    results = compute_avalanche_statistics(spikes, bin_size=bin_size)
+
+    fig = plt.figure(figsize=(15, 4))
+
+    # 1. Size Distribution P(S)
+    ax1 = fig.add_subplot(1, 3, 1)
+    if results["fit_S"]:
+        results["fit_S"].plot_pdf(color="b", linewidth=2, ax=ax1, label="Data")
+        results["fit_S"].power_law.plot_pdf(
+            color="b", linestyle="--", ax=ax1, label=f"Fit (tau={results['tau']:.2f})"
+        )
+    ax1.set_xlabel("Avalanche Size (S)")
+    ax1.set_ylabel("P(S)")
+    ax1.set_title("Size Distribution")
+    ax1.legend()
+
+    # 2. Duration Distribution P(T)
+    ax2 = fig.add_subplot(1, 3, 2)
+    if results["fit_T"]:
+        results["fit_T"].plot_pdf(color="r", linewidth=2, ax=ax2, label="Data")
+        results["fit_T"].power_law.plot_pdf(
+            color="r",
+            linestyle="--",
+            ax=ax2,
+            label=f"Fit (alpha={results['alpha']:.2f})",
+        )
+    ax2.set_xlabel("Avalanche Duration (T)")
+    ax2.set_ylabel("P(T)")
+    ax2.set_title("Duration Distribution")
+    ax2.legend()
+
+    # 3. Average Size vs Duration <S>(T)
+    ax3 = fig.add_subplot(1, 3, 3)
+    if (
+        "avg_size_by_duration" in results
+        and results["avg_size_by_duration"] is not None
+    ):
+        durations, mean_sizes = results["avg_size_by_duration"]
+        ax3.loglog(durations, mean_sizes, "ko", markersize=4, label="Data")
+
+        # Plot fit
+        if not np.isnan(results["gamma"]):
+            if "gamma_stats" in results and "popt" in results["gamma_stats"]:
+                popt = results["gamma_stats"]["popt"]
+                a, gamma = popt
+                x_fit = np.logspace(
+                    np.log10(durations.min()), np.log10(durations.max()), 100
+                )
+                y_fit = a * np.power(x_fit, gamma)
+                ax3.loglog(
+                    x_fit,
+                    y_fit,
+                    "g--",
+                    label=f"Fit (gamma={results['gamma']:.2f})",
+                )
+
+    # Annotate CCC
+    if not np.isnan(results["CCC"]):
+        txt = f"CCC = {results['CCC']:.2f}\nPred gamma = {results['gamma_pred']:.2f}"
+        ax3.text(
+            0.05,
+            0.95,
+            txt,
+            transform=ax3.transAxes,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        )
+
+    ax3.set_xlabel("Duration (T)")
+    ax3.set_ylabel("Average Size <S>")
+    ax3.set_title("Scaling Relation")
+    if ax3.get_legend_handles_labels()[0]:
+        ax3.legend()
+
+    plt.tight_layout()
+    return fig, results
+
+
+def plot_eigenvalue_spectrum(
+    weight_matrix: np.ndarray | torch.Tensor, ax: plt.Axes | None = None
+) -> tuple[Figure, plt.Axes, dict]:
+    """Plot the eigenvalue spectrum of the weight matrix.
+
+    Args:
+        weight_matrix: Square connectivity matrix.
+        ax: Axes to plot on.
+
+    Returns:
+        fig, ax, results
+    """
+    from ..analysis.dynamic_tools.attractor_dynamics import (
+        calculate_structural_eigenvalue_outliers,
     )
 
-    # Add root IDs if converter is available
-    if root_id_converter is not None:
-        cv_df["root_id"] = root_id_converter(np.arange(len(cv_values)))
+    W = _to_numpy(weight_matrix)
+    results = calculate_structural_eigenvalue_outliers(W)
 
-    cv_df.to_csv(f"{args.figure_dir}/cv_statistics.csv", index=False)
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 6))
+    else:
+        fig = ax.get_figure()
 
-    # Print summary statistics
-    print("\nCV Statistics Summary:")
-    print(f"Total neurons: {len(cv_values)}")
-    print(f"Neurons with valid CV: {len(valid_cv)}")
-    print(f"Mean CV: {np.mean(valid_cv):.3f} ± {np.std(valid_cv):.3f}")
-    print(f"Median CV: {np.median(valid_cv):.3f}")
-    print(f"CV range: [{np.min(valid_cv):.3f}, {np.max(valid_cv):.3f}]")
-    print(f"Neurons with CV ≈ 1.1 (±0.2): {np.sum(np.abs(valid_cv - 1.1) <= 0.2)}")
+    evals = results["eigenvalues"]
+    r_spec = results["spectral_radius"]
 
-    return fig, cv_df
+    # Draw unit circle / spectral radius
+    circle = plt.Circle(
+        (0, 0),
+        r_spec,
+        color="black",
+        fill=False,
+        linestyle="--",
+        alpha=0.5,
+        label=f"R={r_spec:.2f}",
+    )
+    ax.add_artist(circle)
+
+    # Scatter eigenvalues
+    ax.scatter(evals.real, evals.imag, s=10, alpha=0.6, c="gray", edgecolors="none")
+
+    # Highlight outliers
+    outliers = results["outliers"]
+    if len(outliers) > 0:
+        ax.scatter(
+            outliers.real,
+            outliers.imag,
+            s=30,
+            c="red",
+            label=f"Outliers ({len(outliers)})",
+        )
+
+    ax.set_aspect("equal")
+    ax.set_xlabel(r"Re($\lambda$)")
+    ax.set_ylabel(r"Im($\lambda$)")
+    ax.set_title("Eigenvalue Spectrum")
+    ax.grid(True, linestyle=":", alpha=0.3)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+    plt.tight_layout()
+
+    return fig, ax, results
+
+
+def plot_lyapunov_spectrum(
+    spectrum: list[float] | np.ndarray, ax: plt.Axes | None = None
+) -> tuple[Figure, plt.Axes]:
+    """Plot the Lyapunov exponents spectrum.
+
+    Args:
+        spectrum: List/Array of Lyapunov exponents.
+        ax: Axes to plot on.
+    """
+    from ..analysis.dynamic_tools.attractor_dynamics import (
+        calculate_kaplan_yorke_dimension,
+    )
+
+    spec = _to_numpy(spectrum)
+    # Sort descending just in case, though standard is descending
+    spec = np.sort(spec)[::-1]
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+    else:
+        fig = ax.get_figure()
+
+    x = np.arange(1, len(spec) + 1)
+    ax.plot(x, spec, "o-", markersize=4, linewidth=1, color="black")
+    ax.axhline(0, color="k", linestyle="--", linewidth=0.8)
+
+    # Calculate Kaplan-Yorke Dim
+    ky_dim = calculate_kaplan_yorke_dimension(spec)
+
+    title = f"Lyapunov Spectrum (D_KY = {ky_dim:.2f})"
+    ax.set_title(title)
+    ax.set_xlabel("Index")
+    ax.set_ylabel("Lyapunov Exponent")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    return fig, ax
+
+
+def plot_firing_rate_distribution(
+    spikes: np.ndarray | torch.Tensor,
+    dt: float = 1.0,
+    ax: plt.Axes | None = None,
+) -> tuple[Figure, dict]:
+    """Plot firing rate distribution.
+
+    Args:
+        spikes: Spike matrix (Time, Neurons)
+        dt: Timestep in ms
+        ax: Axes to plot on
+
+    Returns:
+        fig: Figure
+        stats: FR statistics
+    """
+    from ..analysis.dynamic_tools.micro_scale import calculate_fr_distribution
+
+    spikes = _to_numpy(spikes)
+    stats = calculate_fr_distribution(spikes, dt=dt)
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+    else:
+        fig = ax.get_figure()
+
+    rates = stats["rates"]
+    ax.hist(rates, bins=30, color="skyblue", edgecolor="black", alpha=0.7)
+    ax.axvline(
+        stats["mean"],
+        color="red",
+        linestyle="--",
+        label=f"Mean={stats['mean']:.1f} Hz",
+    )
+    ax.set_xlabel("Firing Rate (Hz)")
+    ax.set_ylabel("Count")
+    ax.set_title("Rate Distribution")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    if ax is None:
+        plt.tight_layout()
+
+    return fig, stats
+
+
+def plot_micro_dynamics(
+    spikes: np.ndarray | torch.Tensor,
+    dt: float = 1.0,
+    ax: plt.Axes | None = None,
+) -> tuple[Figure, dict]:
+    """Plot firing rate distribution and CV_ISI distribution.
+
+    Args:
+        spikes: (Time, Neurons)
+        dt: time step in ms
+        ax: Unused, acts as compatibility wrapper creating a new figure.
+
+    Returns:
+        fig, stats (dict with keys 'fr' and 'cv')
+    """
+    from ..analysis.dynamic_tools.micro_scale import calculate_cv_isi
+
+    # Plot FR
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    _, fr_stats = plot_firing_rate_distribution(spikes, dt=dt, ax=ax1)
+
+    # Plot CV (Re-implementing simplified version or using plot_isi_cv logic)
+    # reusing logic from plot_isi_cv for consistency but without full overhead
+    spikes_np = _to_numpy(spikes)
+    cv_results = calculate_cv_isi(spikes_np, dt=dt)
+    cv_values = cv_results["cv_isi"]
+    valid_cv = cv_values[~np.isnan(cv_values)]
+
+    if len(valid_cv) > 0:
+        ax2.hist(valid_cv, bins=30, color="orange", edgecolor="black", alpha=0.7)
+        ax2.axvline(
+            cv_results["mean"],
+            color="red",
+            linestyle="--",
+            label=f"Mean={cv_results['mean']:.2f}",
+        )
+        ax2.set_xlabel("CV (ISI)")
+        ax2.set_ylabel("Count")
+        ax2.set_title("CV Distribution")
+        ax2.legend()
+    else:
+        ax2.text(0.5, 0.5, "No valid CVs", ha="center")
+    ax2.grid(alpha=0.3)
+
+    plt.tight_layout()
+    return fig, {"fr": fr_stats, "cv": cv_results}
+
+
+def plot_gain_stability(data: tuple) -> tuple[Figure, plt.Axes]:
+    """Plot gain stability analysis (slope, intercept, g_values,
+    lambda_values).
+
+    Args:
+        data: Tuple of (slope, intercept, g_values, lambda_values)
+
+    Returns:
+        fig, ax
+    """
+    slope, intercept, g_values, lambda_values = data
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+
+    # Plot scatter of metrics
+    ax.scatter(g_values, lambda_values, label="Data", color="blue", alpha=0.6)
+
+    # Plot fit line
+    x_range = np.linspace(min(g_values), max(g_values), 100)
+    y_fit = slope * x_range + intercept
+    ax.plot(x_range, y_fit, "r--", label=f"Fit: y={slope:.2f}x+{intercept:.2f}")
+
+    ax.set_xlabel("Gain (g)")
+    ax.set_ylabel("Lyapunov / Eigenvalue metric")
+    ax.set_title("Gain Stability Analysis")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    return fig, ax

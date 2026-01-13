@@ -227,7 +227,11 @@ def calculate_gain_stability_sensitivity(
         device: Device to run on.
 
     Returns:
-        float: The slope of lambda_max vs g.
+        tuple: (slope, intercept, g_values, lambda_values)
+            - slope: The slope of lambda_max vs g.
+            - intercept: The intercept of the fit.
+            - g_values: The gain values used.
+            - lambda_values: The computed max Lyapunov exponents.
     """
     from model import functional, init
 
@@ -311,4 +315,4 @@ def calculate_gain_stability_sensitivity(
 
     slope, intercept = np.polyfit(g_valid, lambda_valid, 1)
 
-    return slope
+    return slope, intercept, g_values, np.array(lambda_values)

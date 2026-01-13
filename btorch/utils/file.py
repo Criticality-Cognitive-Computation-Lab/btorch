@@ -79,6 +79,7 @@ def save_fig(
     file: str | Path | None = None,
     cfg: FigPathConfig | dict | None = None,
     suffix: str = "pdf",
+    transparent: bool = False,
 ) -> Path:
     file_path = Path(file) if file is not None else caller_file()
     if path is None:
@@ -87,5 +88,5 @@ def save_fig(
         name = file_path.stem
     path.mkdir(parents=True, exist_ok=True)
     output_path = path / f"{name}.{suffix}"
-    fig.savefig(output_path.as_posix(), transparent=True)
+    fig.savefig(output_path.as_posix(), transparent=transparent)
     return output_path
