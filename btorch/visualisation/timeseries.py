@@ -424,7 +424,9 @@ def plot_raster(
     if show_rate:
         assert ax_rate is not None
         eff_dt = dt if dt is not None else (t[1] - t[0] if len(t) > 1 else 1.0)
-        fr = firing_rate(spikes_np, width=rate_window / eff_dt, dt=eff_dt * 1e-3)
+        fr = firing_rate(
+            spikes_np, width=rate_window / eff_dt, dt=eff_dt * 1e-3, axis=-1
+        )
 
         ax_rate.plot(t, fr, color="black")
         ax_rate.set_xlim(t[0], t[-1])

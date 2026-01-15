@@ -41,14 +41,14 @@ def test_fano_and_kurtosis_from_spikes_basic():
 
 def test_firing_rate_numpy_and_torch():
     spikes = np.array([[1, 0], [0, 1], [1, 1]], dtype=float)
-    fr_mean = firing_rate(spikes, width=3, dt=1.0, per_neuron=False)
+    fr_mean = firing_rate(spikes, width=3, dt=1.0, axis=-1)
     assert fr_mean.shape == (3,)
 
-    fr_per_neuron = firing_rate(spikes, width=3, dt=1.0, per_neuron=True)
+    fr_per_neuron = firing_rate(spikes, width=3, dt=1.0, axis=None)
     assert fr_per_neuron.shape == spikes.shape
 
     torch_spikes = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-    torch_fr = firing_rate(torch_spikes, width=3, dt=0.5, per_neuron=True)
+    torch_fr = firing_rate(torch_spikes, width=3, dt=0.5, axis=None)
     assert torch_fr.shape == torch_spikes.shape
     assert torch_fr.dtype == torch_spikes.dtype
 
