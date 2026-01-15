@@ -843,7 +843,7 @@ class TracePlotFormat:
 
 def plot_neuron_traces(
     # Dataclass interface
-    states: SimulationStates | None = None,
+    states: SimulationStates | pd.DataFrame | None = None,
     format: TracePlotFormat | None = None,
     # Plain args interface
     voltage: np.ndarray | torch.Tensor | None = None,
