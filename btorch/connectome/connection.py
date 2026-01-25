@@ -763,7 +763,7 @@ def make_hetersynapse_constrained_conn(
 def stack_hetersynapse(
     conn_dict: dict,
     receptor_type_index: pd.DataFrame,
-    ignore_receptor_type: Literal["post", "all"] | None = None,
+    ignore_receptor_type: Literal["pre", "post", "all"] | None = None,
 ) -> scipy.sparse.sparray | tuple[scipy.sparse.sparray, pd.DataFrame]:
     """Convert dict of receptor-specific matrices back to stacked matrix
     format.
@@ -779,172 +779,116 @@ def stack_hetersynapse(
             include 'receptor_index' column and either
             ('pre_receptor_type', 'post_receptor_type') for neuron mode
             or 'receptor_type' for connection mode.
+        ignore_receptor_type: Optional collapse strategy to reduce receptor
+            distinctions. None keeps full indexing. "post" collapses only
+            post-receptor types in neuron mode (treated as "all" in
+            connection mode). "pre" is accepted for connection mode and
+            behaves like "all". "all" sums all receptor channels into one.
 
     Returns:
-        Stacked sparse matrix in (pre_neuron, post_neuron * n_receptor_types) format.
-        If ignore_receptor_type is not None, returns (stacked_conn, new_receptor_type_index)
-        as the receptor index changes.
-
-    Example:
-        >>> # Get dict, modify matrices, then stack back
-        >>> conn_dict, receptor_idx = make_hetersynapse_conn(
-        ...     neurons, connections, return_dict=True
-        ... )
-        >>> # Modify E->I connections
-        >>> conn_dict[('E', 'I')].data *= 2.0
-        >>> # Convert back to stacked format
-        >>> conn_stacked = stack_hetersynapse(conn_dict, receptor_idx)
-        >>> # Or collapse everything
-        >>> conn_all, idx_all = stack_hetersynapse(conn_dict, receptor_idx, ignore_receptor_type="all")
+        Stacked sparse matrix with shape (N, N * n_receptor_types). When
+        collapsing, also returns a new receptor_type_index describing the
+        reduced mapping.
     """
-    if len(conn_dict) == 0:
+
+    if not conn_dict:
         raise ValueError("conn_dict is empty")
 
-    n_neuron = next(iter(conn_dict.values())).shape[0]
-
-    # Check if aggregation is requested
-    if ignore_receptor_type == "all":
-        # Sum all matrices regardless of mode
-        summed_mat = None
-        for mat in conn_dict.values():
-            if summed_mat is None:
-                summed_mat = mat.copy()
-            else:
-                summed_mat += mat
-
-        new_receptor_index_df = pd.DataFrame(
-            [(0, "all")], columns=["receptor_index", "receptor_type"]
-        )
-        return summed_mat.tocoo(), new_receptor_index_df
-
-    # Check if ignore_post_type is requested
-    if ignore_receptor_type == "post":
-        # We need to collapse columns.
-        # Iterate over conn_dict, aggregating by pre-synaptic type
-        collapsed_conn_dict = OrderedDict()
-
-        # Check if we are in neuron mode (keys are tuples)
-        is_tuple_key = isinstance(next(iter(conn_dict.keys())), tuple)
-
-        if is_tuple_key:
-            # Group by pre-synaptic type
-            for (pre, post), mat in conn_dict.items():
-                if pre not in collapsed_conn_dict:
-                    collapsed_conn_dict[pre] = mat.copy()
-                else:
-                    # In standard make_hetersynapse_conn with ignore_post_type=True,
-                    # we create one block of columns per Pre-Receptor-Type.
-                    # Inside that block, for a given pre-neuron, the row connects to
-                    # ALL post-neurons (regardless of post-type) that possess that
-                    # pre-receptor connectivity.
-                    #
-                    # If we have E->E and E->I connections in conn_dict:
-                    # 'E' block should contain BOTH.
-                    # Since conn_dict split them into separate matrices (same size
-                    # N x N), E->E matrix has entries where post is E. E->I has
-                    # entries where post is I. They are mutually exclusive.
-                    # So we should sum them up.
-                    collapsed_conn_dict[pre] += mat
-
-            # Build new receptor index
-            new_receptor_index = []
-            for i, pre in enumerate(collapsed_conn_dict.keys()):
-                new_receptor_index.append((i, pre))
-
-            new_receptor_index_df = pd.DataFrame(
-                new_receptor_index, columns=["receptor_index", "receptor_type"]
-            )
-
-            # Stack using new types
-            n_receptor_types = len(collapsed_conn_dict)
-            new_shape = (n_neuron, n_neuron * n_receptor_types)
-
-            new_row = []
-            new_col = []
-            new_val = []
-
-            for i, (pre, mat) in enumerate(collapsed_conn_dict.items()):
-                mat = mat.tocoo()
-                new_row.append(mat.row)
-                new_col.append(mat.col * n_receptor_types + i)
-                new_val.append(mat.data)
-
-            stacked = scipy.sparse.coo_array(
-                (
-                    np.concatenate(new_val),
-                    (np.concatenate(new_row), np.concatenate(new_col)),
-                ),
-                shape=new_shape,
-            )
-            return stacked, new_receptor_index_df
-
-        else:
-            # Connection mode - keys are already just receptor types (strings)
-            # If ignore_post_type is requested here... connection mode essentially
-            # already ignores post neuron type distinction (it groups by connection
-            # property). So we can just behave like normal stacking, but return
-            # Tuple to match signature? Assuming standard behavior: ignore_post_type
-            # implies clustering purely by the key property. In connection mode,
-            # the key IS the property.
-
-            # Let's just fall back to normal stacking but return index.
-            # Actually, if the input index has 'receptor_type', it's already compatible.
-            pass
-
-    # Standard Stacking Logic
-    # Get the shape from the first matrix
     first_mat = next(iter(conn_dict.values()))
-    base_shape = first_mat.shape
-    n_receptor_pairs = len(receptor_type_index)
+    n_neuron = first_mat.shape[0]
 
-    # Detect mode from receptor_type_index columns
-    has_pre_post = (
-        "pre_receptor_type" in receptor_type_index.columns
-        and "post_receptor_type" in receptor_type_index.columns
-    )
+    neuron_mode = {
+        "pre_receptor_type",
+        "post_receptor_type",
+    }.issubset(receptor_type_index.columns)
+    connection_mode = "receptor_type" in receptor_type_index.columns and not neuron_mode
 
-    new_shape = (base_shape[0], base_shape[1] * n_receptor_pairs)
-    new_row = []
-    new_col = []
-    new_val = []
-
-    # Build mapping from receptor pair to index
-    if has_pre_post:
-        # Neuron mode
-        receptor_to_idx = {}
-        for _, row in receptor_type_index.iterrows():
-            key = (row["pre_receptor_type"], row["post_receptor_type"])
-            receptor_to_idx[key] = row["receptor_index"]
-
-        for (pre_type, post_type), mat in conn_dict.items():
-            if (pre_type, post_type) not in receptor_to_idx:
-                continue  # Skip if not in index (or raise error?)
-            idx = receptor_to_idx[(pre_type, post_type)]
+    def _stack(items, idx_lookup, n_receptor_pairs):
+        rows, cols, vals = [], [], []
+        for key, mat in items:
+            if key not in idx_lookup:
+                raise KeyError(f"Receptor key {key} missing from receptor_type_index")
+            idx = idx_lookup[key]
             mat = mat.tocoo()
+            rows.append(mat.row)
+            cols.append(mat.col * n_receptor_pairs + idx)
+            vals.append(mat.data)
 
-            new_row.append(mat.row)
-            new_col.append(mat.col * n_receptor_pairs + idx)
-            new_val.append(mat.data)
-    else:
-        # Connection mode
-        receptor_to_idx = dict(
-            receptor_type_index[["receptor_type", "receptor_index"]].itertuples(
+        return scipy.sparse.coo_array(
+            (
+                np.concatenate(vals),
+                (np.concatenate(rows), np.concatenate(cols)),
+            ),
+            shape=(n_neuron, n_neuron * n_receptor_pairs),
+        )
+
+    def _make_index_and_lookup(labels: list[str]) -> tuple[pd.DataFrame, dict]:
+        idx_df = pd.DataFrame(
+            [(i, lab) for i, lab in enumerate(labels)],
+            columns=["receptor_index", "receptor_type"],
+        )
+        lookup = dict(
+            idx_df[["receptor_type", "receptor_index"]].itertuples(
                 index=False, name=None
             )
         )
+        return idx_df, lookup
 
-        for receptor_type, mat in conn_dict.items():
-            idx = receptor_to_idx[receptor_type]
-            mat = mat.tocoo()
+    def _collapse_all(conn_dict: dict) -> tuple[scipy.sparse.sparray, pd.DataFrame]:
+        summed = None
+        for mat in conn_dict.values():
+            summed = mat.copy() if summed is None else summed + mat
+        idx_df = pd.DataFrame([(0, "all")], columns=["receptor_index", "receptor_type"])
+        return summed.tocoo(), idx_df
 
-            new_row.append(mat.row)
-            new_col.append(mat.col * n_receptor_pairs + idx)
-            new_val.append(mat.data)
+    # Collapsing behavior
+    if ignore_receptor_type in {"pre", "post", "all"}:
+        # Connection mode: 'pre'/'post' behave like 'all'
+        if connection_mode:
+            return _collapse_all(conn_dict)
 
-    return scipy.sparse.coo_array(
-        (
-            np.concatenate(new_val),
-            (np.concatenate(new_row), np.concatenate(new_col)),
-        ),
-        shape=new_shape,
+        # Neuron mode collapse
+        if ignore_receptor_type == "all":
+            return _collapse_all(conn_dict)
+
+        # Collapse over the specified dimension (pre or post) in neuron mode
+        collapsed = OrderedDict()
+        if ignore_receptor_type == "post":
+            for (pre, _post), mat in conn_dict.items():
+                if pre not in collapsed:
+                    collapsed[pre] = mat.copy()
+                else:
+                    collapsed[pre] += mat
+            labels = list(collapsed.keys())
+            idx_df, lookup = _make_index_and_lookup(labels)
+            return _stack(collapsed.items(), lookup, len(labels)), idx_df
+
+        if ignore_receptor_type == "pre":
+            for (_pre, post), mat in conn_dict.items():
+                if post not in collapsed:
+                    collapsed[post] = mat.copy()
+                else:
+                    collapsed[post] += mat
+            labels = list(collapsed.keys())
+            idx_df, lookup = _make_index_and_lookup(labels)
+            return _stack(collapsed.items(), lookup, len(labels)), idx_df
+
+    if neuron_mode:
+        idx_lookup = {
+            (row.pre_receptor_type, row.post_receptor_type): row.receptor_index
+            for row in receptor_type_index.itertuples(index=False)
+        }
+        return _stack(conn_dict.items(), idx_lookup, len(receptor_type_index))
+
+    if connection_mode:
+        idx_lookup = {
+            row.receptor_type: row.receptor_index
+            for row in receptor_type_index.itertuples(index=False)
+        }
+        return _stack(conn_dict.items(), idx_lookup, len(receptor_type_index))
+
+    raise ValueError(
+        "receptor_type_index must contain either "
+        "(pre_receptor_type, post_receptor_type) "
+        "or receptor_type columns"
     )

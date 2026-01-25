@@ -10,6 +10,8 @@ This test module covers:
 Tests also serve as examples and documentation for how to use these features.
 """
 
+from collections import OrderedDict
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -597,3 +599,212 @@ def test_stack_hetersynapse_dict():
     print("✓ Modifications to dict are preserved after stacking")
     print(f"  Dict keys: {list(conn_dict.keys())}")
     print(f"  Stacked shape: {conn_stacked.shape}")
+
+
+def test_stack_hetersynapse_collapse_neuron_mode():
+    """Test collapsing behavior in neuron mode for 'pre', 'post', and 'all'.
+
+    Uses make_hetersynapse_conn(return_dict=True) to generate receptor-
+    pair matrices. Then verifies the output shapes when collapsing
+    dimensions.
+    """
+    from btorch.connectome.connection import stack_hetersynapse
+
+    neurons = create_test_neurons(n_neurons=30)
+    connections = create_test_connections(neurons, density=0.2)
+
+    conn_dict, receptor_idx = make_hetersynapse_conn(
+        neurons,
+        connections,
+        receptor_type_col="EI",
+        receptor_type_mode="neuron",
+        return_dict=True,
+    )
+
+    n = len(neurons)
+    # Unique receptor types per dimension
+    n_pre_types = receptor_idx["pre_receptor_type"].nunique()
+    n_post_types = receptor_idx["post_receptor_type"].nunique()
+
+    # No collapse: expect N x (N * num_pairs)
+    conn_full = stack_hetersynapse(conn_dict, receptor_idx)
+    assert conn_full.shape == (n, n * len(receptor_idx))
+
+    # Collapse post: expect N x (N * n_pre_types)
+    conn_post = stack_hetersynapse(conn_dict, receptor_idx, ignore_receptor_type="post")
+    assert conn_post[0].shape == (n, n * n_pre_types)
+
+    # Collapse pre: expect N x (N * n_post_types)
+    conn_pre = stack_hetersynapse(conn_dict, receptor_idx, ignore_receptor_type="pre")
+    assert conn_pre[0].shape == (n, n * n_post_types)
+
+    # Collapse all: expect N x N
+    conn_all = stack_hetersynapse(conn_dict, receptor_idx, ignore_receptor_type="all")
+    assert conn_all[0].shape == (n, n)
+
+    print("✓ Neuron-mode collapse shapes verified")
+
+
+def test_stack_hetersynapse_connection_mode_stack_and_collapse():
+    """Test stacking and collapse behavior in connection mode.
+
+    In connection mode, receptor types are properties of connections.
+    Collapsing with 'pre'/'post' should behave like 'all'.
+    """
+    from btorch.connectome.connection import stack_hetersynapse
+
+    neurons = create_test_neurons(n_neurons=25)
+    connections = create_test_connections(neurons, density=0.25)
+
+    # Add receptor type per connection for connection mode
+    conn_df = connections.copy()
+    conn_df["EI"] = np.random.choice(["E", "I"], size=len(conn_df))
+
+    # Dict format in connection mode (keys are receptor_type strings)
+    conn_dict, receptor_idx = make_hetersynapse_conn(
+        neurons,
+        conn_df,
+        receptor_type_col="EI",
+        receptor_type_mode="connection",
+        return_dict=True,
+    )
+
+    n = len(neurons)
+    n_types = len(receptor_idx)
+
+    # No collapse: expect N x (N * n_types)
+    conn_full = stack_hetersynapse(conn_dict, receptor_idx)
+    assert conn_full.shape == (n, n * n_types)
+
+    # 'pre' behaves like 'all' in connection mode: N x N
+    conn_pre = stack_hetersynapse(conn_dict, receptor_idx, ignore_receptor_type="pre")
+    assert conn_pre[0].shape == (n, n)
+
+    # 'post' behaves like 'all' in connection mode: N x N
+    conn_post = stack_hetersynapse(conn_dict, receptor_idx, ignore_receptor_type="post")
+    assert conn_post[0].shape == (n, n)
+
+    # 'all': N x N
+    conn_all = stack_hetersynapse(conn_dict, receptor_idx, ignore_receptor_type="all")
+    assert conn_all[0].shape == (n, n)
+
+    print("✓ Connection-mode stacking and collapse verified")
+
+
+def test_stack_hetersynapse_neuron_mode_values():
+    """Verify data correctness (not just shapes) for neuron-mode collapse."""
+    from btorch.connectome.connection import stack_hetersynapse
+
+    n = 3
+    # Build deterministic receptor pair matrices
+    mat_ax = scipy.sparse.coo_array(([1], ([0], [1])), shape=(n, n))
+    mat_ay = scipy.sparse.coo_array(([3], ([0], [2])), shape=(n, n))
+    mat_bx = scipy.sparse.coo_array(([2], ([1], [0])), shape=(n, n))
+    mat_by = scipy.sparse.coo_array(([5], ([2], [1])), shape=(n, n))
+
+    conn_dict = OrderedDict(
+        [
+            (("A", "X"), mat_ax),
+            (("A", "Y"), mat_ay),
+            (("B", "X"), mat_bx),
+            (("B", "Y"), mat_by),
+        ]
+    )
+
+    receptor_idx = pd.DataFrame(
+        [
+            (0, "A", "X"),
+            (1, "A", "Y"),
+            (2, "B", "X"),
+            (3, "B", "Y"),
+        ],
+        columns=["receptor_index", "pre_receptor_type", "post_receptor_type"],
+    )
+
+    # No collapse
+    conn_full = stack_hetersynapse(conn_dict, receptor_idx).tocoo()
+    dense_full = conn_full.toarray()
+    # Check a few exact positions
+    assert dense_full[0, 1 * 4 + 0] == 1  # AX at col=1
+    assert dense_full[0, 2 * 4 + 1] == 3  # AY at col=2
+    assert dense_full[1, 0 * 4 + 2] == 2  # BX at col=0
+    assert dense_full[2, 1 * 4 + 3] == 5  # BY at col=1
+
+    # Collapse post types -> keep pre types (A, B)
+    conn_post, idx_post = stack_hetersynapse(
+        conn_dict, receptor_idx, ignore_receptor_type="post"
+    )
+    dense_post = conn_post.toarray()
+    # Expected columns per target neuron multiplied by n_pre_types=2
+    # A channel (idx 0): AX + AY -> entries at (0, 2) and (0, 4)
+    assert dense_post[0, 2] == 1
+    assert dense_post[0, 4] == 3
+    # B channel (idx 1): BX + BY -> entries at (1, 1) and (2, 3)
+    assert dense_post[1, 1] == 2
+    assert dense_post[2, 3] == 5
+    assert list(idx_post["receptor_type"]) == ["A", "B"]
+
+    # Collapse pre types -> keep post types (X, Y)
+    conn_pre, idx_pre = stack_hetersynapse(
+        conn_dict, receptor_idx, ignore_receptor_type="pre"
+    )
+    dense_pre = conn_pre.toarray()
+    # X channel (idx 0): AX + BX -> entries at (0, 2) and (1, 0)
+    assert dense_pre[0, 2] == 1
+    assert dense_pre[1, 0] == 2
+    # Y channel (idx 1): AY + BY -> entries at (0, 5) and (2, 3)
+    assert dense_pre[0, 5] == 3
+    assert dense_pre[2, 3] == 5
+    assert list(idx_pre["receptor_type"]) == ["X", "Y"]
+
+    # Collapse all -> sum everything
+    conn_all, idx_all = stack_hetersynapse(
+        conn_dict, receptor_idx, ignore_receptor_type="all"
+    )
+    dense_all = conn_all.toarray()
+    expected_all = mat_ax + mat_ay + mat_bx + mat_by
+    np.testing.assert_array_equal(dense_all, expected_all.toarray())
+    assert list(idx_all["receptor_type"]) == ["all"]
+
+    print("✓ Neuron-mode collapse values verified (data, not just shape)")
+
+
+def test_stack_hetersynapse_connection_mode_values():
+    """Verify data correctness for connection mode and collapse."""
+    from btorch.connectome.connection import stack_hetersynapse
+
+    n = 2
+    mat_e = scipy.sparse.coo_array(([1], ([0], [1])), shape=(n, n))
+    mat_i = scipy.sparse.coo_array(([4], ([1], [0])), shape=(n, n))
+
+    conn_dict = OrderedDict([("E", mat_e), ("I", mat_i)])
+
+    receptor_idx = pd.DataFrame(
+        [(0, "E"), (1, "I")], columns=["receptor_index", "receptor_type"]
+    )
+
+    # No collapse: expect two channels stacked
+    conn_full = stack_hetersynapse(conn_dict, receptor_idx).tocoo()
+    dense_full = conn_full.toarray()
+    # Channel E (idx 0) col = original_col * 2 + 0
+    assert dense_full[0, 1 * 2 + 0] == 1
+    # Channel I (idx 1) col = original_col * 2 + 1
+    assert dense_full[1, 0 * 2 + 1] == 4
+
+    # Collapse with 'pre' behaves like 'all' in connection mode
+    conn_pre, idx_pre = stack_hetersynapse(
+        conn_dict, receptor_idx, ignore_receptor_type="pre"
+    )
+    dense_pre = conn_pre.toarray()
+    expected_all = (mat_e + mat_i).toarray()
+    np.testing.assert_array_equal(dense_pre, expected_all)
+    assert list(idx_pre["receptor_type"]) == ["all"]
+
+    # Collapse with 'post' also behaves like 'all'
+    conn_post, idx_post = stack_hetersynapse(
+        conn_dict, receptor_idx, ignore_receptor_type="post"
+    )
+    np.testing.assert_array_equal(conn_post.toarray(), expected_all)
+    assert list(idx_post["receptor_type"]) == ["all"]
+
+    print("✓ Connection-mode collapse values verified (data, not just shape)")
