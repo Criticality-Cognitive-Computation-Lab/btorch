@@ -6,6 +6,7 @@ import scipy.sparse
 import torch
 import torch.nn as nn
 from jaxtyping import Float
+from torch import Tensor
 
 from btorch.config import SPARSE_BACKEND
 
@@ -16,7 +17,7 @@ try:
     from torch_sparse import spmm
 
     spmm = torch.compiler.disable(spmm)
-except ImportError:
+except (ImportError, OSError):
     spmm = None
 
 SparseBackend = Literal["native", "torch_sparse"]
@@ -45,23 +46,40 @@ def available_sparse_backends() -> list[SparseBackend]:
 # TODO: cleanup and abstract out the logic of native and torch_sparse backends
 
 
-class DenseConn(nn.Linear):
+class DenseConn(nn.Linear, HasConstraint):
     # Matrix product using y = x @ A.
+    mask: Tensor | None
+    initial_sign: Tensor | None
+
     def __init__(
         self,
         in_features: int,
         out_features: int,
-        weight=None,
-        bias=None,
+        weight: Tensor | None = None,
+        bias: Tensor | None = None,
+        mask: float | Tensor | None = None,
+        enforce_dale: bool = False,
         device=None,
         dtype=None,
     ) -> None:
+        """Dense connection layer with optional weight masking and Dale's Law
+        enforcement.
+
+        Args:
+            in_features: Number of input features.
+            out_features: Number of output features.
+            weight: Initial weight matrix (in_features, out_features).
+                Note: internally it is stored as (out_features, in_features)
+                and transposed.
+            bias: Initial bias vector (out_features,).
+            mask: If float, a random binary mask with this density is generated.
+                If Tensor, it must have shape (out_features, in_features).
+            enforce_dale: If True, enforces weights to maintain their initial sign
+                via ReLU in the `constrain()` method.
+            device: Torch device.
+            dtype: Torch dtype.
         """
-        :param bias0: The initial bias, if bias0=None or not assigned a value,
-            use the random initial value assigned by bias.
-        :type bias0: torch.Tensor
-        """
-        # if weight0 is given, in_features and out_features are ignored
+        # if weight is given, in_features and out_features are ignored
         super().__init__(
             in_features, out_features, bias=bias is not None, device=device, dtype=dtype
         )
@@ -69,6 +87,30 @@ class DenseConn(nn.Linear):
             self.weight.data = weight.T
         if bias is not None:
             self.bias.data = bias
+
+        if mask is not None:
+            if isinstance(mask, (int, float)):
+                mask = (
+                    torch.rand(self.weight.shape, device=device, dtype=dtype) < mask
+                ).to(dtype=self.weight.dtype)
+            self.register_buffer("mask", mask)
+        else:
+            self.mask = None
+
+        if enforce_dale:
+            self.register_buffer("initial_sign", torch.sign(self.weight.data))
+        else:
+            self.initial_sign = None
+
+    def constrain(self, *args, **kwargs):
+        """Apply the weight mask and Dale's Law constraints to the weight
+        matrix."""
+        if self.mask is not None:
+            self.weight.data *= self.mask
+        if self.initial_sign is not None:
+            self.weight.data = (
+                self.weight.data * self.initial_sign
+            ).relu() * self.initial_sign
 
 
 class BaseSparseConn(nn.Module):
