@@ -55,26 +55,28 @@ def test_raster_mixed_markers():
     plt.close(fig)
 
 
-def test_large_population_raster():
-    """Test raster with large population (1000 neurons)."""
+def test_raster_large_population_with_rate():
+    """Large population raster with firing rate subplot."""
     n_neurons = 2000
     n_time = 500
-    # Sparse spikes
     spikes = np.random.rand(n_time, n_neurons) > 0.999
 
-    fig, ax = plt.subplots(figsize=(12, 8))
-    plot_raster(
+    axes = plot_raster(
         spikes,
-        ax=ax,
+        dt=0.1,
+        rate=True,
         marker="|",
-        marker_size=2.0,  # Small marker for density
+        marker_size=2.0,
         spike_color="black",
-        title="Large Population Raster (2000 Neurons)",
-        show_tracks=False,  # Tracks might be too dense
+        title="Large Population Raster with Rate",
+        show_tracks=False,
     )
 
-    # Check if it rendered without error
-    save_fig(fig, name="raster_large_population", suffix="png", transparent=False)
+    assert isinstance(axes, tuple) and len(axes) == 2
+    fig = axes[0].figure
+    save_fig(
+        fig, name="raster_large_population_with_rate", suffix="png", transparent=False
+    )
     plt.close(fig)
 
 

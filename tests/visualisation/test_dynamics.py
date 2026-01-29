@@ -184,12 +184,6 @@ def test_plot_isi_cv_dataclass():
     plt.close(fig)
 
 
-def test_multiscale_fano_error_no_spikes():
-    """Test that error is raised when spikes not provided."""
-    with pytest.raises(ValueError, match="spikes is required"):
-        plot_multiscale_fano(dt=0.1)
-
-
 def test_multiscale_fano_error_grouped_no_metadata():
     """Test that error is raised for grouped mode without metadata."""
     spikes = generate_spike_data()

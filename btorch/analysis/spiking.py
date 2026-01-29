@@ -194,7 +194,7 @@ def kurtosis_from_spikes(
     return kurt.reshape(orig_shape[1:])
 
 
-def raster_plot(sp_matrix: np.ndarray, times: np.ndarray):
+def compute_raster(sp_matrix: np.ndarray, times: np.ndarray):
     """Get spike raster plot which displays the spiking activity of a group of
     neurons over time."""
     times = np.asarray(times)
@@ -206,7 +206,7 @@ def raster_plot(sp_matrix: np.ndarray, times: np.ndarray):
 
 def firing_rate(
     spikes: np.ndarray | torch.Tensor,
-    width: int | float,
+    width: int | float | None = 4,
     dt: int | float | None = None,
     axis: int | Sequence[int] | None = None,
 ):
@@ -218,13 +218,16 @@ def firing_rate(
     if dt is None:
         dt = 1.0
 
-    width1 = int(width // 2) * 2 + 1
-
     if axis is not None:
         if isinstance(spikes, np.ndarray):
             spikes = spikes.mean(axis=axis)
         else:
             spikes = spikes.mean(dim=axis)
+
+    if width is None or width == 0:
+        return spikes / dt
+
+    width1 = int(width // 2) * 2 + 1
 
     if isinstance(spikes, np.ndarray):
         window = np.ones(width1, dtype=float) / width1
@@ -247,3 +250,10 @@ def firing_rate(
 
         # [B, 1, T] -> [B, T] -> [T, B] -> [T, *others]
         return y.squeeze(1).T.reshape(orig_shape) / dt
+
+
+def compute_spectrum(y, dt, nperseg=None):
+    from scipy.signal import welch
+
+    freqs, Y_mag = welch(y, fs=1 / dt, nperseg=nperseg, axis=0)
+    return freqs, Y_mag

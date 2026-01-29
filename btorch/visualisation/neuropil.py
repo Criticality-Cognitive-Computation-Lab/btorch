@@ -20,6 +20,7 @@ def plot_agg_by_neuropil(
     figsize: tuple = (12, 8),
     cmap: str = "viridis",
     show_top_n: int = 50,
+    use_polars: bool = False,
 ) -> None:
     """Plot averaged traces by neuropil."""
     if isinstance(y, TensorLike):
@@ -29,6 +30,7 @@ def plot_agg_by_neuropil(
             connections=connections,
             neurons=neurons,
             agg=agg,
+            use_polars=use_polars,
         )
     else:
         pre_ret = y

@@ -2,11 +2,11 @@ import numpy as np
 import torch
 
 from btorch.analysis.spiking import (
+    compute_raster,
     cv_from_spikes,
     fano_factor_from_spikes,
     firing_rate,
     kurtosis_from_spikes,
-    raster_plot,
 )
 
 
@@ -56,6 +56,6 @@ def test_firing_rate_numpy_and_torch():
 def test_raster_plot_returns_indices_and_times():
     sp_matrix = np.array([[1, 0], [0, 1], [1, 1]])
     times = np.array([0.0, 1.0, 2.0])
-    neuron_idx, spike_times = raster_plot(sp_matrix, times)
+    neuron_idx, spike_times = compute_raster(sp_matrix, times)
     np.testing.assert_array_equal(neuron_idx, np.array([0, 1, 0, 1]))
     np.testing.assert_array_equal(spike_times, np.array([0.0, 1.0, 2.0, 2.0]))

@@ -15,8 +15,8 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 from matplotlib.ticker import MaxNLocator
 
-from ..analysis.spiking import firing_rate, raster_plot as compute_raster
-from ..analysis.statistics import compute_log_hist, compute_spectrum
+from ..analysis.spiking import compute_raster, compute_spectrum, firing_rate
+from ..analysis.statistics import compute_log_hist
 
 
 def _to_numpy(data: Any) -> np.ndarray:
@@ -46,6 +46,19 @@ def _sample_cmap_colors(cmap_name: str, n: int) -> list[str]:
         return [to_hex(cmap(0.0))]
     vals = np.linspace(0, 1, n)
     return [to_hex(cmap(v)) for v in vals]
+
+
+def _auto_raster_height(
+    n_neurons: int,
+    min_height: float = 3.5,
+    max_height: float = 10.0,
+    base_height: float = 4.0,
+    log_scale: float = 0.8,
+) -> float:
+    """Compute a raster height that grows gently with neuron count."""
+    n = max(int(n_neurons), 1)
+    est_height = base_height + log_scale * np.log10(n)
+    return float(np.clip(est_height, min_height, max_height))
 
 
 def _build_group_color_maps(
@@ -212,10 +225,16 @@ def plot_raster(
     n_time, n_neurons = spikes_np.shape
     t = _get_time_axis(n_time, dt, times)
 
-    show_rate = bool(rate) or isinstance(rate, (np.ndarray, torch.Tensor))
-    show_group_rate = bool(group_rate) or isinstance(
-        group_rate, (dict, np.ndarray, torch.Tensor)
+    # Evaluate isinstance first to avoid calling bool() on arrays/tensors
+    # (which raises ValueError for >1-element numpy arrays).
+    show_rate = isinstance(rate, (np.ndarray, torch.Tensor)) or bool(rate)
+    show_group_rate = isinstance(group_rate, (dict, np.ndarray, torch.Tensor)) or bool(
+        group_rate
     )
+
+    raster_height = _auto_raster_height(n_neurons)
+    raster_width = 8.0
+    rate_height = 2.6  # keep rate panel at a stable height
 
     if show_rate or show_group_rate:
         if ax is not None:
@@ -224,11 +243,17 @@ def plot_raster(
                 "Creating new figure."
             )
         fig, (ax_raster, ax_rate) = plt.subplots(
-            2, 1, figsize=(8, 5), gridspec_kw={"height_ratios": [2, 1]}
+            2,
+            1,
+            figsize=(raster_width, raster_height + rate_height),
+            gridspec_kw={
+                "height_ratios": [raster_height, rate_height],
+                "hspace": 0.06,
+            },
         )
     else:
         if ax is None:
-            fig, ax = plt.subplots(figsize=(8, 4))
+            fig, ax = plt.subplots(figsize=(raster_width, raster_height))
         ax_raster = ax
         ax_rate = None
 
@@ -518,8 +543,14 @@ def plot_raster(
             for start, end in regions:
                 ax_raster.axvspan(start, end, **def_reg_kwargs)
 
+    spike_count = len(spike_times)
+    fired_neurons = len(np.unique(orig_neuron_indices)) if spike_count > 0 else 0
+    stats_title = f"Fired {fired_neurons}/{n_neurons}, Spikes {spike_count}"
+
     if title:
         ax_raster.set_title(title)
+    else:
+        ax_raster.set_title(f"Spike raster {stats_title}")
 
     # Add separators and group labels
     if group_key and show_group_separators:
@@ -796,7 +827,6 @@ def plot_raster(
                     linewidths=lw,
                 )
 
-    spike_count = len(spike_times)
     ax_raster.text(
         0.01,
         0.99,  # Move to top left to avoid conflict with right-side group labels
@@ -824,6 +854,12 @@ def plot_raster(
             fr = firing_rate(
                 spikes_np, width=rate_window_ms / eff_dt, dt=eff_dt * 1e-3, axis=-1
             )
+
+        group_alpha = 0.45
+        group_lw = 0.9
+        group_zorder = 1
+        total_lw = 1.8
+        total_zorder = 2
 
         if show_group_rate and group_key is not None:
             if group_key not in (neurons_df.columns if neurons_df is not None else []):
@@ -855,8 +891,9 @@ def plot_raster(
                         t,
                         g_rate,
                         color=group_color_map.get(g, "black"),
-                        alpha=0.8,
-                        lw=1.0,
+                        alpha=group_alpha,
+                        lw=group_lw,
+                        zorder=group_zorder,
                         label=str(g),
                     )
             elif isinstance(group_rate, (np.ndarray, torch.Tensor)):
@@ -870,8 +907,9 @@ def plot_raster(
                         t,
                         group_rate_arr[:, idx],
                         color=group_color_map.get(g, "black"),
-                        alpha=0.8,
-                        lw=1.0,
+                        alpha=group_alpha,
+                        lw=group_lw,
+                        zorder=group_zorder,
                         label=str(g),
                     )
             elif group_rate is True:
@@ -890,13 +928,21 @@ def plot_raster(
                         t,
                         g_rate,
                         color=group_color_map.get(g, "black"),
-                        alpha=0.8,
-                        lw=1.0,
+                        alpha=group_alpha,
+                        lw=group_lw,
+                        zorder=group_zorder,
                         label=str(g),
                     )
 
         if fr is not None:
-            ax_rate.plot(t, fr, color="black")
+            ax_rate.plot(
+                t,
+                fr,
+                color="black",
+                lw=total_lw,
+                alpha=0.9,
+                zorder=total_zorder,
+            )
         ax_rate.set_xlim(t[0], t[-1])
         ax_rate.set_ylabel("Rate (Hz)")
         ax_rate.set_xlabel(xlabel)
