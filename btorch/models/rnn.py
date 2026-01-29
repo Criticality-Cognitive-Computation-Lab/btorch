@@ -296,6 +296,8 @@ class RecurrentNN(RecurrentNNAbstract):
             x = self.neuron_inp_module(x)
         if self.syn_inp_module is not None:
             x_syn = self.syn_inp_module(x_syn)
+
+        #print(f"self.synapse的所有属性: {self.synapse.__dict__}")
         z = self.neuron(self.synapse.psc + x)
         _ = self.synapse(z if x_syn is None else z + x_syn)
         states = filter_hidden_states(

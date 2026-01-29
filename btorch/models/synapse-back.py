@@ -8,6 +8,8 @@ from .base import MemoryModule, normalize_n_neuron
 from .ode import exp_euler_step
 from .types import TensorLike
 
+import ipdb
+
 
 class Synapse(Protocol):
     """Minimum Synapse interface."""
@@ -21,7 +23,7 @@ class Synapse(Protocol):
 
 
 class BasePSC(MemoryModule):
-    n_neuron: tuple[int, ...]
+    n_neuron: int #TODO
     size: int
     psc: torch.Tensor
 
@@ -38,13 +40,13 @@ class BasePSC(MemoryModule):
         self.n_neuron, self.size = normalize_n_neuron(n_neuron)
         self.step_mode = step_mode
         self.backend = backend
+        self.latency_steps = round(latency / environ.get("dt"))
         self.latency = latency
         self.linear = linear
 
         self.register_memory("psc", 0.0, self.n_neuron)
 
         if latency > 0:
-            self.latency_steps = round(latency / environ.get("dt"))
             self.register_memory(
                 "delay_buffer",
                 0,
@@ -145,9 +147,9 @@ class BasePSC(MemoryModule):
             return self.psc
 
     def single_step_forward(self, z: torch.Tensor):
-        if self.latency > 0:
+        if self.latency > 0.0:
             self.delay_buffer = torch.cat(
-                (z.unsqueeze(dim=0), self.delay_buffer[:-1]), dim=0
+                (z.unsqueeze(dim=0), self.delay_buffer[:-1].clone()), dim=0
             )
             spike = self.delay_buffer[-1]
         else:
@@ -352,6 +354,7 @@ class DualExponentialPSC(BasePSC):
 
         self.register_memory("g_rise", 0.0, self.n_neuron)
         self.register_memory("g_decay", 0.0, self.n_neuron)
+        self.register_memory("psc", 0.0, self.n_neuron)
 
     def dg_rise(self, g_rise):
         derivative = -g_rise / self.tau_rise
@@ -370,52 +373,37 @@ class DualExponentialPSC(BasePSC):
     def adaptation_charge(self, z: torch.Tensor):
         z_flat, leading = self._flatten_neuron(z)
         wz = self.linear(z_flat)
+
+        # 确保 wz 的维度正确
+        if wz.dim() == 1:  # 无 batch 维度
+            wz = wz.unsqueeze(0)  # [N*R] -> [1, N*R]
+        
+        # 如果维度不匹配，尝试广播
+        if wz.size(-1) != self.g_rise.size(-1):
+            # 尝试将 wz 从 [B, N] 广播到 [B, N*R]
+            if wz.size(-1) == self.size:  # N
+                wz = wz.unsqueeze(-1).expand(-1, -1, self.n_receptor).reshape(wz.size(0), -1)
+            else:
+                raise RuntimeError(
+                    f"Dimension mismatch in adaptation_charge: "
+                    f"expected wz with last dim {self.g_rise.size(-1)} (N*R) or {self.size} (N), "
+                    f"got {wz.size(-1)}"
+                )    
+            
         wz = self._unflatten_neuron(wz, leading)
         self.g_rise = self.g_rise + wz
         self.g_decay = self.g_decay + wz
         self.psc = self.a * (self.g_decay - self.g_rise)
 
-
-# class HeterSynapsePSC(BasePSC):
-#     def __init__(
-#         self,
-#         n_neuron: int | Sequence[int],
-#         n_receptor: int,
-#         linear: torch.nn.Module,
-#         base_psc: type[BasePSC] = AlphaPSC,
-#         step_mode="s",
-#         backend="torch",
-#         **kwargs,
-#     ):
-#         super().__init__(
-#             n_neuron, linear, latency=0, step_mode=step_mode, backend=backend
-#         )
-
-#         self.base_psc = base_psc(
-#             n_neuron=self.size * n_receptor,
-#             linear=linear,
-#             step_mode=step_mode,
-#             backend=backend,
-#             **kwargs,
-#         )
-#         self.n_receptor = n_receptor
-
-#     def single_step_forward(self, z: torch.Tensor):
-#         z_flat, leading = self._flatten_neuron(z)
-#         psc = self.base_psc.single_step_forward(z_flat)
-#         self.psc = psc.view(*psc.shape[:-1], *self.n_neuron, self.n_receptor).sum(-1)
-#         return self.psc
-
 class HeterSynapsePSC(BasePSC):
     def __init__(
         self,
-        n_neuron: int,
+        n_neuron: int | Sequence[int],
         n_receptor: int,
         linear: torch.nn.Module,
-        base_psc: type = AlphaPSC,
+        base_psc: type[BasePSC] = AlphaPSC,
         step_mode="s",
         backend="torch",
-        receptor_is_exc: torch.Tensor | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -423,68 +411,19 @@ class HeterSynapsePSC(BasePSC):
         )
 
         self.base_psc = base_psc(
-            n_neuron=n_neuron * n_receptor,
+            n_neuron=self.size * n_receptor,
             linear=linear,
             step_mode=step_mode,
             backend=backend,
             **kwargs,
         )
         self.n_receptor = n_receptor
-        # receptor_is_exc: shape [R], bool tensor, True表示该receptor_index来自兴奋性突触（E->*）
-        if receptor_is_exc is None:
-            # 若未提供，则默认前一半为E，其余为I（仅作为兜底，不建议依赖）
-            receptor_is_exc = torch.zeros(n_receptor, dtype=torch.bool)
-            receptor_is_exc[: (n_receptor // 2)] = True
-        self.register_buffer("receptor_is_exc", receptor_is_exc.bool(), persistent=False)
-
-        # 注册 memory：总电流、E电流、I电流（按post neuron）
-        self.register_memory("psc", 0.0, n_neuron)
-        self.register_memory("psc_e", 0.0, n_neuron)
-        self.register_memory("psc_i", 0.0, n_neuron)
-
-        #breakpoint()
 
     def single_step_forward(self, z: torch.Tensor):
-        psc = self.base_psc.single_step_forward(z)
-        # Support both no-batch [N*R] and batched [B, N*R] shapes
-        #breakpoint()
-        if psc.dim() == 2:
-            B = psc.shape[0]
-            psc_br = psc.view(B, self.size, self.n_receptor)
-            # # 根据 receptor_is_exc 生成符号：True(E)-> +1, False(I)-> -1
-            # # 注意：receptor_is_exc 形状是 [R]，会自动广播到 [B, N, R]
-            # signs = torch.where(self.receptor_is_exc, 1.0, -1.0)
-            
-            # # 乘以符号后再求和
-            # self.psc = (psc_br * signs).sum(-1)
-            self.psc = psc_br.sum(-1)
-            #breakpoint()
-            # E/I 拆分
-            if self.receptor_is_exc.any():
-                #breakpoint()
-                self.psc_e = psc_br[..., self.receptor_is_exc].sum(-1)
-                self.psc_i = psc_br[..., ~self.receptor_is_exc].sum(-1)
-            else:
-                # 若全为False，则E分量为0，总计入I
-                self.psc_e = torch.zeros_like(self.psc)
-                self.psc_i = self.psc.clone()
-        elif psc.dim() == 1:
-            psc_nr = psc.view(self.n_neuron, self.n_receptor)
-            self.psc = psc_nr.sum(-1)
-            #breakpoint()
-            if self.receptor_is_exc.any():
-                #breakpoint()
-                self.psc_e = psc_nr[:, self.receptor_is_exc].sum(-1)
-                self.psc_i = psc_nr[:, ~self.receptor_is_exc].sum(-1)
-            else:
-                self.psc_e = torch.zeros_like(self.psc)
-                self.psc_i = self.psc.clone()
-        else:
-            raise RuntimeError(
-                f"Unexpected PSC shape {psc.shape}; expected [N*R] or [B, N*R] with N={self.n_neuron}, R={self.n_receptor}"
-            )
-        return self.psc, self.psc_e, self.psc_i
-
+        z_flat, leading = self._flatten_neuron(z)
+        psc = self.base_psc.single_step_forward(z_flat)
+        self.psc = psc.view(*psc.shape[:-1], *self.n_neuron, self.n_receptor).sum(-1)
+        return self.psc
 
 class HeterSynapseDualPSC(BasePSC):
     def __init__(
@@ -577,16 +516,11 @@ class HeterSynapseDualPSC(BasePSC):
         # 2. Reshape and Aggregate (Logic matches HeterSynapsePSC)
         if psc.dim() == 2:
             B = psc.shape[0]
-            #breakpoint()
+            breakpoint()
             # View as [Batch, Neuron, Receptor]
-            psc_br = psc.view(B, self.size, self.n_receptor)
-            # # 根据 receptor_is_exc 生成符号：True(E)-> +1, False(I)-> -1
-            # # 注意：receptor_is_exc 形状是 [R]，会自动广播到 [B, N, R]
-            # signs = torch.where(self.receptor_is_exc, 1.0, -1.0)
+            psc_br = psc.view(B, self.n_neuron, self.n_receptor)
             
-            # # 乘以符号后再求和
-            # self.psc = (psc_br * signs).sum(-1)
-            # # Sum all receptors for total PSC
+            # Sum all receptors for total PSC
             self.psc = psc_br.sum(-1)
 
             # E/I Separation
