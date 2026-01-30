@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import pytest
 import torch
 
-from btorch.models.surrogate import ATan, Erf, Sigmoid, Triangle, atan
+from btorch.models.surrogate import ATan, ATanApprox, Erf, Sigmoid, Triangle, atan
 from btorch.utils.file import save_fig
 
 
@@ -65,6 +65,7 @@ def _spikingjelly_surrogate():
     ("name", "btorch_cls", "kwargs"),
     [
         ("ATan", ATan, {"alpha": 2.0}),
+        ("ATanApprox", ATanApprox, {"alpha": 2.0}),
         ("Sigmoid", Sigmoid, {"alpha": 2.0}),
         ("Erf", Erf, {"alpha": 2.0}),
     ],
@@ -106,6 +107,7 @@ def test_plot_surrogate_comparison():
     # Define all surrogate types to compare
     surrogates = [
         ("ATan", ATan, {"alpha": 2.0}),
+        ("ATanApprox", ATanApprox, {"alpha": 2.0}),
         ("Sigmoid", Sigmoid, {"alpha": 2.0}),
         ("Erf", Erf, {"alpha": 2.0}),
         ("Triangle", Triangle, {"alpha": 1.0}),
@@ -116,7 +118,7 @@ def test_plot_surrogate_comparison():
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     fig.suptitle("Surrogate Function Comparison", fontsize=16)
 
-    colors = ["blue", "red", "green", "purple"]
+    colors = ["blue", "red", "green", "purple", "orange"]
 
     for (name, surrogate_cls, kwargs), color in zip(surrogates, colors):
         # Forward pass (spike function) - spiking=False shows raw output
