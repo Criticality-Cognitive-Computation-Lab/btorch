@@ -11,7 +11,7 @@ from btorch.models import environ
 from btorch.models.base import MemoryModule
 from btorch.models.functional import init_net_state, reset_net_state
 from btorch.models.neurons.glif import GLIF3
-from btorch.models.rnn import make_rnn
+from btorch.models.rnn import RecurrentNNAbstract
 from btorch.models.surrogate import ATanApprox
 from btorch.utils.file import fig_path
 
@@ -20,8 +20,20 @@ _DT = 1.0
 _ALPHA = 2.0
 _M = 2
 _HARD_RESET = False
-_T_SWEEP = [int(v) for v in torch.logspace(6, 11, 16, base=2)]
-_N_SWEEP = [int(v) for v in torch.logspace(3, 5, 16, base=10)]
+_MAX_N = 4096 * 4
+_MAX_T = 2048
+
+
+def _unique_sorted(values: list[int]) -> list[int]:
+    return sorted(set(values))
+
+
+_T_SWEEP = _unique_sorted(
+    [int(v) for v in torch.logspace(6, 11, 16, base=2) if int(v) <= _MAX_T]
+)
+_N_SWEEP = _unique_sorted(
+    [int(v) for v in torch.logspace(3, 5, 16, base=10) if int(v) <= _MAX_N]
+)
 
 
 def _has_module(name: str) -> bool:
@@ -58,18 +70,18 @@ _STYLES = [
 ]
 
 
-class GLIFDenseNet(MemoryModule):
-    def __init__(self, n_neuron: int, neuron: nn.Module):
-        super().__init__()
+class GLIFDenseNet(RecurrentNNAbstract):
+    def __init__(self, n_neuron: int, neuron: nn.Module, **kwargs):
+        super().__init__(**kwargs)
         self.neuron = neuron
         self.linear = nn.Linear(n_neuron, n_neuron)
         self.register_memory("spike", 0.0, n_neuron)
 
-    def forward(self, x):
+    def single_step_forward(self, x):
         x = x + self.linear(self.spike)
         z = self.neuron(x)
         self.spike = z
-        return z
+        return z, {"v": self.neuron.v}
 
 
 class GLIF3Kernel(MemoryModule):
@@ -229,14 +241,14 @@ def _build_model(
     weight, bias, x_seq, params = _make_inputs(T, N, device, require_grad)
     neuron = _build_neuron(provider, N, params, require_grad)
 
-    model = make_rnn(GLIFDenseNet)(N, neuron)
+    model = GLIFDenseNet(N, neuron, unroll=False)
     init_net_state(model, device=device, dtype=torch.float32)
-    model.rnn_cell.linear.weight.data.copy_(weight)
-    model.rnn_cell.linear.bias.data.copy_(bias)
+    model.linear.weight.data.copy_(weight)
+    model.linear.bias.data.copy_(bias)
 
-    grads = [model.rnn_cell.linear.weight, model.rnn_cell.linear.bias, x_seq]
+    grads = [model.linear.weight, model.linear.bias, x_seq]
     if require_grad:
-        grads.append(model.rnn_cell.neuron.asc_amps)
+        grads.append(model.neuron.asc_amps)
     return model, x_seq, grads
 
 
