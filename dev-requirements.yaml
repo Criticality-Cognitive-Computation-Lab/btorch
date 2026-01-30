@@ -2,7 +2,7 @@ channels:
   - conda-forge
 dependencies:
   - python=3.12
-  - pytorch-gpu>=2
+  - pytorch-gpu>=2.8
   - torchvision
   - spikingjelly
   - pytorch_sparse
