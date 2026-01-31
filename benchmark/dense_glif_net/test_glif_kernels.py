@@ -78,6 +78,48 @@ def _reference_step(
     return glif.v, glif.Iasc, spike, glif.asc_amps
 
 
+def _reference_multistep(
+    base,
+    x_seq: torch.Tensor,
+    dt: float,
+    hard_reset: bool,
+    surrogate: SurrogateFunctionBase,
+):
+    B, M = base["Iasc"].shape
+    glif = GLIF3(
+        n_neuron=B,
+        v_threshold=base["v_th"],
+        v_reset=base["v_reset"],
+        v_rest=base["v_rest"],
+        c_m=base["c_m"],
+        tau=base["tau"],
+        k=base["k"],
+        asc_amps=base["asc_amps"],
+        tau_ref=0.0,
+        hard_reset=hard_reset,
+        surrogate_function=surrogate,
+        trainable_param={"asc_amps"},
+        device=base["v"].device,
+        dtype=base["v"].dtype,
+    )
+
+    glif.v = base["v"]
+    glif.Iasc = base["Iasc"]
+    glif.refractory = torch.zeros_like(base["v"])
+
+    spikes = []
+    v_seq = []
+    with environ.context(dt=dt):
+        for x_t in x_seq:
+            s = glif.single_step_forward(x_t)
+            spikes.append(s)
+            v_seq.append(glif.v)
+
+    spike_seq = torch.stack(spikes)
+    v_seq = torch.stack(v_seq)
+    return v_seq, glif.Iasc, spike_seq, glif.asc_amps
+
+
 def _make_upstream(v, Iasc, s):
     # Use a deterministic upstream signal to make gradient comparisons stable.
     gen = torch.Generator(device=v.device).manual_seed(999)
@@ -383,6 +425,79 @@ def test_glif_dense_multistep_fused_matches_reference(backend: str):
             spike_kernel, _ = model_kernel(x_seq)
 
     torch.testing.assert_close(spike_kernel, spike_ref, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("backend", ["triton", "warp", "cupy"])
+def test_glif_multistep_fused_matches_reference(backend: str):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for fused kernels.")
+
+    if backend == "triton":
+        pytest.importorskip("triton")
+        from benchmark.dense_glif_net.glif_triton import glif3_step_triton as step_fn
+    elif backend == "warp":
+        pytest.importorskip("warp")
+        from benchmark.dense_glif_net.glif_warp import glif3_step_warp as step_fn
+    else:
+        pytest.importorskip("cupy")
+        from benchmark.dense_glif_net.glif_cupy import glif3_step_cupy as step_fn
+
+    device = torch.device("cuda")
+    dtype = torch.float32
+    T, B, M = 16, 32, 3
+    dt = 0.5
+    hard_reset = False
+
+    base = _base_inputs(B, M, device, dtype)
+    x_seq = torch.randn((T, B), device=device, dtype=dtype)
+
+    v = base["v"].clone()
+    Iasc = base["Iasc"].clone()
+    not_refrac = torch.ones_like(v)
+
+    with torch.no_grad():
+        s_seq, v_seq, v_out, I_out = step_fn.multistep_fused(
+            x_seq=x_seq,
+            v=v,
+            Iasc=Iasc,
+            params={
+                "v_th": base["v_th"].clone(),
+                "v_reset": base["v_reset"].clone(),
+                "v_rest": base["v_rest"].clone(),
+                "c_m": base["c_m"].clone(),
+                "tau": base["tau"].clone(),
+                "k": base["k"].reshape(-1).clone(),
+                "asc_amps": base["asc_amps"].reshape(-1).clone(),
+            },
+            not_refrac=not_refrac,
+            dt=dt,
+            M=M,
+            hard_reset=hard_reset,
+            alpha=2.0,
+        )
+
+    v_ref_seq, I_ref, s_ref_seq, _ = _reference_multistep(
+        {
+            "v": base["v"].clone(),
+            "Iasc": base["Iasc"].clone(),
+            "v_th": base["v_th"].clone(),
+            "v_reset": base["v_reset"].clone(),
+            "v_rest": base["v_rest"].clone(),
+            "c_m": base["c_m"].clone(),
+            "tau": base["tau"].clone(),
+            "k": base["k"].clone(),
+            "asc_amps": base["asc_amps"].clone(),
+        },
+        x_seq=x_seq,
+        dt=dt,
+        hard_reset=hard_reset,
+        surrogate=ATanApprox(alpha=2.0, spiking=True),
+    )
+
+    torch.testing.assert_close(s_seq, s_ref_seq, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(v_seq, v_ref_seq, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(v_out, v_ref_seq[-1], rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(I_out, I_ref, rtol=1e-4, atol=1e-4)
 
 
 def test_glif3_step_cupy_stress_noncontig_and_casts():
