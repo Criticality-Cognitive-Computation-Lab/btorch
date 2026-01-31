@@ -385,6 +385,51 @@ def test_glif_dense_multistep_fused_matches_reference(backend: str):
     torch.testing.assert_close(spike_kernel, spike_ref, rtol=1e-4, atol=1e-4)
 
 
+def test_glif3_step_cupy_stress_noncontig_and_casts():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for CuPy GLIF3 kernels.")
+    pytest.importorskip("cupy")
+
+    from benchmark.dense_glif_net.glif_cupy import glif3_step_cupy
+
+    device = torch.device("cuda")
+    B, M = 256, 4
+    dt = 0.25
+
+    base = _base_inputs(B, M, device, torch.float32)
+
+    # Create non-contiguous inputs and higher precision to exercise casts.
+    v = base["v"].view(16, 16).t().reshape(-1).double()
+    x = base["x"].view(16, 16).t().reshape(-1).double()
+    Iasc_flat = base["Iasc"].transpose(0, 1).reshape(-1).double()
+    not_refrac = torch.ones_like(v)
+
+    params = {
+        "v_th": base["v_th"].double(),
+        "v_reset": base["v_reset"].double(),
+        "v_rest": base["v_rest"].double(),
+        "c_m": base["c_m"].double(),
+        "tau": base["tau"].double(),
+        "k": base["k"].reshape(-1).double(),
+        "asc_amps": base["asc_amps"].reshape(-1).double(),
+    }
+
+    v_out, I_out, s_out = glif3_step_cupy(
+        v=v,
+        Iasc=Iasc_flat,
+        x=x,
+        params=params,
+        not_refrac=not_refrac,
+        dt=dt,
+        M=M,
+    )
+
+    assert v_out.dtype == torch.float32
+    assert I_out.dtype == torch.float32
+    assert s_out.dtype == torch.float32
+    assert torch.isfinite(v_out).all()
+
+
 def test_draw_glif3_kernel_comparison():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for kernel comparison plots.")

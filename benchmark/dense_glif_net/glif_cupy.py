@@ -277,20 +277,19 @@ def _check_shapes(
             raise ValueError(f"params['{key}'] must have shape (B*M,).")
 
 
-def _to_cupy_ptr(tensor: torch.Tensor) -> "cp.cuda.MemoryPointer":
-    # NOTE: CuPy + PyTorch interop can be slow if we wrap tensors via DLPack
-    # every step (measured ~3-5 us per wrap + stream sync overhead). We follow
-    # the SpikingJelly-style approach of passing raw device pointers to the
-    # kernel to avoid repeated array creation. SpikingJelly passes data_ptr()
-    # directly; here we wrap it with UnownedMemory/MemoryPointer to keep the
-    # owner alive while still avoiding DLPack overhead.
-    if cp is None:  # pragma: no cover - optional dependency
-        raise RuntimeError("cupy is required for GLIF3 cupy kernels.")
+def _to_cupy_ptr(tensor: torch.Tensor) -> int:
+    # NOTE: SpikingJelly-style interop: pass raw device pointers directly to
+    # RawKernel. We do not create CuPy ndarrays here (no DLPack), which avoids
+    # per-step wrapper overhead and reduces stream sync costs in tight loops.
     if not tensor.is_cuda:
         raise RuntimeError("Expected CUDA tensor for CuPy pointer view.")
-    size = tensor.numel() * tensor.element_size()
-    mem = cp.cuda.UnownedMemory(tensor.data_ptr(), size, tensor)
-    return cp.cuda.MemoryPointer(mem, 0)
+    return int(tensor.data_ptr())
+
+
+def _current_stream() -> "cp.cuda.ExternalStream":
+    if cp is None:  # pragma: no cover - optional dependency
+        raise RuntimeError("cupy is required for GLIF3 cupy kernels.")
+    return cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream)
 
 
 @lru_cache(maxsize=None)
@@ -382,31 +381,32 @@ class GLIF3StepCupy(torch.autograd.Function):
 
         fwd, _, _ = _get_kernels()
         grid = ((B + block - 1) // block,)
-        fwd(
-            grid,
-            (block,),
-            (
-                v_cu,
-                I_cu,
-                x_cu,
-                v_th_cu,
-                v_reset_cu,
-                v_rest_cu,
-                c_m_cu,
-                tau_cu,
-                k_cu,
-                asc_cu,
-                mask_cu,
-                v_out_cu,
-                I_out_cu,
-                s_out_cu,
-                cp.int32(B),
-                cp.int32(M),
-                cp.float32(dt),
-                cp.int32(1 if hard_reset else 0),
-                cp.float32(alpha),
-            ),
-        )
+        with _current_stream():
+            fwd(
+                grid,
+                (block,),
+                (
+                    v_cu,
+                    I_cu,
+                    x_cu,
+                    v_th_cu,
+                    v_reset_cu,
+                    v_rest_cu,
+                    c_m_cu,
+                    tau_cu,
+                    k_cu,
+                    asc_cu,
+                    mask_cu,
+                    v_out_cu,
+                    I_out_cu,
+                    s_out_cu,
+                    cp.int32(B),
+                    cp.int32(M),
+                    cp.float32(dt),
+                    cp.int32(1 if hard_reset else 0),
+                    cp.float32(alpha),
+                ),
+            )
 
         ctx.save_for_backward(
             v,
@@ -491,36 +491,37 @@ class GLIF3StepCupy(torch.autograd.Function):
 
         _, bwd, _ = _get_kernels()
         grid = ((B + block - 1) // block,)
-        bwd(
-            grid,
-            (block,),
-            (
-                v_cu,
-                I_cu,
-                x_cu,
-                v_th_cu,
-                v_reset_cu,
-                v_rest_cu,
-                c_m_cu,
-                tau_cu,
-                k_cu,
-                asc_cu,
-                mask_cu,
-                s_cu,
-                dv_out_cu,
-                dI_out_cu,
-                ds_out_cu,
-                dv_cu,
-                dI_cu,
-                dx_cu,
-                dasc_cu,
-                cp.int32(B),
-                cp.int32(M),
-                cp.float32(ctx.dt),
-                cp.int32(1 if ctx.hard_reset else 0),
-                cp.float32(ctx.alpha),
-            ),
-        )
+        with _current_stream():
+            bwd(
+                grid,
+                (block,),
+                (
+                    v_cu,
+                    I_cu,
+                    x_cu,
+                    v_th_cu,
+                    v_reset_cu,
+                    v_rest_cu,
+                    c_m_cu,
+                    tau_cu,
+                    k_cu,
+                    asc_cu,
+                    mask_cu,
+                    s_cu,
+                    dv_out_cu,
+                    dI_out_cu,
+                    ds_out_cu,
+                    dv_cu,
+                    dI_cu,
+                    dx_cu,
+                    dasc_cu,
+                    cp.int32(B),
+                    cp.int32(M),
+                    cp.float32(ctx.dt),
+                    cp.int32(1 if ctx.hard_reset else 0),
+                    cp.float32(ctx.alpha),
+                ),
+            )
 
         return (
             dv,
@@ -633,35 +634,36 @@ def glif3_dense_multistep_fused_cupy(
     I_out_cu = _to_cupy_ptr(I_out)
 
     _, _, fused = _get_kernels()
-    fused(
-        (1,),
-        (1,),
-        (
-            x_cu,
-            w_cu,
-            b_cu,
-            v_cu,
-            I_cu,
-            v_th_cu,
-            v_reset_cu,
-            v_rest_cu,
-            c_m_cu,
-            tau_cu,
-            k_cu,
-            asc_cu,
-            mask_cu,
-            s_seq_cu,
-            v_seq_cu,
-            v_out_cu,
-            I_out_cu,
-            cp.int32(T),
-            cp.int32(B),
-            cp.int32(M),
-            cp.float32(dt),
-            cp.int32(1 if hard_reset else 0),
-            cp.float32(alpha),
-        ),
-    )
+    with _current_stream():
+        fused(
+            (1,),
+            (1,),
+            (
+                x_cu,
+                w_cu,
+                b_cu,
+                v_cu,
+                I_cu,
+                v_th_cu,
+                v_reset_cu,
+                v_rest_cu,
+                c_m_cu,
+                tau_cu,
+                k_cu,
+                asc_cu,
+                mask_cu,
+                s_seq_cu,
+                v_seq_cu,
+                v_out_cu,
+                I_out_cu,
+                cp.int32(T),
+                cp.int32(B),
+                cp.int32(M),
+                cp.float32(dt),
+                cp.int32(1 if hard_reset else 0),
+                cp.float32(alpha),
+            ),
+        )
 
     return s_seq, v_seq, v_out, I_out.view(B, M)
 
