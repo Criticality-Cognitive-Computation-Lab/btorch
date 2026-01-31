@@ -1,16 +1,12 @@
 from __future__ import annotations
 
+import os
 from typing import Callable
 
 import torch
 from triton.testing import Benchmark, do_bench, perf_report
 
-from benchmark.dense_glif_net.glif_common import (
-    _DT,
-    build_model,
-    providers,
-    run_model,
-)
+from benchmark.dense_glif_net.glif_common import _DT, build_model, providers, run_model
 from btorch.models import environ
 from btorch.models.functional import reset_net_state
 from btorch.utils.file import fig_path
@@ -24,21 +20,29 @@ def _unique_sorted(values: list[int]) -> list[int]:
     return sorted(set(values))
 
 
-_T_SWEEP = _unique_sorted(
-    [int(v) for v in torch.logspace(6, 11, 16, base=2) if int(v) <= _MAX_T]
-)
-_N_SWEEP = _unique_sorted(
-    [int(v) for v in torch.logspace(2, 4, 16, base=10) if int(v) <= _MAX_N]
-)
+_DEBUG = os.getenv("BTORCH_BENCH_DEBUG", "0") == "1"
+if _DEBUG:
+    _T_SWEEP = [8, 16]
+    _N_SWEEP = [64, 128]
+else:
+    _T_SWEEP = _unique_sorted(
+        [int(v) for v in torch.logspace(6, 11, 16, base=2) if int(v) <= _MAX_T]
+    )
+    _N_SWEEP = _unique_sorted(
+        [int(v) for v in torch.logspace(2, 4, 16, base=10) if int(v) <= _MAX_N]
+    )
 
 
-_PROVIDERS = providers()
-_PROVIDERS.remove("triton")  # unsure why triton so slow
-for _name in list(_PROVIDERS):
-    # disable "triton", fused compilation takes really long
-    if _name in {"warp", "cupy"}:
-        _PROVIDERS.append(f"fused_{_name}")
-_RECOMPILE_LIMIT = 4 * (len(_T_SWEEP) + len(_N_SWEEP))
+_BASE_PROVIDERS = providers()
+_FUSED_PROVIDERS = [
+    f"fused_{provider}"
+    for provider in _BASE_PROVIDERS
+    if provider in {"triton", "warp", "cupy"}
+]
+_PROVIDERS = _BASE_PROVIDERS + _FUSED_PROVIDERS
+_RECOMPILE_LIMIT = (
+    len(_PROVIDERS) * (len(_T_SWEEP) + len(_N_SWEEP)) * 2
+)  # x2 just in case
 torch._dynamo.config.recompile_limit = _RECOMPILE_LIMIT
 _LINE_NAMES = {
     "torch_eager": "Torch Eager",
@@ -61,8 +65,9 @@ _STYLE_MAP = {
     "fused_cupy": ("green", "--"),
 }
 _STYLES = [_STYLE_MAP[p] for p in _PROVIDERS]
-_AUTO_SKIP_MS = 400.0
-_AUTO_SKIP_CACHE: dict[tuple[str, int, int, str], float] = {}
+_AUTO_SKIP_MS = 300.0
+_AUTO_SKIP_CACHE: dict[tuple[str, str], float] = {}
+_AUTO_SKIP_SWEEP: str | None = None
 
 
 def _bench_ms(fn: Callable, grads: list[torch.Tensor] | None, *, use_quantiles: bool):
@@ -122,7 +127,7 @@ def _run_dense_multistep(model: torch.nn.Module, x_seq: torch.Tensor):
             styles=_STYLES[: len(_PROVIDERS)],
             ylabel="ms",
             plot_name="dense_glif_forward_vs_T",
-            args={"N": 64},
+            args={"N": 256, "sweep": "T"},
         ),
         Benchmark(
             x_names=["N"],
@@ -133,23 +138,28 @@ def _run_dense_multistep(model: torch.nn.Module, x_seq: torch.Tensor):
             styles=_STYLES[: len(_PROVIDERS)],
             ylabel="ms",
             plot_name="dense_glif_forward_vs_n_neuron",
-            args={"T": 100},
+            args={"T": 100, "sweep": "N"},
         ),
     ]
 )
-def bench_dense_glif_forward(T: int, N: int, provider: str):
+def bench_dense_glif_forward(T: int, N: int, provider: str, sweep: str):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for GLIF benchmarks.")
 
     use_multistep = provider.startswith("fused_")
     base_provider = provider.removeprefix("fused_") if use_multistep else provider
     mode = "fused" if use_multistep else "default"
-    skip_key = (provider, T, N, "forward")
+    global _AUTO_SKIP_SWEEP
+    if sweep not in {"T", "N"}:
+        raise ValueError("sweep must be 'T' or 'N'.")
+    if _AUTO_SKIP_SWEEP != sweep:
+        _AUTO_SKIP_CACHE.clear()
+        _AUTO_SKIP_SWEEP = sweep
+    skip_key = (provider, f"forward_{sweep}")
     last_ms = _AUTO_SKIP_CACHE.get(skip_key)
     if last_ms is not None and last_ms > _AUTO_SKIP_MS:
         print(
-            f"[bench] auto-skip provider={provider} T={T} N={N} "
-            f"(last {last_ms:.1f} ms)"
+            f"[bench] auto-skip provider={provider} T={T} N={N} (last {last_ms:.1f} ms)"
         )
         return (float("nan"), None, None)
     print(f"[bench] start forward provider={provider} T={T} N={N} mode={mode}")
@@ -193,27 +203,27 @@ def bench_dense_glif_forward(T: int, N: int, provider: str):
             x_names=["T"],
             x_vals=_T_SWEEP,
             line_arg="provider",
-            line_vals=_PROVIDERS,
-            line_names=[_LINE_NAMES[p] for p in _PROVIDERS],
-            styles=_STYLES[: len(_PROVIDERS)],
+            line_vals=_BASE_PROVIDERS,
+            line_names=[_LINE_NAMES[p] for p in _BASE_PROVIDERS],
+            styles=_STYLES[: len(_BASE_PROVIDERS)],
             ylabel="ms",
             plot_name="dense_glif_forward_backward_vs_T",
-            args={"N": 128},
+            args={"N": 256, "sweep": "T"},
         ),
         Benchmark(
             x_names=["N"],
             x_vals=_N_SWEEP,
             line_arg="provider",
-            line_vals=_PROVIDERS,
-            line_names=[_LINE_NAMES[p] for p in _PROVIDERS],
-            styles=_STYLES[: len(_PROVIDERS)],
+            line_vals=_BASE_PROVIDERS,
+            line_names=[_LINE_NAMES[p] for p in _BASE_PROVIDERS],
+            styles=_STYLES[: len(_BASE_PROVIDERS)],
             ylabel="ms",
             plot_name="dense_glif_forward_backward_vs_n_neuron",
-            args={"T": 100},
+            args={"T": 100, "sweep": "N"},
         ),
     ]
 )
-def bench_dense_glif_forward_backward(T: int, N: int, provider: str):
+def bench_dense_glif_forward_backward(T: int, N: int, provider: str, sweep: str):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for GLIF benchmarks.")
 
@@ -223,7 +233,13 @@ def bench_dense_glif_forward_backward(T: int, N: int, provider: str):
     if use_multistep:
         print(f"[bench] skip fwd+bwd provider={provider} T={T} N={N} (forward-only)")
         return (float("nan"), None, None)
-    skip_key = (provider, T, N, "fwd_bwd")
+    global _AUTO_SKIP_SWEEP
+    if sweep not in {"T", "N"}:
+        raise ValueError("sweep must be 'T' or 'N'.")
+    if _AUTO_SKIP_SWEEP != sweep:
+        _AUTO_SKIP_CACHE.clear()
+        _AUTO_SKIP_SWEEP = sweep
+    skip_key = (provider, f"fwd_bwd_{sweep}")
     last_ms = _AUTO_SKIP_CACHE.get(skip_key)
     if last_ms is not None and last_ms > _AUTO_SKIP_MS:
         print(
