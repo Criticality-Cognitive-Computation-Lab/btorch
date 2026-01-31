@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 
 import torch
 from jaxtyping import Float
@@ -280,13 +281,22 @@ def _to_cupy(tensor: torch.Tensor) -> "cp.ndarray":
     return cp.from_dlpack(torch.utils.dlpack.to_dlpack(tensor))
 
 
+@lru_cache(maxsize=None)
+def _get_kernels_cached(device: int):
+    if cp is None:  # pragma: no cover - optional dependency
+        raise RuntimeError("cupy is required for GLIF3 cupy kernels.")
+    with cp.cuda.Device(device):
+        fwd = cp.RawKernel(_FWD_SRC, "glif3_fwd")
+        bwd = cp.RawKernel(_BWD_SRC, "glif3_bwd")
+        fused = cp.RawKernel(_FUSED_SRC, "glif3_dense_fwd")
+    return fwd, bwd, fused
+
+
 def _get_kernels():
     if cp is None:  # pragma: no cover - optional dependency
         raise RuntimeError("cupy is required for GLIF3 cupy kernels.")
-    fwd = cp.RawKernel(_FWD_SRC, "glif3_fwd")
-    bwd = cp.RawKernel(_BWD_SRC, "glif3_bwd")
-    fused = cp.RawKernel(_FUSED_SRC, "glif3_dense_fwd")
-    return fwd, bwd, fused
+    device = cp.cuda.runtime.getDevice()
+    return _get_kernels_cached(int(device))
 
 
 class GLIF3StepCupy(torch.autograd.Function):

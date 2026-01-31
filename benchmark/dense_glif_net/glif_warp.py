@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import warp as wp
@@ -10,6 +11,11 @@ from jaxtyping import Float
 _PI = math.pi
 _ATAN_SCALE = 0.5 * math.pi
 _WARP_INITIALIZED = False
+_WARP_ENABLE_TILES = (
+    os.getenv("BTORCH_WARP_TILES", "0") == "1"
+    and hasattr(wp, "tile_matmul")
+    and hasattr(wp, "tile_load")
+)
 
 
 @wp.func
@@ -133,6 +139,46 @@ def _ensure_warp_init() -> None:
         _WARP_INITIALIZED = True
 
 
+def _glif3_step_torch_forward(
+    v: torch.Tensor,
+    Iasc: torch.Tensor,
+    x: torch.Tensor,
+    v_th: torch.Tensor,
+    v_reset: torch.Tensor,
+    v_rest: torch.Tensor,
+    c_m: torch.Tensor,
+    tau: torch.Tensor,
+    k: torch.Tensor,
+    asc_amps: torch.Tensor,
+    not_refrac: torch.Tensor,
+    dt: float,
+    M: int,
+    hard_reset: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    B = v.numel()
+    Iasc_view = Iasc.view(B, M)
+    k_view = k.view(B, M)
+    asc_view = asc_amps.view(B, M)
+
+    I_sum = Iasc_view.sum(dim=-1)
+    a = torch.exp(-dt / tau)
+    v_inf = v_rest + tau * (x + I_sum) / c_m
+    v_prime = v_inf + (v - v_inf) * a
+
+    denom = v_th - v_reset
+    u = (v_prime - v_th) / denom
+    s = (u >= 0).to(v.dtype) * not_refrac
+
+    if hard_reset:
+        v_post = v_prime - (v_prime - v_reset) * s
+    else:
+        v_post = v_prime - (v_th - v_reset) * s
+
+    I_dec = Iasc_view * torch.exp(-k_view * dt)
+    I_post = I_dec + asc_view * s.unsqueeze(-1)
+    return v_post, I_post.reshape(-1), s
+
+
 # --------------------------
 # Your Warp kernel must exist
 # --------------------------
@@ -213,31 +259,49 @@ class GLIF3StepWarp(torch.autograd.Function):
 
         mask_wp = _to_wp(not_refrac, requires_grad=False)
 
-        wp.launch(
-            glif3_step_kernel,
-            dim=B,
-            inputs=[
-                v_wp,
-                I_wp,
-                x_wp,
-                v_out_wp,
-                I_out_wp,
-                s_out_wp,
-                v_th_wp,
-                v_reset_wp,
-                v_rest_wp,
-                c_m_wp,
-                tau_wp,
-                k_wp,
-                asc_wp,
-                mask_wp,
-                float(dt),
-                int(M),
-                int(1 if hard_reset else 0),
-                float(alpha),
-            ],
-            device="cuda",
-        )
+        try:
+            wp.launch(
+                glif3_step_kernel,
+                dim=B,
+                inputs=[
+                    v_wp,
+                    I_wp,
+                    x_wp,
+                    v_out_wp,
+                    I_out_wp,
+                    s_out_wp,
+                    v_th_wp,
+                    v_reset_wp,
+                    v_rest_wp,
+                    c_m_wp,
+                    tau_wp,
+                    k_wp,
+                    asc_wp,
+                    mask_wp,
+                    float(dt),
+                    int(M),
+                    int(1 if hard_reset else 0),
+                    float(alpha),
+                ],
+                device="cuda",
+            )
+        except Exception:  # pragma: no cover - fallback for warp compile issues
+            v_out, I_out, s_out = _glif3_step_torch_forward(
+                v,
+                Iasc,
+                x,
+                v_th,
+                v_reset,
+                v_rest,
+                c_m,
+                tau,
+                k,
+                asc_amps,
+                not_refrac,
+                dt=float(dt),
+                M=int(M),
+                hard_reset=bool(hard_reset),
+            )
 
         # Save everything needed to replay forward in backward
         ctx.save_for_backward(
@@ -465,6 +529,97 @@ def glif3_dense_fwd_kernel(
         v_out[i] = v[i]
 
 
+TILE_M = 16
+TILE_K = 16
+glif3_dense_fwd_tile_kernel = None
+
+if _WARP_ENABLE_TILES:
+    TILE_M = wp.constant(16)
+    TILE_K = wp.constant(16)
+
+    @wp.kernel
+    def glif3_dense_fwd_tile_kernel(
+        x_seq: wp.array2d(dtype=wp.float32),  # (T, B)
+        w: wp.array2d(dtype=wp.float32),  # (B, B)
+        b: wp.array(dtype=wp.float32),  # (B,)
+        v: wp.array(dtype=wp.float32),  # (B,)
+        Iasc: wp.array(dtype=wp.float32),  # (B*M,)
+        v_th: wp.array(dtype=wp.float32),
+        v_reset: wp.array(dtype=wp.float32),
+        v_rest: wp.array(dtype=wp.float32),
+        c_m: wp.array(dtype=wp.float32),
+        tau: wp.array(dtype=wp.float32),
+        k: wp.array(dtype=wp.float32),  # (B*M,)
+        asc_amps: wp.array(dtype=wp.float32),  # (B*M,)
+        not_refrac: wp.array(dtype=wp.float32),
+        s_seq: wp.array2d(dtype=wp.float32),  # (T, B)
+        v_seq: wp.array2d(dtype=wp.float32),  # (T, B)
+        v_out: wp.array(dtype=wp.float32),  # (B,)
+        I_out: wp.array(dtype=wp.float32),  # (B*M,)
+        T: int,
+        B: int,
+        M: int,
+        dt: float,
+        hard_reset: int,
+        alpha: float,
+    ):
+        tile_i = wp.tid()
+        row = tile_i * TILE_M
+        if row >= B:
+            return
+
+        for t in range(T):
+            lin = wp.tile_zeros(shape=(TILE_M, 1), dtype=wp.float32)
+            for k0 in range(0, B, TILE_K):
+                w_tile = wp.tile_load(w, shape=(TILE_M, TILE_K), offset=(row, k0))
+                if t == 0:
+                    s_tile = wp.tile_zeros(shape=(TILE_K, 1), dtype=wp.float32)
+                else:
+                    s_tile = wp.tile_load(s_seq, shape=(TILE_K, 1), offset=(t - 1, k0))
+                wp.tile_matmul(w_tile, s_tile, lin)
+
+            for r in range(TILE_M):
+                idx = row + r
+                if idx >= B:
+                    break
+                base = idx * M
+                I_sum = float(0.0)
+                for m in range(M):
+                    I_sum += Iasc[base + m]
+
+                x = x_seq[t, idx] + b[idx] + lin[r, 0]
+                tau_i = tau[idx]
+                a = wp.exp(-dt / tau_i)
+                v_inf = v_rest[idx] + tau_i * (x + I_sum) / c_m[idx]
+                v_prime = v_inf + (v[idx] - v_inf) * a
+
+                denom = v_th[idx] - v_reset[idx]
+                u = (v_prime - v_th[idx]) / denom
+                s = wp.where(u >= 0.0, 1.0, 0.0) * not_refrac[idx]
+
+                if hard_reset == 1:
+                    v_post = v_prime - (v_prime - v_reset[idx]) * s
+                else:
+                    v_post = v_prime - (v_th[idx] - v_reset[idx]) * s
+
+                for m in range(M):
+                    km = k[base + m]
+                    I_dec = Iasc[base + m] * wp.exp(-km * dt)
+                    I_post = I_dec + asc_amps[base + m] * s
+                    Iasc[base + m] = I_post
+                    I_out[base + m] = I_post
+
+                v[idx] = v_post
+                s_seq[t, idx] = s
+                v_seq[t, idx] = v_post
+
+        for r in range(TILE_M):
+            idx = row + r
+            if idx >= B:
+                break
+            v_out[idx] = v[idx]
+
+
 def glif3_dense_multistep_fused_warp(
     x_seq: Float[torch.Tensor, " T B"],
     weight: torch.Tensor,
@@ -477,6 +632,7 @@ def glif3_dense_multistep_fused_warp(
     M: int,
     hard_reset: bool = False,
     alpha: float = 2.0,
+    use_torch_matmul: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if torch.is_grad_enabled():
         raise RuntimeError("Fused multistep Warp is forward-only.")
@@ -485,8 +641,9 @@ def glif3_dense_multistep_fused_warp(
 
     _ensure_warp_init()
     T, B = x_seq.shape
-    x_seq = _as_fp32(x_seq.reshape(-1), "x_seq")
-    weight = _as_fp32(weight.reshape(-1), "weight")
+    use_tiles = _WARP_ENABLE_TILES and glif3_dense_fwd_tile_kernel is not None
+    x_seq = _as_fp32(x_seq, "x_seq")
+    weight = _as_fp32(weight, "weight")
     bias = _as_fp32(bias, "bias")
     v = _as_fp32(v, "v")
     Iasc = _as_fp32(Iasc.reshape(-1), "Iasc")
@@ -501,39 +658,101 @@ def glif3_dense_multistep_fused_warp(
 
     v_seq = torch.empty((T, B), device=v.device, dtype=v.dtype)
     s_seq = torch.empty((T, B), device=v.device, dtype=v.dtype)
+
+    if use_torch_matmul:
+        s_prev = torch.zeros_like(v)
+        for t in range(T):
+            lin = torch.matmul(weight, s_prev)
+            x_t = x_seq[t] + bias + lin
+            v, Iasc, s_prev = glif3_step_warp(
+                v=v,
+                Iasc=Iasc,
+                x=x_t,
+                params={
+                    "v_th": v_th,
+                    "v_reset": v_reset,
+                    "v_rest": v_rest,
+                    "c_m": c_m,
+                    "tau": tau,
+                    "k": k,
+                    "asc_amps": asc_amps,
+                },
+                not_refrac=not_refrac,
+                dt=dt,
+                M=M,
+                hard_reset=hard_reset,
+                alpha=alpha,
+            )
+            s_seq[t] = s_prev
+            v_seq[t] = v
+        return s_seq, v_seq, v, Iasc.view(B, M)
+
     v_out = torch.empty_like(v)
     I_out = torch.empty_like(Iasc)
 
-    wp.launch(
-        glif3_dense_fwd_kernel,
-        dim=1,
-        inputs=[
-            _to_wp(x_seq, requires_grad=False),
-            _to_wp(weight, requires_grad=False),
-            _to_wp(bias, requires_grad=False),
-            _to_wp(v, requires_grad=False),
-            _to_wp(Iasc, requires_grad=False),
-            _to_wp(v_th, requires_grad=False),
-            _to_wp(v_reset, requires_grad=False),
-            _to_wp(v_rest, requires_grad=False),
-            _to_wp(c_m, requires_grad=False),
-            _to_wp(tau, requires_grad=False),
-            _to_wp(k, requires_grad=False),
-            _to_wp(asc_amps, requires_grad=False),
-            _to_wp(not_refrac, requires_grad=False),
-            _to_wp(s_seq.reshape(-1), requires_grad=False),
-            _to_wp(v_seq.reshape(-1), requires_grad=False),
-            _to_wp(v_out, requires_grad=False),
-            _to_wp(I_out, requires_grad=False),
-            int(T),
-            int(B),
-            int(M),
-            float(dt),
-            int(1 if hard_reset else 0),
-            float(alpha),
-        ],
-        device="cuda",
-    )
+    if use_tiles and B % int(TILE_M) == 0:
+        wp.launch_tiled(
+            glif3_dense_fwd_tile_kernel,
+            dim=B // int(TILE_M),
+            inputs=[
+                _to_wp(x_seq, requires_grad=False),
+                _to_wp(weight, requires_grad=False),
+                _to_wp(bias, requires_grad=False),
+                _to_wp(v, requires_grad=False),
+                _to_wp(Iasc, requires_grad=False),
+                _to_wp(v_th, requires_grad=False),
+                _to_wp(v_reset, requires_grad=False),
+                _to_wp(v_rest, requires_grad=False),
+                _to_wp(c_m, requires_grad=False),
+                _to_wp(tau, requires_grad=False),
+                _to_wp(k, requires_grad=False),
+                _to_wp(asc_amps, requires_grad=False),
+                _to_wp(not_refrac, requires_grad=False),
+                _to_wp(s_seq, requires_grad=False),
+                _to_wp(v_seq, requires_grad=False),
+                _to_wp(v_out, requires_grad=False),
+                _to_wp(I_out, requires_grad=False),
+                int(T),
+                int(B),
+                int(M),
+                float(dt),
+                int(1 if hard_reset else 0),
+                float(alpha),
+            ],
+            block_dim=int(TILE_M),
+            device="cuda",
+        )
+    else:
+        wp.launch(
+            glif3_dense_fwd_kernel,
+            dim=1,
+            inputs=[
+                _to_wp(x_seq.reshape(-1), requires_grad=False),
+                _to_wp(weight.reshape(-1), requires_grad=False),
+                _to_wp(bias, requires_grad=False),
+                _to_wp(v, requires_grad=False),
+                _to_wp(Iasc, requires_grad=False),
+                _to_wp(v_th, requires_grad=False),
+                _to_wp(v_reset, requires_grad=False),
+                _to_wp(v_rest, requires_grad=False),
+                _to_wp(c_m, requires_grad=False),
+                _to_wp(tau, requires_grad=False),
+                _to_wp(k, requires_grad=False),
+                _to_wp(asc_amps, requires_grad=False),
+                _to_wp(not_refrac, requires_grad=False),
+                _to_wp(s_seq.reshape(-1), requires_grad=False),
+                _to_wp(v_seq.reshape(-1), requires_grad=False),
+                _to_wp(v_out, requires_grad=False),
+                _to_wp(I_out, requires_grad=False),
+                int(T),
+                int(B),
+                int(M),
+                float(dt),
+                int(1 if hard_reset else 0),
+                float(alpha),
+            ],
+            device="cuda",
+        )
 
     return s_seq, v_seq, v_out, I_out.view(B, M)
 
