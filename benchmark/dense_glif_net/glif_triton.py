@@ -175,16 +175,30 @@ def glif3_dense_fwd(
     tau = tl.load(tau_ptr + i, mask=inb, other=1.0).to(tl.float32)
     mask = tl.load(mask_ptr + i, mask=inb, other=1.0).to(tl.float32)
 
-    spike = tl.zeros([BLOCK], dtype=tl.float32)
-
     for t in tl.static_range(0, T):
         x = tl.load(x_ptr + t * B + i, mask=inb, other=0.0).to(tl.float32)
         bias = tl.load(b_ptr + i, mask=inb, other=0.0).to(tl.float32)
 
-        w_idx_i = i[:, None] * B
-        w_idx_j = tl.arange(0, BLOCK)[None, :]
-        w = tl.load(w_ptr + w_idx_i + w_idx_j, mask=inb[:, None], other=0.0)
-        lin = tl.sum(w * spike[None, :], axis=1)
+        lin = tl.zeros([BLOCK], dtype=tl.float32)
+        for k in tl.static_range(0, B, 32):
+            k_idx = k + tl.arange(0, 32)
+            in_k = k_idx < B
+            w_ptrs = (i[:, None] * B) + k_idx[None, :]
+            w = tl.load(
+                w_ptr + w_ptrs,
+                mask=inb[:, None] & in_k[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            s_prev = tl.where(
+                t == 0,
+                tl.zeros([32], dtype=tl.float32),
+                tl.load(
+                    s_seq_ptr + (t - 1) * B + k_idx,
+                    mask=in_k,
+                    other=0.0,
+                ).to(tl.float32),
+            )
+            lin += tl.sum(w * s_prev[None, :], axis=1)
         x_in = x + bias + lin
 
         I_sum = tl.zeros([BLOCK], dtype=tl.float32)
@@ -214,7 +228,6 @@ def glif3_dense_fwd(
             tl.store(I_out_ptr + base + m, I_post.to(tl.float32), mask=inb)
 
         v = v_post
-        spike = s
         tl.store(v_seq_ptr + t * B + i, v_post.to(tl.float32), mask=inb)
         tl.store(s_seq_ptr + t * B + i, s.to(tl.float32), mask=inb)
 
@@ -582,14 +595,13 @@ def glif3_dense_multistep_fused_triton(
     hard_reset: bool = False,
     alpha: float = 2.0,
     block: int = 256,
+    use_torch_matmul: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if torch.is_grad_enabled():
         raise RuntimeError("Fused multistep Triton is forward-only.")
     if not x_seq.is_cuda:
         raise RuntimeError("Fused multistep Triton requires CUDA tensors.")
     B = v.numel()
-    if B > block:
-        raise RuntimeError("Fused multistep Triton requires B <= block.")
     if weight.shape[0] != B or weight.shape[1] != B:
         raise ValueError("weight must have shape (B, B).")
     if bias.shape[0] != B:
@@ -597,9 +609,6 @@ def glif3_dense_multistep_fused_triton(
 
     v = _as_fp32(v, "v")
     Iasc = _as_fp32(Iasc.reshape(-1), "Iasc")
-    x_seq = _as_fp32(x_seq, "x_seq")
-    weight = _as_fp32(weight, "weight")
-    bias = _as_fp32(bias, "bias")
     v_th = _as_fp32(params["v_th"], "v_th")
     v_reset = _as_fp32(params["v_reset"], "v_reset")
     v_rest = _as_fp32(params["v_rest"], "v_rest")
@@ -612,6 +621,45 @@ def glif3_dense_multistep_fused_triton(
     T = x_seq.shape[0]
     v_seq = torch.empty((T, B), device=v.device, dtype=v.dtype)
     s_seq = torch.empty((T, B), device=v.device, dtype=v.dtype)
+
+    if use_torch_matmul:
+        x_seq = _as_fp32(x_seq, "x_seq")
+        weight = _as_fp32(weight, "weight")
+        bias = _as_fp32(bias, "bias")
+        s_prev = torch.zeros_like(v)
+        for t in range(T):
+            lin = torch.matmul(weight, s_prev)
+            x_t = x_seq[t] + bias + lin
+            v, Iasc, s_prev = glif3_step_triton(
+                v=v,
+                Iasc=Iasc,
+                x=x_t,
+                params={
+                    "v_th": v_th,
+                    "v_reset": v_reset,
+                    "v_rest": v_rest,
+                    "c_m": c_m,
+                    "tau": tau,
+                    "k": k,
+                    "asc_amps": asc_amps,
+                },
+                not_refrac=not_refrac,
+                dt=dt,
+                M=M,
+                hard_reset=hard_reset,
+                alpha=alpha,
+                block=block,
+            )
+            s_seq[t] = s_prev
+            v_seq[t] = v
+        return s_seq, v_seq, v, Iasc.view(B, M)
+
+    if B > block:
+        raise RuntimeError("Fused multistep Triton requires B <= block.")
+
+    x_seq = _as_fp32(x_seq, "x_seq")
+    weight = _as_fp32(weight, "weight")
+    bias = _as_fp32(bias, "bias")
     v_out = torch.empty_like(v)
     I_out = torch.empty_like(Iasc)
 

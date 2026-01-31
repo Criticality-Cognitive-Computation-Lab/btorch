@@ -68,7 +68,7 @@ def _bench_ms(fn: Callable, grads: list[torch.Tensor] | None, *, use_quantiles: 
     ms = do_bench(
         fn,
         warmup=1,
-        rep=5,
+        rep=2,
         quantiles=quantiles,
         grad_to_none=grads,
     )
@@ -142,6 +142,9 @@ def bench_dense_glif_forward(T: int, N: int, provider: str):
     use_multistep = provider.startswith("fused_")
     base_provider = provider.removeprefix("fused_") if use_multistep else provider
     mode = "fused" if use_multistep else "default"
+    if provider == "fused_cupy" and N > 1500:
+        print(f"[bench] skip provider={provider} T={T} N={N} (N too large)")
+        return (float("nan"), None, None)
     print(f"[bench] start forward provider={provider} T={T} N={N} mode={mode}")
     model, x_seq, _ = build_model(base_provider, T, N, require_grad=False)
 
