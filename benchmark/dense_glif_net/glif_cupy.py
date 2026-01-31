@@ -166,7 +166,11 @@ void glif3_bwd(
 }
 """
 
-_FUSED_SRC = r"""
+_FUSED_TILE_K = 128
+
+_FUSED_SRC = (
+    f"#define TILE_K {_FUSED_TILE_K}\n"
+    + r"""
 extern "C" __global__
 void glif3_dense_fwd(
     const float* x_seq,  // (T*B,)
@@ -193,59 +197,79 @@ void glif3_dense_fwd(
     int hard_reset,
     float alpha
 ) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= B) return;
+
+    int base = i * M;
+    float v_i = v[i];
+    float v_th_i = v_th[i];
+    float v_reset_i = v_reset[i];
+    float v_rest_i = v_rest[i];
+    float c_m_i = c_m[i];
+    float tau_i = tau[i];
+    float mask_i = mask[i];
+
+    int w_base = i * B;
+    extern __shared__ float s_sh[];
 
     for (int t = 0; t < T; ++t) {
-        for (int i = 0; i < B; ++i) {
-            int base = i * M;
-            float I_sum = 0.0f;
-            for (int m = 0; m < M; ++m) {
-                I_sum += Iasc[base + m];
-            }
-
-            float lin = 0.0f;
-            int w_base = i * B;
-            for (int j = 0; j < B; ++j) {
-                float s_prev = 0.0f;
-                if (t > 0) {
-                    s_prev = s_seq[(t - 1) * B + j];
-                }
-                lin += w[w_base + j] * s_prev;
-            }
-
-            float x = x_seq[t * B + i] + b[i] + lin;
-            float tau_i = tau[i];
-            float a = expf(-dt / tau_i);
-            float v_inf = v_rest[i] + tau_i * (x + I_sum) / c_m[i];
-            float v_prime = v_inf + (v[i] - v_inf) * a;
-
-            float denom = v_th[i] - v_reset[i];
-            float u = (v_prime - v_th[i]) / denom;
-            float s = (u > 0.0f) ? 1.0f : 0.0f;
-            s *= mask[i];
-
-            float v_post = v_prime - (hard_reset ? (v_prime - v_reset[i])
-                                                 : (v_th[i] - v_reset[i])) * s;
-
-            for (int m = 0; m < M; ++m) {
-                float k_m = k[base + m];
-                float I_dec = Iasc[base + m] * expf(-k_m * dt);
-                float I_post = I_dec + asc[base + m] * s;
-                Iasc[base + m] = I_post;
-                I_out[base + m] = I_post;
-            }
-
-            v[i] = v_post;
-            s_seq[t * B + i] = s;
-            v_seq[t * B + i] = v_post;
+        float I_sum = 0.0f;
+        for (int m = 0; m < M; ++m) {
+            I_sum += Iasc[base + m];
         }
+
+        float lin = 0.0f;
+        for (int k0 = 0; k0 < B; k0 += TILE_K) {
+            int k = k0 + threadIdx.x;
+            if (threadIdx.x < TILE_K) {
+                float s_prev = 0.0f;
+                if (t > 0 && k < B) {
+                    s_prev = s_seq[(t - 1) * B + k];
+                }
+                s_sh[threadIdx.x] = s_prev;
+            }
+            __syncthreads();
+            int k_max = B - k0;
+            if (k_max > TILE_K) {
+                k_max = TILE_K;
+            }
+            for (int j = 0; j < k_max; ++j) {
+                lin += w[w_base + k0 + j] * s_sh[j];
+            }
+            __syncthreads();
+        }
+
+        float x = x_seq[t * B + i] + b[i] + lin;
+        float a = expf(-dt / tau_i);
+        float v_inf = v_rest_i + tau_i * (x + I_sum) / c_m_i;
+        float v_prime = v_inf + (v_i - v_inf) * a;
+
+        float denom = v_th_i - v_reset_i;
+        float u = (v_prime - v_th_i) / denom;
+        float s = (u > 0.0f) ? 1.0f : 0.0f;
+        s *= mask_i;
+
+        float v_post = v_prime - (hard_reset ? (v_prime - v_reset_i)
+                                             : (v_th_i - v_reset_i)) * s;
+
+        for (int m = 0; m < M; ++m) {
+            float k_m = k[base + m];
+            float I_dec = Iasc[base + m] * expf(-k_m * dt);
+            float I_post = I_dec + asc[base + m] * s;
+            Iasc[base + m] = I_post;
+            I_out[base + m] = I_post;
+        }
+
+        v_i = v_post;
+        s_seq[t * B + i] = s;
+        v_seq[t * B + i] = v_post;
     }
 
-    for (int i = 0; i < B; ++i) {
-        v_out[i] = v[i];
-    }
+    v[i] = v_i;
+    v_out[i] = v_i;
 }
 """
+)
 
 
 def _as_fp32(tensor: torch.Tensor, name: str) -> torch.Tensor:
@@ -587,6 +611,7 @@ def glif3_dense_multistep_fused_cupy(
     M: int,
     hard_reset: bool = False,
     alpha: float = 2.0,
+    block: int = 256,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if cp is None:  # pragma: no cover - optional dependency
         raise RuntimeError("cupy is required for fused GLIF3 cupy kernels.")
@@ -594,6 +619,8 @@ def glif3_dense_multistep_fused_cupy(
         raise RuntimeError("Fused multistep CuPy is forward-only.")
     if not x_seq.is_cuda:
         raise RuntimeError("Fused multistep CuPy requires CUDA tensors.")
+    if block < _FUSED_TILE_K:
+        raise ValueError("block must be >= TILE_K for fused CuPy kernel.")
 
     T, B = x_seq.shape
     x_seq = _as_fp32(x_seq.reshape(-1), "x_seq")
@@ -634,10 +661,12 @@ def glif3_dense_multistep_fused_cupy(
     I_out_cu = _to_cupy_ptr(I_out)
 
     _, _, fused = _get_kernels()
+    grid = ((B + block - 1) // block,)
+    shared_mem = int(_FUSED_TILE_K * 4)
     with _current_stream():
         fused(
-            (1,),
-            (1,),
+            grid,
+            (int(block),),
             (
                 x_cu,
                 w_cu,
@@ -663,6 +692,7 @@ def glif3_dense_multistep_fused_cupy(
                 cp.int32(1 if hard_reset else 0),
                 cp.float32(alpha),
             ),
+            shared_mem=shared_mem,
         )
 
     return s_seq, v_seq, v_out, I_out.view(B, M)
