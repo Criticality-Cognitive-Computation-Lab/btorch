@@ -61,6 +61,8 @@ _STYLE_MAP = {
     "fused_cupy": ("green", "--"),
 }
 _STYLES = [_STYLE_MAP[p] for p in _PROVIDERS]
+_AUTO_SKIP_MS = 400.0
+_AUTO_SKIP_CACHE: dict[tuple[str, int, int, str], float] = {}
 
 
 def _bench_ms(fn: Callable, grads: list[torch.Tensor] | None, *, use_quantiles: bool):
@@ -142,8 +144,13 @@ def bench_dense_glif_forward(T: int, N: int, provider: str):
     use_multistep = provider.startswith("fused_")
     base_provider = provider.removeprefix("fused_") if use_multistep else provider
     mode = "fused" if use_multistep else "default"
-    if provider in {"cupy", "fused_cupy"} and N > 800:
-        print(f"[bench] skip provider={provider} T={T} N={N} (N too large)")
+    skip_key = (provider, T, N, "forward")
+    last_ms = _AUTO_SKIP_CACHE.get(skip_key)
+    if last_ms is not None and last_ms > _AUTO_SKIP_MS:
+        print(
+            f"[bench] auto-skip provider={provider} T={T} N={N} "
+            f"(last {last_ms:.1f} ms)"
+        )
         return (float("nan"), None, None)
     print(f"[bench] start forward provider={provider} T={T} N={N} mode={mode}")
     model, x_seq, _ = build_model(base_provider, T, N, require_grad=False)
@@ -175,6 +182,7 @@ def bench_dense_glif_forward(T: int, N: int, provider: str):
                     run_model(model, x_seq)
 
     ms = _bench_ms(fn, grads=None, use_quantiles=False)
+    _AUTO_SKIP_CACHE[skip_key] = float(ms[0])
     print(f"[bench] forward provider={provider} T={T} N={N} ms={ms}")
     return ms
 
@@ -215,8 +223,13 @@ def bench_dense_glif_forward_backward(T: int, N: int, provider: str):
     if use_multistep:
         print(f"[bench] skip fwd+bwd provider={provider} T={T} N={N} (forward-only)")
         return (float("nan"), None, None)
-    if provider == "cupy" and N > 1200:
-        print(f"[bench] skip fwd+bwd provider={provider} T={T} N={N} (N too large)")
+    skip_key = (provider, T, N, "fwd_bwd")
+    last_ms = _AUTO_SKIP_CACHE.get(skip_key)
+    if last_ms is not None and last_ms > _AUTO_SKIP_MS:
+        print(
+            f"[bench] auto-skip fwd+bwd provider={provider} T={T} N={N} "
+            f"(last {last_ms:.1f} ms)"
+        )
         return (float("nan"), None, None)
     print(f"[bench] start fwd+bwd provider={provider} T={T} N={N} mode={mode}")
     model, x_seq, grads = build_model(base_provider, T, N, require_grad=True)
@@ -241,6 +254,7 @@ def bench_dense_glif_forward_backward(T: int, N: int, provider: str):
             spike_seq_inner.sum().backward()
 
     ms = _bench_ms(fn, grads=grads, use_quantiles=False)
+    _AUTO_SKIP_CACHE[skip_key] = float(ms[0])
     print(f"[bench] fwd+bwd provider={provider} T={T} N={N} ms={ms}")
     return ms
 
