@@ -110,6 +110,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         """
         # Determine actual number of steps for this small chunk (might be remainder)
         # However, args are already sliced to the correct size by caller.
+        torch.cuda.nvtx.range_push("unroll_chunk")
         T = args[loop_args[0]].shape[0]
         z_seq = []
         states_seq = {}
@@ -124,6 +125,7 @@ class RecurrentNNAbstract(base.MemoryModule):
             for k, v in states.items():
                 states_seq.setdefault(k, []).append(v)
 
+        torch.cuda.nvtx.range_pop()
         return z_seq, states_seq
 
     @partial(torch.compiler.disable, recursive=False)
