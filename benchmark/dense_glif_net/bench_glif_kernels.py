@@ -28,7 +28,7 @@ _T_SWEEP = _unique_sorted(
     [int(v) for v in torch.logspace(6, 11, 16, base=2) if int(v) <= _MAX_T]
 )
 _N_SWEEP = _unique_sorted(
-    [int(v) for v in torch.logspace(3, 5, 16, base=10) if int(v) <= _MAX_N]
+    [int(v) for v in torch.logspace(3, 4, 16, base=10) if int(v) <= _MAX_N]
 )
 
 
@@ -142,9 +142,9 @@ def bench_dense_glif_forward(T: int, N: int, provider: str):
     use_multistep = provider.startswith("fused_")
     base_provider = provider.removeprefix("fused_") if use_multistep else provider
     mode = "fused" if use_multistep else "default"
-    if provider == "fused_cupy" and N > 1500:
-        print(f"[bench] skip provider={provider} T={T} N={N} (N too large)")
-        return (float("nan"), None, None)
+    # if provider == "fused_cupy" and N > 1500:
+    #     print(f"[bench] skip provider={provider} T={T} N={N} (N too large)")
+    #     return (float("nan"), None, None)
     print(f"[bench] start forward provider={provider} T={T} N={N} mode={mode}")
     model, x_seq, _ = build_model(base_provider, T, N, require_grad=False)
 
@@ -212,6 +212,9 @@ def bench_dense_glif_forward_backward(T: int, N: int, provider: str):
     use_multistep = provider.startswith("fused_")
     base_provider = provider.removeprefix("fused_") if use_multistep else provider
     mode = "fused" if use_multistep else "default"
+    if use_multistep:
+        print(f"[bench] skip fwd+bwd provider={provider} T={T} N={N} (forward-only)")
+        return (float("nan"), None, None)
     print(f"[bench] start fwd+bwd provider={provider} T={T} N={N} mode={mode}")
     model, x_seq, grads = build_model(base_provider, T, N, require_grad=True)
 
