@@ -4,7 +4,9 @@ import matplotlib.pyplot as plt
 import pytest
 import torch
 
+from benchmark.dense_glif_net.glif_common import GLIFDenseNet, build_neuron, make_inputs
 from btorch.models import environ
+from btorch.models.functional import init_net_state
 from btorch.models.neurons.glif import GLIF3
 from btorch.models.surrogate import ATan, ATanApprox
 from btorch.models.surrogate.base import SurrogateFunctionBase
@@ -344,6 +346,43 @@ def test_glif3_step_matches_reference(backend: str, hard_reset: bool):
     torch.testing.assert_close(
         asc_flat.grad.view(B, M), asc_ref.grad, rtol=1e-4, atol=1e-4
     )
+
+
+@pytest.mark.parametrize("backend", ["triton", "warp", "cupy"])
+def test_glif_dense_multistep_fused_matches_reference(backend: str):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for fused kernels.")
+
+    if backend == "triton":
+        pytest.importorskip("triton")
+    elif backend == "warp":
+        pytest.importorskip("warp")
+    else:
+        pytest.importorskip("cupy")
+
+    device = torch.device("cuda")
+    dtype = torch.float32
+    T, N = 16, 16
+
+    weight, bias, x_seq, params = make_inputs(T, N, device, require_grad=False)
+    neuron_ref = build_neuron("torch_eager", N, params, require_grad=False)
+    model_ref = GLIFDenseNet(N, neuron_ref, unroll=16)
+    init_net_state(model_ref, device=device, dtype=dtype)
+    model_ref.linear.weight.data.copy_(weight)
+    model_ref.linear.bias.data.copy_(bias)
+
+    neuron_kernel = build_neuron(backend, N, params, require_grad=False)
+    model_kernel = GLIFDenseNet(N, neuron_kernel, unroll=16)
+    init_net_state(model_kernel, device=device, dtype=dtype)
+    model_kernel.linear.weight.data.copy_(weight)
+    model_kernel.linear.bias.data.copy_(bias)
+
+    with torch.no_grad():
+        with environ.context(dt=1.0):
+            spike_ref, _ = model_ref(x_seq)
+            spike_kernel, _ = model_kernel(x_seq)
+
+    torch.testing.assert_close(spike_kernel, spike_ref, rtol=1e-4, atol=1e-4)
 
 
 def test_draw_glif3_kernel_comparison():

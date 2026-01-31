@@ -44,6 +44,40 @@ class GLIFDenseNet(RecurrentNNAbstract):
         self.linear = nn.Linear(n_neuron, n_neuron)
         self.register_memory("spike", 0.0, n_neuron)
 
+    def multi_step_forward(self, x_seq: torch.Tensor):
+        if (
+            hasattr(self.neuron, "step_fn")
+            and hasattr(self.neuron.step_fn, "dense_multistep_fused")
+            and not torch.is_grad_enabled()
+        ):
+            step_fn = self.neuron.step_fn
+            spike_seq, v_seq, v_out, I_out = step_fn.dense_multistep_fused(
+                x_seq=x_seq,
+                weight=self.linear.weight,
+                bias=self.linear.bias,
+                v=self.neuron.v,
+                Iasc=self.neuron.Iasc,
+                params={
+                    "v_th": self.neuron.v_th,
+                    "v_reset": self.neuron.v_reset,
+                    "v_rest": self.neuron.v_rest,
+                    "c_m": self.neuron.c_m,
+                    "tau": self.neuron.tau,
+                    "k": self.neuron.k.reshape(-1),
+                    "asc_amps": self.neuron.asc_amps.reshape(-1),
+                },
+                not_refrac=self.neuron.not_refrac,
+                dt=self.neuron.dt,
+                M=self.neuron.M,
+                hard_reset=self.neuron.hard_reset,
+                alpha=self.neuron.alpha,
+            )
+            self.neuron.v = v_out
+            self.neuron.Iasc = I_out
+            self.spike = spike_seq[-1]
+            return spike_seq, {"v": v_seq}
+        return super().multi_step_forward(x_seq)
+
     def single_step_forward(self, x):
         x = x + self.linear(self.spike)
         z = self.neuron(x)
@@ -208,7 +242,7 @@ def build_model(
     weight, bias, x_seq, params = make_inputs(T, N, device, require_grad)
     neuron = build_neuron(provider, N, params, require_grad)
 
-    model = GLIFDenseNet(N, neuron, unroll=16)
+    model = GLIFDenseNet(N, neuron, unroll=8)
     init_net_state(model, device=device, dtype=torch.float32)
     model.linear.weight.data.copy_(weight)
     model.linear.bias.data.copy_(bias)

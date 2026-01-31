@@ -165,6 +165,87 @@ void glif3_bwd(
 }
 """
 
+_FUSED_SRC = r"""
+extern "C" __global__
+void glif3_dense_fwd(
+    const float* x_seq,  // (T*B,)
+    const float* w,      // (B*B,)
+    const float* b,      // (B,)
+    float* v,            // (B,)
+    float* Iasc,         // (B*M,)
+    const float* v_th,
+    const float* v_reset,
+    const float* v_rest,
+    const float* c_m,
+    const float* tau,
+    const float* k,      // (B*M,)
+    const float* asc,    // (B*M,)
+    const float* mask,
+    float* s_seq,        // (T*B,)
+    float* v_seq,        // (T*B,)
+    float* v_out,        // (B,)
+    float* I_out,        // (B*M,)
+    int T,
+    int B,
+    int M,
+    float dt,
+    int hard_reset,
+    float alpha
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+
+    for (int t = 0; t < T; ++t) {
+        for (int i = 0; i < B; ++i) {
+            int base = i * M;
+            float I_sum = 0.0f;
+            for (int m = 0; m < M; ++m) {
+                I_sum += Iasc[base + m];
+            }
+
+            float lin = 0.0f;
+            int w_base = i * B;
+            for (int j = 0; j < B; ++j) {
+                float s_prev = 0.0f;
+                if (t > 0) {
+                    s_prev = s_seq[(t - 1) * B + j];
+                }
+                lin += w[w_base + j] * s_prev;
+            }
+
+            float x = x_seq[t * B + i] + b[i] + lin;
+            float tau_i = tau[i];
+            float a = expf(-dt / tau_i);
+            float v_inf = v_rest[i] + tau_i * (x + I_sum) / c_m[i];
+            float v_prime = v_inf + (v[i] - v_inf) * a;
+
+            float denom = v_th[i] - v_reset[i];
+            float u = (v_prime - v_th[i]) / denom;
+            float s = (u > 0.0f) ? 1.0f : 0.0f;
+            s *= mask[i];
+
+            float v_post = v_prime - (hard_reset ? (v_prime - v_reset[i])
+                                                 : (v_th[i] - v_reset[i])) * s;
+
+            for (int m = 0; m < M; ++m) {
+                float k_m = k[base + m];
+                float I_dec = Iasc[base + m] * expf(-k_m * dt);
+                float I_post = I_dec + asc[base + m] * s;
+                Iasc[base + m] = I_post;
+                I_out[base + m] = I_post;
+            }
+
+            v[i] = v_post;
+            s_seq[t * B + i] = s;
+            v_seq[t * B + i] = v_post;
+        }
+    }
+
+    for (int i = 0; i < B; ++i) {
+        v_out[i] = v[i];
+    }
+}
+"""
+
 
 def _as_fp32(tensor: torch.Tensor, name: str) -> torch.Tensor:
     if tensor.dtype != torch.float32:
@@ -204,7 +285,8 @@ def _get_kernels():
         raise RuntimeError("cupy is required for GLIF3 cupy kernels.")
     fwd = cp.RawKernel(_FWD_SRC, "glif3_fwd")
     bwd = cp.RawKernel(_BWD_SRC, "glif3_bwd")
-    return fwd, bwd
+    fused = cp.RawKernel(_FUSED_SRC, "glif3_dense_fwd")
+    return fwd, bwd, fused
 
 
 class GLIF3StepCupy(torch.autograd.Function):
@@ -276,7 +358,7 @@ class GLIF3StepCupy(torch.autograd.Function):
         I_out_cu = _to_cupy(I_out)
         s_out_cu = _to_cupy(s_out)
 
-        fwd, _ = _get_kernels()
+        fwd, _, _ = _get_kernels()
         grid = ((B + block - 1) // block,)
         fwd(
             grid,
@@ -385,7 +467,7 @@ class GLIF3StepCupy(torch.autograd.Function):
         dx_cu = _to_cupy(dx)
         dasc_cu = _to_cupy(dasc)
 
-        _, bwd = _get_kernels()
+        _, bwd, _ = _get_kernels()
         grid = ((B + block - 1) // block,)
         bwd(
             grid,
@@ -468,6 +550,101 @@ def glif3_step_cupy(
         float(alpha),
         int(block),
     )
+
+
+def glif3_dense_multistep_fused_cupy(
+    x_seq: Float[torch.Tensor, " T B"],
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    v: Float[torch.Tensor, " B"],
+    Iasc: Float[torch.Tensor, " B M"],
+    params: dict,
+    not_refrac: Float[torch.Tensor, " B"],
+    dt: float,
+    M: int,
+    hard_reset: bool = False,
+    alpha: float = 2.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if cp is None:  # pragma: no cover - optional dependency
+        raise RuntimeError("cupy is required for fused GLIF3 cupy kernels.")
+    if torch.is_grad_enabled():
+        raise RuntimeError("Fused multistep CuPy is forward-only.")
+    if not x_seq.is_cuda:
+        raise RuntimeError("Fused multistep CuPy requires CUDA tensors.")
+
+    T, B = x_seq.shape
+    x_seq = _as_fp32(x_seq.reshape(-1), "x_seq")
+    weight = _as_fp32(weight.reshape(-1), "weight")
+    bias = _as_fp32(bias, "bias")
+    v = _as_fp32(v, "v")
+    Iasc = _as_fp32(Iasc.reshape(-1), "Iasc")
+    v_th = _as_fp32(params["v_th"], "v_th")
+    v_reset = _as_fp32(params["v_reset"], "v_reset")
+    v_rest = _as_fp32(params["v_rest"], "v_rest")
+    c_m = _as_fp32(params["c_m"], "c_m")
+    tau = _as_fp32(params["tau"], "tau")
+    k = _as_fp32(params["k"], "k")
+    asc_amps = _as_fp32(params["asc_amps"], "asc_amps")
+    not_refrac = _as_fp32(not_refrac, "not_refrac")
+
+    v_seq = torch.empty((T, B), device=v.device, dtype=v.dtype)
+    s_seq = torch.empty((T, B), device=v.device, dtype=v.dtype)
+    v_out = torch.empty_like(v)
+    I_out = torch.empty_like(Iasc)
+
+    x_cu = _to_cupy(x_seq)
+    w_cu = _to_cupy(weight)
+    b_cu = _to_cupy(bias)
+    v_cu = _to_cupy(v)
+    I_cu = _to_cupy(Iasc)
+    v_th_cu = _to_cupy(v_th)
+    v_reset_cu = _to_cupy(v_reset)
+    v_rest_cu = _to_cupy(v_rest)
+    c_m_cu = _to_cupy(c_m)
+    tau_cu = _to_cupy(tau)
+    k_cu = _to_cupy(k)
+    asc_cu = _to_cupy(asc_amps)
+    mask_cu = _to_cupy(not_refrac)
+    s_seq_cu = _to_cupy(s_seq)
+    v_seq_cu = _to_cupy(v_seq)
+    v_out_cu = _to_cupy(v_out)
+    I_out_cu = _to_cupy(I_out)
+
+    _, _, fused = _get_kernels()
+    fused(
+        (1,),
+        (1,),
+        (
+            x_cu,
+            w_cu,
+            b_cu,
+            v_cu,
+            I_cu,
+            v_th_cu,
+            v_reset_cu,
+            v_rest_cu,
+            c_m_cu,
+            tau_cu,
+            k_cu,
+            asc_cu,
+            mask_cu,
+            s_seq_cu,
+            v_seq_cu,
+            v_out_cu,
+            I_out_cu,
+            cp.int32(T),
+            cp.int32(B),
+            cp.int32(M),
+            cp.float32(dt),
+            cp.int32(1 if hard_reset else 0),
+            cp.float32(alpha),
+        ),
+    )
+
+    return s_seq, v_seq, v_out, I_out.view(B, M)
+
+
+glif3_step_cupy.dense_multistep_fused = glif3_dense_multistep_fused_cupy
 
 
 class GLIF3Cupy(torch.nn.Module):
