@@ -3,9 +3,8 @@ import torch
 import triton
 
 from btorch.models.ode import euler_step, exp_euler_step
+from btorch.utils.bench import do_bench
 from btorch.utils.file import fig_path, save_fig
-
-from ..utils.bench import do_bench
 
 
 def test_numerically_close():

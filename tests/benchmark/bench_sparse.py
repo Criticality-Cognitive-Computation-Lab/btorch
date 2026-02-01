@@ -16,9 +16,8 @@ from jax.experimental import sparse as jsparse
 from torch_sparse import SparseTensor
 from triton.testing import Benchmark, perf_report
 
+from btorch.utils.bench import do_bench
 from btorch.utils.file import fig_path
-
-from ..utils.bench import do_bench
 
 
 providers_forward = ["torch.sparse", "torch_sparse", "jax", "cupy"]
