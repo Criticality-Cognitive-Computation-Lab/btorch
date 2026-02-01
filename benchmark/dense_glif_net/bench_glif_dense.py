@@ -4,11 +4,12 @@ import os
 from typing import Callable
 
 import torch
-from triton.testing import Benchmark, do_bench, perf_report
+from triton.testing import Benchmark, perf_report
 
 from benchmark.dense_glif_net.glif_common import _DT, build_model, providers, run_model
 from btorch.models import environ
 from btorch.models.functional import reset_net_state
+from btorch.utils.bench import do_bench
 from btorch.utils.file import fig_path
 
 
@@ -128,6 +129,8 @@ def _run_dense_multistep(model: torch.nn.Module, x_seq: torch.Tensor):
             ylabel="ms",
             plot_name="dense_glif_forward_vs_T",
             args={"N": 256, "sweep": "T"},
+            x_log=True,
+            y_log=True,
         ),
         Benchmark(
             x_names=["N"],
@@ -139,6 +142,8 @@ def _run_dense_multistep(model: torch.nn.Module, x_seq: torch.Tensor):
             ylabel="ms",
             plot_name="dense_glif_forward_vs_n_neuron",
             args={"T": 100, "sweep": "N"},
+            x_log=True,
+            y_log=True,
         ),
     ]
 )
@@ -209,6 +214,8 @@ def bench_dense_glif_forward(T: int, N: int, provider: str, sweep: str):
             ylabel="ms",
             plot_name="dense_glif_forward_backward_vs_T",
             args={"N": 256, "sweep": "T"},
+            x_log=True,
+            y_log=True,
         ),
         Benchmark(
             x_names=["N"],
@@ -220,6 +227,8 @@ def bench_dense_glif_forward(T: int, N: int, provider: str, sweep: str):
             ylabel="ms",
             plot_name="dense_glif_forward_backward_vs_n_neuron",
             args={"T": 100, "sweep": "N"},
+            x_log=True,
+            y_log=True,
         ),
     ]
 )

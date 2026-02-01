@@ -2,13 +2,14 @@ import os
 from collections.abc import Callable
 
 import torch
-from triton.testing import Benchmark, do_bench, perf_report
+from triton.testing import Benchmark, perf_report
 
 from benchmark.dense_glif_net.glif_common import _DT, make_inputs, providers
 from btorch.models import environ
 from btorch.models.functional import init_net_state, reset_net_state
 from btorch.models.neurons.glif import GLIF3
 from btorch.models.rnn import make_rnn
+from btorch.utils.bench import do_bench
 from btorch.utils.file import fig_path
 
 
@@ -151,6 +152,8 @@ def _run_multistep_kernel(
             ylabel="ms",
             plot_name="glif_multistep_forward_vs_T",
             args={"N": 256, "sweep": "T"},
+            x_log=True,
+            y_log=True,
         ),
         Benchmark(
             x_names=["N"],
@@ -162,6 +165,8 @@ def _run_multistep_kernel(
             ylabel="ms",
             plot_name="glif_multistep_forward_vs_n_neuron",
             args={"T": 100, "sweep": "N"},
+            x_log=True,
+            y_log=True,
         ),
     ]
 )
@@ -182,8 +187,7 @@ def bench_glif_multistep_forward(T: int, N: int, provider: str, sweep: str):
     last_ms = _AUTO_SKIP_CACHE.get(skip_key)
     if last_ms is not None and last_ms > _AUTO_SKIP_MS:
         print(
-            f"[bench] auto-skip provider={provider} T={T} N={N} "
-            f"(last {last_ms:.1f} ms)"
+            f"[bench] auto-skip provider={provider} T={T} N={N} (last {last_ms:.1f} ms)"
         )
         return (float("nan"), None, None)
 
@@ -257,6 +261,8 @@ def bench_glif_multistep_forward(T: int, N: int, provider: str, sweep: str):
             ylabel="ms",
             plot_name="glif_multistep_forward_backward_vs_T",
             args={"N": 256, "sweep": "T"},
+            x_log=True,
+            y_log=True,
         ),
         Benchmark(
             x_names=["N"],
@@ -268,6 +274,8 @@ def bench_glif_multistep_forward(T: int, N: int, provider: str, sweep: str):
             ylabel="ms",
             plot_name="glif_multistep_forward_backward_vs_n_neuron",
             args={"T": 100, "sweep": "N"},
+            x_log=True,
+            y_log=True,
         ),
     ]
 )
