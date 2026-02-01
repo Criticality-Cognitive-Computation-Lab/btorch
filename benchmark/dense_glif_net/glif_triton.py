@@ -18,7 +18,6 @@ Assumptions:
 import torch
 import triton
 import triton.language as tl
-import triton.language.extra.cuda.libdevice as libdevice
 from jaxtyping import Float
 
 
@@ -97,7 +96,7 @@ def glif3_fwd(
 
     mask = tl.load(mask_ptr + i, mask=inb, other=1.0).to(tl.float32)
 
-    a = libdevice.exp(-dt / tau)
+    a = tl.exp(-dt / tau)
 
     # sum Iasc over modes
     I_sum = tl.zeros([BLOCK], dtype=tl.float32)
@@ -121,7 +120,7 @@ def glif3_fwd(
     for m in tl.static_range(0, M):
         I_m = tl.load(I_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
         k_m = tl.load(k_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-        b = libdevice.exp(-k_m * dt)
+        b = tl.exp(-k_m * dt)
         I_dec = I_m * b
 
         asc_m = tl.load(asc_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
@@ -202,7 +201,7 @@ def glif3_dense_fwd(
             I_m = tl.load(I_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
             I_sum += I_m
 
-        a = libdevice.exp(-dt / tau)
+        a = tl.exp(-dt / tau)
         v_inf = v_rest + tau * (x_in + I_sum) / c_m
         v_prime = v_inf + (v - v_inf) * a
 
@@ -216,7 +215,7 @@ def glif3_dense_fwd(
         for m in tl.static_range(0, M):
             I_m = tl.load(I_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
             k_m = tl.load(k_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-            b = libdevice.exp(-k_m * dt)
+            b = tl.exp(-k_m * dt)
             I_dec = I_m * b
             asc_m = tl.load(asc_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
             I_post = I_dec + asc_m * s
@@ -285,7 +284,7 @@ def glif3_multistep_fwd(
             I_m = tl.load(I_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
             I_sum += I_m
 
-        a = libdevice.exp(-dt / tau)
+        a = tl.exp(-dt / tau)
         v_inf = v_rest + tau * (x + I_sum) / c_m
         v_prime = v_inf + (v - v_inf) * a
 
@@ -299,7 +298,7 @@ def glif3_multistep_fwd(
         for m in tl.static_range(0, M):
             I_m = tl.load(I_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
             k_m = tl.load(k_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-            b = libdevice.exp(-k_m * dt)
+            b = tl.exp(-k_m * dt)
             I_dec = I_m * b
             asc_m = tl.load(asc_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
             I_post = I_dec + asc_m * s
@@ -363,7 +362,7 @@ def glif3_multistep_bwd(
     tau = tl.load(tau_ptr + i, mask=inb, other=1.0).to(tl.float32)
     mask = tl.load(mask_ptr + i, mask=inb, other=1.0).to(tl.float32)
 
-    a = libdevice.exp(-dt / tau)
+    a = tl.exp(-dt / tau)
     denom = v_th - v_reset
     tau_over_c = tau / c_m
     scale = 1.5707963267948966 * alpha
@@ -373,7 +372,7 @@ def glif3_multistep_bwd(
     mask_bm = inb[:, None]
 
     k = tl.load(k_ptr + offs, mask=mask_bm, other=0.0).to(tl.float32)
-    b = libdevice.exp(-k * dt)
+    b = tl.exp(-k * dt)
     asc = tl.load(asc_ptr + offs, mask=mask_bm, other=0.0).to(tl.float32)
     I_post = tl.load(I_out_ptr + offs, mask=mask_bm, other=0.0).to(tl.float32)
     dI_post = tl.load(dI_out_ptr + offs, mask=mask_bm, other=0.0).to(tl.float32)
@@ -495,7 +494,7 @@ def glif3_bwd(
     s = tl.load(s_ptr + i, mask=inb, other=0.0).to(tl.float32)
     dv_post = tl.load(dv_post_ptr + i, mask=inb, other=0.0).to(tl.float32)
 
-    a = libdevice.exp(-dt / tau)
+    a = tl.exp(-dt / tau)
 
     # recompute v_prime and u
     I_sum = tl.zeros([BLOCK], dtype=tl.float32)
@@ -554,7 +553,7 @@ def glif3_bwd(
     for m in tl.static_range(0, M):
         I_m = tl.load(I_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
         k_m = tl.load(k_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-        b = libdevice.exp(-k_m * dt)
+        b = tl.exp(-k_m * dt)
 
         dI_post_m = tl.load(dI_post_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
         dI_m = dI_post_m * b + dI_common
