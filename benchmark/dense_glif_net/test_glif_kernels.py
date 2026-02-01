@@ -476,6 +476,11 @@ def test_glif_multistep_fused_matches_reference(backend: str):
             alpha=2.0,
         )
 
+    surrogate = (
+        ATan(alpha=2.0, spiking=True)
+        if backend in ("warp", "cupy")
+        else ATanApprox(alpha=2.0, spiking=True)
+    )
     v_ref_seq, I_ref, s_ref_seq, _ = _reference_multistep(
         {
             "v": base["v"].clone(),
@@ -491,13 +496,102 @@ def test_glif_multistep_fused_matches_reference(backend: str):
         x_seq=x_seq,
         dt=dt,
         hard_reset=hard_reset,
-        surrogate=ATanApprox(alpha=2.0, spiking=True),
+        surrogate=surrogate,
     )
 
     torch.testing.assert_close(s_seq, s_ref_seq, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(v_seq, v_ref_seq, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(v_out, v_ref_seq[-1], rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(I_out, I_ref, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("backend", ["triton", "warp", "cupy"])
+def test_glif_multistep_fused_grad_matches_reference(backend: str):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for fused kernels.")
+
+    if backend == "triton":
+        pytest.importorskip("triton")
+        from benchmark.dense_glif_net.glif_triton import glif3_step_triton as step_fn
+    elif backend == "warp":
+        pytest.importorskip("warp")
+        from benchmark.dense_glif_net.glif_warp import glif3_step_warp as step_fn
+    else:
+        pytest.importorskip("cupy")
+        from benchmark.dense_glif_net.glif_cupy import glif3_step_cupy as step_fn
+
+    device = torch.device("cuda")
+    dtype = torch.float32
+    T, B, M = 8, 6, 2
+    dt = 0.5
+    hard_reset = False
+
+    base = _base_inputs(B, M, device, dtype)
+    x_seq = torch.randn((T, B), device=device, dtype=dtype, requires_grad=True)
+
+    v = base["v"].clone().requires_grad_(True)
+    Iasc = base["Iasc"].clone().requires_grad_(True)
+    asc_flat = base["asc_amps"].reshape(-1).clone().requires_grad_(True)
+    not_refrac = torch.ones_like(v)
+
+    s_seq, v_seq, v_out, I_out = step_fn.multistep_fused(
+        x_seq=x_seq,
+        v=v,
+        Iasc=Iasc,
+        params={
+            "v_th": base["v_th"].clone(),
+            "v_reset": base["v_reset"].clone(),
+            "v_rest": base["v_rest"].clone(),
+            "c_m": base["c_m"].clone(),
+            "tau": base["tau"].clone(),
+            "k": base["k"].reshape(-1).clone(),
+            "asc_amps": asc_flat,
+        },
+        not_refrac=not_refrac,
+        dt=dt,
+        M=M,
+        hard_reset=hard_reset,
+        alpha=2.0,
+    )
+
+    loss = s_seq.sum() + v_seq.sum() + v_out.sum() + I_out.sum()
+    loss.backward()
+
+    x_seq_ref = x_seq.detach().clone().requires_grad_(True)
+    v_ref = base["v"].clone().requires_grad_(True)
+    Iasc_ref = base["Iasc"].clone().requires_grad_(True)
+    asc_ref = base["asc_amps"].clone().requires_grad_(True)
+    surrogate = (
+        ATan(alpha=2.0, spiking=True)
+        if backend in ("warp", "cupy")
+        else ATanApprox(alpha=2.0, spiking=True)
+    )
+    v_ref_seq, I_ref, s_ref_seq, asc_ref_param = _reference_multistep(
+        {
+            "v": v_ref,
+            "Iasc": Iasc_ref,
+            "v_th": base["v_th"].clone(),
+            "v_reset": base["v_reset"].clone(),
+            "v_rest": base["v_rest"].clone(),
+            "c_m": base["c_m"].clone(),
+            "tau": base["tau"].clone(),
+            "k": base["k"].clone(),
+            "asc_amps": asc_ref,
+        },
+        x_seq=x_seq_ref,
+        dt=dt,
+        hard_reset=hard_reset,
+        surrogate=surrogate,
+    )
+    loss_ref = s_ref_seq.sum() + v_ref_seq.sum() + v_ref_seq[-1].sum() + I_ref.sum()
+    loss_ref.backward()
+
+    torch.testing.assert_close(x_seq.grad, x_seq_ref.grad, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(v.grad, v_ref.grad, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(Iasc.grad, Iasc_ref.grad, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(
+        asc_flat.grad.view(B, M), asc_ref_param.grad, rtol=1e-4, atol=1e-4
+    )
 
 
 def test_glif3_step_cupy_stress_noncontig_and_casts():

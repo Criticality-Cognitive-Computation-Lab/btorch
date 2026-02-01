@@ -251,9 +251,9 @@ def bench_glif_multistep_forward(T: int, N: int, provider: str, sweep: str):
             x_names=["T"],
             x_vals=_T_SWEEP,
             line_arg="provider",
-            line_vals=["torch_eager"],
-            line_names=[_LINE_NAMES["torch_eager"]],
-            styles=[_STYLE_MAP["torch_eager"]],
+            line_vals=_PROVIDERS,
+            line_names=[_LINE_NAMES[p] for p in _PROVIDERS],
+            styles=_STYLES[: len(_PROVIDERS)],
             ylabel="ms",
             plot_name="glif_multistep_forward_backward_vs_T",
             args={"N": 256, "sweep": "T"},
@@ -262,9 +262,9 @@ def bench_glif_multistep_forward(T: int, N: int, provider: str, sweep: str):
             x_names=["N"],
             x_vals=_N_SWEEP,
             line_arg="provider",
-            line_vals=["torch_eager"],
-            line_names=[_LINE_NAMES["torch_eager"]],
-            styles=[_STYLE_MAP["torch_eager"]],
+            line_vals=_PROVIDERS,
+            line_names=[_LINE_NAMES[p] for p in _PROVIDERS],
+            styles=_STYLES[: len(_PROVIDERS)],
             ylabel="ms",
             plot_name="glif_multistep_forward_backward_vs_n_neuron",
             args={"T": 100, "sweep": "N"},
@@ -294,9 +294,59 @@ def bench_glif_multistep_forward_backward(T: int, N: int, provider: str, sweep: 
     _, _, x_seq, params = make_inputs(T, N, device, require_grad=True)
     params["asc_amps"].requires_grad_(True)
 
-    def fn():
-        spike_seq = _run_multistep_torch(params, x_seq, dt=_DT, hard_reset=False)
-        spike_seq.sum().backward()
+    if provider in {"torch_eager", "torch_compile", "torch_compile_unrolled"}:
+        glif = GLIF3(
+            n_neuron=N,
+            v_threshold=params["v_th"],
+            v_reset=params["v_reset"],
+            v_rest=params["v_rest"],
+            c_m=params["c_m"],
+            tau=params["tau"],
+            k=params["k"],
+            asc_amps=params["asc_amps"],
+            tau_ref=0.0,
+            hard_reset=False,
+            trainable_param={"asc_amps"},
+            device=device,
+            dtype=x_seq.dtype,
+            step_mode="m",
+        )
+        init_net_state(glif, device=device, dtype=x_seq.dtype)
+        if provider == "torch_compile":
+            glif = torch.compile(glif)
+
+            def fn():
+                reset_net_state(glif)
+                with environ.context(dt=_DT):
+                    spike_seq = glif(x_seq)
+                spike_seq.sum().backward()
+
+        elif provider == "torch_compile_unrolled":
+            wrapper = make_rnn(glif)
+            init_net_state(wrapper, device=device, dtype=x_seq.dtype)
+            wrapper = torch.compile(wrapper)
+
+            def fn():
+                reset_net_state(wrapper)
+                with environ.context(dt=_DT):
+                    spike_seq = wrapper.multi_step_forward(x_seq)
+                spike_seq.sum().backward()
+
+        else:
+
+            def fn():
+                reset_net_state(glif)
+                with environ.context(dt=_DT):
+                    spike_seq = glif.multi_step_forward(x_seq)
+                spike_seq.sum().backward()
+
+    else:
+
+        def fn():
+            s_seq = _run_multistep_kernel(
+                provider, x_seq, params, dt=_DT, hard_reset=False
+            )
+            s_seq.sum().backward()
 
     ms = _bench_ms(fn, grads=[x_seq, params["asc_amps"]], use_quantiles=False)
     _AUTO_SKIP_CACHE[skip_key] = float(ms[0])
