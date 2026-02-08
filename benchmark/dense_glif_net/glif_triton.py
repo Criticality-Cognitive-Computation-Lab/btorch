@@ -81,29 +81,126 @@ def glif3_fwd(
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    i = pid * BLOCK + tl.arange(0, BLOCK)
+    offs_b = pid * BLOCK
+    i = offs_b + tl.arange(0, BLOCK)
     inb = i < B
 
-    v = tl.load(v_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    x = tl.load(x_ptr + i, mask=inb, other=0.0).to(tl.float32)
+    v_ptrs = tl.make_block_ptr(
+        base=v_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    x_ptrs = tl.make_block_ptr(
+        base=x_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    v_th_ptrs = tl.make_block_ptr(
+        base=v_th_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    v_reset_ptrs = tl.make_block_ptr(
+        base=v_reset_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    v_rest_ptrs = tl.make_block_ptr(
+        base=v_rest_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    c_m_ptrs = tl.make_block_ptr(
+        base=c_m_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    tau_ptrs = tl.make_block_ptr(
+        base=tau_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    mask_ptrs = tl.make_block_ptr(
+        base=mask_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
 
-    v_th = tl.load(v_th_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    v_reset = tl.load(v_reset_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    v_rest = tl.load(v_rest_ptr + i, mask=inb, other=0.0).to(tl.float32)
+    v = tl.load(v_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    x = tl.load(x_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
 
-    c_m = tl.load(c_m_ptr + i, mask=inb, other=1.0).to(tl.float32)
-    tau = tl.load(tau_ptr + i, mask=inb, other=1.0).to(tl.float32)
+    v_th = tl.load(v_th_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    v_reset = tl.load(v_reset_ptrs, boundary_check=(0,), padding_option="zero").to(
+        tl.float32
+    )
+    v_rest = tl.load(v_rest_ptrs, boundary_check=(0,), padding_option="zero").to(
+        tl.float32
+    )
 
-    mask = tl.load(mask_ptr + i, mask=inb, other=1.0).to(tl.float32)
+    c_m = tl.load(c_m_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    c_m = tl.where(inb, c_m, 1.0)
+    tau = tl.load(tau_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    tau = tl.where(inb, tau, 1.0)
+
+    mask = tl.load(mask_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    mask = tl.where(inb, mask, 1.0)
 
     a = tl.exp(-dt / tau)
 
     # sum Iasc over modes
-    I_sum = tl.zeros([BLOCK], dtype=tl.float32)
-    base = i * M
-    for m in tl.static_range(0, M):
-        I_m = tl.load(I_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-        I_sum += I_m
+    I_ptrs = tl.make_block_ptr(
+        base=I_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    k_ptrs = tl.make_block_ptr(
+        base=k_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    asc_ptrs = tl.make_block_ptr(
+        base=asc_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+
+    I_block = tl.load(I_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
+    I_sum = tl.sum(I_block, axis=1)
 
     v_inf = v_rest + tau * (x + I_sum) / c_m
     v_prime = v_inf + (v - v_inf) * a
@@ -117,19 +214,44 @@ def glif3_fwd(
         v_post = v_prime - (v_th - v_reset) * s
 
     # Iasc decay + jump
-    for m in tl.static_range(0, M):
-        I_m = tl.load(I_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-        k_m = tl.load(k_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-        b = tl.exp(-k_m * dt)
-        I_dec = I_m * b
+    k_block = tl.load(k_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
+    asc_block = tl.load(asc_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
+    b = tl.exp(-k_block * dt)
+    I_dec = I_block * b
+    I_post = I_dec + asc_block * s[:, None]
 
-        asc_m = tl.load(asc_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-        I_post = I_dec + asc_m * s
+    I_out_ptrs = tl.make_block_ptr(
+        base=I_out_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    tl.store(I_out_ptrs, I_post.to(tl.float32), boundary_check=(0, 1))
 
-        tl.store(I_out_ptr + base + m, I_post.to(tl.float32), mask=inb)
-
-    tl.store(v_out_ptr + i, v_post.to(tl.float32), mask=inb)
-    tl.store(s_out_ptr + i, s.to(tl.float32), mask=inb)
+    v_out_ptrs = tl.make_block_ptr(
+        base=v_out_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    s_out_ptrs = tl.make_block_ptr(
+        base=s_out_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    tl.store(v_out_ptrs, v_post.to(tl.float32), boundary_check=(0,))
+    tl.store(s_out_ptrs, s.to(tl.float32), boundary_check=(0,))
 
 
 # ----------------------------
@@ -168,38 +290,172 @@ def glif3_dense_fwd(
     i = tl.arange(0, BLOCK)
     inb = i < B
 
-    v = tl.load(v_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    v_th = tl.load(v_th_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    v_reset = tl.load(v_reset_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    v_rest = tl.load(v_rest_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    c_m = tl.load(c_m_ptr + i, mask=inb, other=1.0).to(tl.float32)
-    tau = tl.load(tau_ptr + i, mask=inb, other=1.0).to(tl.float32)
-    mask = tl.load(mask_ptr + i, mask=inb, other=1.0).to(tl.float32)
+    v_ptrs = tl.make_block_ptr(
+        base=v_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    v_th_ptrs = tl.make_block_ptr(
+        base=v_th_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    v_reset_ptrs = tl.make_block_ptr(
+        base=v_reset_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    v_rest_ptrs = tl.make_block_ptr(
+        base=v_rest_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    c_m_ptrs = tl.make_block_ptr(
+        base=c_m_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    tau_ptrs = tl.make_block_ptr(
+        base=tau_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    mask_ptrs = tl.make_block_ptr(
+        base=mask_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    b_ptrs = tl.make_block_ptr(
+        base=b_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    s_prev_ptrs = tl.make_block_ptr(
+        base=s_prev_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
 
-    s_prev_vec = tl.load(s_prev_ptr + i, mask=inb, other=0.0).to(tl.float32)
+    v = tl.load(v_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    v_th = tl.load(v_th_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    v_reset = tl.load(v_reset_ptrs, boundary_check=(0,), padding_option="zero").to(
+        tl.float32
+    )
+    v_rest = tl.load(v_rest_ptrs, boundary_check=(0,), padding_option="zero").to(
+        tl.float32
+    )
+    c_m = tl.load(c_m_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    c_m = tl.where(inb, c_m, 1.0)
+    tau = tl.load(tau_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    tau = tl.where(inb, tau, 1.0)
+    mask = tl.load(mask_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    mask = tl.where(inb, mask, 1.0)
+
+    bias = tl.load(b_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    s_prev_vec = tl.load(s_prev_ptrs, boundary_check=(0,), padding_option="zero").to(
+        tl.float32
+    )
+
     k_idx = tl.arange(0, BLOCK)
     in_k = k_idx < B
 
+    w_ptrs = tl.make_block_ptr(
+        base=w_ptr,
+        shape=(B, B),
+        strides=(B, 1),
+        offsets=(0, 0),
+        block_shape=(BLOCK, BLOCK),
+        order=(1, 0),
+    )
+    I_ptrs = tl.make_block_ptr(
+        base=I_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(0, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    I_out_ptrs = tl.make_block_ptr(
+        base=I_out_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(0, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    k_ptrs = tl.make_block_ptr(
+        base=k_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(0, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    asc_ptrs = tl.make_block_ptr(
+        base=asc_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(0, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+
+    I_block = tl.load(I_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
+    k_block = tl.load(k_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
+    asc_block = tl.load(asc_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
+
     for t in tl.static_range(0, T):
         do = t < T_valid
-        x = tl.load(x_ptr + t * B + i, mask=inb, other=0.0).to(tl.float32)
-        bias = tl.load(b_ptr + i, mask=inb, other=0.0).to(tl.float32)
+        x_ptrs = tl.make_block_ptr(
+            base=x_ptr,
+            shape=(T, B),
+            strides=(B, 1),
+            offsets=(t, 0),
+            block_shape=(1, BLOCK),
+            order=(1, 0),
+        )
+        x = tl.load(x_ptrs, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+        x = x[0, :]
 
-        w_ptrs = (i[:, None] * B) + k_idx[None, :]
-        w = tl.load(
-            w_ptr + w_ptrs,
-            mask=inb[:, None] & in_k[None, :],
-            other=0.0,
-        ).to(tl.float32)
+        w = tl.load(w_ptrs, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
         s_prev = tl.where(in_k, s_prev_vec, 0.0)
         lin = tl.sum(w * s_prev[None, :], axis=1)
         x_in = x + bias + lin
 
-        I_sum = tl.zeros([BLOCK], dtype=tl.float32)
-        base = i * M
-        for m in tl.static_range(0, M):
-            I_m = tl.load(I_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-            I_sum += I_m
+        I_sum = tl.sum(I_block, axis=1)
 
         a = tl.exp(-dt / tau)
         v_inf = v_rest + tau * (x_in + I_sum) / c_m
@@ -212,24 +468,46 @@ def glif3_dense_fwd(
         else:
             v_post = v_prime - (v_th - v_reset) * s
 
-        for m in tl.static_range(0, M):
-            I_m = tl.load(I_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-            k_m = tl.load(k_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-            b = tl.exp(-k_m * dt)
-            I_dec = I_m * b
-            asc_m = tl.load(asc_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-            I_post = I_dec + asc_m * s
-            I_post = tl.where(do, I_post, I_m)
-            tl.store(I_ptr + base + m, I_post.to(tl.float32), mask=inb)
-            tl.store(I_out_ptr + base + m, I_post.to(tl.float32), mask=inb)
+        b = tl.exp(-k_block * dt)
+        I_dec = I_block * b
+        I_post = I_dec + asc_block * s[:, None]
+        I_post = tl.where(do, I_post, I_block)
+        I_block = I_post
+        tl.store(I_ptrs, I_post.to(tl.float32), boundary_check=(0, 1))
+        tl.store(I_out_ptrs, I_post.to(tl.float32), boundary_check=(0, 1))
 
         v = tl.where(do, v_post, v)
         s_prev_vec = tl.where(do, s, s_prev_vec)
         v_store = tl.where(do, v_post, v)
-        tl.store(v_seq_ptr + t * B + i, v_store.to(tl.float32), mask=inb)
-        tl.store(s_seq_ptr + t * B + i, s.to(tl.float32), mask=inb)
 
-    tl.store(v_out_ptr + i, v.to(tl.float32), mask=inb)
+        v_seq_ptrs = tl.make_block_ptr(
+            base=v_seq_ptr,
+            shape=(T, B),
+            strides=(B, 1),
+            offsets=(t, 0),
+            block_shape=(1, BLOCK),
+            order=(1, 0),
+        )
+        s_seq_ptrs = tl.make_block_ptr(
+            base=s_seq_ptr,
+            shape=(T, B),
+            strides=(B, 1),
+            offsets=(t, 0),
+            block_shape=(1, BLOCK),
+            order=(1, 0),
+        )
+        tl.store(v_seq_ptrs, v_store[None, :].to(tl.float32), boundary_check=(0, 1))
+        tl.store(s_seq_ptrs, s[None, :].to(tl.float32), boundary_check=(0, 1))
+
+    v_out_ptrs = tl.make_block_ptr(
+        base=v_out_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    tl.store(v_out_ptrs, v.to(tl.float32), boundary_check=(0,))
 
 
 # ----------------------------
@@ -263,26 +541,139 @@ def glif3_multistep_fwd(
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    i = pid * BLOCK + tl.arange(0, BLOCK)
+    offs_b = pid * BLOCK
+    i = offs_b + tl.arange(0, BLOCK)
     inb = i < B
 
-    v = tl.load(v_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    v_th = tl.load(v_th_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    v_reset = tl.load(v_reset_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    v_rest = tl.load(v_rest_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    c_m = tl.load(c_m_ptr + i, mask=inb, other=1.0).to(tl.float32)
-    tau = tl.load(tau_ptr + i, mask=inb, other=1.0).to(tl.float32)
-    mask = tl.load(mask_ptr + i, mask=inb, other=1.0).to(tl.float32)
+    v_ptrs = tl.make_block_ptr(
+        base=v_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    v_th_ptrs = tl.make_block_ptr(
+        base=v_th_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    v_reset_ptrs = tl.make_block_ptr(
+        base=v_reset_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    v_rest_ptrs = tl.make_block_ptr(
+        base=v_rest_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    c_m_ptrs = tl.make_block_ptr(
+        base=c_m_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    tau_ptrs = tl.make_block_ptr(
+        base=tau_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    mask_ptrs = tl.make_block_ptr(
+        base=mask_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+
+    v = tl.load(v_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    v_th = tl.load(v_th_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    v_reset = tl.load(v_reset_ptrs, boundary_check=(0,), padding_option="zero").to(
+        tl.float32
+    )
+    v_rest = tl.load(v_rest_ptrs, boundary_check=(0,), padding_option="zero").to(
+        tl.float32
+    )
+    c_m = tl.load(c_m_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    c_m = tl.where(inb, c_m, 1.0)
+    tau = tl.load(tau_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    tau = tl.where(inb, tau, 1.0)
+    mask = tl.load(mask_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    mask = tl.where(inb, mask, 1.0)
+
+    I_ptrs = tl.make_block_ptr(
+        base=I_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    I_out_ptrs = tl.make_block_ptr(
+        base=I_out_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    k_ptrs = tl.make_block_ptr(
+        base=k_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    asc_ptrs = tl.make_block_ptr(
+        base=asc_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+
+    I_block = tl.load(I_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
+    k_block = tl.load(k_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
+    asc_block = tl.load(asc_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
 
     for t in tl.static_range(0, T):
         do = t < T_valid
-        x = tl.load(x_ptr + t * B + i, mask=inb, other=0.0).to(tl.float32)
+        x_ptrs = tl.make_block_ptr(
+            base=x_ptr,
+            shape=(T, B),
+            strides=(B, 1),
+            offsets=(t, offs_b),
+            block_shape=(1, BLOCK),
+            order=(1, 0),
+        )
+        x = tl.load(x_ptrs, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+        x = x[0, :]
 
-        I_sum = tl.zeros([BLOCK], dtype=tl.float32)
-        base = i * M
-        for m in tl.static_range(0, M):
-            I_m = tl.load(I_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-            I_sum += I_m
+        I_sum = tl.sum(I_block, axis=1)
 
         a = tl.exp(-dt / tau)
         v_inf = v_rest + tau * (x + I_sum) / c_m
@@ -295,23 +686,44 @@ def glif3_multistep_fwd(
         else:
             v_post = v_prime - (v_th - v_reset) * s
 
-        for m in tl.static_range(0, M):
-            I_m = tl.load(I_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-            k_m = tl.load(k_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-            b = tl.exp(-k_m * dt)
-            I_dec = I_m * b
-            asc_m = tl.load(asc_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-            I_post = I_dec + asc_m * s
-            I_post = tl.where(do, I_post, I_m)
-            tl.store(I_ptr + base + m, I_post.to(tl.float32), mask=inb)
-            tl.store(I_out_ptr + base + m, I_post.to(tl.float32), mask=inb)
+        b = tl.exp(-k_block * dt)
+        I_dec = I_block * b
+        I_post = I_dec + asc_block * s[:, None]
+        I_post = tl.where(do, I_post, I_block)
+        I_block = I_post
+        tl.store(I_ptrs, I_post.to(tl.float32), boundary_check=(0, 1))
+        tl.store(I_out_ptrs, I_post.to(tl.float32), boundary_check=(0, 1))
 
         v = tl.where(do, v_post, v)
         v_store = tl.where(do, v_post, v)
-        tl.store(v_seq_ptr + t * B + i, v_store.to(tl.float32), mask=inb)
-        tl.store(s_seq_ptr + t * B + i, s.to(tl.float32), mask=inb)
+        v_seq_ptrs = tl.make_block_ptr(
+            base=v_seq_ptr,
+            shape=(T, B),
+            strides=(B, 1),
+            offsets=(t, offs_b),
+            block_shape=(1, BLOCK),
+            order=(1, 0),
+        )
+        s_seq_ptrs = tl.make_block_ptr(
+            base=s_seq_ptr,
+            shape=(T, B),
+            strides=(B, 1),
+            offsets=(t, offs_b),
+            block_shape=(1, BLOCK),
+            order=(1, 0),
+        )
+        tl.store(v_seq_ptrs, v_store[None, :].to(tl.float32), boundary_check=(0, 1))
+        tl.store(s_seq_ptrs, s[None, :].to(tl.float32), boundary_check=(0, 1))
 
-    tl.store(v_out_ptr + i, v.to(tl.float32), mask=inb)
+    v_out_ptrs = tl.make_block_ptr(
+        base=v_out_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    tl.store(v_out_ptrs, v.to(tl.float32), boundary_check=(0,))
 
 
 # ----------------------------
@@ -351,53 +763,232 @@ def glif3_multistep_bwd(
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    i = pid * BLOCK + tl.arange(0, BLOCK)
+    offs_b = pid * BLOCK
+    i = offs_b + tl.arange(0, BLOCK)
     inb = i < B
 
-    v0 = tl.load(v0_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    v_th = tl.load(v_th_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    v_reset = tl.load(v_reset_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    v_rest = tl.load(v_rest_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    c_m = tl.load(c_m_ptr + i, mask=inb, other=1.0).to(tl.float32)
-    tau = tl.load(tau_ptr + i, mask=inb, other=1.0).to(tl.float32)
-    mask = tl.load(mask_ptr + i, mask=inb, other=1.0).to(tl.float32)
+    v0_ptrs = tl.make_block_ptr(
+        base=v0_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    v_th_ptrs = tl.make_block_ptr(
+        base=v_th_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    v_reset_ptrs = tl.make_block_ptr(
+        base=v_reset_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    v_rest_ptrs = tl.make_block_ptr(
+        base=v_rest_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    c_m_ptrs = tl.make_block_ptr(
+        base=c_m_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    tau_ptrs = tl.make_block_ptr(
+        base=tau_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    mask_ptrs = tl.make_block_ptr(
+        base=mask_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+
+    v0 = tl.load(v0_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    v_th = tl.load(v_th_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    v_reset = tl.load(v_reset_ptrs, boundary_check=(0,), padding_option="zero").to(
+        tl.float32
+    )
+    v_rest = tl.load(v_rest_ptrs, boundary_check=(0,), padding_option="zero").to(
+        tl.float32
+    )
+    c_m = tl.load(c_m_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    c_m = tl.where(inb, c_m, 1.0)
+    tau = tl.load(tau_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    tau = tl.where(inb, tau, 1.0)
+    mask = tl.load(mask_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    mask = tl.where(inb, mask, 1.0)
 
     a = tl.exp(-dt / tau)
     denom = v_th - v_reset
     tau_over_c = tau / c_m
     scale = 1.5707963267948966 * alpha
 
-    offs_m = tl.arange(0, M)
-    offs = i[:, None] * M + offs_m[None, :]
-    mask_bm = inb[:, None]
+    k_ptrs = tl.make_block_ptr(
+        base=k_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    asc_ptrs = tl.make_block_ptr(
+        base=asc_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    I_post_ptrs = tl.make_block_ptr(
+        base=I_out_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    dI_post_ptrs = tl.make_block_ptr(
+        base=dI_out_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    dI0_ptrs = tl.make_block_ptr(
+        base=dI0_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    dasc_ptrs = tl.make_block_ptr(
+        base=dasc_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
 
-    k = tl.load(k_ptr + offs, mask=mask_bm, other=0.0).to(tl.float32)
+    k = tl.load(k_ptrs, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
     b = tl.exp(-k * dt)
-    asc = tl.load(asc_ptr + offs, mask=mask_bm, other=0.0).to(tl.float32)
-    I_post = tl.load(I_out_ptr + offs, mask=mask_bm, other=0.0).to(tl.float32)
-    dI_post = tl.load(dI_out_ptr + offs, mask=mask_bm, other=0.0).to(tl.float32)
+    asc = tl.load(asc_ptrs, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+    I_post = tl.load(I_post_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
+    dI_post = tl.load(dI_post_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
     dasc_acc = tl.zeros([BLOCK, M], dtype=tl.float32)
 
-    dv_post = tl.load(dv_out_ptr + i, mask=inb, other=0.0).to(tl.float32)
+    dv_out_ptrs = tl.make_block_ptr(
+        base=dv_out_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    dv_post = tl.load(dv_out_ptrs, boundary_check=(0,), padding_option="zero").to(
+        tl.float32
+    )
 
     for t in tl.static_range(T - 1, -1, -1):
         do = t < T_valid
         do_f = tl.where(do, 1.0, 0.0)
-        ds_t = tl.load(ds_ptr + t * B + i, mask=inb, other=0.0).to(tl.float32) * do_f
-        dv_t = (
-            tl.load(dv_seq_ptr + t * B + i, mask=inb, other=0.0).to(tl.float32) * do_f
+        ds_ptrs = tl.make_block_ptr(
+            base=ds_ptr,
+            shape=(T, B),
+            strides=(B, 1),
+            offsets=(t, offs_b),
+            block_shape=(1, BLOCK),
+            order=(1, 0),
         )
-        s_t = tl.load(s_seq_ptr + t * B + i, mask=inb, other=0.0).to(tl.float32) * do_f
+        dv_seq_ptrs = tl.make_block_ptr(
+            base=dv_seq_ptr,
+            shape=(T, B),
+            strides=(B, 1),
+            offsets=(t, offs_b),
+            block_shape=(1, BLOCK),
+            order=(1, 0),
+        )
+        s_seq_ptrs = tl.make_block_ptr(
+            base=s_seq_ptr,
+            shape=(T, B),
+            strides=(B, 1),
+            offsets=(t, offs_b),
+            block_shape=(1, BLOCK),
+            order=(1, 0),
+        )
+        ds_t = tl.load(ds_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+            tl.float32
+        )
+        ds_t = ds_t * do_f
+        dv_t = tl.load(dv_seq_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+            tl.float32
+        )
+        dv_t = dv_t * do_f
+        s_t = tl.load(s_seq_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+            tl.float32
+        )
+        s_t = s_t * do_f
+        ds_t = ds_t[0, :]
+        dv_t = dv_t[0, :]
+        s_t = s_t[0, :]
         dv_post = dv_post + dv_t
 
         if t == 0:
             v_pre = v0
         else:
-            v_pre = tl.load(v_seq_ptr + (t - 1) * B + i, mask=inb, other=0.0).to(
-                tl.float32
+            v_seq_ptrs = tl.make_block_ptr(
+                base=v_seq_ptr,
+                shape=(T, B),
+                strides=(B, 1),
+                offsets=(t - 1, offs_b),
+                block_shape=(1, BLOCK),
+                order=(1, 0),
             )
+            v_pre = tl.load(
+                v_seq_ptrs, boundary_check=(0, 1), padding_option="zero"
+            ).to(tl.float32)
+            v_pre = v_pre[0, :]
 
-        x_t = tl.load(x_ptr + t * B + i, mask=inb, other=0.0).to(tl.float32) * do_f
+        x_ptrs = tl.make_block_ptr(
+            base=x_ptr,
+            shape=(T, B),
+            strides=(B, 1),
+            offsets=(t, offs_b),
+            block_shape=(1, BLOCK),
+            order=(1, 0),
+        )
+        x_t = tl.load(x_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+            tl.float32
+        )
+        x_t = x_t[0, :]
+        x_t = x_t * do_f
 
         I_pre = (I_post - asc * s_t[:, None]) / b
         I_sum = tl.sum(I_pre, axis=1)
@@ -427,7 +1018,19 @@ def glif3_multistep_bwd(
         dv_inf = dvprime * (1.0 - a)
 
         dx = dv_inf * tau_over_c
-        tl.store(dx_ptr + t * B + i, (dx * do_f).to(tl.float32), mask=inb)
+        dx_ptrs = tl.make_block_ptr(
+            base=dx_ptr,
+            shape=(T, B),
+            strides=(B, 1),
+            offsets=(t, offs_b),
+            block_shape=(1, BLOCK),
+            order=(1, 0),
+        )
+        tl.store(
+            dx_ptrs,
+            (dx * do_f)[None, :].to(tl.float32),
+            boundary_check=(0, 1),
+        )
 
         dI_common = dv_inf * tau_over_c
         dasc_acc += dI_post * s_t[:, None]
@@ -437,9 +1040,17 @@ def glif3_multistep_bwd(
 
         dv_post = tl.where(do, dv_pre, dv_post)
 
-    tl.store(dv0_ptr + i, dv_post.to(tl.float32), mask=inb)
-    tl.store(dI0_ptr + offs, dI_post.to(tl.float32), mask=mask_bm)
-    tl.store(dasc_ptr + offs, dasc_acc.to(tl.float32), mask=mask_bm)
+    dv0_ptrs = tl.make_block_ptr(
+        base=dv0_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    tl.store(dv0_ptrs, dv_post.to(tl.float32), boundary_check=(0,))
+    tl.store(dI0_ptrs, dI_post.to(tl.float32), boundary_check=(0, 1))
+    tl.store(dasc_ptrs, dasc_acc.to(tl.float32), boundary_check=(0, 1))
 
 
 # ----------------------------
@@ -476,32 +1087,179 @@ def glif3_bwd(
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    i = pid * BLOCK + tl.arange(0, BLOCK)
+    offs_b = pid * BLOCK
+    i = offs_b + tl.arange(0, BLOCK)
     inb = i < B
 
-    v = tl.load(v_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    x = tl.load(x_ptr + i, mask=inb, other=0.0).to(tl.float32)
+    v_ptrs = tl.make_block_ptr(
+        base=v_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    x_ptrs = tl.make_block_ptr(
+        base=x_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    v_th_ptrs = tl.make_block_ptr(
+        base=v_th_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    v_reset_ptrs = tl.make_block_ptr(
+        base=v_reset_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    v_rest_ptrs = tl.make_block_ptr(
+        base=v_rest_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    c_m_ptrs = tl.make_block_ptr(
+        base=c_m_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    tau_ptrs = tl.make_block_ptr(
+        base=tau_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    mask_ptrs = tl.make_block_ptr(
+        base=mask_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    s_ptrs = tl.make_block_ptr(
+        base=s_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    ds_ptrs = tl.make_block_ptr(
+        base=ds_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    dv_post_ptrs = tl.make_block_ptr(
+        base=dv_post_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
 
-    v_th = tl.load(v_th_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    v_reset = tl.load(v_reset_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    v_rest = tl.load(v_rest_ptr + i, mask=inb, other=0.0).to(tl.float32)
+    v = tl.load(v_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    x = tl.load(x_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
 
-    c_m = tl.load(c_m_ptr + i, mask=inb, other=1.0).to(tl.float32)
-    tau = tl.load(tau_ptr + i, mask=inb, other=1.0).to(tl.float32)
+    v_th = tl.load(v_th_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    v_reset = tl.load(v_reset_ptrs, boundary_check=(0,), padding_option="zero").to(
+        tl.float32
+    )
+    v_rest = tl.load(v_rest_ptrs, boundary_check=(0,), padding_option="zero").to(
+        tl.float32
+    )
 
-    mask = tl.load(mask_ptr + i, mask=inb, other=1.0).to(tl.float32)
+    c_m = tl.load(c_m_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    c_m = tl.where(inb, c_m, 1.0)
+    tau = tl.load(tau_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    tau = tl.where(inb, tau, 1.0)
 
-    s = tl.load(s_ptr + i, mask=inb, other=0.0).to(tl.float32)
-    dv_post = tl.load(dv_post_ptr + i, mask=inb, other=0.0).to(tl.float32)
+    mask = tl.load(mask_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    mask = tl.where(inb, mask, 1.0)
+
+    s = tl.load(s_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    dv_post = tl.load(dv_post_ptrs, boundary_check=(0,), padding_option="zero").to(
+        tl.float32
+    )
 
     a = tl.exp(-dt / tau)
 
     # recompute v_prime and u
-    I_sum = tl.zeros([BLOCK], dtype=tl.float32)
-    base = i * M
-    for m in tl.static_range(0, M):
-        I_m = tl.load(I_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-        I_sum += I_m
+    I_ptrs = tl.make_block_ptr(
+        base=I_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    k_ptrs = tl.make_block_ptr(
+        base=k_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    asc_ptrs = tl.make_block_ptr(
+        base=asc_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    dI_post_ptrs = tl.make_block_ptr(
+        base=dI_post_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    dI_ptrs = tl.make_block_ptr(
+        base=dI_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+    dasc_ptrs = tl.make_block_ptr(
+        base=dasc_ptr,
+        shape=(B, M),
+        strides=(M, 1),
+        offsets=(offs_b, 0),
+        block_shape=(BLOCK, M),
+        order=(1, 0),
+    )
+
+    I_block = tl.load(I_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
+    I_sum = tl.sum(I_block, axis=1)
 
     v_inf = v_rest + tau * (x + I_sum) / c_m
     v_prime = v_inf + (v - v_inf) * a
@@ -529,15 +1287,16 @@ def glif3_bwd(
         ds_from_v = dv_post * (-(v_th - v_reset))
 
     # ds gradient from Iasc jump: I_post = I_dec + asc*s
-    dI_s_sum = tl.zeros([BLOCK], dtype=tl.float32)
-    for m in tl.static_range(0, M):
-        dI_post_m = tl.load(dI_post_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-        asc_m = tl.load(asc_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-        dI_s_sum += dI_post_m * asc_m
-        # grad wrt asc_amps: dL/dasc = dI_post * s
-        tl.store(dasc_ptr + base + m, (dI_post_m * s).to(tl.float32), mask=inb)
+    dI_post = tl.load(dI_post_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
+    asc = tl.load(asc_ptrs, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+    dI_s_sum = tl.sum(dI_post * asc, axis=1)
+    # grad wrt asc_amps: dL/dasc = dI_post * s
+    dasc = dI_post * s[:, None]
+    tl.store(dasc_ptrs, dasc.to(tl.float32), boundary_check=(0, 1))
 
-    ds_out = tl.load(ds_ptr + i, mask=inb, other=0.0).to(tl.float32)
+    ds_out = tl.load(ds_ptrs, boundary_check=(0,), padding_option="zero").to(tl.float32)
     ds_total = ds_from_v + dI_s_sum + ds_out
     dvprime = dvprime + ds_total * ds_dvprime
 
@@ -550,17 +1309,29 @@ def glif3_bwd(
     dI_common = dv_inf * (tau / c_m)
 
     # Iasc decay + add dI_common
-    for m in tl.static_range(0, M):
-        I_m = tl.load(I_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-        k_m = tl.load(k_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-        b = tl.exp(-k_m * dt)
+    k = tl.load(k_ptrs, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+    b = tl.exp(-k * dt)
+    dI = dI_post * b + dI_common[:, None]
+    tl.store(dI_ptrs, dI.to(tl.float32), boundary_check=(0, 1))
 
-        dI_post_m = tl.load(dI_post_ptr + base + m, mask=inb, other=0.0).to(tl.float32)
-        dI_m = dI_post_m * b + dI_common
-        tl.store(dI_ptr + base + m, dI_m.to(tl.float32), mask=inb)
-
-    tl.store(dv_ptr + i, dv.to(tl.float32), mask=inb)
-    tl.store(dx_ptr + i, dx.to(tl.float32), mask=inb)
+    dv_ptrs = tl.make_block_ptr(
+        base=dv_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    dx_ptrs = tl.make_block_ptr(
+        base=dx_ptr,
+        shape=(B,),
+        strides=(1,),
+        offsets=(offs_b,),
+        block_shape=(BLOCK,),
+        order=(0,),
+    )
+    tl.store(dv_ptrs, dv.to(tl.float32), boundary_check=(0,))
+    tl.store(dx_ptrs, dx.to(tl.float32), boundary_check=(0,))
 
 
 # ----------------------------
