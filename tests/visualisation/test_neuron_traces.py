@@ -294,7 +294,7 @@ def test_plot_neuron_traces_multi_column_neurons():
 
 
 def test_plot_neuron_traces_custom_side_labels_callable():
-    """Test custom side labels via callable."""
+    """Test custom top labels via callable in multi-column layout."""
     n_time, n_neurons = 120, 3
     voltage = -65 + 2 * np.random.randn(n_time, n_neurons)
     asc = -10 * np.random.exponential(1, (n_time, n_neurons))
@@ -307,14 +307,26 @@ def test_plot_neuron_traces_custom_side_labels_callable():
         dt=0.1,
         neuron_indices=[0, 2],
         neuron_labels=lambda idx: f"Cell-{idx}",
+        neuron_label_position="top",
+        neurons_per_row=2,
     )
 
-    labels = [text.get_text() for ax in fig.axes for text in ax.texts]
-    assert sorted([label for label in labels if label.startswith("Cell-")]) == [
+    labels = [text for ax in fig.axes for text in ax.texts]
+    label_texts = [
+        text.get_text() for text in labels if text.get_text().startswith("Cell-")
+    ]
+    assert sorted(label_texts) == [
         "Cell-0",
         "Cell-2",
     ]
+    # For top placement, labels are rendered in dedicated label-row axes.
+    assert all(
+        len(text.axes.lines) == 0
+        for text in labels
+        if text.get_text().startswith("Cell-")
+    )
 
+    save_fig(fig, name="neuron_traces_top_labels_callable")
     plt.close(fig)
 
 

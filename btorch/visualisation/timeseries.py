@@ -1381,6 +1381,9 @@ class TracePlotFormat:
         figsize_per_neuron: Figure size per neuron row (width, height)
         neuron_labels: Side labels as sequence or callable(neuron_idx) -> str.
             Default None disables side labels.
+        neuron_label_position: Position for neuron labels when enabled.
+            "side" places labels at the right of each neuron slot; "top"
+            places labels above each neuron slot.
         neurons_per_row: Number of neurons to place per row in combined mode
     """
 
@@ -1396,6 +1399,7 @@ class TracePlotFormat:
     colors: dict[str, str] | None = None
     figsize_per_neuron: tuple[float, float] = (12, 2.5)
     neuron_labels: Sequence[str] | Callable[[int], str] | None = None
+    neuron_label_position: Literal["side", "top"] = "side"
     neuron_specs: list[NeuronSpec | dict] | NeuronSpec | dict | None = None
     neurons_per_row: int | None = None
 
@@ -1421,6 +1425,7 @@ def plot_neuron_traces(
     show_asc: bool = True,
     show_psc: bool = True,
     neuron_labels: Sequence[str] | Callable[[int], str] | None = None,
+    neuron_label_position: Literal["side", "top"] = "side",
     neuron_specs: list[NeuronSpec | dict] | NeuronSpec | dict | None = None,
     neurons_df: pd.DataFrame | None = None,
     separate_figures: bool = False,
@@ -1453,6 +1458,8 @@ def plot_neuron_traces(
         show_psc: Show PSC subplot
         neuron_labels: Side labels as sequence or callable(neuron_idx) -> str.
             Default None disables side labels.
+        neuron_label_position: Position for neuron labels when enabled.
+            "side" or "top".
         neuron_specs: Specifications for per-neuron styling (scalar or list)
         neurons_df: DataFrame with neuron metadata for labels
         separate_figures: Return dict of figures (one per trace type)
@@ -1484,6 +1491,7 @@ def plot_neuron_traces(
         show_asc = format.show_asc
         show_psc = format.show_psc
         neuron_labels = format.neuron_labels if neuron_labels is None else neuron_labels
+        neuron_label_position = format.neuron_label_position
         neuron_specs = format.neuron_specs if neuron_specs is None else neuron_specs
         separate_figures = format.separate_figures
         auto_width = format.auto_width
@@ -1638,16 +1646,28 @@ def plot_neuron_traces(
                     ax.set_xlabel("Time (ms)")
                 ax.grid(alpha=0.3, linewidth=0.5)
                 if label is not None:
-                    ax.text(
-                        1.02,
-                        0.5,
-                        label,
-                        transform=ax.transAxes,
-                        fontsize=10,
-                        fontweight="bold",
-                        va="center",
-                        ha="left",
-                    )
+                    if neuron_label_position == "top":
+                        ax.text(
+                            0.5,
+                            1.12,
+                            label,
+                            transform=ax.transAxes,
+                            fontsize=10,
+                            fontweight="bold",
+                            va="bottom",
+                            ha="center",
+                        )
+                    else:
+                        ax.text(
+                            1.02,
+                            0.5,
+                            label,
+                            transform=ax.transAxes,
+                            fontsize=10,
+                            fontweight="bold",
+                            va="center",
+                            ha="left",
+                        )
 
             plt.tight_layout()
             figures[t_type] = fig
@@ -1669,16 +1689,28 @@ def plot_neuron_traces(
 
     n_rows = int(ceil(n_plot / neurons_per_row))
     total_cols = n_cols * neurons_per_row
-    total_height_grid = height_per_row * n_rows
+    use_top_label_rows = neuron_label_position == "top"
+    total_height_grid = height_per_row * n_rows * (1.2 if use_top_label_rows else 1.0)
     # Keep enough width per trace column to avoid label crowding.
     base_width = max(base_width, 4.0 * n_cols)
     fig_width = base_width * neurons_per_row
+    n_grid_rows = n_rows * 2 if use_top_label_rows else n_rows
+    gridspec_kw = (
+        {"height_ratios": [v for _ in range(n_rows) for v in (0.22, 1.0)]}
+        if use_top_label_rows
+        else None
+    )
     fig, axes = plt.subplots(
-        n_rows,
+        n_grid_rows,
         total_cols,
         figsize=(fig_width, total_height_grid),
         squeeze=False,
+        gridspec_kw=gridspec_kw,
     )
+    if use_top_label_rows:
+        for label_row in range(0, n_grid_rows, 2):
+            for c in range(total_cols):
+                axes[label_row, c].set_axis_off()
 
     asc_arr = _to_numpy(asc) if _show_asc else None
     psc_arr = _to_numpy(psc) if _show_psc else None
@@ -1688,6 +1720,7 @@ def plot_neuron_traces(
         row_idx = plot_idx // neurons_per_row
         slot_idx = plot_idx % neurons_per_row
         col_base = slot_idx * n_cols
+        plot_row = row_idx * 2 + 1 if use_top_label_rows else row_idx
 
         # Resolve spec
         spec = NeuronSpec()
@@ -1717,7 +1750,7 @@ def plot_neuron_traces(
 
         # Voltage subplot
         if _show_v:
-            ax = axes[row_idx, col_idx]
+            ax = axes[plot_row, col_idx]
             _plot_voltage_on_ax(
                 ax,
                 times,
@@ -1742,12 +1775,12 @@ def plot_neuron_traces(
             if row_idx == n_rows - 1:
                 ax.set_xlabel("Time (ms)")
             ax.grid(alpha=0.3, linewidth=0.5)
-            used_axes.add((row_idx, col_idx))
+            used_axes.add((plot_row, col_idx))
             col_idx += 1
 
         # ASC subplot
         if _show_asc and asc_arr is not None:
-            ax = axes[row_idx, col_idx]
+            ax = axes[plot_row, col_idx]
             _plot_simple_trace_on_ax(
                 ax,
                 times,
@@ -1763,12 +1796,12 @@ def plot_neuron_traces(
             if row_idx == n_rows - 1:
                 ax.set_xlabel("Time (ms)")
             ax.grid(alpha=0.3, linewidth=0.5)
-            used_axes.add((row_idx, col_idx))
+            used_axes.add((plot_row, col_idx))
             col_idx += 1
 
         # PSC subplot
         if _show_psc and psc_arr is not None:
-            ax = axes[row_idx, col_idx]
+            ax = axes[plot_row, col_idx]
             epsc_arr = _to_numpy(epsc[:, neuron_idx]) if epsc is not None else None
             ipsc_arr = _to_numpy(ipsc[:, neuron_idx]) if ipsc is not None else None
             _plot_psc_on_ax(
@@ -1789,30 +1822,46 @@ def plot_neuron_traces(
             if row_idx == n_rows - 1:
                 ax.set_xlabel("Time (ms)")
             ax.grid(alpha=0.3, linewidth=0.5)
-            used_axes.add((row_idx, col_idx))
+            used_axes.add((plot_row, col_idx))
             col_idx += 1
 
         if label is not None:
-            # Add label to the rightmost subplot in this neuron slot.
-            last_ax = axes[row_idx, col_base + n_cols - 1]
-            last_ax.text(
-                1.02,
-                0.5,
-                label,
-                transform=last_ax.transAxes,
-                fontsize=10,
-                fontweight="bold",
-                va="center",
-                ha="left",
-            )
+            if use_top_label_rows:
+                label_row = row_idx * 2
+                label_ax = axes[label_row, col_base + (n_cols - 1) // 2]
+                label_ax.text(
+                    0.5,
+                    0.5,
+                    label,
+                    transform=label_ax.transAxes,
+                    fontsize=10,
+                    fontweight="bold",
+                    va="center",
+                    ha="center",
+                )
+            else:
+                # Add label to the rightmost subplot in this neuron slot.
+                last_ax = axes[plot_row, col_base + n_cols - 1]
+                last_ax.text(
+                    1.02,
+                    0.5,
+                    label,
+                    transform=last_ax.transAxes,
+                    fontsize=10,
+                    fontweight="bold",
+                    va="center",
+                    ha="left",
+                )
 
-    # Hide unused axes for empty neuron slots in the final row.
+    # Hide unused plot axes for empty neuron slots in the final row.
     for r in range(n_rows):
+        plot_row = r * 2 + 1 if use_top_label_rows else r
         for c in range(total_cols):
-            if (r, c) not in used_axes:
-                axes[r, c].set_visible(False)
+            if (plot_row, c) not in used_axes:
+                axes[plot_row, c].set_visible(False)
 
-    fig.tight_layout(rect=(0.0, 0.0, 0.96, 1.0), w_pad=0.8, h_pad=0.8)
+    right_margin = 0.96 if neuron_label_position == "side" else 1.0
+    fig.tight_layout(rect=(0.0, 0.0, right_margin, 1.0), w_pad=0.8, h_pad=0.8)
     return fig
 
 
