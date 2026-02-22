@@ -197,7 +197,8 @@ def test_multiscale_fano_error_grouped_no_metadata():
 
 def test_plot_avalanche_analysis():
     # Generate random spike data
-    spikes = (np.random.rand(100, 10) > 0.8).astype(int)
+    rng = np.random.default_rng(0)
+    spikes = (rng.random((2000, 10)) < 0.05).astype(int)
     fig, res = plot_avalanche_analysis(spikes, bin_size=1)
     save_fig(fig, name="avalanche_analysis")
     plt.close(fig)

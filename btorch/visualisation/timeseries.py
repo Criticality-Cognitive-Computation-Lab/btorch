@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from typing import Any, Literal, Sequence, Union
+from math import ceil
+from typing import Any, Callable, Literal, Sequence, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -25,6 +26,44 @@ def _to_numpy(data: Any) -> np.ndarray:
     return np.asarray(data)
 
 
+def _resolve_per_neuron_values(
+    value: float | Sequence[float] | np.ndarray | torch.Tensor | None,
+    neuron_indices: list[int],
+    n_neurons: int,
+    name: str,
+) -> list[float | None]:
+    """Resolve scalar or vector input to per-plotted-neuron values."""
+    n_plot = len(neuron_indices)
+    if value is None:
+        return [None] * n_plot
+
+    if np.isscalar(value):
+        return [float(value)] * n_plot
+
+    arr = _to_numpy(value)
+    if arr.ndim == 0:
+        return [float(arr)] * n_plot
+    if arr.ndim != 1:
+        raise ValueError(
+            f"{name} must be a scalar or 1D array-like, got shape {arr.shape}."
+        )
+
+    if arr.shape[0] == n_neurons:
+        selected = arr[np.asarray(neuron_indices, dtype=int)]
+    elif arr.shape[0] == n_plot:
+        selected = arr
+    else:
+        raise ValueError(
+            f"{name} must be a scalar, length {n_neurons} (all neurons), or "
+            f"length {n_plot} (plotted neurons), got length {arr.shape[0]}."
+        )
+
+    try:
+        return [float(v) for v in selected]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must contain numeric values.") from exc
+
+
 def _get_time_axis(
     length: int, dt: float | None = None, times: Sequence[float] | None = None
 ) -> np.ndarray:
@@ -41,10 +80,13 @@ def _get_time_axis(
 
 
 def _sample_cmap_colors(cmap_name: str, n: int) -> list[str]:
-    cmap = plt.get_cmap(cmap_name)
     if n <= 1:
+        cmap = plt.get_cmap(cmap_name, 1)
         return [to_hex(cmap(0.0))]
-    vals = np.linspace(0, 1, n)
+    # Request a colormap with N=n to avoid duplicate bins for ListedColormap
+    # (e.g., tab10) when n exceeds the base number of colors.
+    cmap = plt.get_cmap(cmap_name, n)
+    vals = np.linspace(0, 1, n, endpoint=True)
     return [to_hex(cmap(v)) for v in vals]
 
 
@@ -1306,8 +1348,8 @@ class SimulationStates:
         epsc: Excitatory PSC (time, neurons)
         ipsc: Inhibitory PSC (time, neurons)
         spikes: Spike trains (time, neurons)
-        v_threshold: Spike threshold voltage
-        v_reset: Reset voltage
+        v_threshold: Spike threshold voltage(s), scalar or per-neuron
+        v_reset: Reset voltage(s), scalar or per-neuron
     """
 
     voltage: np.ndarray | torch.Tensor
@@ -1317,8 +1359,8 @@ class SimulationStates:
     epsc: np.ndarray | torch.Tensor | None = None
     ipsc: np.ndarray | torch.Tensor | None = None
     spikes: np.ndarray | torch.Tensor | None = None
-    v_threshold: float | None = None
-    v_reset: float | None = None
+    v_threshold: float | Sequence[float] | np.ndarray | torch.Tensor | None = None
+    v_reset: float | Sequence[float] | np.ndarray | torch.Tensor | None = None
 
 
 @dataclass
@@ -1337,7 +1379,9 @@ class TracePlotFormat:
         auto_width: Adjust figure width based on simulation duration
         colors: Color mapping for different traces
         figsize_per_neuron: Figure size per neuron row (width, height)
-        neuron_labels: Custom labels for each neuron
+        neuron_labels: Side labels as sequence or callable(neuron_idx) -> str.
+            Default None disables side labels.
+        neurons_per_row: Number of neurons to place per row in combined mode
     """
 
     neuron_indices: list[int] | None = None
@@ -1351,8 +1395,9 @@ class TracePlotFormat:
     auto_width: bool = True
     colors: dict[str, str] | None = None
     figsize_per_neuron: tuple[float, float] = (12, 2.5)
-    neuron_labels: list[str] | None = None
+    neuron_labels: Sequence[str] | Callable[[int], str] | None = None
     neuron_specs: list[NeuronSpec | dict] | NeuronSpec | dict | None = None
+    neurons_per_row: int | None = None
 
 
 def plot_neuron_traces(
@@ -1367,19 +1412,20 @@ def plot_neuron_traces(
     epsc: np.ndarray | torch.Tensor | None = None,
     ipsc: np.ndarray | torch.Tensor | None = None,
     spikes: np.ndarray | torch.Tensor | None = None,
-    v_threshold: float | None = None,
-    v_reset: float | None = None,
+    v_threshold: float | Sequence[float] | np.ndarray | torch.Tensor | None = None,
+    v_reset: float | Sequence[float] | np.ndarray | torch.Tensor | None = None,
     neuron_indices: list[int] | None = None,
     sample_size: int | None = None,
     seed: int = 42,
     show_voltage: bool = True,
     show_asc: bool = True,
     show_psc: bool = True,
-    neuron_labels: list[str] | None = None,
+    neuron_labels: Sequence[str] | Callable[[int], str] | None = None,
     neuron_specs: list[NeuronSpec | dict] | NeuronSpec | dict | None = None,
     neurons_df: pd.DataFrame | None = None,
     separate_figures: bool = False,
     auto_width: bool = True,
+    neurons_per_row: int | None = None,
 ) -> Figure | dict[str, Figure]:
     """Plot neuron state traces with flexible interface.
 
@@ -1396,8 +1442,8 @@ def plot_neuron_traces(
         epsc: Excitatory PSC traces
         ipsc: Inhibitory PSC traces
         spikes: Spike trains
-        v_threshold: Spike threshold for marking
-        v_reset: Reset voltage reference line
+        v_threshold: Spike threshold(s), scalar or per-neuron values
+        v_reset: Reset voltage reference line(s), scalar or per-neuron values
         neuron_indices: Specific neurons to plot
         sample_size: Number of neurons to randomly sample
         seed: Random seed for sampling
@@ -1405,11 +1451,13 @@ def plot_neuron_traces(
         show_asc: Show ASC subplot
         show_psc: Show PSC subplot
         show_psc: Show PSC subplot
-        neuron_labels: Custom labels for neurons
+        neuron_labels: Side labels as sequence or callable(neuron_idx) -> str.
+            Default None disables side labels.
         neuron_specs: Specifications for per-neuron styling (scalar or list)
         neurons_df: DataFrame with neuron metadata for labels
         separate_figures: Return dict of figures (one per trace type)
         auto_width: Adjust width based on duration
+        neurons_per_row: Number of neurons per row in combined figure
 
     Returns:
         Figure with neuron trace subplots OR dict of Figures
@@ -1439,6 +1487,9 @@ def plot_neuron_traces(
         neuron_specs = format.neuron_specs if neuron_specs is None else neuron_specs
         separate_figures = format.separate_figures
         auto_width = format.auto_width
+        neurons_per_row = (
+            format.neurons_per_row if neurons_per_row is None else neurons_per_row
+        )
 
     # Validate required data
     if voltage is None:
@@ -1462,6 +1513,17 @@ def plot_neuron_traces(
         )
 
     n_plot = len(neuron_indices)
+    if neurons_per_row is None:
+        neurons_per_row = 1
+    if neurons_per_row < 1:
+        raise ValueError("neurons_per_row must be >= 1")
+
+    v_threshold_per_neuron = _resolve_per_neuron_values(
+        v_threshold, neuron_indices, n_neurons, "v_threshold"
+    )
+    v_reset_per_neuron = _resolve_per_neuron_values(
+        v_reset, neuron_indices, n_neurons, "v_reset"
+    )
 
     # Determine figure dimensions
     base_width = 12.0
@@ -1485,20 +1547,23 @@ def plot_neuron_traces(
     }
     colors = format.colors if format and format.colors else default_colors
 
-    # Generate labels
-    if neuron_labels is None and neurons_df is not None:
-        # Try to get labels from dataframe
-        if "cell_type" in neurons_df.columns:
-            neuron_labels = [
-                f"N{idx}: {neurons_df.iloc[idx]['cell_type']}"
-                if idx < len(neurons_df)
-                else f"N{idx}"
-                for idx in neuron_indices
-            ]
-        else:
-            neuron_labels = [f"Neuron {idx}" for idx in neuron_indices]
-    elif neuron_labels is None:
-        neuron_labels = [f"Neuron {idx}" for idx in neuron_indices]
+    label_values: Sequence[str] | None = None
+    label_fn: Callable[[int], str] | None = None
+    if callable(neuron_labels):
+        label_fn = neuron_labels
+    elif neuron_labels is not None:
+        label_values = neuron_labels
+
+    def _resolve_side_label(
+        plot_idx: int, neuron_idx: int, spec: NeuronSpec | None = None
+    ) -> str | None:
+        if spec is not None and spec.label is not None:
+            return spec.label
+        if label_fn is not None:
+            return str(label_fn(neuron_idx))
+        if label_values is not None and plot_idx < len(label_values):
+            return str(label_values[plot_idx])
+        return None
 
     # Determine subplot layout based on data availability
     # Only show columns if requested AND data is present
@@ -1521,8 +1586,9 @@ def plot_neuron_traces(
                 n_plot, 1, figsize=(base_width, total_height), squeeze=False
             )
 
-            for i, (neuron_idx, label) in enumerate(zip(neuron_indices, neuron_labels)):
+            for i, neuron_idx in enumerate(neuron_indices):
                 ax = axes[i, 0]
+                label = _resolve_side_label(i, neuron_idx)
 
                 if t_type == "voltage":
                     _plot_voltage_on_ax(
@@ -1532,12 +1598,17 @@ def plot_neuron_traces(
                         spikes[:, neuron_idx] if spikes is not None else None,
                         colors,
                         format,
-                        v_threshold,
-                        v_reset,
+                        v_threshold_per_neuron[i],
+                        v_reset_per_neuron[i],
                     )
                     ax.set_ylabel("V (mV)")
                     if i == 0:
                         ax.set_title("Voltage Traces")
+                        if (
+                            v_threshold_per_neuron[i] is not None
+                            or v_reset_per_neuron[i] is not None
+                        ):
+                            ax.legend(loc="upper right", fontsize=8)
 
                 elif t_type == "asc":
                     asc_arr = _to_numpy(asc)
@@ -1558,7 +1629,6 @@ def plot_neuron_traces(
                     _plot_psc_on_ax(
                         ax, times, psc_arr[:, neuron_idx], epsc_arr, ipsc_arr, colors
                     )
-                    ax.set_ylabel("PSC (pA)")
                     if i == 0:
                         ax.set_title("Postsynaptic Current")
                         if epsc is not None or ipsc is not None:
@@ -1567,23 +1637,24 @@ def plot_neuron_traces(
                 if i == n_plot - 1:
                     ax.set_xlabel("Time (ms)")
                 ax.grid(alpha=0.3, linewidth=0.5)
-                ax.text(
-                    1.02,
-                    0.5,
-                    label,
-                    transform=ax.transAxes,
-                    fontsize=10,
-                    fontweight="bold",
-                    va="center",
-                    ha="left",
-                )
+                if label is not None:
+                    ax.text(
+                        1.02,
+                        0.5,
+                        label,
+                        transform=ax.transAxes,
+                        fontsize=10,
+                        fontweight="bold",
+                        va="center",
+                        ha="left",
+                    )
 
             plt.tight_layout()
             figures[t_type] = fig
 
         return figures
 
-    # Combined Figure (Original Logic)
+    # Combined figure
     n_cols = sum([_show_v, _show_asc, _show_psc])
     if n_cols == 0:
         # Default fallback: if nothing strictly requested by data presence,
@@ -1596,42 +1667,41 @@ def plot_neuron_traces(
                 "No data available to plot (voltage, asc, or psc required)"
             )
 
+    n_rows = int(ceil(n_plot / neurons_per_row))
+    total_cols = n_cols * neurons_per_row
+    total_height_grid = height_per_row * n_rows
+    # Keep enough width per trace column to avoid label crowding.
+    base_width = max(base_width, 4.0 * n_cols)
+    fig_width = base_width * neurons_per_row
     fig, axes = plt.subplots(
-        n_plot, n_cols, figsize=(base_width, total_height), squeeze=False
+        n_rows,
+        total_cols,
+        figsize=(fig_width, total_height_grid),
+        squeeze=False,
     )
 
-    for row_idx, neuron_idx in enumerate(neuron_indices):
+    asc_arr = _to_numpy(asc) if _show_asc else None
+    psc_arr = _to_numpy(psc) if _show_psc else None
+    used_axes: set[tuple[int, int]] = set()
+
+    for plot_idx, neuron_idx in enumerate(neuron_indices):
+        row_idx = plot_idx // neurons_per_row
+        slot_idx = plot_idx % neurons_per_row
+        col_base = slot_idx * n_cols
+
         # Resolve spec
         spec = NeuronSpec()
         if neuron_specs is not None:
             if isinstance(neuron_specs, list):
-                if row_idx < len(neuron_specs):
-                    s = neuron_specs[row_idx]
-                    if isinstance(s, dict):
-                        spec = NeuronSpec(**s)
-                    else:
-                        spec = s
+                if plot_idx < len(neuron_specs):
+                    s = neuron_specs[plot_idx]
+                    spec = NeuronSpec(**s) if isinstance(s, dict) else s
             elif isinstance(neuron_specs, dict):
                 spec = NeuronSpec(**neuron_specs)
             elif isinstance(neuron_specs, NeuronSpec):
                 spec = neuron_specs
 
-        # Label resolution: Spec > Argument > DataFrame > Default
-        label = spec.label
-        if label is None:
-            if neuron_labels is not None and row_idx < len(neuron_labels):
-                label = neuron_labels[row_idx]
-            elif neurons_df is not None:
-                if "cell_type" in neurons_df.columns:
-                    label = (
-                        f"N{neuron_idx}: {neurons_df.iloc[neuron_idx]['cell_type']}"
-                        if neuron_idx < len(neurons_df)
-                        else f"N{neuron_idx}"
-                    )
-                else:
-                    label = f"Neuron {neuron_idx}"
-            else:
-                label = f"Neuron {neuron_idx}"
+        label = _resolve_side_label(plot_idx, neuron_idx, spec)
 
         # Color resolution
         local_colors = colors.copy()
@@ -1640,10 +1710,10 @@ def plot_neuron_traces(
                 local_colors.update(spec.color)
             else:
                 for k in local_colors:
-                    if k != "spike":  # Keep spike color distinct usually, or override?
+                    if k != "spike":
                         local_colors[k] = spec.color
 
-        col_idx = 0
+        col_idx = col_base
 
         # Voltage subplot
         if _show_v:
@@ -1655,8 +1725,8 @@ def plot_neuron_traces(
                 spikes[:, neuron_idx] if spikes is not None else None,
                 local_colors,
                 format,
-                v_threshold,
-                v_reset,
+                v_threshold_per_neuron[plot_idx],
+                v_reset_per_neuron[plot_idx],
                 linestyle=spec.linestyle,
                 linewidth=spec.linewidth,
                 alpha=spec.alpha,
@@ -1664,15 +1734,20 @@ def plot_neuron_traces(
             ax.set_ylabel("V (mV)")
             if row_idx == 0:
                 ax.set_title("Voltage")
-            if row_idx == n_plot - 1:
+                if (
+                    v_threshold_per_neuron[plot_idx] is not None
+                    or v_reset_per_neuron[plot_idx] is not None
+                ):
+                    ax.legend(loc="upper right", fontsize=8)
+            if row_idx == n_rows - 1:
                 ax.set_xlabel("Time (ms)")
             ax.grid(alpha=0.3, linewidth=0.5)
+            used_axes.add((row_idx, col_idx))
             col_idx += 1
 
         # ASC subplot
-        if _show_asc:
+        if _show_asc and asc_arr is not None:
             ax = axes[row_idx, col_idx]
-            asc_arr = _to_numpy(asc)
             _plot_simple_trace_on_ax(
                 ax,
                 times,
@@ -1685,15 +1760,15 @@ def plot_neuron_traces(
             )
             if row_idx == 0:
                 ax.set_title("Afterspike Current")
-            if row_idx == n_plot - 1:
+            if row_idx == n_rows - 1:
                 ax.set_xlabel("Time (ms)")
             ax.grid(alpha=0.3, linewidth=0.5)
+            used_axes.add((row_idx, col_idx))
             col_idx += 1
 
         # PSC subplot
-        if _show_psc:
+        if _show_psc and psc_arr is not None:
             ax = axes[row_idx, col_idx]
-            psc_arr = _to_numpy(psc)
             epsc_arr = _to_numpy(epsc[:, neuron_idx]) if epsc is not None else None
             ipsc_arr = _to_numpy(ipsc[:, neuron_idx]) if ipsc is not None else None
             _plot_psc_on_ax(
@@ -1711,14 +1786,15 @@ def plot_neuron_traces(
                 ax.set_title("Postsynaptic Current")
                 if epsc is not None or ipsc is not None:
                     ax.legend(loc="upper right", fontsize=8)
-            if row_idx == n_plot - 1:
+            if row_idx == n_rows - 1:
                 ax.set_xlabel("Time (ms)")
             ax.grid(alpha=0.3, linewidth=0.5)
+            used_axes.add((row_idx, col_idx))
             col_idx += 1
 
-        # Add label to the rightmost subplot of the row
-        if n_cols > 0:
-            last_ax = axes[row_idx, n_cols - 1]
+        if label is not None:
+            # Add label to the rightmost subplot in this neuron slot.
+            last_ax = axes[row_idx, col_base + n_cols - 1]
             last_ax.text(
                 1.02,
                 0.5,
@@ -1730,7 +1806,13 @@ def plot_neuron_traces(
                 ha="left",
             )
 
-    plt.tight_layout()
+    # Hide unused axes for empty neuron slots in the final row.
+    for r in range(n_rows):
+        for c in range(total_cols):
+            if (r, c) not in used_axes:
+                axes[r, c].set_visible(False)
+
+    fig.tight_layout(rect=(0.0, 0.0, 0.96, 1.0), w_pad=0.8, h_pad=0.8)
     return fig
 
 
@@ -1768,15 +1850,22 @@ def _plot_voltage_on_ax(
     # Reference lines
     if v_th is not None:
         ax.axhline(
-            v_th, color="gray", linestyle="--", linewidth=0.8, alpha=0.5, label="V_th"
+            v_th,
+            color="#555555",
+            linestyle="--",
+            linewidth=1.2,
+            alpha=0.9,
+            zorder=4,
+            label="V_th",
         )
     if v_reset is not None:
         ax.axhline(
             v_reset,
-            color="gray",
+            color="#555555",
             linestyle=":",
-            linewidth=0.8,
-            alpha=0.5,
+            linewidth=1.2,
+            alpha=0.9,
+            zorder=4,
             label="V_reset",
         )
 
@@ -1838,3 +1927,4 @@ def _plot_psc_on_ax(
             linestyle="--",
             label="IPSC",
         )
+    ax.set_ylabel("PSC (pA)")

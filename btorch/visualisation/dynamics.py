@@ -553,7 +553,8 @@ def plot_avalanche_analysis(
     ax1.set_xlabel("Avalanche Size (S)")
     ax1.set_ylabel("P(S)")
     ax1.set_title("Size Distribution")
-    ax1.legend()
+    if ax1.get_legend_handles_labels()[0]:
+        ax1.legend()
 
     # 2. Duration Distribution P(T)
     ax2 = fig.add_subplot(1, 3, 2)
@@ -568,7 +569,8 @@ def plot_avalanche_analysis(
     ax2.set_xlabel("Avalanche Duration (T)")
     ax2.set_ylabel("P(T)")
     ax2.set_title("Duration Distribution")
-    ax2.legend()
+    if ax2.get_legend_handles_labels()[0]:
+        ax2.legend()
 
     # 3. Average Size vs Duration <S>(T)
     ax3 = fig.add_subplot(1, 3, 3)
