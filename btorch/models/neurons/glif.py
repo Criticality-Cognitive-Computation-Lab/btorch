@@ -14,6 +14,15 @@ from ..surrogate import ATan
 from ..types import TensorLike
 
 
+def get_rheobase(v_threshold, v_rest, c_m, tau):
+    """Calculate rheobase current, the minimum constant input current required
+    to make the neuron fire."""
+    # For GLIF3, rheobase can be calculated as:
+    # I_rheobase = (v_threshold - v_rest) * c_m / tau
+    I_rheobase = (v_threshold - v_rest) * c_m / tau
+    return I_rheobase
+
+
 class GLIF3(BaseNode, SupportScaleState):
     """GLIF3 model as described in [1]. Leaky integrate and fire model with
     refractory period and after spike currents.
@@ -184,6 +193,11 @@ class GLIF3(BaseNode, SupportScaleState):
             self.refractory = torch.relu(
                 self.refractory + spike_d * self.tau_ref - environ.get("dt")
             )
+
+    def get_rheobase(self):
+        """Calculate rheobase current, the minimum constant input current
+        required to make the neuron fire."""
+        return get_rheobase(self.v_threshold, self.v_rest, self.c_m, self.tau)
 
     def extra_repr(self):
         parts = [
