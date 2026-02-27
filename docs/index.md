@@ -8,6 +8,11 @@ Welcome! Documentation is under construction. Planned sections include:
 
 For now, see `README.md` for usage notes. Contributions to the docs are welcome.
 
+## Current API Pages
+
+- `Connection Conversion`: conversion between base and heter layouts for
+  dense and sparse connection layers.
+
 ## Shape Conventions
 
 - Most stateful models accept inputs shaped as `(*batch, *neuron)`.

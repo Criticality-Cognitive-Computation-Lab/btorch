@@ -321,6 +321,7 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
     """
 
     enforce_dale: bool
+    persist_initial_weight: bool
     initial_weight: torch.Tensor
     magnitude: torch.nn.Parameter
     _constraint_scatter_indices: torch.Tensor
@@ -335,6 +336,7 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
         sparse_backend: SparseBackend | None = None,
         device=None,
         dtype=None,
+        persist_initial_weight: bool = False,
     ):
         """
         Args:
@@ -345,8 +347,11 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
             enforce_dale (bool): If True, applies ReLU to enforce Dale's law.
             bias (Tensor, optional): Optional bias of shape (num_dst,).
             sparse_backend: "native" or "torch_sparse".
+            persist_initial_weight: If True, saves ``initial_weight`` in
+                ``state_dict`` for checkpoint reproducibility.
         """
         self.enforce_dale = enforce_dale
+        self.persist_initial_weight = persist_initial_weight
         self.constraint_info = None  # Will be populated by from_hetersynapse
         constraint = constraint.T
         constraint.eliminate_zeros()
@@ -363,7 +368,11 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
 
     def _init_weights(self, value: torch.Tensor):
         initial_weight = value
-        self.register_buffer("initial_weight", initial_weight, persistent=False)
+        self.register_buffer(
+            "initial_weight",
+            initial_weight,
+            persistent=self.persist_initial_weight,
+        )
         num_groups = int(self._constraint_matrix.data.max())
         self.magnitude = nn.Parameter(torch.empty(num_groups))
         self.register_buffer(
@@ -425,6 +434,7 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
         sparse_backend: SparseBackend | None = None,
         device=None,
         dtype=None,
+        persist_initial_weight: bool = False,
     ) -> "SparseConstrainedConn":
         """Create from make_hetersynapse_constrained_conn() output.
 
@@ -437,6 +447,8 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
             sparse_backend: "native" or "torch_sparse"
             device: Device to place tensors on
             dtype: Data type for tensors
+            persist_initial_weight: If True, includes ``initial_weight`` in
+                ``state_dict``.
 
         Returns:
             SparseConstrainedConn instance with constraint_info populated
@@ -449,6 +461,7 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
             sparse_backend=sparse_backend,
             device=device,
             dtype=dtype,
+            persist_initial_weight=persist_initial_weight,
         )
         instance.constraint_info = {
             "receptor_type_index": receptor_type_index,

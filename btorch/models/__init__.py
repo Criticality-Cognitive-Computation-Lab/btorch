@@ -1,5 +1,6 @@
 from . import (
     base,
+    connection_conversion,
     constrain,
     conv,
     environ,
@@ -15,6 +16,7 @@ from .neurons import alif, glif, lif
 
 __all__ = [
     "base",
+    "connection_conversion",
     "constrain",
     "conv",
     "environ",

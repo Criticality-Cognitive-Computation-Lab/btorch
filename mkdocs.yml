@@ -8,6 +8,7 @@ theme:
       accent: deep orange
 nav:
   - Home: index.md
+  - Connection Conversion: connection_conversion.md
 docs_dir: docs
 repo_url: https://github.com/Criticality-Cognitive-Computation-Lab/btorch
 edit_uri: ""
