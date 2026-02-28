@@ -76,7 +76,7 @@ def _plot_wave_style(ax, data_dict, time_points, show_top_n=50):
             normalized_activity + offset,
             linewidth=0.8,
             alpha=0.7,
-            label=region if i < 5 else "",
+            label=region,
         )
 
     yticks = np.arange(len(sorted_regions)) * offset_step
@@ -84,7 +84,7 @@ def _plot_wave_style(ax, data_dict, time_points, show_top_n=50):
     ax.set_yticklabels([r for r, _ in sorted_regions], fontsize=8)
 
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper right", fontsize=8)
+    # ax.legend(loc="upper right", fontsize=8)
 
 
 def _plot_heatmap_style(ax, data_dict, time_points, cmap="viridis"):
