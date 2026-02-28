@@ -1,4 +1,12 @@
-from .aggregation import agg_by_neuron, agg_by_neuropil, agg_conn
+from .aggregation import (
+    agg_by_neuron,
+    agg_by_neuropil,
+    agg_conn,
+    build_group_frame,
+    group_ecdf,
+    group_summary,
+    group_values,
+)
 from .branching import MR_estimation
 from .connectivity import HopDistanceModel, compute_ie_ratio
 from .metrics import indices_to_mask, select_on_metric
@@ -18,6 +26,10 @@ __all__ = [
     "agg_by_neuropil",
     "agg_by_neuron",
     "agg_conn",
+    "build_group_frame",
+    "group_values",
+    "group_summary",
+    "group_ecdf",
     "MR_estimation",
     "HopDistanceModel",
     "compute_ie_ratio",

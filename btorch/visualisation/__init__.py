@@ -1,3 +1,11 @@
+from .aggregation import (
+    plot_group_box,
+    plot_group_distribution,
+    plot_group_ecdf,
+    plot_group_violin,
+    plot_neuropil_timeseries_overview,
+    plot_neuropil_timeseries_panels,
+)
 from .dynamics import (
     DFAConfig,
     DynamicsData,
@@ -31,6 +39,12 @@ __all__ = [
     "animate_mem_potential",
     "hex_heatmap",
     "plot_network",
+    "plot_group_box",
+    "plot_group_distribution",
+    "plot_group_ecdf",
+    "plot_group_violin",
+    "plot_neuropil_timeseries_overview",
+    "plot_neuropil_timeseries_panels",
     "plot_agg_by_neuropil",
     "plot_neuropil_comparison",
     "plot_3d_activities",

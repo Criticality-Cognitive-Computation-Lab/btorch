@@ -1,9 +1,12 @@
+from collections.abc import Sequence
 from typing import Literal
 
 import numpy as np
 import pandas as pd
 import scipy.sparse
 import torch
+
+from ..models.types import TensorLike
 
 
 def agg_by_neuron(
@@ -151,3 +154,199 @@ def agg_conn(
         return conn.groupby(
             [f"pre_{neuron_type_column}", f"post_{neuron_type_column}"]
         )["weight"].agg(agg)
+
+
+def build_group_frame(
+    values: TensorLike,
+    neurons_df: pd.DataFrame,
+    group_by: str,
+    *,
+    simple_id_col: str = "simple_id",
+    value_name: str = "value",
+    dropna: bool = True,
+) -> pd.DataFrame:
+    """Convert neuron-aligned values to a tidy frame for grouped analyses.
+
+    Args:
+        values: Array/tensor shaped `[N]` or `[..., N]` where the last axis is
+            neuron. All leading dimensions are flattened into independent
+            samples (e.g., trials, conditions, or time points).
+        neurons_df: DataFrame containing at least `simple_id_col` and `group_by`.
+        group_by: Column in `neurons_df` used as grouping key.
+        simple_id_col: Column mapping rows in `neurons_df` to neuron index in
+            `values`.
+        value_name: Name for the output value column.
+        dropna: Drop missing values in group/value columns when `True`.
+    """
+    y = _to_numpy(values)
+    if y.ndim < 1:
+        raise ValueError("`values` must have at least one dimension.")
+
+    if simple_id_col not in neurons_df.columns:
+        raise ValueError(f"Missing `{simple_id_col}` in `neurons_df`.")
+    if group_by not in neurons_df.columns:
+        raise ValueError(f"Missing `{group_by}` in `neurons_df`.")
+
+    metadata = neurons_df.loc[:, [simple_id_col, group_by]].copy()
+    if dropna:
+        metadata = metadata.dropna(subset=[group_by])
+    if metadata.empty:
+        raise ValueError("No neuron metadata available after filtering.")
+
+    if metadata[simple_id_col].duplicated().any():
+        raise ValueError(f"`{simple_id_col}` must be unique in `neurons_df`.")
+
+    try:
+        simple_ids = pd.to_numeric(metadata[simple_id_col], errors="raise").to_numpy(
+            dtype=np.int64
+        )
+    except Exception as exc:
+        raise ValueError(f"`{simple_id_col}` must be numeric.") from exc
+
+    n_neurons = y.shape[-1]
+    out_of_range = (simple_ids < 0) | (simple_ids >= n_neurons)
+    if np.any(out_of_range):
+        bad_ids = simple_ids[out_of_range]
+        raise ValueError(
+            f"Found `{simple_id_col}` outside [0, {n_neurons - 1}]: {bad_ids.tolist()}"
+        )
+
+    selected = y[..., simple_ids]
+    n_samples = int(np.prod(selected.shape[:-1], dtype=np.int64))
+    n_samples = max(1, n_samples)
+
+    flattened = selected.reshape(n_samples, len(simple_ids))
+    group_labels = metadata[group_by].to_numpy()
+
+    frame = pd.DataFrame(
+        {
+            group_by: np.repeat(group_labels, n_samples),
+            value_name: flattened.T.reshape(-1),
+        }
+    )
+
+    if dropna:
+        frame = frame.dropna(subset=[value_name])
+    if frame.empty:
+        raise ValueError("No values available after filtering.")
+
+    return frame
+
+
+def group_values(
+    values: TensorLike,
+    neurons_df: pd.DataFrame,
+    group_by: str,
+    *,
+    simple_id_col: str = "simple_id",
+    value_name: str = "value",
+    group_order: Sequence | None = None,
+    dropna: bool = True,
+) -> dict[object, np.ndarray]:
+    """Return grouped value arrays, keyed by group label in plotting order."""
+    frame = build_group_frame(
+        values,
+        neurons_df,
+        group_by,
+        simple_id_col=simple_id_col,
+        value_name=value_name,
+        dropna=dropna,
+    )
+    order = _resolve_group_order(frame, group_by, group_order)
+    return {
+        group: frame.loc[frame[group_by] == group, value_name].to_numpy(dtype=float)
+        for group in order
+    }
+
+
+def group_summary(
+    values: TensorLike,
+    neurons_df: pd.DataFrame,
+    group_by: str,
+    *,
+    simple_id_col: str = "simple_id",
+    value_name: str = "value",
+    group_order: Sequence | None = None,
+    dropna: bool = True,
+) -> pd.DataFrame:
+    """Compute per-group summary statistics from neuron-aligned values."""
+    grouped = group_values(
+        values,
+        neurons_df,
+        group_by,
+        simple_id_col=simple_id_col,
+        value_name=value_name,
+        group_order=group_order,
+        dropna=dropna,
+    )
+
+    rows = []
+    for group, vals in grouped.items():
+        rows.append(
+            {
+                group_by: group,
+                "n": int(vals.size),
+                "mean": float(np.mean(vals)),
+                "std": float(np.std(vals)),
+                "min": float(np.min(vals)),
+                "q25": float(np.quantile(vals, 0.25)),
+                "median": float(np.median(vals)),
+                "q75": float(np.quantile(vals, 0.75)),
+                "max": float(np.max(vals)),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def group_ecdf(
+    values: TensorLike,
+    neurons_df: pd.DataFrame,
+    group_by: str,
+    *,
+    simple_id_col: str = "simple_id",
+    value_name: str = "value",
+    group_order: Sequence | None = None,
+    dropna: bool = True,
+) -> dict[object, pd.DataFrame]:
+    """Compute grouped ECDF points ready for plotting or analysis."""
+    grouped = group_values(
+        values,
+        neurons_df,
+        group_by,
+        simple_id_col=simple_id_col,
+        value_name=value_name,
+        group_order=group_order,
+        dropna=dropna,
+    )
+
+    ret: dict[object, pd.DataFrame] = {}
+    for group, vals in grouped.items():
+        x = np.sort(vals)
+        y = np.arange(1, len(x) + 1, dtype=float) / len(x)
+        ret[group] = pd.DataFrame({value_name: x, "ecdf": y})
+    return ret
+
+
+def _resolve_group_order(
+    frame: pd.DataFrame,
+    group_by: str,
+    group_order: Sequence | None,
+) -> list[object]:
+    if group_order is None:
+        return list(pd.unique(frame[group_by]))
+
+    requested = list(group_order)
+    available = set(frame[group_by].tolist())
+    missing = [group for group in requested if group not in available]
+    if missing:
+        raise ValueError(f"`group_order` contains unknown groups: {missing}")
+    return requested
+
+
+def _to_numpy(values: TensorLike) -> np.ndarray:
+    if isinstance(values, torch.Tensor):
+        return values.detach().cpu().numpy()
+    if isinstance(values, np.ndarray):
+        return values
+    raise TypeError("`values` must be a numpy array or torch tensor.")

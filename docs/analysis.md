@@ -62,6 +62,10 @@ Group-wise data aggregation.
 | `agg_by_neuron` | Aggregate by neuron type |
 | `agg_by_neuropil` | Aggregate by neuropil region |
 | `agg_conn` | Aggregate connectivity weights |
+| `build_group_frame` | Convert `[N]` or `[..., N]` into long-format grouped values |
+| `group_values` | Return grouped value arrays in deterministic group order |
+| `group_summary` | Compute per-group descriptive statistics |
+| `group_ecdf` | Compute per-group ECDF points for analysis/plotting |
 
 ---
 

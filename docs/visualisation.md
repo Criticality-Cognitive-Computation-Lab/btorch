@@ -53,13 +53,17 @@ Hexagonal heatmap visualization using Plotly.
 
 ---
 
-### `neuropil.py`
-Neuropil-level aggregated activity visualization.
+### `aggregation.py`
+Grouped distribution and neuropil time-series visualization.
 
 | Function | Description |
 |----------|-------------|
-| `plot_agg_by_neuropil` | Aggregated traces by neuropil (wave or heatmap style) |
-| `plot_neuropil_comparison` | Subplot grid comparing selected neuropils |
+| `plot_group_distribution` | Generic grouped plot API with `violin`, `box`, or `ecdf` |
+| `plot_group_violin` | Grouped violin plot convenience wrapper |
+| `plot_group_box` | Grouped box plot convenience wrapper |
+| `plot_group_ecdf` | Grouped ECDF plot convenience wrapper |
+| `plot_neuropil_timeseries_overview` | Aggregated neuropil overview in wave/heatmap style |
+| `plot_neuropil_timeseries_panels` | Region-wise subplot grid for detailed comparison |
 
 ---
 
