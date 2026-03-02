@@ -59,7 +59,16 @@ jobs:
         continue-on-error: true
 
       - name: Tests (CPU)
-        run: pytest tests/models
+        run: pytest tests/models --cov=btorch --cov-report=xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          flags: unittests
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Build docs
         run: mkdocs build --strict
