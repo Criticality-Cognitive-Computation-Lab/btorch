@@ -6,4 +6,3 @@ ruff>=0.4
 mkdocs>=1.5
 mkdocs-material>=9.5
 pre-commit>=3.7
-matplotlib>=3.7

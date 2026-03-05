@@ -12,3 +12,4 @@ plotly
 nolds
 powerlaw
 pytorch_sparse
+matplotlib>=3.7

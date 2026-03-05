@@ -17,24 +17,38 @@ We thank the developers of both libraries for the inspirations.
 
 ## Installation
 
-Until the package is published to PyPI/conda, install from source. The upside is that edits are immediately usable.
+As `btorch` is not yet published to PyPI or Conda-forge, it must be installed from source. This approach also allows for rapid development, as any modifications to the code are immediately available.
 
-1) Clone:
+### 1. Clone the Repository
 
 ```bash
 git clone https://github.com/Criticality-Cognitive-Computation-Lab/btorch.git
 cd btorch
 ```
 
-2) Create the dev environment (choose one):
+### 2. Set Up the Environment
+
+We recommend using `conda` or `micromamba` with the provided environment file:
 
 ```bash
+# Using Conda
 conda env create -n ml-py312 --file=dev-requirements.yaml
-# or
+
+# or using Micromamba
 micromamba env create -n ml-py312 -f dev-requirements.yaml
 ```
 
-3) Install in editable mode so local changes are importable right away:
+#### Note on `pip` and `pytorch_sparse`
+If you prefer using `pip` directly, installing `pytorch_sparse` from source or default pypi can be challenging. We recommend using prebuilt wheels from the [PyG repository](https://data.pyg.org/whl/) that match your PyTorch and CUDA installation:
+
+```bash
+# Example for PyTorch 2.8.0 with CUDA 12.8
+pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-2.8.0+cu128.html
+```
+
+### 3. Install in Editable Mode
+
+Finally, install `btorch` in editable mode to ensure your local changes are reflected immediately:
 
 ```bash
 pip install -e . --config-settings editable_mode=strict
@@ -52,10 +66,6 @@ pre-commit install --install-hooks
 
 Highly recommended to use [jaxtyping](https://docs.kidger.site/jaxtyping/) to mark expected array shape,
 see [good example of using jaxtyping](https://fullstackdeeplearning.com/blog/posts/rwkv-explainer)
-
-Highly encouraged to put your prototyping work under [braintools-examples](https://github.com/Criticality-Cognitive-Computation-Lab/btorch-examples.git).
-In light of the nature of fast changing prototyping common in machine learning, and to avoid duplicated work scattered among multiple branches,
-we need to share "just-work" implementation as early as possible and iterate fast.
 
 ### run the tests
 
