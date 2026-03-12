@@ -1341,13 +1341,15 @@ class SimulationStates:
     """Container for simulation state data and configs.
 
     Attributes:
-        voltage: Membrane voltage traces (time, neurons)
+        voltage: Membrane voltage traces (time, neurons) or
+            (time, batch, neurons) if batch dimension present
         dt: Simulation timestep in ms
-        asc: Afterspike current traces (time, neurons)
-        psc: Total postsynaptic current (time, neurons)
-        epsc: Excitatory PSC (time, neurons)
-        ipsc: Inhibitory PSC (time, neurons)
-        spikes: Spike trains (time, neurons)
+        asc: Afterspike current traces (time, neurons), (time, batch, neurons),
+            or (time, batch, neurons, n_asc) for multiple ASC components
+        psc: Total postsynaptic current (time, neurons) or (time, batch, neurons)
+        epsc: Excitatory PSC (time, neurons) or (time, batch, neurons)
+        ipsc: Inhibitory PSC (time, neurons) or (time, batch, neurons)
+        spikes: Spike trains (time, neurons) or (time, batch, neurons)
         v_threshold: Spike threshold voltage(s), scalar or per-neuron
         v_reset: Reset voltage(s), scalar or per-neuron
     """
@@ -1385,6 +1387,8 @@ class TracePlotFormat:
             "side" places labels at the right of each neuron slot; "top"
             places labels above each neuron slot.
         neurons_per_row: Number of neurons to place per row in combined mode
+        batch_idx: Batch index to plot when data has shape (time, batch, neurons).
+            If None and data is 3D, defaults to 0 (first batch sample).
     """
 
     neuron_indices: list[int] | None = None
@@ -1402,6 +1406,45 @@ class TracePlotFormat:
     neuron_label_position: Literal["side", "top"] = "side"
     neuron_specs: list[NeuronSpec | dict] | NeuronSpec | dict | None = None
     neurons_per_row: int | None = None
+    batch_idx: int | None = None
+
+
+def _extract_batch_dim(
+    data: np.ndarray | torch.Tensor | None, batch_idx: int
+) -> np.ndarray | None:
+    """Extract a single batch from 3D/4D data (time, batch, neurons, ...).
+
+    Args:
+        data: Array with shape (time, neurons), (time, batch, neurons),
+            or (time, batch, neurons, n_asc) for ASC currents
+        batch_idx: Index of the batch sample to extract
+
+    Returns:
+        Array with batch dimension removed or None if input is None
+    """
+    if data is None:
+        return None
+
+    arr = _to_numpy(data)
+    if arr.ndim == 2:
+        # No batch dimension: (time, neurons)
+        return arr
+    elif arr.ndim == 3:
+        # Has batch dimension: (time, batch, neurons)
+        if batch_idx >= arr.shape[1]:
+            raise ValueError(
+                f"batch_idx {batch_idx} is out of bounds for batch dim {arr.shape[1]}"
+            )
+        return arr[:, batch_idx]
+    elif arr.ndim == 4:
+        # Has batch and ASC dimension: (time, batch, neurons, n_asc)
+        if batch_idx >= arr.shape[1]:
+            raise ValueError(
+                f"batch_idx {batch_idx} is out of bounds for batch dim {arr.shape[1]}"
+            )
+        return arr[:, batch_idx]
+    else:
+        raise ValueError(f"Expected 2D, 3D, or 4D data, got shape {arr.shape}")
 
 
 def plot_neuron_traces(
@@ -1431,6 +1474,7 @@ def plot_neuron_traces(
     separate_figures: bool = False,
     auto_width: bool = True,
     neurons_per_row: int | None = None,
+    batch_idx: int | None = None,
 ) -> Figure | dict[str, Figure]:
     """Plot neuron state traces with flexible interface.
 
@@ -1440,13 +1484,14 @@ def plot_neuron_traces(
     Args:
         states: SimulationStates dataclass with all state data
         format: TracePlotFormat dataclass with formatting options
-        voltage: Voltage traces (time, neurons) - required if states=None
+        voltage: Voltage traces (time, neurons) or (time, batch, neurons)
         dt: Timestep in ms
-        asc: Afterspike current traces
-        psc: Postsynaptic current traces
-        epsc: Excitatory PSC traces
-        ipsc: Inhibitory PSC traces
-        spikes: Spike trains
+        asc: Afterspike current traces (time, neurons), (time, batch, neurons),
+            or (time, batch, neurons, n_asc) for multiple ASC components
+        psc: Postsynaptic current traces (time, neurons) or (time, batch, neurons)
+        epsc: Excitatory PSC traces (time, neurons) or (time, batch, neurons)
+        ipsc: Inhibitory PSC traces (time, neurons) or (time, batch, neurons)
+        spikes: Spike trains (time, neurons) or (time, batch, neurons)
         v_threshold: Spike threshold(s), scalar or per-neuron values
         v_reset: Reset voltage reference line(s), scalar or per-neuron values
         neuron_indices: Specific neurons to plot
@@ -1454,7 +1499,6 @@ def plot_neuron_traces(
         seed: Random seed for sampling
         show_voltage: Show voltage subplot
         show_asc: Show ASC subplot
-        show_psc: Show PSC subplot
         show_psc: Show PSC subplot
         neuron_labels: Side labels as sequence or callable(neuron_idx) -> str.
             Default None disables side labels.
@@ -1465,6 +1509,8 @@ def plot_neuron_traces(
         separate_figures: Return dict of figures (one per trace type)
         auto_width: Adjust width based on duration
         neurons_per_row: Number of neurons per row in combined figure
+        batch_idx: Batch index to plot when data has shape (time, batch, neurons).
+            If None and data is 3D, defaults to 0.
 
     Returns:
         Figure with neuron trace subplots OR dict of Figures
@@ -1498,14 +1544,27 @@ def plot_neuron_traces(
         neurons_per_row = (
             format.neurons_per_row if neurons_per_row is None else neurons_per_row
         )
+        batch_idx = format.batch_idx if batch_idx is None else batch_idx
 
     # Validate required data
     if voltage is None:
         raise ValueError("voltage is required (provide via states or direct arg)")
 
-    # Convert to numpy
+    # Default batch_idx to 0 if data is 3D and no index specified
+    if batch_idx is None:
+        batch_idx = 0
+
+    # Extract batch dimension from all data arrays
+    voltage = _extract_batch_dim(voltage, batch_idx)
+    spikes = _extract_batch_dim(spikes, batch_idx)
+    asc = _extract_batch_dim(asc, batch_idx)
+    psc = _extract_batch_dim(psc, batch_idx)
+    epsc = _extract_batch_dim(epsc, batch_idx)
+    ipsc = _extract_batch_dim(ipsc, batch_idx)
+
+    # Convert to numpy (preserve None for optional arrays)
     voltage = _to_numpy(voltage)
-    spikes = _to_numpy(spikes)
+    spikes = _to_numpy(spikes) if spikes is not None else None
     n_time, n_neurons = voltage.shape
     times = np.arange(n_time) * dt
     duration_ms = n_time * dt
