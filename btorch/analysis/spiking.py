@@ -405,7 +405,7 @@ def fano(
     spike: np.ndarray | torch.Tensor,
     window: int | None = None,
     overlap: int = 0,
-    batch_axis: tuple[int, ...] | None = None,
+    batch_axis: tuple[int, ...] | int | None = None,
 ):
     """Compute Fano factor for spike trains using optimized cumulative sums.
 
@@ -438,6 +438,8 @@ def fano(
             If `stat` is provided, returns the aggregated statistic instead.
         info: Dictionary with optional computed statistics and percentile data.
     """
+    if isinstance(batch_axis, int):
+        batch_axis = (batch_axis,)
     if window is None:
         # Default window size to get ~10 bins for variance computation
         # Need at least 2 bins for valid variance with unbiased=True
@@ -455,7 +457,7 @@ def kurtosis(
     window: int | None = None,
     overlap: int = 0,
     fisher: bool = True,
-    batch_axis: tuple[int, ...] | None = None,
+    batch_axis: tuple[int, ...] | int | None = None,
 ):
     """Compute kurtosis of spike counts using optimized cumulative sums.
 
@@ -489,6 +491,8 @@ def kurtosis(
             If `stat` is provided, returns the aggregated statistic instead.
         info: Dictionary with optional computed statistics and percentile data.
     """
+    if isinstance(batch_axis, int):
+        batch_axis = (batch_axis,)
     if window is None:
         # Default window size to get ~10 bins for variance computation
         # Need at least 2 bins for valid variance with unbiased=True

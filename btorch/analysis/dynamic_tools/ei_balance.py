@@ -16,7 +16,7 @@ def compute_eci(
     I_i: torch.Tensor | np.ndarray,
     *,
     I_ext: torch.Tensor | np.ndarray | None = None,
-    batch_axis: tuple[int, ...] | None = None,
+    batch_axis: tuple[int, ...] | int | None = None,
     eps: float = 1e-8,
     dtype: torch.dtype | np.dtype | None = None,
 ) -> torch.Tensor | np.ndarray:
@@ -69,10 +69,12 @@ def _compute_eci(
     I_i: torch.Tensor | np.ndarray,
     *,
     I_ext: torch.Tensor | np.ndarray | None = None,
-    batch_axis: tuple[int, ...] | None = None,
+    batch_axis: tuple[int, ...] | int | None = None,
     eps: float = 1e-8,
     dtype: torch.dtype | np.dtype | None = None,
 ) -> torch.Tensor | np.ndarray:
+    if isinstance(batch_axis, int):
+        batch_axis = (batch_axis,)
     if isinstance(I_e, torch.Tensor):
         I_i = torch.as_tensor(I_i, dtype=I_e.dtype, device=I_e.device)
         I_ext = (
@@ -116,7 +118,7 @@ def _eci_numpy(
     # Determine axes for aggregation
     if batch_axis is not None:
         # Average over specified batch axes
-        axes = tuple(batch_axis)
+        axes = (0,) + tuple(batch_axis)
     else:
         # Average over all dimensions except last (neurons)
         axes = tuple(range(I_e.ndim - 1))
@@ -150,7 +152,7 @@ def _eci_torch(
 
         # Determine dimensions for aggregation
         if batch_axis is not None:
-            dims = tuple(batch_axis)
+            dims = (0,) + tuple(batch_axis)
         else:
             # Average over all dimensions except last
             dims = tuple(range(I_e.ndim - 1))
@@ -171,7 +173,7 @@ def compute_lag_correlation(
     *,
     dt: float = 1.0,
     max_lag_ms: float = 30.0,
-    batch_axis: tuple[int, ...] | None = None,
+    batch_axis: tuple[int, ...] | int | None = None,
     use_fft: bool = True,
 ):
     """Compute lagged cross-correlation between two signals.
@@ -232,7 +234,7 @@ def _compute_lag_correlation(
     *,
     dt: float = 1.0,
     max_lag_ms: float = 30.0,
-    batch_axis: tuple[int, ...] | None = None,
+    batch_axis: tuple[int, ...] | int | None = None,
     use_fft: bool = True,
 ):
     if isinstance(x, torch.Tensor):
@@ -248,7 +250,7 @@ def _lag_corr_numpy(
     y: np.ndarray,
     dt: float,
     max_lag_ms: float,
-    batch_axis: tuple[int, ...] | None,
+    batch_axis: tuple[int, ...] | int | None,
     use_fft: bool,
 ):
     """NumPy implementation of lagged correlation."""
@@ -490,7 +492,7 @@ def compute_ei_balance(
     I_ext: torch.Tensor | np.ndarray | None = None,
     dt: float = 1.0,
     max_lag_ms: float = 8.0,
-    batch_axis: tuple[int, ...] | None = None,
+    batch_axis: tuple[int, ...] | int | None = None,
     use_fft: bool = True,
 ):
     """Compute full E/I balance metrics including ECI and lag correlation.

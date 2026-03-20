@@ -18,7 +18,7 @@ from matplotlib.figure import Figure
 
 from ..analysis.aggregation import agg_by_neuron, agg_by_neuropil
 from ..analysis.dynamic_tools.micro_scale import calculate_cv_isi
-from ..analysis.spiking import fano_factor_from_spikes
+from ..analysis.spiking import fano
 
 
 def _to_numpy(data) -> np.ndarray:
@@ -167,14 +167,13 @@ def plot_multiscale_fano(
     if windows is None:
         windows = [int(w) for w in np.logspace(1, np.log10(n_time // 4), 10)]
 
-    # Reshape for fano_factor_from_spikes: (time, batch=1, neurons)
-    spikes_3d = spikes[:, np.newaxis, :]
+    # Reshape for fano: (time, batch=1, neurons)
 
     # Compute Fano factor for each window
     fano_results = {}
     for w in windows:
-        fano = fano_factor_from_spikes(spikes_3d, window=w, overlap=overlap)
-        fano_results[w] = fano.squeeze(0)  # Remove batch dim: (neurons,)
+        fano_values, info = fano(spikes, window=w, overlap=overlap)
+        fano_results[w] = fano_values
 
     # Create figure based on mode
     if mode == "individual":
