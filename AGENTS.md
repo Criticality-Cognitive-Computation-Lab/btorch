@@ -27,7 +27,7 @@ Btorch is a brain-inspired Torch library for neuromorphic research. Follow the p
 
 - Lint: `ruff check .`
 - Tests: `pytest tests`
-- Docs: `mkdocs build --strict`
+- Docs: `python -m sphinx.cmd.build docs docs/_build/html`
 
 Run the smallest relevant subset when possible; call out if tests were not run.
 Recommended targeted runs:
