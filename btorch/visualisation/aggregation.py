@@ -33,7 +33,40 @@ def plot_group_distribution(
     linewidth: float = 1.5,
     alpha: float = 0.8,
 ) -> tuple[Figure, Axes]:
-    """Plot grouped value distributions as violin, box, or ECDF."""
+    """Plot grouped value distributions as violin, box, or ECDF.
+
+    Groups per-neuron values by a categorical column in `neurons_df` and
+    visualizes the distribution using the specified plot type.
+
+    Args:
+        values: Per-neuron values with shape (neurons,) or (time, neurons).
+            If 2D, values are flattened across time for each neuron.
+        neurons_df: DataFrame with neuron metadata. Must contain `simple_id_col`
+            and `group_by` columns.
+        group_by: Column name in `neurons_df` to group by (e.g., "cell_type").
+        kind: Plot type - "violin", "box", or "ecdf".
+        simple_id_col: Column name for neuron identifiers in `neurons_df`.
+        value_name: Label for the y-axis / value dimension.
+        group_order: Explicit order for groups. If None, uses natural sort.
+        dropna: Whether to drop NaN values before plotting.
+        ax: Existing axes to plot on. If None, creates new figure.
+        figsize: Figure size (width, height) in inches.
+        title: Plot title. If None, auto-generated from `kind` and `group_by`.
+        showfliers: For box plots, whether to show outlier points.
+        linewidth: Line width for ECDF curves.
+        alpha: Opacity for violin/box fill.
+
+    Returns:
+        Tuple of (figure, axes) containing the plot.
+
+    Raises:
+        ValueError: If `kind` is not one of "violin", "box", "ecdf".
+
+    Example:
+        >>> fig, ax = plot_group_distribution(
+        ...     firing_rates, neurons_df, group_by="cell_type", kind="violin"
+        ... )
+    """
     fig, ax = _resolve_figure_ax(ax=ax, figsize=figsize)
 
     if kind in {"violin", "box"}:
@@ -96,7 +129,19 @@ def plot_group_violin(
     group_by: str,
     **kwargs,
 ) -> tuple[Figure, Axes]:
-    """Convenience wrapper for grouped violin plots."""
+    """Plot grouped value distributions as violin plots.
+
+    Convenience wrapper around `plot_group_distribution` with `kind="violin"`.
+
+    Args:
+        values: Per-neuron values with shape (neurons,) or (time, neurons).
+        neurons_df: DataFrame with neuron metadata.
+        group_by: Column name to group by.
+        **kwargs: Additional arguments passed to `plot_group_distribution`.
+
+    Returns:
+        Tuple of (figure, axes) containing the violin plot.
+    """
     return plot_group_distribution(
         values,
         neurons_df,
@@ -112,7 +157,19 @@ def plot_group_box(
     group_by: str,
     **kwargs,
 ) -> tuple[Figure, Axes]:
-    """Convenience wrapper for grouped box plots."""
+    """Plot grouped value distributions as box plots.
+
+    Convenience wrapper around `plot_group_distribution` with `kind="box"`.
+
+    Args:
+        values: Per-neuron values with shape (neurons,) or (time, neurons).
+        neurons_df: DataFrame with neuron metadata.
+        group_by: Column name to group by.
+        **kwargs: Additional arguments passed to `plot_group_distribution`.
+
+    Returns:
+        Tuple of (figure, axes) containing the box plot.
+    """
     return plot_group_distribution(
         values,
         neurons_df,
@@ -128,7 +185,19 @@ def plot_group_ecdf(
     group_by: str,
     **kwargs,
 ) -> tuple[Figure, Axes]:
-    """Convenience wrapper for grouped ECDF plots."""
+    """Plot grouped value distributions as ECDF curves.
+
+    Convenience wrapper around `plot_group_distribution` with `kind="ecdf"`.
+
+    Args:
+        values: Per-neuron values with shape (neurons,) or (time, neurons).
+        neurons_df: DataFrame with neuron metadata.
+        group_by: Column name to group by.
+        **kwargs: Additional arguments passed to `plot_group_distribution`.
+
+    Returns:
+        Tuple of (figure, axes) containing the ECDF plot.
+    """
     return plot_group_distribution(
         values,
         neurons_df,
@@ -153,7 +222,43 @@ def plot_neuropil_timeseries_overview(
     use_polars: bool = False,
     show: bool = False,
 ) -> tuple[Figure, Axes]:
-    """Plot aggregated neuropil traces as a single overview figure."""
+    """Plot aggregated neuropil traces as a single overview figure.
+
+    Visualizes neural activity aggregated by brain regions (neuropils).
+    Can display as stacked waveforms or a heatmap.
+
+    Args:
+        data: Spike matrix (time, neurons) or pre-computed dict of
+            {region_name: activity_array}.
+        dt: Time step in seconds for x-axis scaling.
+        mode: Aggregation mode - "top_innervated" uses primary neuropil per
+            neuron, "all_innervated" includes all neuropil connections.
+        agg: Aggregation function applied per neuropil ("mean", "sum", "std").
+        connections: DataFrame with connection metadata (required if `data`
+            is a matrix, not a dict).
+        neurons: DataFrame with neuron metadata (required if `data` is a
+            matrix, not a dict).
+        kind: Visualization style - "wave" for stacked traces, "heatmap"
+            for 2D intensity map.
+        figsize: Figure size (width, height) in inches.
+        cmap: Colormap for heatmap style.
+        top_n: Number of top regions to show in wave style (ranked by
+            maximum absolute activity).
+        use_polars: Whether to use Polars for aggregation (faster for large
+            datasets).
+        show: Whether to call `plt.show()` before returning.
+
+    Returns:
+        Tuple of (figure, axes) containing the plot.
+
+    Raises:
+        ValueError: If no neuropil traces can be computed from inputs.
+
+    Example:
+        >>> fig, ax = plot_neuropil_timeseries_overview(
+        ...     spikes, dt=0.001, connections=conn_df, neurons=neurons_df
+        ... )
+    """
     traces = _resolve_neuropil_traces(
         data,
         mode=mode,
@@ -198,7 +303,32 @@ def plot_neuropil_timeseries_panels(
     use_polars: bool = False,
     show: bool = False,
 ) -> tuple[Figure, np.ndarray]:
-    """Plot selected neuropil traces as a subplot grid."""
+    """Plot selected neuropil traces as a subplot grid.
+
+    Creates a grid of subplots showing individual neuropil activity traces,
+    with optional statistics annotations.
+
+    Args:
+        data: Spike matrix (time, neurons) or pre-computed dict of
+            {region_name: activity_array}.
+        dt: Time step in seconds for x-axis scaling.
+        mode: Aggregation mode - "top_innervated" or "all_innervated".
+        agg: Aggregation function applied per neuropil ("mean", "sum", "std").
+        connections: DataFrame with connection metadata.
+        neurons: DataFrame with neuron metadata.
+        regions: List of region names to plot. If None, top 9 regions by
+            maximum activity are selected automatically.
+        figsize: Figure size (width, height) in inches.
+        cols: Number of columns in the subplot grid.
+        use_polars: Whether to use Polars for aggregation.
+        show: Whether to call `plt.show()` before returning.
+
+    Returns:
+        Tuple of (figure, axes_array) containing the subplot grid.
+
+    Raises:
+        ValueError: If no neuropil traces available or regions is empty.
+    """
     traces = _resolve_neuropil_traces(
         data,
         mode=mode,
@@ -250,7 +380,7 @@ def plot_neuropil_timeseries_panels(
             ax.text(
                 0.02,
                 0.98,
-                f"μ={mean_act:.2f}\\nσ={std_act:.2f}",
+                f"μ={mean_act:.2f}\nσ={std_act:.2f}",
                 transform=ax.transAxes,
                 verticalalignment="top",
                 bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),

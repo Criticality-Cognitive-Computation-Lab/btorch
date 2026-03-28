@@ -1,3 +1,10 @@
+"""Hexagonal heatmap visualization using Plotly.
+
+Provides interactive hexagonal grid plots for spatial data
+visualization, commonly used for brain region mapping with hexagonal
+tiling.
+"""
+
 import pandas as pd
 import plotly.graph_objects as go
 
@@ -12,7 +19,46 @@ def hex_heatmap(
     dpi: int = 72,
     custom_colorscale: list | None = None,
 ) -> go.Figure:
-    """Generate a hexagonal heat map plot of the data."""
+    """Generate an interactive hexagonal heatmap.
+
+    Visualizes data on a hexagonal grid layout. Single-column data produces
+    a static heatmap; multi-column DataFrames produce an animated heatmap
+    with a slider to navigate through timepoints or conditions.
+
+    Args:
+        df: Data to visualize. Single Series for static plot, or DataFrame
+            with multiple columns for animated plot (one frame per column).
+            Must have 'p' and 'q' columns representing hex grid coordinates.
+        dataset: Reference dataset defining the full hex grid background.
+            Used to render empty hexagons for spatial context.
+        style: Styling options dict with keys:
+            - "font_type": Font family (default: "arial")
+            - "markerlinecolor": Marker line color
+            - "linecolor": Axis/line color (default: "black")
+            - "papercolor": Background color (default: "rgba(255,255,255,255)")
+        sizing: Size configuration dict with keys:
+            - "fig_width", "fig_height": Figure dimensions in mm
+            - "markersize": Hexagon marker size (default: 16)
+            - "cbar_thickness", "cbar_len": Colorbar dimensions
+        dpi: Dots per inch for pixel calculations (default: 72).
+        custom_colorscale: Custom Plotly colorscale. Default is white-to-blue.
+
+    Returns:
+        Plotly Figure with hexagonal heatmap. Static for Series input,
+        animated with slider for DataFrame input.
+
+    Raises:
+        ValueError: If `df` is not a Series or DataFrame.
+
+    Example:
+        >>> # Static heatmap
+        >>> fig = hex_heatmap(data_series, background_dataset)
+        >>> fig.show()
+        >>>
+        >>> # Animated heatmap with timepoints
+        >>> fig = hex_heatmap(timepoint_df, background_dataset)
+        >>> fig.write_html("animated_hexmap.html")
+    """
 
     def bg_hex():
         goscatter = go.Scatter(

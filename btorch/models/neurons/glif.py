@@ -1,3 +1,20 @@
+"""Generalized leaky integrate-and-fire (GLIF) neuron models.
+
+This module implements the GLIF3 model from the Allen Institute [1], which
+extends standard LIF with after-spike currents (ASC) that capture
+spike-frequency adaptation and other slow currents.
+
+The GLIF3 neuron follows:
+    dV/dt = -(V - V_rest) / tau + (I_in + sum(I_asc)) / c_m
+    dI_asc/dt = -k * I_asc
+
+where I_asc are after-spike currents that increment by asc_amps at each spike.
+
+References:
+    [1] Teeter et al., "Generalized leaky integrate-and-fire models
+        classify multiple neuron types," Nat. Commun., 2018.
+"""
+
 from collections.abc import Callable, Sequence
 from typing import Any, Literal
 
@@ -13,9 +30,27 @@ from ..shape import expand_trailing_dims
 from ..surrogate import ATan
 
 
-def get_rheobase(v_threshold, v_rest, c_m, tau):
-    """Calculate rheobase current, the minimum constant input current required
-    to make the neuron fire."""
+def get_rheobase(
+    v_threshold: float | torch.Tensor,
+    v_rest: float | torch.Tensor,
+    c_m: float | torch.Tensor,
+    tau: float | torch.Tensor,
+) -> float | torch.Tensor:
+    """Calculate rheobase current.
+
+    The rheobase is the minimum constant input current required to make
+    the neuron fire. For GLIF models:
+        I_rheobase = (v_threshold - v_rest) * c_m / tau
+
+    Args:
+        v_threshold: Firing threshold (mV).
+        v_rest: Resting potential (mV).
+        c_m: Membrane capacitance (pF).
+        tau: Membrane time constant (ms).
+
+    Returns:
+        Rheobase current (pA).
+    """
     # For GLIF3, rheobase can be calculated as:
     # I_rheobase = (v_threshold - v_rest) * c_m / tau
     I_rheobase = (v_threshold - v_rest) * c_m / tau
@@ -23,14 +58,53 @@ def get_rheobase(v_threshold, v_rest, c_m, tau):
 
 
 class GLIF3(BaseNode):
-    """GLIF3 model as described in [1]. Leaky integrate and fire model with
-    refractory period and after spike currents.
+    """GLIF3 model with after-spike currents and refractory period.
 
-    TODO: support parameter scatter
+    The GLIF3 model extends standard LIF by adding after-spike currents
+    (ASC) that capture spike-frequency adaptation. Each spike adds
+    asc_amps to the ASC vector, which then decays exponentially with
+    time constants 1/k.
 
-    [1] C. Teeter et al., "Generalized leaky integrate-and-fire models
-    classify multiple neuron types," Nat. Commun., vol. 9, no. 1, p.
-    709, Feb. 2018, doi: 10.1038/s41467-017-02717-4.
+    Dynamics:
+        dV/dt = -(V - V_rest) / tau + (I_in + sum(I_asc)) / c_m
+        dI_asc/dt = -k * I_asc
+
+        At spike: I_asc += asc_amps
+
+    Args:
+        n_neuron: Number of neurons (int or tuple of dimensions).
+        v_threshold: Firing threshold (mV). Default: -50.0.
+        v_reset: Reset voltage after spike (mV). Default: -70.0.
+        v_rest: Resting potential (mV). Defaults to v_reset if None.
+        c_m: Membrane capacitance (pF). Default: 0.05.
+        tau: Membrane time constant (ms). Default: 20.0.
+        k: ASC decay rates (ms^-1), can be list for multiple ASC components.
+            Default: [0.2].
+        asc_amps: ASC amplitudes (pA) added at each spike.
+            Default: [0.0].
+        tau_ref: Refractory period (ms). Default: 0.0.
+        trainable_param: Set of parameter names to make trainable.
+        surrogate_function: Surrogate gradient function. Default: ATan().
+        detach_reset: If True, detach reset signal. Default: False.
+        hard_reset: If True, use hard reset. Default: False.
+        pre_spike_v: If True, store pre-spike voltage. Default: False.
+        step_mode: Step mode. Default: "s".
+        backend: Backend implementation. Default: "torch".
+        device: Device for tensors. Default: None.
+        dtype: Data type for tensors. Default: None.
+
+    Attributes:
+        v: Membrane potential, shape (*batch, n_neuron).
+        Iasc: After-spike currents, shape (*batch, n_neuron, n_Iasc).
+        refractory: Refractory counter (if tau_ref > 0).
+        c_m, tau, tau_ref: Neuron parameters.
+        k: ASC decay rates, shape (n_neuron, n_Iasc) or (n_Iasc,).
+        asc_amps: ASC amplitudes, shape (n_neuron, n_Iasc) or (n_Iasc,).
+        n_Iasc: Number of ASC components.
+
+    References:
+        Teeter et al., "Generalized leaky integrate-and-fire models
+        classify multiple neuron types," Nature Communications, 2018.
     """
 
     # make mypy typing and autocompletion easier
@@ -120,18 +194,38 @@ class GLIF3(BaseNode):
         )
 
     @property
-    def v_rest(self):
-        """For compat with glif4, glif5, use v_reset instead."""
+    def v_rest(self) -> torch.Tensor:
+        """Resting potential (mV).
+
+        For compatibility with GLIF4/GLIF5, falls back to v_reset if
+        not explicitly set during initialization.
+
+        Returns:
+            Resting potential tensor.
+        """
         if self._v_rest is None:
             return self.v_reset
         return self._v_rest
 
     @v_rest.setter
-    def v_rest(self, v_rest):
+    def v_rest(self, v_rest: float | torch.Tensor):
+        """Set resting potential.
+
+        Args:
+            v_rest: New resting potential value (mV).
+        """
         if self._v_rest is not None:
             self._v_rest = v_rest
 
     def dIasc(self, Iasc: Float[Tensor, "*batch n_neuron {self.n_Iasc}"]):
+        """Compute ASC derivative for exponential Euler integration.
+
+        Args:
+            Iasc: After-spike currents, shape (*batch, n_neuron, n_Iasc).
+
+        Returns:
+            Tuple of (derivative, linear_coefficient) for exp_euler_step.
+        """
         return -self.k * Iasc, -self.k
 
     def dV(
@@ -140,6 +234,16 @@ class GLIF3(BaseNode):
         Iasc: Float[Tensor, "*batch n_neuron {self.n_Iasc}"],
         x: Float[Tensor, "*batch n_neuron"],
     ):
+        """Compute membrane potential derivative for exp Euler integration.
+
+        Args:
+            v: Membrane potential, shape (*batch, n_neuron).
+            Iasc: After-spike currents, shape (*batch, n_neuron, n_Iasc).
+            x: Input current, shape (*batch, n_neuron).
+
+        Returns:
+            Tuple of (derivative, linear_coefficient) for exp_euler_step.
+        """
         Isum = x
         # torch.autocast will cast half to float32 for sum op
         # see https://docs.pytorch.org/docs/stable/amp.html#ops-that-can-autocast-to-float32

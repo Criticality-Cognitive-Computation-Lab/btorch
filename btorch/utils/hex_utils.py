@@ -1,4 +1,12 @@
-"""Utility function for operations on hexagonal lattices."""
+"""Hexagonal lattice coordinate utilities.
+
+Functions for working with hexagonal grid coordinates (axial/cube),
+conversions between hex and pixel coordinates, and geometric
+operations on hexagonal lattices.
+
+See Also:
+    https://www.redblobgames.com/grids/hexagons/
+"""
 
 from numbers import Number
 from typing import Iterable, Literal, Tuple
@@ -715,7 +723,7 @@ class HexLattice(HexArray):
                 if h in hexals:
                     h.value = hexals[h == hexals][0].value
         else:
-            u, v = flyvis.utils.hex_utils.get_hex_coords(extent)
+            u, v = get_hex_coords(extent)
             u += center.u
             v += center.v
             values = [np.nan for _ in range(len(u))]  # np.ones_like(u) * np.nan

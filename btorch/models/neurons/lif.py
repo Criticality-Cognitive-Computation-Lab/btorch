@@ -1,3 +1,17 @@
+"""Leaky integrate-and-fire (LIF) neuron models.
+
+This module provides LIF and IF (integrate-and-fire) neuron implementations
+with optional refractory periods. These are the simplest spiking neuron models,
+suitable for basic neuromorphic computing tasks and as building blocks for
+more complex networks.
+
+The LIF neuron follows the dynamics:
+    dV/dt = -(V - V_reset) / tau + I / c_m
+
+where V is membrane potential, tau is the time constant, I is input current,
+and c_m is membrane capacitance.
+"""
+
 from collections.abc import Callable, Sequence
 from typing import Any, Literal
 
@@ -13,7 +27,54 @@ from ..surrogate import Sigmoid
 
 
 class LIF(BaseNode):
-    """Leaky integrate-and-fire neuron with optional refractory period."""
+    """Leaky integrate-and-fire neuron with optional refractory period.
+
+    The LIF neuron integrates input current while leaking towards a resting
+    potential. When the membrane potential exceeds a threshold, a spike is
+    emitted and the potential is reset.
+
+    Dynamics:
+        dV/dt = -(V - V_reset) / tau + I / c_m
+
+        If tau_ref is specified, a refractory period prevents spiking for
+        tau_ref milliseconds after each spike.
+
+    Args:
+        n_neuron: Number of neurons (int or tuple of dimensions).
+        v_threshold: Firing threshold (mV). Default: 1.0.
+        v_reset: Reset voltage after spike (mV). Default: 0.0.
+        c_m: Membrane capacitance. Default: 1.0.
+        tau: Membrane time constant (ms). Default: 20.0.
+        tau_ref: Refractory period duration (ms). None disables refractory
+            behavior. Default: None.
+        trainable_param: Set of parameter names to make trainable.
+            Default: empty set.
+        surrogate_function: Surrogate gradient function for backpropagation.
+            Default: Sigmoid().
+        detach_reset: If True, detach reset signal from computation graph.
+            Default: False.
+        hard_reset: If True, reset to v_reset directly. If False, subtract
+            (v_threshold - v_reset) from membrane potential (soft reset).
+            Default: False.
+        pre_spike_v: If True, store pre-spike voltage in v_pre_spike buffer.
+            Default: False.
+        step_mode: Step mode, currently only "s" (single step) supported.
+            Default: "s".
+        backend: Backend implementation. Default: "torch".
+        device: Device for tensors. Default: None.
+        dtype: Data type for tensors. Default: None.
+
+    Attributes:
+        v: Membrane potential tensor, shape (*batch, n_neuron).
+        refractory: Refractory counter (if tau_ref specified).
+        c_m: Membrane capacitance (parameter or buffer).
+        tau: Time constant (parameter or buffer).
+        tau_ref: Refractory period (parameter or buffer, or None).
+
+    Shape:
+        - Input: (*batch, n_neuron)
+        - Output: (*batch, n_neuron) spike tensor (0 or 1)
+    """
 
     refractory: torch.Tensor | None
     c_m: torch.Tensor | torch.nn.Parameter
@@ -122,15 +183,54 @@ class LIF(BaseNode):
 
 
 class IF(LIF):
-    """Integrate-and-fire neuron without leak."""
+    """Integrate-and-fire neuron without leak.
+
+    Simplified variant of LIF that lacks the leak term, meaning the membrane
+    potential integrates input current linearly without decay:
+
+        dV/dt = I / c_m
+
+    This model is useful for theoretical analysis and as a baseline,
+    though it lacks biological realism due to unbounded integration.
+
+    Args:
+        n_neuron: Number of neurons (int or tuple of dimensions).
+        v_threshold: Firing threshold. Default: 1.0.
+        v_reset: Reset voltage after spike. Default: 0.0.
+        c_m: Membrane capacitance. Default: 1.0.
+        tau: Time constant (inherited from LIF but not used in dynamics).
+        tau_ref: Refractory period duration. Default: None.
+        trainable_param: Set of parameter names to make trainable.
+        surrogate_function: Surrogate gradient function. Default: Sigmoid().
+        detach_reset: If True, detach reset signal. Default: False.
+        hard_reset: If True, use hard reset. Default: False.
+        pre_spike_v: If True, store pre-spike voltage. Default: False.
+        step_mode: Step mode. Default: "s".
+        backend: Backend implementation. Default: "torch".
+        device: Device for tensors. Default: None.
+        dtype: Data type for tensors. Default: None.
+    """
 
     def dV(
         self,
         x: Float[Tensor, "*batch n_neuron"],
-    ):
+    ) -> Float[Tensor, "*batch n_neuron"]:
+        """Compute membrane potential derivative (no leak term).
+
+        Args:
+            x: Input current, shape (*batch, n_neuron).
+
+        Returns:
+            dV/dt derivative, shape (*batch, n_neuron).
+        """
         derivative = x / self.c_m
         return derivative
 
     def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]):
+        """Update membrane potential using Euler integration (no leak).
+
+        Args:
+            x: Input current, shape (*batch, n_neuron).
+        """
         v = euler_step(self.dV, x, dt=environ.get("dt"))
         self.v = v

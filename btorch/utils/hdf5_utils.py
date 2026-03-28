@@ -1,3 +1,9 @@
+"""HDF5 serialization utilities.
+
+Helpers for saving and loading nested dictionaries containing arrays to
+HDF5 files with optional Blosc2 compression for large arrays.
+"""
+
 import os
 from typing import Optional
 
@@ -12,6 +18,25 @@ def save_dict_to_hdf5(
     filename: Optional[str] = None,
     compression_threshold=1024 * 1024,  # 1MiB
 ):
+    """Save nested dictionary with array values to HDF5 file.
+
+    Recursively traverses ``data`` and saves arrays as datasets.
+    Datasets larger than ``compression_threshold`` are compressed
+    with the specified compression filter.
+
+    Args:
+        folder_or_filename: Directory path if ``filename`` is provided,
+            otherwise full file path.
+        data: Nested dictionary with array-like values to serialize.
+        compression: Compression filter (default: Blosc2).
+        filename: Optional filename when ``folder_or_filename`` is a directory.
+        compression_threshold: Minimum array size in bytes to trigger
+            compression (default: 1 MiB).
+
+    Returns:
+        None
+    """
+
     def save_array(h5file, path_k, v):
         if v.nbytes > compression_threshold:
             h5file.create_dataset(path_k, data=v, compression=compression)
@@ -40,6 +65,16 @@ def save_dict_to_hdf5(
 
 
 def load_dict_from_hdf5(folder_or_filename, filename: Optional[str] = None):
+    """Load nested dictionary from HDF5 file.
+
+    Args:
+        folder_or_filename: Directory path if ``filename`` is provided,
+            otherwise full file path.
+        filename: Optional filename when ``folder_or_filename`` is a directory.
+
+    Returns:
+        Nested dictionary with restored array values.
+    """
     file = (
         folder_or_filename
         if filename is None

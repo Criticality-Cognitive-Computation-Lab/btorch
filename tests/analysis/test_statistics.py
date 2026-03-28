@@ -12,7 +12,6 @@ import torch
 from btorch.analysis.statistics import (
     compute_log_hist,
     describe_array,
-    get_corr_stats,
     use_percentiles,
     use_stats,
 )
@@ -76,57 +75,6 @@ def test_compute_log_hist_connection_weights():
     # Verify histogram captures most of the distribution (may miss values
     # at exact bin boundaries due to right-edge exclusivity in np.histogram)
     assert hist_mid.sum() > 0.99 * len(weights)
-
-
-# =============================================================================
-# Example 3: Correlation analysis for spike trains (get_corr_stats)
-# =============================================================================
-def test_get_corr_stats_stimulus_noise_correlations():
-    """Compute stimulus and noise correlations from repeated stimulus
-    presentations.
-
-    This demonstrates the standard analysis for separating stimulus-driven
-    correlations from trial-to-trial variability (noise correlations) in
-    neural population recordings.
-
-    Setup: Multiple repetitions (nrep) of the same stimulus, recording from
-    multiple cells (ncell) over time frames (nframe).
-    """
-    rng = np.random.default_rng(42)
-    nrep = 10  # 10 repetitions
-    ncell = 5  # 5 neurons
-    nframe = 100  # 100 time frames
-    max_dur = 3  # Correlation window of +/- 3 frames
-
-    # Generate synthetic spike data with:
-    # - Shared stimulus component (correlated across neurons)
-    # - Independent noise component
-    stimulus_component = rng.poisson(2.0, size=(nrep, 1, nframe))
-    individual_component = rng.poisson(1.0, size=(nrep, ncell, nframe))
-    spikes = stimulus_component + individual_component
-
-    # Flatten for the function (expects (nrep*ncell, nframe))
-    spikes_flat = spikes.reshape(nrep * ncell, nframe)
-
-    # Compute correlations
-    C_stim, C_tot, C_noise, stim_corr, total_corr, noise_corr = get_corr_stats(
-        spikes_flat, max_dur=max_dur, nrep=nrep, ncell=ncell, nframe=nframe
-    )
-
-    # Verify output shapes
-    assert C_stim.shape == (ncell, ncell, max_dur * 2 + 1)
-    assert C_tot.shape == (ncell, ncell, max_dur * 2 + 1)
-    assert C_noise.shape == (ncell, ncell, max_dur * 2 + 1)
-
-    # Stimulus correlations should exist (due to shared stimulus component)
-    assert len(stim_corr) == ncell * (ncell - 1) // 2
-    assert len(noise_corr) == len(stim_corr)
-
-    # Total correlation should approximately equal stimulus + noise correlations
-    # (within numerical precision)
-    for i in range(len(stim_corr)):
-        expected_total = stim_corr[i] + noise_corr[i]
-        assert np.isclose(total_corr[i], expected_total, rtol=1e-10)
 
 
 # =============================================================================

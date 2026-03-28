@@ -1,3 +1,10 @@
+"""Benchmarking utilities.
+
+Performance measurement tools for PyTorch code, supporting both CPU
+wall-clock and GPU event-based timing with warmup and statistical
+summarization.
+"""
+
 import time
 from typing import Callable, Dict, List, Literal, Optional, Union
 
@@ -5,7 +12,13 @@ import torch
 
 
 class PerfTimer:
-    """A simple performance timer for measuring execution time."""
+    """Context manager for measuring execution time.
+
+    Example:
+        >>> with PerfTimer() as timer:
+        ...     result = some_function()
+        >>> print(f"Took {timer.elapsed_ms():.2f} ms")
+    """
 
     def __init__(self):
         self.start_time = None
@@ -19,7 +32,15 @@ class PerfTimer:
         self.end_time = time.perf_counter()
 
     def elapsed_ms(self) -> float:
-        """Returns elapsed time in milliseconds."""
+        """Return elapsed time in milliseconds.
+
+        Returns:
+            Elapsed time from ``__enter__`` to ``__exit__`` (or now
+            if ``__exit__`` hasn't been called).
+
+        Raises:
+            RuntimeError: If timer was never started.
+        """
         if self.start_time is None:
             raise RuntimeError("Timer never started")
         end = self.end_time if self.end_time is not None else time.perf_counter()
@@ -36,21 +57,35 @@ def do_bench(
     timing_method: Literal["gpu", "cpu"] = "cpu",
     sync_cuda: bool = True,
 ) -> Union[float, Dict[str, float]]:
-    """Benchmark the runtime of the provided function.
+    """Benchmark function runtime with warmup and statistics.
+
+    Supports both CPU wall-clock timing and GPU CUDA event timing.
+    Warmup and repetition can be specified as iteration counts (int)
+    or durations in milliseconds (float).
 
     Args:
-        fn: Function to benchmark
-        warmup: Warmup time in ms (float) or warmup iterations (int)
-        rep: Repetition time in ms (float) or measured iterations (int)
-        grad_to_none: Reset the gradient of the provided tensor to None
-        quantiles: Performance percentiles to return
-                   in addition to the central statistic
-        return_mode: The statistical measure to return.
-            Options are "min", "max", "mean", "median", or "all"
-        timing_method: Method to use for timing - "gpu" for CUDA event timing or
-            "cpu" for wall clock timing
-        sync_cuda: Whether to synchronize CUDA devices before/after execution
-            (only used with timing_method="cpu")
+        fn: Function to benchmark (callable with no arguments).
+        warmup: Warmup iterations (int) or duration in ms (float).
+        rep: Measurement iterations (int) or duration in ms (float).
+        grad_to_none: Optional tensor whose gradient is reset to None
+            between repetitions.
+        quantiles: Optional quantiles to compute (e.g., [0.05, 0.95]).
+        return_mode: Central statistic to return:
+            "min", "max", "mean", "median", or "all" for all stats.
+        timing_method: "gpu" for CUDA events (if available) or "cpu"
+            for wall-clock timing.
+        sync_cuda: Whether to synchronize CUDA before/after timing
+            (only applies to CPU timing).
+
+    Returns:
+        Timing result. Float for single statistics, dict for "all"
+        or when quantiles are specified.
+
+    Example:
+        >>> def bench_fn():
+        ...     return torch.mm(a, b)
+        >>> do_bench(bench_fn, warmup=10, rep=100, return_mode="median")
+        0.523
     """
     if not callable(fn):
         raise TypeError("The 'fn' parameter must be callable")

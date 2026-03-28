@@ -1,4 +1,31 @@
-"""Statistical utilities for analysis."""
+"""Statistical utilities for analysis.
+
+This module provides statistical computation utilities that work with both
+NumPy arrays and PyTorch tensors, with consistent APIs across both backends.
+
+Key features:
+    - Unified API for common statistics (mean, std, var, median, etc.)
+    - Configurable NaN and Inf handling policies
+    - Batch computation optimization (reuses mean/std for CV)
+    - Decorators for adding aggregation and percentile support
+
+Decorators:
+    - `use_stats`: Adds `stat`, `stat_info`, `nan_policy`, `inf_policy` args
+    - `use_percentiles`: Adds `percentiles` arg for computing percentiles
+
+Policy options:
+    - nan_policy: "skip" (default), "warn", "assert"
+    - inf_policy: "propagate" (default), "skip", "warn", "assert"
+
+Example:
+    >>> from btorch.analysis.statistics import compute_stat, use_stats
+    >>> import numpy as np
+    >>> data = np.random.randn(100, 10)  # 100 samples, 10 neurons
+    >>> compute_stat(data, "mean", dim=0)  # mean per neuron
+    >>> @use_stats
+    ... def compute_metric(x): return x.mean(axis=0), {}
+    >>> compute_metric(data, stat="median")  # returns median instead
+"""
 
 import inspect
 from collections.abc import Callable, Iterable
@@ -15,7 +42,19 @@ StatChoice = Literal[
 
 
 def describe_array(array: np.ndarray):
-    """Print descriptive statistics for a 1D array."""
+    """Print descriptive statistics for a 1D array.
+
+    Displays mean, median, std, min, max, and quartiles.
+
+    Args:
+        array: 1D NumPy array to describe.
+
+    Example:
+        >>> describe_array(np.random.randn(100))
+        Mean: 0.05
+        Median: 0.12
+        ...
+    """
     mean = np.mean(array)
     median = np.median(array)
     std_dev = np.std(array)
@@ -36,6 +75,25 @@ def describe_array(array: np.ndarray):
 
 
 def compute_log_hist(data, bins=1000, edge_pos: Literal["mid", "sep"] = "mid"):
+    """Compute histogram with logarithmically-spaced bins.
+
+    Useful for visualizing heavy-tailed distributions like synaptic weights
+    or degree distributions.
+
+    Args:
+        data: Input data array (must be positive).
+        bins: Number of histogram bins.
+        edge_pos: Position to return for bin edges.
+            "mid": Return bin centers (midpoints).
+            "sep": Return bin separators (edges).
+
+    Returns:
+        Tuple of (hist, bin_edges) where hist is the count array and
+        bin_edges are the positions (centers or edges based on edge_pos).
+
+    Raises:
+        ValueError: If data contains non-positive values (required for log scale).
+    """
     bin_edges = np.logspace(np.log10(np.min(data)), np.log10(np.max(data)), num=bins)
     hist, edges = np.histogram(data, bins=bin_edges)
     if edge_pos == "mid":

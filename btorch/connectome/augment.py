@@ -1,3 +1,31 @@
+"""Data augmentation and sampling utilities for connectome data.
+
+This module provides functions for manipulating neuron and connection
+DataFrames, including:
+
+- Slicing neurons and their connections by ID subsets
+- Sampling strategies for representative neuron subsets
+- Downsampling connections while preserving network structure
+- Dropping neurons/connections and computing degrees
+- E/I connection matrix construction
+
+Expected DataFrame schemas:
+    neurons DataFrame:
+        - root_id: Unique neuron identifier (64-bit int)
+        - simple_id: Linear 0..N-1 index
+        - flow, super_class, class, nt_type: Classification columns
+        - area_nm: Surface area for capacitance computation
+
+    connections DataFrame:
+        - pre_root_id, post_root_id: Root IDs
+        - pre_simple_id, post_simple_id: Simple IDs
+        - syn_count: Synapse count
+
+Side effects:
+    Functions may modify DataFrame indices, add new columns (e.g.,
+    original_simple_id for backup), or remap IDs to local ranges.
+"""
+
 from collections.abc import Sequence
 from typing import Literal
 
