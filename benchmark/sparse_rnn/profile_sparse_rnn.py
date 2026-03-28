@@ -6,11 +6,11 @@ from pathlib import Path
 import scipy.sparse
 import torch
 from torch import nn
-from torch.profiler import profile, ProfilerActivity, schedule
+from torch.profiler import ProfilerActivity, profile, schedule
 
 from btorch.models.base import MemoryModule
 from btorch.models.functional import reset_net_state
-from btorch.models.linear import available_sparse_backends, DenseConn, SparseConn
+from btorch.models.linear import DenseConn, SparseConn, available_sparse_backends
 from btorch.models.rnn import make_rnn
 from btorch.utils.file import fig_path
 

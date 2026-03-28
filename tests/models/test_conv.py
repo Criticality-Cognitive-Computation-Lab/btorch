@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import torch
+
 from btorch.models.conv import Conv1dSpatial
 
 

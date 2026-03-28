@@ -25,6 +25,8 @@ site/
 docs/_build/
 docs/api/generated/
 docs/.doctrees/
+.coverage
+coverage.xml
 
 *.log
 *.swp

@@ -9,7 +9,15 @@ omegaconf
 hdf5plugin
 plotly
 # dynamic tools
-nolds
+# https://github.com/CSchoel/nolds/issues/80
+nolds!=0.6.3
 powerlaw
-pytorch_sparse
+
+torch_sparse
+torch_scatter
 matplotlib>=3.7
+
+# io
+xarray
+zarr
+numcodecs

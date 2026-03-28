@@ -17,6 +17,7 @@ dependencies:
   - tqdm
   - matplotlib
   - scipy
+  - xarray
   - h5py
   - hdf5plugin
   - pandas >= 2 # assume CoW

@@ -1,10 +1,20 @@
 import matplotlib.pyplot as plt
+import pytest
 import torch
-import triton
 
 from btorch.models.ode import euler_step, exp_euler_step
 from btorch.utils.bench import do_bench
 from btorch.utils.file import fig_path, save_fig
+
+
+def _try_import_triton():
+    """Safely import triton, returning None if not available."""
+    try:
+        import triton as tri
+
+        return tri
+    except ImportError:
+        pytest.skip("Triton is not available, skipping benchmark.")
 
 
 def test_numerically_close():
@@ -65,11 +75,18 @@ def test_numerically_close():
     save_fig(fig, "ode_solver_comparison")
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="Requires CUDA",
+)
 def benchmark_ode_solvers(shape=(512, 512), device="cuda"):
     # result: compiled versions of euler and exponent euler perform the same
     # in terms of speed/throughput and are generally 4-5 times faster
     # than non-compiled ones
     # ODE: dx/dt = -2.0*x + 3.0*y
+
+    triton = _try_import_triton()
+
     def f(x, y):
         return -2.0 * x + 3.0 * y
 
@@ -163,10 +180,5 @@ def benchmark_ode_solvers(shape=(512, 512), device="cuda"):
         show_plots=False,
         print_data=False,
         return_df=False,
-        save_path=fig_path(__file__),
+        save_path=fig_path(),
     )
-
-
-if __name__ == "__main__":
-    test_numerically_close()
-    # benchmark_ode_solvers()

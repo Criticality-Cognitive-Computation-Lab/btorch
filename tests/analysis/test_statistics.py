@@ -130,15 +130,15 @@ def test_use_stat_decorator_numpy_and_torch():
     mean_rate, info = compute_firing_rates(spike_data, stat="mean")
     assert isinstance(mean_rate, float)
     assert np.isclose(mean_rate, rates.mean())
-    assert info["values0_mean"] == mean_rate
+    assert info["values_mean"] == mean_rate
 
     # Use case 3: Get per-neuron rates but also compute population statistics
     rates, info = compute_firing_rates(spike_data, stat_info=["mean", "std", "max"])
     assert rates.shape == (n_neurons,)
-    assert "values0_mean" in info
-    assert "values0_std" in info
-    assert "values0_max" in info
-    assert np.isclose(info["values0_mean"], rates.mean())
+    assert "values_mean" in info
+    assert "values_std" in info
+    assert "values_max" in info
+    assert np.isclose(info["values_mean"], rates.mean())
 
     # Use case 4: Test with torch tensors (should work seamlessly)
     spike_data_torch = torch.from_numpy(spike_data).float()
@@ -239,18 +239,18 @@ def test_use_percentiles_decorator():
     assert "values_levels" not in info  # Not computed
 
     # Use case 2: Get modulation indices and compute median (50th percentile)
-    mod_idx, info = compute_response_modulation_index(responses, percentiles=0.5)
+    mod_idx, info = compute_response_modulation_index(responses, percentiles=50)
     assert "values_percentiles" in info
     assert "values_levels" in info
-    assert info["values_levels"] == (0.5,)
+    assert info["values_levels"] == (50.0,)
     median_value = info["values_percentiles"][0]
     assert np.isclose(median_value, np.median(mod_idx))
 
     # Use case 3: Compute multiple percentiles (quartiles)
     mod_idx, info = compute_response_modulation_index(
-        responses, percentiles=(0.25, 0.5, 0.75)
+        responses, percentiles=(25, 50, 75)
     )
-    assert info["values_levels"] == (0.25, 0.5, 0.75)
+    assert info["values_levels"] == (25.0, 50.0, 75.0)
     p25, p50, p75 = info["values_percentiles"]
     assert p25 < p50 < p75
     assert np.isclose(p25, np.percentile(mod_idx, 25))
@@ -301,13 +301,13 @@ def test_combined_decorators():
 
     # Get per-neuron selectivity with population percentiles
     selectivity, info = analyze_tuning_selectivity(
-        tuning, stat_info="mean", percentiles=(0.1, 0.9)
+        tuning, stat_info="mean", percentiles=(10, 90)
     )
     assert selectivity.shape == (n_neurons,)
-    assert "values0_mean" in info  # From use_stat
+    assert "values_mean" in info  # From use_stat
     assert "values_percentiles" in info  # From use_percentiles (inner decorator)
     assert "values_levels" in info  # From use_percentiles (inner decorator)
-    assert info["values_levels"] == (0.1, 0.9)
+    assert info["values_levels"] == (10.0, 90.0)
 
     # Get aggregated mean with percentiles computed on the aggregated value
     # (though percentiles make most sense on per-neuron values)
@@ -398,10 +398,10 @@ def test_use_percentiles_dict_format_multiple_returns():
     data = rng.random((50, 10))
 
     # Compute percentiles using tuple format (applies to position 0 by default)
-    eci, lag, info = compute_eci_and_lag(data, percentiles=(0.25, 0.75))
+    eci, lag, info = compute_eci_and_lag(data, percentiles=(25, 75))
     assert eci.shape == (50,)
     assert lag.shape == (50,)
     # Percentiles stored with separate keys for values and levels
     assert "values_percentiles" in info
     assert "values_levels" in info
-    assert info["values_levels"] == (0.25, 0.75)
+    assert info["values_levels"] == (25.0, 75.0)
