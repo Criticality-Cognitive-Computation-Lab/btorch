@@ -177,7 +177,7 @@ def _memory_var(
         # avoid accidentally carrying grad from old v
         v = torch.as_tensor(reset_val.value, **format_args).detach().clone()
     if v.shape != sizes:
-        v = expand_leading_dims(v, sizes, match_full_shape=True)
+        v = expand_leading_dims(v, sizes, match_full_shape=True, view=False)
     return v
 
 
