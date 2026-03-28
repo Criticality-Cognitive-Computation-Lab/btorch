@@ -8,6 +8,9 @@ Btorch Documentation
    :caption: Contents:
 
    quickstart
+   analysis
+   connection_conversion
+   visualisation
    api/index
 
 

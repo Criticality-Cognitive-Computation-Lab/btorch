@@ -14,8 +14,8 @@ dynamic = ["dependencies"]
 
 [project.optional-dependencies]
 docs = [
-  "mkdocs>=1.5",
-  "mkdocs-material>=9.5",
+  "sphinx>=7.0",
+  "myst-parser>=2.0",
 ]
 test = [
   "pytest>=8.2",
@@ -47,7 +47,6 @@ include = [
   "/requirements.txt",
   "/requirements-dev.txt",
   "/docs",
-  "/mkdocs.yml",
 ]
 allow-direct-references = true
 

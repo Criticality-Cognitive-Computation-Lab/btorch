@@ -21,6 +21,7 @@ extensions = [
     "sphinx.ext.napoleon",
     "sphinx.ext.viewcode",
     "sphinx.ext.intersphinx",
+    "myst_parser",
 ]
 
 # Autodoc settings
@@ -58,7 +59,10 @@ html_theme_options = {
 }
 
 # Source suffix
-source_suffix = ".rst"
+source_suffix = {
+    ".rst": "restructuredtext",
+    ".md": "markdown",
+}
 
 # Master document
 master_doc = "index"
