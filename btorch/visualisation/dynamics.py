@@ -1,14 +1,20 @@
 """Multiscale dynamics visualization with unified dual interface.
 
 This module provides plotting functions for multiscale dynamics analysis
-including Fano factor, DFA, and ISI CV across different time scales and
-aggregation levels.
+including Fano factor, DFA (Detrended Fluctuation Analysis), ISI CV
+(Coefficient of Variation), and criticality analysis. Supports both
+dataclass and plain argument interfaces for flexible usage.
+
+The visualization modes include:
+- Individual neuron traces
+- Grouped aggregations (by neuron type or neuropil)
+- Distribution summaries (violin, histogram)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,6 +25,10 @@ from matplotlib.figure import Figure
 from ..analysis.aggregation import agg_by_neuron, agg_by_neuropil
 from ..analysis.dynamic_tools.micro_scale import calculate_cv_isi
 from ..analysis.spiking import fano
+
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
 
 
 def _to_numpy(data) -> np.ndarray:
@@ -33,10 +43,11 @@ class DynamicsData:
     """Container for dynamics analysis data and configs.
 
     Attributes:
-        spikes: Spike trains (time, neurons)
-        dt: Simulation timestep in ms
-        neurons_df: DataFrame with neuron metadata
-        connections_df: DataFrame with connection metadata
+        spikes: Spike trains with shape (time, neurons).
+        dt: Simulation timestep in milliseconds.
+        neurons_df: DataFrame with neuron metadata for grouping.
+        connections_df: DataFrame with connection metadata for neuropil
+            aggregation.
     """
 
     spikes: np.ndarray | torch.Tensor
@@ -50,12 +61,13 @@ class DynamicsPlotFormat:
     """Figure formatting for dynamics plots.
 
     Attributes:
-        mode: Visualization mode - individual neurons, grouped, or distribution
-        group_by: Grouping method for aggregation
-        neuron_type_column: Column name for neuron classification
-        neuron_indices: Specific neurons for individual mode
-        colors: Color mapping
-        figsize: Figure size
+        mode: Visualization mode - "individual" for specific neurons,
+            "grouped" for aggregated groups, "distribution" for summary stats.
+        group_by: Grouping method for aggregation ("neuropil" or "neuron_type").
+        neuron_type_column: Column name in neurons_df for neuron classification.
+        neuron_indices: Specific neuron indices for individual mode.
+        colors: Color mapping dictionary.
+        figsize: Figure size as (width, height) in inches.
     """
 
     mode: Literal["individual", "grouped", "distribution"] = "individual"
@@ -71,8 +83,9 @@ class FanoFactorConfig:
     """Configuration for Fano factor analysis.
 
     Attributes:
-        windows: Time windows in timesteps for multiscale analysis
-        overlap: Overlap between windows in timesteps
+        windows: Time windows in timesteps for multiscale analysis.
+            If None, logarithmically spaced windows are auto-generated.
+        overlap: Overlap between consecutive windows in timesteps.
     """
 
     windows: list[int] | None = None
@@ -81,12 +94,12 @@ class FanoFactorConfig:
 
 @dataclass
 class DFAConfig:
-    """Configuration for DFA analysis.
+    """Configuration for DFA (Detrended Fluctuation Analysis).
 
     Attributes:
-        min_window: Minimum window size for DFA
-        max_window: Maximum window size for DFA
-        bin_size: Bin size for spike binning
+        min_window: Minimum window size for DFA in timesteps.
+        max_window: Maximum window size. If None, auto-calculated.
+        bin_size: Bin size for spike binning in timesteps.
     """
 
     min_window: int = 4
@@ -114,26 +127,49 @@ def plot_multiscale_fano(
 ) -> Figure:
     """Plot multiscale Fano factor analysis.
 
-    Computes and visualizes Fano factor across multiple time windows,
-    supporting individual neurons, grouped aggregations, and distributions.
+    Computes and visualizes Fano factor (spike count variance/mean) across
+    multiple time windows. Supports three visualization modes:
+    - "individual": Line plots for selected neurons
+    - "grouped": Aggregated by neuron type or neuropil
+    - "distribution": Violin plots showing population distribution
+
+    Supports both dataclass and plain argument interfaces. Dataclass
+    arguments take precedence when both are provided.
 
     Args:
-        data: DynamicsData dataclass
-        config: FanoFactorConfig dataclass
-        format: DynamicsPlotFormat dataclass
-        spikes: Spike trains (time, neurons)
-        dt: Timestep in ms
-        windows: Time windows in timesteps
-        overlap: Window overlap in timesteps
-        mode: Visualization mode
-        neurons_df: Neuron metadata
-        connections_df: Connection metadata
-        group_by: Grouping method
-        neuron_type_column: Column for neuron types
-        neuron_indices: Specific neurons to plot
+        data: DynamicsData container with spikes and metadata.
+        config: FanoFactorConfig with window settings.
+        format: DynamicsPlotFormat with visualization options.
+        spikes: Spike trains with shape (time, neurons). Required if
+            `data` is not provided.
+        dt: Timestep in milliseconds. Default 1.0.
+        windows: List of window sizes in timesteps. Auto-generated if None.
+        overlap: Window overlap in timesteps. Default 0.
+        mode: Visualization mode - "individual", "grouped", "distribution".
+        neurons_df: DataFrame with neuron metadata for grouping.
+        connections_df: DataFrame with connection metadata for neuropil
+            grouping.
+        group_by: Grouping method - "neuropil" or "neuron_type".
+        neuron_type_column: Column name for neuron types in neurons_df.
+        neuron_indices: Specific neuron indices for "individual" mode.
+            If None, first 10 neurons are plotted.
+        **kwargs: Additional arguments passed to plotting functions.
 
     Returns:
-        Figure with Fano factor plots
+        Figure with Fano factor plots.
+
+    Raises:
+        ValueError: If spikes are not provided through either `data` or
+            `spikes` argument.
+
+    Example:
+        >>> # Plain args interface
+        >>> fig = plot_multiscale_fano(spikes, dt=1.0, mode="distribution")
+        >>>
+        >>> # Dataclass interface
+        >>> data = DynamicsData(spikes=spikes, dt=1.0, neurons_df=df)
+        >>> config = FanoFactorConfig(windows=[10, 50, 100])
+        >>> fig = plot_multiscale_fano(data=data, config=config)
     """
     # Resolve dataclass vs plain args
     if data is not None:
@@ -166,8 +202,6 @@ def plot_multiscale_fano(
     # Default windows: logarithmically spaced
     if windows is None:
         windows = [int(w) for w in np.logspace(1, np.log10(n_time // 4), 10)]
-
-    # Reshape for fano: (time, batch=1, neurons)
 
     # Compute Fano factor for each window
     fano_results = {}
@@ -362,20 +396,35 @@ def plot_dfa_analysis(
 ) -> Figure:
     """Plot DFA (Detrended Fluctuation Analysis) results.
 
+    DFA quantifies long-range temporal correlations in spike trains.
+    The scaling exponent (alpha) indicates:
+    - alpha ≈ 0.5: Uncorrelated (random) activity
+    - alpha > 0.5: Long-range positive correlations
+    - alpha < 0.5: Long-range anti-correlations
+
+    Supports both dataclass and plain argument interfaces.
+
     Args:
-        data: DynamicsData dataclass
-        config: DFAConfig dataclass
-        format: DynamicsPlotFormat dataclass
-        spikes: Spike trains
-        dt: Timestep in ms
-        min_window: Minimum window size
-        max_window: Maximum window size
-        bin_size: Bin size for spike binning
-        mode: Visualization mode
-        neurons_df: Neuron metadata
+        data: DynamicsData container with spikes.
+        config: DFAConfig with window and bin settings.
+        format: DynamicsPlotFormat (mode affects plot style).
+        spikes: Spike trains (time, neurons). Required if `data` not provided.
+        dt: Timestep in milliseconds (for label consistency).
+        min_window: Minimum window size for DFA in timesteps.
+        max_window: Maximum window size. Auto-calculated if None.
+        bin_size: Bin size for spike binning in timesteps.
+        mode: Visualization mode (affects annotation style).
+        neurons_df: Neuron metadata for potential grouping.
+        **kwargs: Additional arguments.
 
     Returns:
-        Figure with DFA analysis
+        Figure with DFA summary and interpretation guide.
+
+    Raises:
+        ValueError: If spikes are not provided.
+
+    Example:
+        >>> fig = plot_dfa_analysis(spikes, bin_size=10)
     """
     # Resolve dataclass vs plain args
     if data is not None:
@@ -440,18 +489,38 @@ def plot_isi_cv(
 ) -> Figure:
     """Plot ISI CV (Coefficient of Variation) distribution.
 
+    ISI CV measures spike train irregularity:
+    - CV = 1: Poisson-like (irregular) firing
+    - CV < 1: Regular, periodic firing
+    - CV > 1: Bursty, irregular firing
+
+    Supports histogram view for distributions and bar plots for grouped
+    comparisons.
+
     Args:
-        data: DynamicsData dataclass
-        format: DynamicsPlotFormat dataclass
-        spikes: Spike trains
-        dt: Timestep in ms
-        mode: Visualization mode
-        neurons_df: Neuron metadata
-        group_by: Grouping method
-        neuron_type_column: Column for neuron types
+        data: DynamicsData container with spikes and metadata.
+        format: DynamicsPlotFormat with visualization settings.
+        spikes: Spike trains (time, neurons). Required if `data` not provided.
+        dt: Timestep in milliseconds for ISI calculation.
+        mode: Visualization mode - "distribution", "individual", or "grouped".
+        neurons_df: DataFrame with neuron metadata for grouping.
+        group_by: Grouping method - "neuropil" or "neuron_type".
+        neuron_type_column: Column name for neuron types in neurons_df.
+        **kwargs: Additional arguments.
 
     Returns:
-        Figure with ISI CV plots
+        Figure with ISI CV histogram or grouped bar plot.
+
+    Raises:
+        ValueError: If spikes are not provided, or if grouped mode is
+            requested without required metadata.
+
+    Example:
+        >>> fig = plot_isi_cv(spikes, dt=1.0, mode="distribution")
+        >>>
+        >>> # Grouped by cell type
+        >>> fig = plot_isi_cv(spikes, neurons_df=df,
+        ...                   mode="grouped", group_by="neuron_type")
     """
     # Resolve dataclass vs plain args
     if data is not None:
@@ -526,14 +595,27 @@ def plot_avalanche_analysis(
 ) -> tuple[Figure, dict]:
     """Plot avalanche size and duration distributions to analyze criticality.
 
+    Creates a 3-panel figure showing:
+    1. Avalanche size distribution P(S) with power-law fit
+    2. Avalanche duration distribution P(T) with power-law fit
+    3. Average size vs duration scaling relation <S>(T)
+
+    Criticality is indicated by power-law distributions and specific
+    scaling exponents (tau, alpha, gamma).
+
     Args:
-        spikes: Spike matrix of shape (Time, Neurons).
-        bin_size: Bin size for avalanche detection.
-        dt: Timestep in ms (unused for checking, but kept for interface).
+        spikes: Spike matrix with shape (time, neurons).
+        bin_size: Bin size for avalanche detection in timesteps.
+        dt: Timestep in ms (unused, kept for interface consistency).
 
     Returns:
-        fig: The matplotlib figure containing 3 panels.
-        results: The statistics returned by compute_avalanche_statistics.
+        Tuple of (figure, results) where results contains fitted exponents
+        (tau, alpha, gamma), CCC (criticality consistency check), and
+        power-law fit objects.
+
+    Example:
+        >>> fig, results = plot_avalanche_analysis(spikes, bin_size=5)
+        >>> print(f"Tau: {results['tau']:.2f}, CCC: {results['CCC']:.2f}")
     """
     from ..analysis.dynamic_tools.criticality import compute_avalanche_statistics
 
@@ -619,16 +701,27 @@ def plot_avalanche_analysis(
 
 
 def plot_eigenvalue_spectrum(
-    weight_matrix: np.ndarray | torch.Tensor, ax: plt.Axes | None = None
-) -> tuple[Figure, plt.Axes, dict]:
-    """Plot the eigenvalue spectrum of the weight matrix.
+    weight_matrix: np.ndarray | torch.Tensor, ax: Axes | None = None
+) -> tuple[Figure, Axes, dict]:
+    """Plot the eigenvalue spectrum of a weight matrix.
+
+    Visualizes eigenvalues in the complex plane with the spectral radius
+    indicated by a dashed circle. Outliers (eigenvalues outside the bulk)
+    are highlighted in red.
 
     Args:
-        weight_matrix: Square connectivity matrix.
-        ax: Axes to plot on.
+        weight_matrix: Square connectivity matrix (N, N).
+        ax: Existing axes to plot on. Creates new figure if None.
 
     Returns:
-        fig, ax, results
+        Tuple of (figure, axes, results) where results contains:
+        - "eigenvalues": Complex array of all eigenvalues
+        - "spectral_radius": Radius of spectral bulk
+        - "outliers": Array of outlier eigenvalues
+
+    Example:
+        >>> fig, ax, results = plot_eigenvalue_spectrum(W)
+        >>> print(f"Spectral radius: {results['spectral_radius']:.2f}")
     """
     from ..analysis.dynamic_tools.attractor_dynamics import (
         calculate_structural_eigenvalue_outliers,
@@ -683,13 +776,24 @@ def plot_eigenvalue_spectrum(
 
 
 def plot_lyapunov_spectrum(
-    spectrum: list[float] | np.ndarray, ax: plt.Axes | None = None
-) -> tuple[Figure, plt.Axes]:
+    spectrum: list[float] | np.ndarray, ax: Axes | None = None
+) -> tuple[Figure, Axes]:
     """Plot the Lyapunov exponents spectrum.
 
+    Displays Lyapunov exponents sorted by magnitude. Positive exponents
+    indicate chaos; the number of non-negative exponents relates to the
+    Kaplan-Yorke dimension.
+
     Args:
-        spectrum: List/Array of Lyapunov exponents.
-        ax: Axes to plot on.
+        spectrum: List or array of Lyapunov exponents.
+        ax: Existing axes to plot on. Creates new figure if None.
+
+    Returns:
+        Tuple of (figure, axes) with the spectrum plot.
+
+    Example:
+        >>> fig, ax = plot_lyapunov_spectrum(lyap_spectrum)
+        >>> # Positive exponents indicate chaotic dynamics
     """
     from ..analysis.dynamic_tools.attractor_dynamics import (
         calculate_kaplan_yorke_dimension,
@@ -724,18 +828,26 @@ def plot_lyapunov_spectrum(
 def plot_firing_rate_distribution(
     spikes: np.ndarray | torch.Tensor,
     dt: float = 1.0,
-    ax: plt.Axes | None = None,
+    ax: Axes | None = None,
 ) -> tuple[Figure, dict]:
-    """Plot firing rate distribution.
+    """Plot the distribution of firing rates across neurons.
+
+    Computes per-neuron firing rates and displays as a histogram with
+    mean indicator.
 
     Args:
-        spikes: Spike matrix (Time, Neurons)
-        dt: Timestep in ms
-        ax: Axes to plot on
+        spikes: Spike matrix with shape (time, neurons).
+        dt: Timestep in milliseconds for rate calculation.
+        ax: Existing axes to plot on. Creates new figure if None.
 
     Returns:
-        fig: Figure
-        stats: FR statistics
+        Tuple of (figure, stats) where stats contains:
+        - "rates": Array of firing rates per neuron (Hz)
+        - "mean", "std", "median": Summary statistics
+
+    Example:
+        >>> fig, stats = plot_firing_rate_distribution(spikes, dt=1.0)
+        >>> print(f"Mean rate: {stats['mean']:.1f} Hz")
     """
     from ..analysis.dynamic_tools.micro_scale import calculate_fr_distribution
 
@@ -770,17 +882,27 @@ def plot_firing_rate_distribution(
 def plot_micro_dynamics(
     spikes: np.ndarray | torch.Tensor,
     dt: float = 1.0,
-    ax: plt.Axes | None = None,
+    ax: Axes | None = None,
 ) -> tuple[Figure, dict]:
-    """Plot firing rate distribution and CV_ISI distribution.
+    """Plot firing rate and ISI CV distributions side-by-side.
+
+    Creates a 2-panel figure summarizing micro-scale dynamics:
+    - Left: Firing rate distribution histogram
+    - Right: ISI CV distribution histogram
 
     Args:
-        spikes: (Time, Neurons)
-        dt: time step in ms
-        ax: Unused, acts as compatibility wrapper creating a new figure.
+        spikes: Spike matrix with shape (time, neurons).
+        dt: Timestep in milliseconds.
+        ax: Unused parameter (kept for API compatibility).
 
     Returns:
-        fig, stats (dict with keys 'fr' and 'cv')
+        Tuple of (figure, stats) where stats is a dict with keys:
+        - "fr": Firing rate statistics
+        - "cv": ISI CV statistics
+
+    Example:
+        >>> fig, stats = plot_micro_dynamics(spikes, dt=1.0)
+        >>> print(f"Rate: {stats['fr']['mean']:.1f} Hz, CV: {stats['cv']['mean']:.2f}")
     """
     from ..analysis.dynamic_tools.micro_scale import calculate_cv_isi
 
@@ -816,15 +938,25 @@ def plot_micro_dynamics(
     return fig, {"fr": fr_stats, "cv": cv_results}
 
 
-def plot_gain_stability(data: tuple) -> tuple[Figure, plt.Axes]:
-    """Plot gain stability analysis (slope, intercept, g_values,
-    lambda_values).
+def plot_gain_stability(data: tuple) -> tuple[Figure, Axes]:
+    """Plot gain stability analysis results.
+
+    Visualizes the relationship between network gain (g) and stability
+    metrics (e.g., maximum Lyapunov exponent or spectral abscissa).
+    A linear fit indicates consistent scaling behavior.
 
     Args:
-        data: Tuple of (slope, intercept, g_values, lambda_values)
+        data: Tuple of (slope, intercept, g_values, lambda_values) where:
+            - slope, intercept: Linear fit parameters
+            - g_values: Array of gain values tested
+            - lambda_values: Corresponding stability metrics
 
     Returns:
-        fig, ax
+        Tuple of (figure, axes) with scatter plot and fit line.
+
+    Example:
+        >>> data = (slope, intercept, g_vals, lyap_vals)
+        >>> fig, ax = plot_gain_stability(data)
     """
     slope, intercept, g_values, lambda_values = data
 

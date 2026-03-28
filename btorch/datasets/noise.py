@@ -1,3 +1,46 @@
+"""Noise generation utilities for spiking neural network simulations.
+
+This module provides functional and stateful (layer-based) noise generators
+for creating temporally structured input noise, background activity, and
+synaptic noise in SNNs.
+
+Physical Units
+--------------
+All time-related parameters use consistent units based on ``dt``:
+
+- ``tau``: Time constant in same units as ``dt`` (typically milliseconds)
+- ``sigma``: Standard deviation in arbitrary units matching the output
+- ``rate``: Events per unit time (Hz if dt is in seconds, kHz if dt is ms)
+- ``dt``: Simulation time step (default usually from ``environ.get("dt")``)
+
+Shape Conventions
+-----------------
+- Functional API: Output shape is ``(T, *size)`` where ``size`` is the
+  per-timestep shape (e.g., ``(B, N)`` for batch x neurons).
+- Layer API multi-step: Returns ``(T, *n_neuron)``.
+- Layer API single-step: Returns ``(*n_neuron)``.
+
+Stateful Behavior
+-----------------
+Layer classes (``OUNoiseLayer``, ``PoissonNoiseLayer``, ``PinkNoiseLayer``)
+maintain internal state between calls when ``stateful=True``:
+
+- OU: Stores current noise value (carries over between sequences)
+- Poisson: Stores last sampled value
+- Pink: Stores white noise history for FIR continuity
+
+State is preserved across ``multi_step_forward`` calls and updated at the
+end of each sequence (last timestep becomes initial state for next call).
+Use ``reset()`` (inherited from ``MemoryModule``) to reinitialize state.
+
+Determinism
+-----------
+All generators accept an optional ``torch.Generator`` for reproducible
+sampling. Note that multi-step OU uses vectorized convolution which may
+produce slightly different values than sequential single-step calls due
+to floating-point ordering.
+"""
+
 from collections.abc import Sequence
 from typing import Literal
 
@@ -19,6 +62,16 @@ def _unflatten_td(seq: Tensor, rest_shape: Sequence[int]) -> Tensor:
 def randn_like(
     like: Tensor, generator: torch.Generator | None = None, **kwargs
 ) -> Tensor:
+    """Generate standard normal noise matching a reference tensor's metadata.
+
+    Args:
+        like: Reference tensor providing shape, device, dtype.
+        generator: Optional RNG generator for deterministic sampling.
+        **kwargs: Additional args passed to ``torch.empty_like``.
+
+    Returns:
+        Tensor with same shape/device/dtype as ``like``, filled with N(0,1).
+    """
     return torch.empty_like(like).normal_(generator=generator, **kwargs)
 
 
@@ -33,18 +86,38 @@ def ou_noise(
     noise0: Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> Tensor:
-    """Functional OU noise generator.
+    """Generate Ornstein-Uhlenbeck (OU) noise sequence.
+
+    OU noise follows the stochastic differential equation:
+        dx = -x/tau * dt + sigma * sqrt(2/tau) * dW
+
+    The exact discretization used is:
+        n_{t+1} = alpha * n_t + beta * eps_t
+        alpha = exp(-dt/tau)
+        beta = sigma * sqrt(1 - exp(-2*dt/tau))
+        eps_t ~ N(0, 1)
 
     Args:
-        size: Output noise shape, like torch.randn.
-        sigma: Scalar or per-neuron sigma, broadcastable to noise.
-        tau: Scalar or per-neuron tau, broadcastable to noise.
-        T: Sequence length.
-        dt: Time step.
-        device: Device for generated noise0 if not provided.
-        dtype: Dtype for generated noise0 if not provided.
-        noise0: Optional initial noise state, shape `size`.
-        generator: Optional RNG generator for noise sampling.
+        *size: Shape of the noise per timestep (e.g., ``B, N`` for batch,
+            neurons). Output will be ``(T, *size)``.
+        sigma: Standard deviation of the stationary distribution. Can be
+            scalar or per-element (broadcastable to ``size``).
+        tau: Time constant controlling correlation length. Can be scalar or
+            per-element (broadcastable to ``size``). Same units as ``dt``.
+        T: Number of timesteps to generate.
+        dt: Simulation timestep (same units as ``tau``).
+        device: Device for the output tensor (if ``noise0`` not provided).
+        dtype: Dtype for the output tensor (if ``noise0`` not provided).
+        noise0: Initial noise state with shape ``size``. If provided, ``size``
+            must match or be empty. Defaults to N(0,1) sample if None.
+        generator: Optional RNG generator for deterministic sampling.
+
+    Returns:
+        Tensor of shape ``(T, *size)`` containing the OU noise sequence.
+
+    Raises:
+        ValueError: If neither ``size`` nor ``noise0`` is provided.
+        RuntimeError: If ``sigma`` or ``tau`` cannot broadcast to ``size``.
     """
     if noise0 is None:
         if len(size) == 0:
@@ -130,16 +203,23 @@ def ou_noise_like(
     noise0: Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> Tensor:
-    """OU noise convenience wrapper using a reference tensor.
+    """Generate OU noise matching a reference tensor's shape and device.
+
+    Convenience wrapper around ``ou_noise`` that infers ``size``, ``device``,
+    and ``dtype`` from a reference tensor.
 
     Args:
-        like: Reference tensor providing shape, device, dtype.
-        sigma: Scalar or per-neuron sigma, broadcastable to `like`.
-        tau: Scalar or per-neuron tau, broadcastable to `like`.
-        T: Sequence length.
-        dt: Time step.
-        noise0: Optional initial state. Defaults to randn_like(like).
-        generator: Optional RNG generator for noise sampling.
+        like: Reference tensor with shape ``(*batch, *neuron)`` that defines
+            the per-timestep shape. Output will be ``(T, *like.shape)``.
+        sigma: Standard deviation (scalar or broadcastable to ``like.shape``).
+        tau: Time constant (scalar or broadcastable to ``like.shape``).
+        T: Number of timesteps.
+        dt: Simulation timestep.
+        noise0: Optional initial state with shape ``like.shape``.
+        generator: Optional RNG generator.
+
+    Returns:
+        OU noise tensor of shape ``(T, *like.shape)``.
     """
     if noise0 is None:
         noise0 = randn_like(like, generator=generator)
@@ -162,10 +242,28 @@ def poisson_noise(
     dtype: torch.dtype | None = None,
     generator: torch.Generator | None = None,
 ) -> Tensor:
-    """Functional Poisson noise generator.
+    """Generate Poisson noise (discrete event counts).
 
-    The rate parameter is interpreted per unit time; samples are drawn
-    with lambda = rate * dt for each step.
+    Samples are drawn from Poisson distribution with lambda = rate * dt
+    for each timestep and element. The output represents event counts per
+    timestep (0, 1, 2, ...).
+
+    Args:
+        *size: Shape per timestep (e.g., ``B, N``). Output is ``(T, *size)``.
+        rate: Event rate per unit time. Can be scalar or per-element
+            (broadcastable to ``size``).
+        T: Number of timesteps.
+        dt: Simulation timestep (scales the rate: lambda = rate * dt).
+        device: Device for the output tensor.
+        dtype: Dtype for the output (must be floating point).
+        generator: Optional RNG generator for deterministic sampling.
+
+    Returns:
+        Event count tensor of shape ``(T, *size)`` with dtype ``float``.
+
+    Raises:
+        ValueError: If ``size`` is empty, ``T < 0``, or dtype is not floating.
+        ValueError: If ``rate * dt`` is negative.
     """
     if len(size) == 0:
         raise ValueError("Provide output size for poisson_noise.")
@@ -197,7 +295,19 @@ def poisson_noise_like(
     dt: float = 1.0,
     generator: torch.Generator | None = None,
 ) -> Tensor:
-    """Poisson noise convenience wrapper using a reference tensor."""
+    """Generate Poisson noise matching a reference tensor's metadata.
+
+    Args:
+        like: Reference tensor defining per-timestep shape ``(*size)``.
+            Output will be ``(T, *like.shape)``.
+        rate: Event rate per unit time (scalar or broadcastable).
+        T: Number of timesteps.
+        dt: Simulation timestep.
+        generator: Optional RNG generator.
+
+    Returns:
+        Poisson event counts of shape ``(T, *like.shape)``.
+    """
     dtype = like.dtype if like.is_floating_point() else torch.get_default_dtype()
     return poisson_noise(
         *like.shape,
@@ -218,7 +328,16 @@ def _pink_fir_kernel(
     Uses truncated fractional-integration coefficients:
         h[0] = 1
         h[k] = h[k-1] * (k - 1 + alpha) / k,  alpha=0.5
+
     This gives |H(f)| ~ f^-alpha at low frequency, so PSD ~ 1/f for alpha=0.5.
+
+    Args:
+        fir_order: Length of the FIR kernel (>= 1).
+        device: Device for the kernel tensor.
+        dtype: Dtype for the kernel (must be floating point).
+
+    Returns:
+        Normalized FIR kernel of shape ``(fir_order,)``.
     """
     if fir_order < 1:
         raise ValueError(f"fir_order must be >= 1, got {fir_order}.")
@@ -252,7 +371,18 @@ def _white_noise_2d(
 def _apply_fir_2d(
     white: Tensor, kernel: Tensor, history: Tensor | None = None
 ) -> tuple[Tensor, Tensor]:
-    """Apply a causal FIR filter to [D, T] white noise."""
+    """Apply a causal FIR filter to [D, T] white noise.
+
+    Args:
+        white: White noise of shape ``(D, T)``.
+        kernel: FIR kernel of shape ``(fir_order,)``.
+        history: Optional previous white noise history of shape
+            ``(D, fir_order-1)`` for continuity across calls.
+
+    Returns:
+        Tuple of (filtered_noise, new_history) where filtered_noise has
+        shape ``(D, T)`` and new_history has shape ``(D, fir_order-1)``.
+    """
     D, _ = white.shape
     fir_order = kernel.numel()
     hist_len = fir_order - 1
@@ -291,10 +421,33 @@ def pink_noise(
     generator: torch.Generator | None = None,
     return_white_history: bool = False,
 ) -> Tensor | tuple[Tensor, Tensor]:
-    """Functional pink-noise generator using a causal FIR filter.
+    """Generate pink (1/f) noise using a causal FIR filter.
 
-    Multi-step generation is vectorized: it samples all white inputs once and
-    applies one convolution, instead of iterative per-step updates.
+    Pink noise has power spectral density proportional to 1/frequency,
+    creating naturalistic temporal correlations. Generated by filtering
+    white noise through a fractional integration FIR kernel.
+
+    Args:
+        *size: Shape per timestep. Output will be ``(T, *size)``.
+        T: Number of timesteps to generate.
+        fir_order: Length of the FIR filter kernel (default 64). Higher
+            values give better low-frequency approximation but more state.
+        device: Device for the output tensor (if ``white_history`` not given).
+        dtype: Dtype for the output (must be floating point).
+        white_history: Optional previous white noise history with shape
+            ``(*size, fir_order-1)`` for continuity across calls.
+        generator: Optional RNG generator for deterministic sampling.
+        return_white_history: If True, also return the updated history tensor
+            for stateful usage.
+
+    Returns:
+        Pink noise tensor of shape ``(T, *size)``. If ``return_white_history``
+        is True, returns ``(noise, history)`` where history has shape
+        ``(*size, fir_order-1)``.
+
+    Raises:
+        ValueError: If ``T < 0``, ``fir_order < 1``, or dtype not floating.
+        ValueError: If ``size`` conflicts with ``white_history`` shape.
     """
     if T < 0:
         raise ValueError(f"T must be non-negative, got {T}.")
@@ -350,7 +503,22 @@ def pink_noise_like(
     generator: torch.Generator | None = None,
     return_white_history: bool = False,
 ) -> Tensor | tuple[Tensor, Tensor]:
-    """Pink-noise convenience wrapper using a reference tensor."""
+    """Generate pink noise matching a reference tensor's metadata.
+
+    Args:
+        like: Reference tensor with shape ``(*size)``. Output will be
+            ``(T, *like.shape)``.
+        T: Number of timesteps.
+        fir_order: FIR filter length.
+        white_history: Optional history tensor with shape
+            ``(*like.shape, fir_order-1)``.
+        generator: Optional RNG generator.
+        return_white_history: If True, also return updated history.
+
+    Returns:
+        Pink noise of shape ``(T, *like.shape)``, or ``(noise, history)``
+        tuple if ``return_white_history=True``.
+    """
     dtype = like.dtype if like.is_floating_point() else torch.get_default_dtype()
     return pink_noise(
         *like.shape,
@@ -367,36 +535,47 @@ def pink_noise_like(
 class OUNoiseLayer(base.MemoryModule):
     """Ornstein-Uhlenbeck (OU) noise layer for temporally correlated noise.
 
-    Exact discretization (sigma is stationary std):
+    Implements exact discretization of the OU process where ``sigma`` is the
+    stationary standard deviation:
+
         n_{t+1} = alpha * n_t + beta * eps_t
         alpha = exp(-dt/tau)
         beta  = sigma * sqrt(1 - exp(-2*dt/tau))
         eps_t ~ N(0, 1)
 
-    Tensor conventions:
-                - multi-step input x: [T, *batch_dims, *n_neuron]
-                    (neuron dims must be trailing)
-                - single-step input x: [*batch_dims, *n_neuron]
-                - internal memory self.noise is aligned with x[0]
-                    (state BEFORE current step/sequence)
+    The layer supports both single-step (stateful) and multi-step (vectorized)
+    modes. In stateful mode, the noise state persists across forward calls.
 
-        Multi-step backend:
-                - convolution (scalar tau/sigma -> one conv1d; per-neuron
-                    tau/sigma -> grouped conv1d, O(T^2*D))
-        Determinism note:
-                - multi-step uses a vectorized RNG path and convolution, so
-                  exact equality with repeated single-step updates is not
-                  guaranteed even when a generator is provided. Use single-step
-                  loops if you need step-by-step equivalence; otherwise compare
-                  statistical properties.
+    Tensor Conventions:
+        - Multi-step input: Output shape is ``(T, *batch_dims, *n_neuron)``
+          where neuron dims are trailing.
+        - Single-step input: Output shape is ``(*batch_dims, *n_neuron)``.
+        - Internal state ``self.noise`` stores the state BEFORE the current
+          step/sequence (i.e., the initial condition).
+
+    Multi-step Backend:
+        - Scalar tau/sigma: Uses single conv1d (fast)
+        - Per-neuron tau/sigma: Uses grouped conv1d, O(T^2 * D) complexity
+
+    Determinism Note:
+        Multi-step uses vectorized RNG and convolution, so exact equality with
+        repeated single-step updates is not guaranteed even with a generator.
+        Use single-step loops if you need step-by-step equivalence.
 
     Args:
         n_neuron: Number of neurons or shape of trailing neuron dims.
-        sigma: scalar or tensor broadcastable to n_neuron.
-        tau: scalar or tensor broadcastable to n_neuron.
-        step_mode: 's' single-step, 'm' multi-step.
-        trainable: whether sigma and tau are learnable.
-        tau_min: clamp tau to this minimum (stability).
+        sigma: Stationary standard deviation (scalar or per-neuron).
+        tau: Time constant in same units as dt (scalar or per-neuron).
+        step_mode: ``'s'`` for single-step, ``'m'`` for multi-step.
+        trainable: Whether sigma and tau are learnable parameters.
+        stateful: If True, maintain noise state between calls (required for
+            single-step mode).
+        tau_min: Minimum value for tau (clamped for numerical stability).
+
+    Attributes:
+        noise: Current noise state tensor (only if ``stateful=True``).
+        sigma: Standard deviation (Parameter if trainable, else buffer).
+        tau: Time constant (Parameter if trainable, else buffer).
     """
 
     noise: Tensor
@@ -420,10 +599,9 @@ class OUNoiseLayer(base.MemoryModule):
         self.n_neuron, self.size = base.normalize_n_neuron(n_neuron)
         self.tau_min = float(tau_min)
 
-        # Memory state: stored as "n_0" (state BEFORE current
-        # step/sequence).
-        # Will be expanded lazily to match x[0] if
-        # register_memory does not include batch dims.
+        # Memory state: stored as "n_0" (state BEFORE current step/sequence).
+        # Will be expanded lazily to match x[0] if register_memory does not
+        # include batch dims.
         if stateful:
             self.register_memory("noise", 0.0, self.n_neuron)
 
@@ -442,8 +620,15 @@ class OUNoiseLayer(base.MemoryModule):
     ) -> Tensor:
         """Single-step update of OU noise.
 
-        Uses `self.noise` for device, dtype and shape. Returns the updated
-        noise tensor (no input `x` is required or used).
+        Uses ``self.noise`` for device, dtype, and shape. Returns the updated
+        noise tensor (no input ``x`` is required or used).
+
+        Args:
+            dt: Timestep (defaults to ``environ.get("dt")``).
+            generator: Optional RNG generator.
+
+        Returns:
+            Updated noise tensor with same shape as ``self.noise``.
         """
         assert self.stateful, "single_step_forward requires stateful=True"
 
@@ -467,10 +652,19 @@ class OUNoiseLayer(base.MemoryModule):
         *,
         generator: torch.Generator | None = None,
     ) -> Tensor:
-        """Public multi-step forward.
+        """Generate a multi-step OU noise sequence.
 
-        Generates a noise sequence of length
-        `T` and returns a tensor of shape [T, *noise_shape].
+        Args:
+            T: Number of timesteps.
+            dt: Timestep (defaults to ``environ.get("dt")``).
+            generator: Optional RNG generator.
+
+        Returns:
+            Noise sequence of shape ``(T, *noise_shape)`` where ``noise_shape``
+            matches ``self.noise.shape``.
+
+        Raises:
+            RuntimeError: If stateful but noise buffer not initialized.
         """
         if T == 0:
             return torch.empty(
@@ -508,10 +702,26 @@ class OUNoiseLayer(base.MemoryModule):
 
 
 class PoissonNoiseLayer(base.MemoryModule):
-    """Poisson noise layer with per-step lambda = rate * dt.
+    """Poisson noise layer for discrete event generation.
 
-    Supports single-step stateful sampling and vectorized multi-step
-    sampling.
+    Generates Poisson-distributed event counts with rate scaled by ``dt``:
+    ``lambda = rate * dt`` per timestep. Supports both single-step stateful
+    sampling and vectorized multi-step generation.
+
+    In stateful mode, the last sampled value is preserved as ``self.noise``
+    and used as the initial state for subsequent calls.
+
+    Args:
+        n_neuron: Number of neurons or shape of trailing neuron dims.
+        rate: Events per unit time (scalar or per-neuron, broadcastable).
+        step_mode: ``'s'`` for single-step, ``'m'`` for multi-step.
+        trainable: Whether rate is a learnable parameter.
+        stateful: If True, maintain state between calls (required for
+            single-step mode).
+
+    Attributes:
+        noise: Last sampled value (only if ``stateful=True``).
+        rate: Event rate (Parameter if trainable, else buffer).
     """
 
     noise: Tensor
@@ -544,7 +754,15 @@ class PoissonNoiseLayer(base.MemoryModule):
     def single_step_forward(
         self, dt: float | None = None, *, generator: torch.Generator | None = None
     ) -> Tensor:
-        """Single-step Poisson sampling based on current dt."""
+        """Single-step Poisson sampling.
+
+        Args:
+            dt: Timestep (defaults to ``environ.get("dt")``).
+            generator: Optional RNG generator.
+
+        Returns:
+            Event counts tensor with same shape as ``self.noise``.
+        """
         assert self.stateful, "single_step_forward requires stateful=True"
         dt = dt if dt is not None else environ.get("dt")
 
@@ -566,7 +784,16 @@ class PoissonNoiseLayer(base.MemoryModule):
         *,
         generator: torch.Generator | None = None,
     ) -> Tensor:
-        """Vectorized multi-step Poisson sampling."""
+        """Vectorized multi-step Poisson sampling.
+
+        Args:
+            T: Number of timesteps.
+            dt: Timestep (defaults to ``environ.get("dt")``).
+            generator: Optional RNG generator.
+
+        Returns:
+            Event counts of shape ``(T, *noise_shape)``.
+        """
         if T == 0:
             return torch.empty(
                 (0,) + tuple(self.noise.shape),
@@ -601,11 +828,27 @@ class PoissonNoiseLayer(base.MemoryModule):
 
 
 class PinkNoiseLayer(base.MemoryModule):
-    """Pink (1/f) noise layer using a causal FIR filter.
+    """Pink (1/f) noise layer using causal FIR filtering.
 
-    Single-step mode updates the FIR state one sample at a time. Multi-
-    step mode uses one vectorized convolution pass over generated white
-    noise.
+    Generates colored noise with PSD ~ 1/frequency by filtering white noise
+    through a fractional integration FIR kernel. Supports both single-step
+    (stateful, with history preservation) and multi-step (vectorized) modes.
+
+    In stateful mode, the FIR history is preserved across calls for seamless
+    continuation of noise sequences.
+
+    Args:
+        n_neuron: Number of neurons or shape of trailing neuron dims.
+        fir_order: Length of the FIR filter kernel (default 64).
+        step_mode: ``'s'`` for single-step, ``'m'`` for multi-step.
+        stateful: If True, maintain FIR history between calls (required for
+            single-step mode).
+
+    Attributes:
+        noise: Current noise value (only if ``stateful=True``).
+        white_history: Previous white noise samples for FIR continuity
+            (shape ``(*n_neuron, fir_order-1)``).
+        fir_order: Length of the FIR kernel.
     """
 
     noise: Tensor
@@ -639,7 +882,14 @@ class PinkNoiseLayer(base.MemoryModule):
     def single_step_forward(
         self, *, generator: torch.Generator | None = None
     ) -> Tensor:
-        """Single-step pink-noise update using FIR history."""
+        """Single-step pink-noise update using FIR history.
+
+        Args:
+            generator: Optional RNG generator.
+
+        Returns:
+            Single noise sample with shape ``(*n_neuron)``.
+        """
         assert self.stateful, "single_step_forward requires stateful=True"
         out, new_hist = pink_noise(
             T=1,
@@ -658,7 +908,15 @@ class PinkNoiseLayer(base.MemoryModule):
         *,
         generator: torch.Generator | None = None,
     ) -> Tensor:
-        """Vectorized multi-step pink-noise generation."""
+        """Vectorized multi-step pink-noise generation.
+
+        Args:
+            T: Number of timesteps.
+            generator: Optional RNG generator.
+
+        Returns:
+            Noise sequence of shape ``(T, *n_neuron)``.
+        """
         if T == 0:
             return torch.empty(
                 (0,) + tuple(self.noise.shape),

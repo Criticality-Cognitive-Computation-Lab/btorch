@@ -1,3 +1,15 @@
+"""Timeseries visualization utilities for spike trains and continuous traces.
+
+This module provides plotting functions for:
+- Spike raster plots with grouping and styling options
+- Continuous timeseries traces (voltage, currents)
+- Frequency spectrum analysis
+- Log-binned histograms
+
+The raster plot supports neuron grouping, color-coded strips, population
+firing rates, and event/region annotations.
+"""
+
 from __future__ import annotations
 
 import warnings
@@ -1126,7 +1138,31 @@ def plot_spectrum(
     alpha: float = 0.2,
     mean_linewidth: float = 1.5,
 ) -> tuple[np.ndarray, np.ndarray, Axes]:
-    """Plot frequency spectrum of data."""
+    """Plot frequency spectrum of timeseries data.
+
+    Computes power spectral density using Welch's method and visualizes
+    the frequency content. For 2D input (time, neurons), plots individual
+    traces with optional mean overlay.
+
+    Args:
+        data: Input timeseries with shape (time,) or (time, neurons).
+        dt: Sampling interval in ms. Default 1.0.
+        nperseg: Length of FFT segments. Default is min(256, time//4).
+        ax: Existing axes to plot on. Creates new figure if None.
+        mode: Plot scale - "loglog" (default) or "semilogx".
+        show_mean: Whether to overlay the mean spectrum (for 2D data).
+        title: Plot title.
+        color: Color for traces. Uses default if None.
+        label: Legend label for mean trace.
+        alpha: Opacity for individual traces.
+        mean_linewidth: Line width for mean trace.
+
+    Returns:
+        Tuple of (frequencies, power_spectrum, axes).
+
+    Example:
+        >>> freqs, power, ax = plot_spectrum(spikes, dt=1.0, mode="loglog")
+    """
     data_np = _to_numpy(data)
     if dt is None:
         dt = 1.0
@@ -1298,7 +1334,25 @@ def plot_log_hist(
     xlabel: str = "Value",
     **kwargs,
 ) -> Axes:
-    """Plot log-log histogram."""
+    """Plot log-log histogram with logarithmic binning.
+
+    Creates a scatter plot of histogram counts using logarithmically
+    spaced bins. Useful for visualizing heavy-tailed distributions
+    (e.g., power laws).
+
+    Args:
+        values: Input values to histogram. Flattened if multidimensional.
+        ax: Existing axes to plot on. Creates new figure if None.
+        title: Plot title.
+        xlabel: X-axis label.
+        **kwargs: Additional arguments passed to ax.scatter().
+
+    Returns:
+        Axes containing the log-log histogram.
+
+    Example:
+        >>> ax = plot_log_hist(synapse_weights, title="Weight Distribution")
+    """
     vals = _to_numpy(values)
     hist, bin_centers = compute_log_hist(vals)
 

@@ -1,3 +1,28 @@
+"""Connectivity analysis utilities for neural networks.
+
+This module provides tools for analyzing connectivity properties of
+neural circuits, including:
+
+- Inhibitory/excitatory (IE) ratio computation
+- Hop distance analysis using BFS
+- Network reachability statistics
+- Shortest path reconstruction
+
+Expected DataFrame schemas:
+    neurons DataFrame:
+        - simple_id: Linear neuron index (0..N-1)
+        - root_id: Unique neuron identifier
+        - EI: Excitatory/inhibitory type ("E" or "I")
+
+    connections/edges DataFrame:
+        - pre_simple_id: Presynaptic neuron simple_id
+        - post_simple_id: Postsynaptic neuron simple_id
+        - syn_count: Number of synapses (optional)
+
+The `HopDistanceModel` class provides efficient hop distance computation
+using either sparse matrix or edge list representations.
+"""
+
 from collections import deque
 from typing import Dict, List, Optional, Union
 

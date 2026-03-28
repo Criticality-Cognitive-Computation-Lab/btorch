@@ -1,3 +1,10 @@
+"""OmegaConf configuration utilities.
+
+Helpers for loading, manipulating, and comparing structured configs.
+Provides CLI-style dotlist conversion and diff operations for
+configuration management workflows.
+"""
+
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal
@@ -13,7 +20,29 @@ def load_config(
     return_cli=False,
     make_concrete: bool = True,
 ):
-    """Doesn't support help text and Literal though."""
+    """Load structured config from defaults, file, and CLI arguments.
+
+    Merges configuration in order: dataclass defaults -> config file ->
+    CLI arguments. Config file path is read from ``config_path`` in CLI
+    arguments.
+
+    Args:
+        Param: Dataclass type defining the configuration schema.
+        use_config_file: Whether to load from file specified by
+            ``config_path`` CLI argument.
+        search_path: Directory to search for relative config paths.
+        argv_arglist: Optional CLI arguments list (defaults to sys.argv).
+        return_cli: If True, also return raw CLI config.
+        make_concrete: If True, convert to Python objects. If False,
+            return OmegaConf containers.
+
+    Returns:
+        Loaded configuration. Tuple of (config, cli_config) if
+        ``return_cli=True``.
+
+    Note:
+        Does not support help text or Literal types in the schema.
+    """
     defaults = OmegaConf.structured(Param)
     if argv_arglist is None:
         cli_cfg_ = cli_cfg = OmegaConf.from_cli()
@@ -51,7 +80,7 @@ def to_dotlist(
     subfield: str | None = None,
     missing_subfield_policy: Literal["raise", "empty"] = "raise",
 ):
-    """Flatten a ``DictConfig``/``ListConfig`` into CLI-style dotlist entries.
+    """Flatten DictConfig/ListConfig to CLI-style dotlist.
 
     Parameters
     ----------
@@ -500,7 +529,16 @@ def diff_conf_dotlist(
 
 
 def get_dotkey(obj: Any, key: str, default=None):
-    """Get attribute by dot key."""
+    """Get nested attribute by dot-separated key.
+
+    Args:
+        obj: Object to access (supports DictConfig/ListConfig or regular objects).
+        key: Dot-separated path (e.g., "a.b.c").
+        default: Value to return if key not found.
+
+    Returns:
+        Value at the nested path, or ``default`` if not found.
+    """
     if isinstance(obj, (DictConfig, ListConfig)):
         return OmegaConf.select(obj, key, default=default)
     try:
@@ -512,7 +550,16 @@ def get_dotkey(obj: Any, key: str, default=None):
 
 
 def set_dotkey(obj: Any, key: str, value):
-    """Set attribute by dot key."""
+    """Set nested attribute by dot-separated key.
+
+    Args:
+        obj: Object to modify (supports DictConfig/ListConfig or regular objects).
+        key: Dot-separated path (e.g., "a.b.c").
+        value: Value to set.
+
+    Returns:
+        None
+    """
     if isinstance(obj, (DictConfig, ListConfig)):
         OmegaConf.update(obj, key, value)
         return

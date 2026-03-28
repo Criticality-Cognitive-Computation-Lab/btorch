@@ -39,6 +39,7 @@ micromamba env create -n ml-py312 -f dev-requirements.yaml
 ```
 
 #### Note on `pip` and `pytorch_sparse`
+
 If you prefer using `pip` directly, installing `pytorch_sparse` from source or default pypi can be challenging. We recommend using prebuilt wheels from the [PyG repository](https://data.pyg.org/whl/) that match your PyTorch and CUDA installation:
 
 ```bash
@@ -72,15 +73,27 @@ see [good example of using jaxtyping](https://fullstackdeeplearning.com/blog/pos
 ```bash
 ruff check .
 pytest tests
-mkdocs build --strict
+python -m sphinx.cmd.build docs docs/_build/html
 ```
 
 ## Documentation
 
-Docs are scaffolded with MkDocs (Material). Edit content under `docs/` and build locally with:
+Documentation is generated with **Sphinx** using API auto-generation from
+docstrings (autodoc + autosummary).
+
+Build locally with:
 
 ```bash
-mkdocs serve
+python -m sphinx.cmd.build docs docs/_build/html
+```
+
+The generated site is written to `docs/_build/html/`.
+
+If you want a clean rebuild:
+
+```bash
+rm -rf docs/_build docs/api/generated
+python -m sphinx.cmd.build docs docs/_build/html
 ```
 
 ## TODO List

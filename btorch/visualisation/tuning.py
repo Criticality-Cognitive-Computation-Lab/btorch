@@ -1,25 +1,60 @@
+"""Neuron response curve visualization.
+
+Plotting utilities for f-I (frequency-current) and V-I (voltage-current)
+curves, commonly used to characterize neuron excitability and response
+properties.
+"""
+
+from collections.abc import Callable
+
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.figure import Figure
 
 
 def plot_fi_vi_curve(
-    results=None,
-    plot_fi=True,
-    plot_vi=True,
-    get_data_func=None,
-    data_func_kwargs=None,
-    name="fi_vi_curve",
-    file_path=None,
-):
-    """Plot f-I and V-I curves.
+    results: dict | None = None,
+    plot_fi: bool = True,
+    plot_vi: bool = True,
+    get_data_func: Callable | None = None,
+    data_func_kwargs: dict | None = None,
+    name: str = "fi_vi_curve",
+    file_path: str | None = None,
+) -> Figure:
+    """Plot f-I and V-I response curves for neuron characterization.
+
+    Generates subplots showing the relationship between input current and
+    firing rate (f-I curve), and input current and membrane voltage traces
+    (V-I curve, displayed as waterfall plot).
 
     Args:
-        results: Dictionary containing 'currents', 'frequencies', 'voltages'.
+        results: Dictionary containing simulation results with keys:
+            - "currents": Input current values, shape (n_steps,)
+            - "frequencies": Firing rates in Hz, shape (n_steps,)
+            - "voltages": Voltage traces, shape (time, n_steps)
+            - "time": Optional time array, shape (time,)
         plot_fi: Whether to plot the f-I curve.
-        plot_vi: Whether to plot the V-I curve (voltage traces).
+        plot_vi: Whether to plot the V-I waterfall traces.
         get_data_func: Function to generate results if not provided.
-        data_func_kwargs: Arguments to pass to get_data_func.
-        name: Name of the figure to save.
+            Called as `get_data_func(**data_func_kwargs)`.
+        data_func_kwargs: Arguments passed to `get_data_func`.
+        name: Base filename for saving (if file_path is provided).
+        file_path: Directory path for saving figure. If None, figure is
+            returned but not saved.
+
+    Returns:
+        Figure containing the requested subplots.
+
+    Raises:
+        ValueError: If neither `results` nor `get_data_func` is provided.
+
+    Example:
+        >>> results = {
+        ...     "currents": torch.linspace(0, 10, 20),
+        ...     "frequencies": firing_rates,
+        ...     "voltages": voltage_traces,
+        ... }
+        >>> fig = plot_fi_vi_curve(results, file_path="./output/")
     """
     if results is None:
         if get_data_func is None:
@@ -33,7 +68,7 @@ def plot_fi_vi_curve(
     # Determine number of subplots
     num_plots = sum([plot_fi, plot_vi])
     if num_plots == 0:
-        return
+        raise ValueError("At least one of plot_fi or plot_vi must be True.")
 
     fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 5), squeeze=False)
     axes = axes.flatten()
@@ -102,7 +137,6 @@ def plot_fi_vi_curve(
         plot_idx += 1
 
     plt.tight_layout()
-    plt.tight_layout()
     if file_path is not None:
-        fig.savefig(file_path / f"{name}.png")
+        fig.savefig(f"{file_path}/{name}.png")
     return fig

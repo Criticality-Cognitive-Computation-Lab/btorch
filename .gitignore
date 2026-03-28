@@ -22,6 +22,9 @@ nsight_report*
 .pkl_memoize*
 .pytest_cache/
 site/
+docs/_build/
+docs/api/generated/
+docs/.doctrees/
 
 *.log
 *.swp

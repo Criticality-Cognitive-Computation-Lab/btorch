@@ -29,6 +29,19 @@ class Synapse(Protocol):
 
 
 class BasePSC(MemoryModule):
+    """Base class for post-synaptic current models.
+
+    Provides infrastructure for synaptic dynamics including weight
+    application, delay buffering, and PSC state management.
+
+    Args:
+        n_neuron: Number of post-synaptic neurons.
+        linear: Linear layer for weight application.
+        latency: Synaptic delay (ms). Default: 0.0.
+        step_mode: Step mode. Default: "s".
+        backend: Compute backend. Default: "torch".
+    """
+
     n_neuron: tuple[int, ...]
     size: int
     psc: torch.Tensor
@@ -172,6 +185,20 @@ class BasePSC(MemoryModule):
 
 
 class ExponentialPSC(BasePSC):
+    """Exponential decay synapse model.
+
+    Simple first-order synapse with single exponential decay:
+        d(psc)/dt = -psc / tau_syn
+
+    Args:
+        n_neuron: Number of neurons.
+        tau_syn: Synaptic time constant (ms).
+        linear: Linear layer for weights.
+        latency: Synaptic delay (ms). Default: 0.0.
+        step_mode: Step mode. Default: "s".
+        backend: Compute backend. Default: "torch".
+    """
+
     tau_syn: torch.Tensor | torch.nn.Parameter
 
     def __init__(

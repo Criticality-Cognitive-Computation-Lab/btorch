@@ -1,3 +1,34 @@
+"""Spike train analysis utilities for computing various metrics.
+
+This module provides functions for analyzing spike train data, including:
+
+- ISI (inter-spike interval) statistics: CV, local variation
+- Fano factor (spike count variability)
+- Kurtosis (spike count distribution shape)
+- Population-level metrics (pooled across neurons)
+- Temporal windowed analysis
+- Firing rate smoothing
+
+All functions support both NumPy arrays and PyTorch tensors, with
+GPU-optimized implementations where applicable. The time dimension is
+assumed to be the first dimension (axis=0) for all inputs.
+
+Shape conventions:
+    - Input spike trains: [T, ...] where T is time steps, remaining
+      dimensions can be arbitrary (neurons, trials, batches, etc.)
+    - Per-neuron outputs: [...] (same as input without time dimension)
+    - Temporal outputs: [n_windows, ...] for sliding window functions
+
+Batch axis behavior:
+    - Most functions support `batch_axis` parameter for aggregating
+      across specific dimensions (e.g., trials) before computing metrics
+    - Aggregation is typically done via sum (for spike counts) or mean
+
+The module uses decorators from `statistics.py` to add optional
+aggregation (`stat`), additional statistics (`stat_info`), and
+percentile computation (`percentiles`) to many functions.
+"""
+
 from collections.abc import Sequence
 
 import numpy as np

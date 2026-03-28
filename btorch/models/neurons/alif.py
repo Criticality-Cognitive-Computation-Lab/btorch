@@ -1,3 +1,18 @@
+"""Adaptive leaky integrate-and-fire (ALIF) neuron models.
+
+This module provides ALIF and ELIF (exponential LIF) neuron implementations
+with conductance-based adaptation mechanisms.
+
+The ALIF neuron extends LIF by adding a potassium conductance (g_k) that
+increases with each spike, creating spike-frequency adaptation:
+
+    dv/dt = (-g_leak * (v - E_leak) - g_k * (v - E_k) + x) / c_m
+    dg_k/dt = -g_k / tau_adapt
+
+where g_k increments by dg_k at each spike and decays exponentially,
+creating negative feedback that slows firing rate over time.
+"""
+
 from collections.abc import Callable, Sequence
 from typing import Any, Literal
 
@@ -13,13 +28,48 @@ from ..surrogate import Sigmoid
 
 
 class ALIF(BaseNode):
-    """Adaptive leaky integrate-and-fire neuron with conductance-based
-    adaptation.
+    """Adaptive leaky integrate-and-fire neuron with conductance adaptation.
 
-    The model follows a simple conductance formulation:
+    The ALIF model extends standard LIF by adding a voltage-dependent
+    potassium conductance (g_k) that creates spike-frequency adaptation.
+    Each spike increases g_k by dg_k, which then decays exponentially.
 
-    dv/dt = (-g_leak * (v - E_leak) - g_k * (v - E_k) + x) / c_m
-    dg_k/dt = -g_k / tau_adapt
+    Dynamics:
+        dv/dt = (-g_leak * (v - E_leak) - g_k * (v - E_k) + x) / c_m
+        dg_k/dt = -g_k / tau_adapt
+
+        At spike: g_k += dg_k
+
+    Args:
+        n_neuron: Number of neurons (int or tuple of dimensions).
+        v_threshold: Firing threshold (mV). Default: 1.0.
+        v_reset: Reset voltage after spike (mV). Default: 0.0.
+        c_m: Membrane capacitance (pF). Default: 1.0.
+        g_leak: Leak conductance (nS). Default: 1.0.
+        E_leak: Leak reversal potential (mV). Default: 0.0.
+        E_k: Potassium reversal potential (mV). Default: -70.0.
+        g_k_init: Initial adaptation conductance (nS). Default: 0.0.
+        tau_adapt: Adaptation time constant (ms). Default: 20.0.
+        dg_k: Adaptation increment per spike (nS). Default: 0.0.
+        tau_ref: Refractory period (ms). None disables refractory.
+            Default: None.
+        trainable_param: Set of parameter names to make trainable.
+        surrogate_function: Surrogate gradient function. Default: Sigmoid().
+        detach_reset: If True, detach reset signal. Default: False.
+        hard_reset: If True, use hard reset. Default: False.
+        pre_spike_v: If True, store pre-spike voltage. Default: False.
+        step_mode: Step mode. Default: "s".
+        backend: Backend implementation. Default: "torch".
+        device: Device for tensors. Default: None.
+        dtype: Data type for tensors. Default: None.
+
+    Attributes:
+        v: Membrane potential, shape (*batch, n_neuron).
+        g_k: Adaptation conductance, shape (*batch, n_neuron).
+        refractory: Refractory counter (if tau_ref specified).
+        c_m, g_leak, E_leak, E_k: Neuron parameters.
+        tau_adapt: Adaptation time constant.
+        dg_k: Per-spike adaptation increment.
     """
 
     g_k: torch.Tensor
@@ -184,8 +234,49 @@ class ALIF(BaseNode):
 
 
 class ELIF(ALIF):
-    """Exponential integrate-and-fire neuron with conductance-based
-    adaptation."""
+    """Exponential integrate-and-fire neuron with adaptation.
+
+    The ELIF model extends ALIF by adding an exponential term to the
+    voltage dynamics, creating a sharp upswing when approaching threshold
+    (the "initiation zone"). This captures the rapid depolarization seen
+    in real neurons.
+
+    Dynamics:
+        dv/dt = (g_leak * delta_T * exp((v - v_T) / delta_T)
+                 - g_leak * (v - E_leak) - g_k * (v - E_k) + x) / c_m
+        dg_k/dt = -g_k / tau_adapt
+
+    The exponential term creates a soft threshold effect where membrane
+    potential accelerates as it approaches v_T.
+
+    Args:
+        n_neuron: Number of neurons (int or tuple of dimensions).
+        v_threshold: Firing threshold (mV). Default: 1.0.
+        v_reset: Reset voltage after spike (mV). Default: 0.0.
+        c_m: Membrane capacitance (pF). Default: 1.0.
+        g_leak: Leak conductance (nS). Default: 1.0.
+        E_leak: Leak reversal potential (mV). Default: 0.0.
+        E_k: Potassium reversal potential (mV). Default: -70.0.
+        g_k_init: Initial adaptation conductance (nS). Default: 0.0.
+        tau_adapt: Adaptation time constant (ms). Default: 20.0.
+        dg_k: Adaptation increment per spike (nS). Default: 0.0.
+        tau_ref: Refractory period (ms). Default: 0.0.
+        delta_T: Slope factor for exponential term (mV). Default: 1.0.
+        v_T: Soft threshold potential (mV). Default: 0.0.
+        trainable_param: Set of parameter names to make trainable.
+        surrogate_function: Surrogate gradient function. Default: Sigmoid().
+        detach_reset: If True, detach reset signal. Default: False.
+        hard_reset: If True, use hard reset. Default: False.
+        pre_spike_v: If True, store pre-spike voltage. Default: False.
+        step_mode: Step mode. Default: "s".
+        backend: Backend implementation. Default: "torch".
+        device: Device for tensors. Default: None.
+        dtype: Data type for tensors. Default: None.
+
+    Attributes:
+        delta_T: Slope factor for exponential term.
+        v_T: Soft threshold potential.
+    """
 
     delta_T: torch.Tensor | torch.nn.Parameter
     v_T: torch.Tensor | torch.nn.Parameter

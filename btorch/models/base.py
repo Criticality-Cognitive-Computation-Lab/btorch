@@ -182,17 +182,33 @@ def _memory_var(
 
 
 class MemoryModule(base.MemoryModule):
-    """``MemoryModule`` is the base class of all stateful modules like in
-    SpikingJelly. However, they are **NOT** compatible. Major differences are:
+    """Base class for all stateful modules with managed memory buffers.
 
-    1. all memories are torch.tensor and managed by register_buffer. This
-        allows torch.onnx.exporter and torch.export.export to work properly.
-    2. does not support list / tuple type memory that is usually used to
-        track history in SpikingJelly. For such use cases, please override
-        reset_state() and init_state(), see synapse.delay_buffer. TODO:
-        provide a common template.
-    3. memory size is fixed (dims following batch axis), but batch size can be
-        changed by reset_state.
+    MemoryModule provides infrastructure for managing stateful tensors
+    (memories) in neuromorphic models. Unlike SpikingJelly's MemoryModule,
+    this implementation:
+
+    1. Stores all memories as torch.Tensor buffers (enables ONNX export)
+    2. Does not support list/tuple memories (override reset/init for history)
+    3. Uses fixed memory sizes, with variable batch size
+
+    Memories are registered via register_memory() and automatically
+    initialized/reset via init_state() and reset(). Each memory has a
+    ResetValue configuration controlling its initialization behavior.
+
+    Example:
+        >>> class MyNeuron(MemoryModule):
+        ...     def __init__(self, n_neuron):
+        ...         super().__init__()
+        ...         self.register_memory("v", 0.0, n_neuron)
+        ...
+        ...     def forward(self, x):
+        ...         self.v = self.v + x  # simple integration
+        ...         return self.v
+        >>>
+        >>> neuron = MyNeuron(10)
+        >>> neuron.init_state(batch_size=2)  # init with batch dim
+        >>> out = neuron(torch.randn(2, 10))
     """
 
     def __init__(self):
@@ -431,6 +447,26 @@ class MemoryModule(base.MemoryModule):
 
 
 class BaseNode(MemoryModule):
+    """Base class for differentiable spiking neurons.
+
+    Implements the spiking neuron lifecycle: charge -> adapt -> fire -> reset.
+    Subclasses implement neuronal_charge() and neuronal_adaptation().
+
+    Args:
+        n_neuron: Number of neurons (int or tuple).
+        v_threshold: Firing threshold. Default: 1.0.
+        v_reset: Reset voltage. Default: 0.0.
+        trainable_param: Trainable parameter names. Default: ().
+        surrogate_function: Surrogate for backprop. Default: Sigmoid().
+        detach_reset: Detach reset signal. Default: False.
+        hard_reset: Hard vs soft reset. Default: False.
+        pre_spike_v: Store pre-spike voltage. Default: False.
+        step_mode: "s" or "m". Default: "s".
+        backend: Compute backend. Default: "torch".
+        device: Tensor device. Default: None.
+        dtype: Tensor dtype. Default: None.
+    """
+
     n_neuron: tuple[int, ...]
     size: int
     v: torch.Tensor
