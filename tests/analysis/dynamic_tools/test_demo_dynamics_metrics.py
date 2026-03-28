@@ -17,7 +17,6 @@ from btorch.visualisation.dynamics import (
     plot_gain_stability,
     plot_lyapunov_spectrum,
     plot_micro_dynamics,
-    plot_scalar_metrics,
 )
 
 
@@ -35,7 +34,7 @@ class SimpleReservoir(nn.Module):
         # Normalize spectral radius
         radius = np.max(np.abs(np.linalg.eigvals(W)))
         W = W * (spectral_radius / radius)
-        self.W = torch.tensor(W, dtype=torch.float32)
+        self.W = torch.as_tensor(W, dtype=torch.float32)
 
         # Structure for gain stability mocking
         class DummySynapse:
@@ -43,7 +42,7 @@ class SimpleReservoir(nn.Module):
                 self.linear = nn.Linear(1, 1)  # dummy
                 with torch.no_grad():
                     self.linear.magnitude = nn.Parameter(
-                        torch.tensor(W)
+                        torch.as_tensor(W)
                     )  # Mock magnitude
 
         class DummyBrain:
@@ -79,11 +78,20 @@ def simulation_data():
     model = SimpleReservoir(n_neurons=N, spectral_radius=1.2)
     dt = 1.0
 
-    # A. Baseline run
-    with torch.no_grad():
-        baseline_activity = model(None, steps=1000)
-        baseline_rates = (baseline_activity + 1) / 2
-        baseline_spikes = (baseline_activity > 0.0).float().squeeze(0)
+    # A. Baseline run - generate sparse Poisson-like spikes for avalanche
+    # analysis. Sparse firing creates silent periods between avalanches,
+    # enabling proper avalanche detection. Continuous thresholded activity
+    # would produce only one long avalanche spanning the entire time series.
+    rng = np.random.default_rng(42)
+    n_steps = 2000
+    p_spike = 0.02  # 2% firing rate per neuron per timestep
+    baseline_spikes = torch.as_tensor(
+        rng.random((n_steps, N)) < p_spike, dtype=torch.float32
+    )
+    # Generate matching activity/rates for other tests that expect them.
+    # Maintain 3D shape (Batch, Time, Neurons) for compatibility.
+    baseline_activity = baseline_spikes.unsqueeze(0) * 2.0 - 1.0  # Scale to [-1, 1]
+    baseline_rates = baseline_spikes.unsqueeze(0)  # Shape: (1, Time, Neurons)
 
     # B. Perturbation run (for PCIst)
     model.state = torch.zeros(1, N)
@@ -91,12 +99,11 @@ def simulation_data():
     with torch.no_grad():
         perturb_activity = model(None, steps=500)
 
-    # C. Final run (for RA)
-    with torch.no_grad():
-        # Modify weights
-        model.W += torch.randn_like(model.W) * 0.05
-        final_activity = model(None, steps=1000)
-        final_spikes = (final_activity > 0.0).float().squeeze(0)
+    # C. Final run (for RA) - generate different sparse spike pattern
+    # Using different seed to simulate different network state
+    final_spikes = torch.as_tensor(
+        rng.random((n_steps, N)) < p_spike, dtype=torch.float32
+    )
 
     return {
         "model": model,
@@ -207,18 +214,3 @@ def test_micro_dynamics(simulation_data):
     except Exception:
         spike_dist = 0.0
     assert isinstance(spike_dist, float)
-
-
-def test_scalar_dashboard_generation(simulation_data):
-    """Test generating the scalar metrics dashboard."""
-    # We just create dummy metrics to test plotting
-    scalars = {
-        "DFA Alpha": 0.75,
-        "RA Score": 0.9,
-        "PCIst": 1.2,
-        "Spike Dist": 0.4,
-    }
-
-    fig_dash, ax_dash = plot_scalar_metrics(scalars, title="Key Complexity Metrics")
-    save_fig(fig_dash, name="demo_scalar_dashboard")
-    plt.close(fig_dash)

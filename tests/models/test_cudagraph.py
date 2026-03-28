@@ -14,9 +14,10 @@ from btorch.models.neurons.glif import GLIF3
 from tests.utils.compile import compile_or_skip
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA required for CUDA graphs."
-)
+if not torch.cuda.is_available():
+    pytest.skip("CUDA not available - skipping entire module", allow_module_level=True)
+
+
 @pytest.mark.parametrize("backend", available_sparse_backends())
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_cudagraph_linear(backend: str, use_compile: bool):
@@ -130,9 +131,6 @@ def test_cudagraph_linear(backend: str, use_compile: bool):
     )
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA required for CUDA graphs."
-)
 @pytest.mark.parametrize(
     "case",
     [
