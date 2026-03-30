@@ -40,7 +40,12 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 import xarray as xr
-import zarr
+
+
+try:
+    from numcodecs import Blosc
+except ImportError:
+    from zarr import Blosc
 
 
 def _to_numpy(val: Any) -> np.ndarray | sp.spmatrix | sp.sparray:
@@ -747,9 +752,7 @@ def save_memories_to_xarray(
     )
 
     encoding = {}
-    compressor = zarr.Blosc(
-        cname="zstd", clevel=compression_level, shuffle=zarr.Blosc.BITSHUFFLE
-    )
+    compressor = Blosc(cname="zstd", clevel=compression_level, shuffle=Blosc.BITSHUFFLE)
 
     for v_name in ds.variables:
         v_encoding: dict[str, Any] = {"compressor": compressor}

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from math import ceil
 from typing import Any, Callable, Literal, Sequence, Union
 
+import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -36,6 +37,23 @@ def _to_numpy(data: Any) -> np.ndarray:
     if isinstance(data, torch.Tensor):
         return data.detach().cpu().numpy()
     return np.asarray(data)
+
+
+def _estimate_text_width_inches(
+    text: str, fontsize: float = 10, dpi: float = 100
+) -> float:
+    """Estimate text width in inches based on character count and font size.
+
+    Uses a heuristic approximation: each character is roughly 0.6 * fontsize
+    in width at standard DPI.
+    """
+    if not text:
+        return 0.0
+    # Approximate character width: 0.6 * fontsize points per char
+    # 1 inch = 72 points, 1 point = 1/dpi inches
+    char_width_points = 0.6 * fontsize
+    total_width_points = len(text) * char_width_points
+    return total_width_points / 72.0
 
 
 def _resolve_per_neuron_values(
@@ -1802,39 +1820,97 @@ def plot_neuron_traces(
             )
 
     n_rows = int(ceil(n_plot / neurons_per_row))
-    total_cols = n_cols * neurons_per_row
     use_top_label_rows = neuron_label_position == "top"
     total_height_grid = height_per_row * n_rows * (1.2 if use_top_label_rows else 1.0)
     # Keep enough width per trace column to avoid label crowding.
     base_width = max(base_width, 4.0 * n_cols)
     fig_width = base_width * neurons_per_row
-    n_grid_rows = n_rows * 2 if use_top_label_rows else n_rows
-    gridspec_kw = (
-        {"height_ratios": [v for _ in range(n_rows) for v in (0.22, 1.0)]}
-        if use_top_label_rows
-        else None
-    )
-    fig, axes = plt.subplots(
-        n_grid_rows,
-        total_cols,
-        figsize=(fig_width, total_height_grid),
-        squeeze=False,
-        gridspec_kw=gridspec_kw,
-    )
+
+    # Pre-resolve labels to estimate width for adaptive sizing
+    # when using top-positioned labels
+    if use_top_label_rows and (label_fn is not None or label_values is not None):
+        resolved_labels = [
+            _resolve_side_label(i, neuron_indices[i]) for i in range(n_plot)
+        ]
+        max_label_width_inches = max(
+            (
+                _estimate_text_width_inches(label, fontsize=10)
+                for label in resolved_labels
+                if label
+            ),
+            default=0.0,
+        )
+        # Each neuron slot must be wide enough for its label
+        # Add padding (1.5x) to ensure labels don't crowd
+        min_slot_width = max_label_width_inches * 1.5
+        slot_width = fig_width / neurons_per_row
+        if min_slot_width > slot_width:
+            # Expand figure width to accommodate labels
+            fig_width = min_slot_width * neurons_per_row
+
+    fig = plt.figure(figsize=(fig_width, total_height_grid))
+
     if use_top_label_rows:
-        for label_row in range(0, n_grid_rows, 2):
-            for c in range(total_cols):
-                axes[label_row, c].set_axis_off()
+        # Single GridSpec: 2 rows per neuron row (label + plot)
+        # Use spanning cells for labels
+        total_gs_rows = n_rows * 2
+        total_gs_cols = neurons_per_row * n_cols
+        gs = gridspec.GridSpec(
+            total_gs_rows,
+            total_gs_cols,
+            figure=fig,
+            height_ratios=[v for _ in range(n_rows) for v in (0.22, 1.0)],
+            hspace=0.3,
+            wspace=0.3,
+        )
+        axes: dict[tuple[int, int, int], Axes] = {}
+        label_axes: dict[tuple[int, int], Axes] = {}
+
+        for row in range(n_rows):
+            label_row = row * 2
+            plot_row = row * 2 + 1
+            for slot in range(neurons_per_row):
+                col_start = slot * n_cols
+                col_end = (slot + 1) * n_cols
+
+                # Label axis spans all columns for this neuron slot
+                label_ax = fig.add_subplot(gs[label_row, col_start:col_end])
+                label_ax.set_axis_off()
+                label_axes[(row, slot)] = label_ax
+
+                # Plot axes for each column
+                for col in range(n_cols):
+                    ax = fig.add_subplot(gs[plot_row, col_start + col])
+                    axes[(row, slot, col)] = ax
+    else:
+        # Simple grid without label rows
+        gs = gridspec.GridSpec(
+            n_rows,
+            neurons_per_row * n_cols,
+            figure=fig,
+            height_ratios=[1.0] * n_rows,
+            hspace=0.3,
+            wspace=0.3,
+        )
+        axes = {}
+        label_axes = {}
+        for row in range(n_rows):
+            for slot in range(neurons_per_row):
+                for col in range(n_cols):
+                    axes[(row, slot, col)] = fig.add_subplot(
+                        gs[row, slot * n_cols + col]
+                    )
 
     asc_arr = _to_numpy(asc) if _show_asc else None
     psc_arr = _to_numpy(psc) if _show_psc else None
-    used_axes: set[tuple[int, int]] = set()
+    used_axes: set[tuple[int, int, int]] = set()
 
     for plot_idx, neuron_idx in enumerate(neuron_indices):
         row_idx = plot_idx // neurons_per_row
         slot_idx = plot_idx % neurons_per_row
-        col_base = slot_idx * n_cols
-        plot_row = row_idx * 2 + 1 if use_top_label_rows else row_idx
+        # In the new nested gridspec structure, each row is a separate
+        # subgridspec with columns 0 to n_cols-1
+        plot_row = row_idx
 
         # Resolve spec
         spec = NeuronSpec()
@@ -1860,11 +1936,11 @@ def plot_neuron_traces(
                     if k != "spike":
                         local_colors[k] = spec.color
 
-        col_idx = col_base
+        col_idx = 0
 
         # Voltage subplot
         if _show_v:
-            ax = axes[plot_row, col_idx]
+            ax = axes[(plot_row, slot_idx, col_idx)]
             _plot_voltage_on_ax(
                 ax,
                 times,
@@ -1889,12 +1965,12 @@ def plot_neuron_traces(
             if row_idx == n_rows - 1:
                 ax.set_xlabel("Time (ms)")
             ax.grid(alpha=0.3, linewidth=0.5)
-            used_axes.add((plot_row, col_idx))
+            used_axes.add((plot_row, slot_idx, col_idx))
             col_idx += 1
 
         # ASC subplot
         if _show_asc and asc_arr is not None:
-            ax = axes[plot_row, col_idx]
+            ax = axes[(plot_row, slot_idx, col_idx)]
             _plot_simple_trace_on_ax(
                 ax,
                 times,
@@ -1910,12 +1986,12 @@ def plot_neuron_traces(
             if row_idx == n_rows - 1:
                 ax.set_xlabel("Time (ms)")
             ax.grid(alpha=0.3, linewidth=0.5)
-            used_axes.add((plot_row, col_idx))
+            used_axes.add((plot_row, slot_idx, col_idx))
             col_idx += 1
 
         # PSC subplot
         if _show_psc and psc_arr is not None:
-            ax = axes[plot_row, col_idx]
+            ax = axes[(plot_row, slot_idx, col_idx)]
             epsc_arr = _to_numpy(epsc[:, neuron_idx]) if epsc is not None else None
             ipsc_arr = _to_numpy(ipsc[:, neuron_idx]) if ipsc is not None else None
             _plot_psc_on_ax(
@@ -1936,13 +2012,13 @@ def plot_neuron_traces(
             if row_idx == n_rows - 1:
                 ax.set_xlabel("Time (ms)")
             ax.grid(alpha=0.3, linewidth=0.5)
-            used_axes.add((plot_row, col_idx))
+            used_axes.add((plot_row, slot_idx, col_idx))
             col_idx += 1
 
         if label is not None:
             if use_top_label_rows:
-                label_row = row_idx * 2
-                label_ax = axes[label_row, col_base + (n_cols - 1) // 2]
+                # Use the spanning label axis for this neuron slot
+                label_ax = label_axes[(row_idx, slot_idx)]
                 label_ax.text(
                     0.5,
                     0.5,
@@ -1955,7 +2031,7 @@ def plot_neuron_traces(
                 )
             else:
                 # Add label to the rightmost subplot in this neuron slot.
-                last_ax = axes[plot_row, col_base + n_cols - 1]
+                last_ax = axes[(plot_row, slot_idx, n_cols - 1)]
                 last_ax.text(
                     1.02,
                     0.5,
@@ -1969,13 +2045,16 @@ def plot_neuron_traces(
 
     # Hide unused plot axes for empty neuron slots in the final row.
     for r in range(n_rows):
-        plot_row = r * 2 + 1 if use_top_label_rows else r
-        for c in range(total_cols):
-            if (plot_row, c) not in used_axes:
-                axes[plot_row, c].set_visible(False)
+        for slot in range(neurons_per_row):
+            for c in range(n_cols):
+                if (r, slot, c) not in used_axes:
+                    if (r, slot, c) in axes:
+                        axes[(r, slot, c)].set_visible(False)
 
     right_margin = 0.96 if neuron_label_position == "side" else 1.0
-    fig.tight_layout(rect=(0.0, 0.0, right_margin, 1.0), w_pad=0.8, h_pad=0.8)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fig.tight_layout(rect=(0.0, 0.0, right_margin, 1.0), w_pad=0.8, h_pad=0.8)
     return fig
 
 

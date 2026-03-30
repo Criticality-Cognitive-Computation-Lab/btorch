@@ -295,7 +295,7 @@ def test_plot_neuron_traces_multi_column_neurons():
 
 def test_plot_neuron_traces_custom_side_labels_callable():
     """Test custom top labels via callable in multi-column layout."""
-    n_time, n_neurons = 120, 3
+    n_time, n_neurons = 400, 3
     voltage = -65 + 2 * np.random.randn(n_time, n_neurons)
     asc = -10 * np.random.exponential(1, (n_time, n_neurons))
     psc = 50 * np.random.randn(n_time, n_neurons)
@@ -311,6 +311,7 @@ def test_plot_neuron_traces_custom_side_labels_callable():
         neurons_per_row=2,
     )
 
+    # Top labels are added via ax.text() on label-row axes
     labels = [text for ax in fig.axes for text in ax.texts]
     label_texts = [
         text.get_text() for text in labels if text.get_text().startswith("Cell-")
@@ -327,6 +328,95 @@ def test_plot_neuron_traces_custom_side_labels_callable():
     )
 
     save_fig(fig, name="neuron_traces_top_labels_callable")
+    plt.close(fig)
+
+
+def test_plot_neuron_traces_long_labels_adaptive_width():
+    """Test that figure width adapts to accommodate long top labels.
+
+    When labels are very long and positioned at the top, the figure
+    width should expand to prevent subfigures from becoming too narrow.
+    """
+    n_time, n_neurons = 100, 3
+    voltage = -65 + 5 * np.random.randn(n_time, n_neurons)
+    psc = 50 * np.random.randn(n_time, n_neurons)
+
+    # Create an extremely long label to force adaptive sizing
+    # This label is ~120 chars, which should require significant width
+    long_label_prefix = (
+        "rid=720575940606137632|v=-51.6|fr=23.7|cv=0.00|fa=0.00|"
+        "eci=650540544.00|lg=-8.0|r_pa=3.15|r_ei=0.00|extra_field=12345"
+    )
+
+    fig = plot_neuron_traces(
+        voltage=voltage,
+        psc=psc,
+        dt=0.1,
+        neuron_indices=[0, 1],
+        neuron_labels=lambda idx: f"{long_label_prefix}|idx={idx}",
+        neuron_label_position="top",
+        neurons_per_row=2,
+        show_asc=False,
+    )
+
+    # With adaptive sizing, figure should be wide enough for labels
+    # Default would be ~base_width * neurons_per_row = ~10 * 2 = 20 inches
+    # With very long labels (~120 chars = ~10 inches), min_slot_width = 15 inches
+    # So figure should expand to at least 30 inches
+    fig_width = fig.get_figwidth()
+
+    # The label is about 120 characters, which at 0.6*10pt per char = ~10 inches
+    # With 1.5x padding, min_slot_width = 15 inches
+    # For 2 neurons per row, figure should be at least 30 inches
+    assert fig_width >= 25.0, (
+        f"Figure width ({fig_width:.1f}) should be >= 25.0 "
+        "to accommodate very long labels"
+    )
+
+    # Verify labels are present (top labels are axis-level on label-row axes)
+    labels = [
+        text.get_text()
+        for ax in fig.axes
+        for text in ax.texts
+        if text.get_text().startswith("rid=")
+    ]
+    assert len(labels) == 2, "Expected 2 neuron labels"
+    assert all(long_label_prefix in label for label in labels)
+
+    # Verify subplots have reasonable width (not too narrow)
+    # Each subplot should be at least ~3 inches wide
+    axes_positions = [ax.get_position() for ax in fig.axes if ax.get_visible()]
+    for pos in axes_positions:
+        subplot_width_inches = pos.width * fig_width
+        assert (
+            subplot_width_inches >= 3.0
+        ), f"Subplot width ({subplot_width_inches:.1f}) should be >= 3.0 inches"
+
+    save_fig(fig, name="neuron_traces_long_labels_adaptive_width")
+    plt.close(fig)
+
+    n_time, n_neurons = 100, 4
+    voltage = -65 + 5 * np.random.randn(n_time, n_neurons)
+
+    fig = plot_neuron_traces(
+        voltage=voltage,
+        dt=0.1,
+        neuron_indices=[0, 1, 2, 3],
+        neuron_labels=lambda idx: f"N{idx}",  # Short labels
+        neuron_label_position="top",
+        neurons_per_row=2,
+        show_asc=False,
+        show_psc=False,
+    )
+
+    # With short labels, figure should use default width (~20 inches)
+    fig_width = fig.get_figwidth()
+    assert fig_width <= 25.0, (
+        f"Figure width ({fig_width:.1f}) should not expand unnecessarily "
+        "for short labels"
+    )
+
+    save_fig(fig, name="neuron_traces_short_labels_compact")
     plt.close(fig)
 
 
