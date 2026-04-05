@@ -553,13 +553,11 @@ class GapJunction(nn.Module):
         g_gap: float | TensorLike = 1.0,
         linear: torch.nn.Module | None = None,
         step_mode: str = "s",
-        backend: str = "torch",
     ):
         super().__init__()
 
         self.n_neuron, self.size = normalize_n_neuron(n_neuron)
         self.step_mode = step_mode
-        self.backend = backend
 
         # Register global scaling factor as buffer (non-trainable by default)
         self.register_buffer("g_gap", torch.as_tensor(g_gap))
@@ -574,7 +572,7 @@ class GapJunction(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"n_neuron={self.n_neuron}, g_gap={self.g_gap.item():.4g}, "
-            f"step_mode={self.step_mode}, backend={self.backend}"
+            f"step_mode={self.step_mode}"
         )
 
     def forward(
@@ -631,8 +629,111 @@ class GapJunction(nn.Module):
         return torch.stack(i_seq)
 
 
-class VoltageCoupling(GapJunction):
-    """Alias for GapJunction, emphasizing voltage coupling role of gap
-    junctions in compartment models."""
+class VoltageCoupling(nn.Module):
+    """Voltage coupling for multicompartment neuron models.
 
-    pass
+    Models coupling currents between compartments via linear weighting of
+    membrane potentials. Unlike GapJunction which computes `W*(V_post - V_pre)`,
+    VoltageCoupling directly computes `W*V` for coupling currents between
+    compartments.
+
+    The current is computed as:
+
+        I_couple = g_couple * linear(v)
+
+    where `linear` models the coupling conductance between compartments.
+
+    Args:
+        n_neuron: Number of neurons (or compartments).
+        g_couple: Global scaling factor for coupling conductance. Default: 1.0.
+        linear: Linear layer for weight application (models coupling
+            conductance). If None, an identity weight matrix is used.
+            Default: None.
+        step_mode: Step mode. Default: "s".
+
+    Attributes:
+        g_couple: Coupling global scaling factor.
+        linear: Linear transformation for coupling weights.
+
+    Example:
+        >>> couple = VoltageCoupling(n_neuron=4, g_couple=0.1)
+        >>> v = torch.randn(2, 4)  # compartment voltages (mV)
+        >>> i_couple = couple(v)   # coupling current (pA)
+    """
+
+    n_neuron: tuple[int, ...]
+    size: int
+    g_couple: torch.Tensor
+
+    def __init__(
+        self,
+        n_neuron: int | Sequence[int],
+        g_couple: float | TensorLike = 1.0,
+        linear: torch.nn.Module | None = None,
+        step_mode: str = "s",
+    ):
+        super().__init__()
+
+        self.n_neuron, self.size = normalize_n_neuron(n_neuron)
+        self.step_mode = step_mode
+
+        # Register global scaling factor as buffer (non-trainable by default)
+        self.register_buffer("g_couple", torch.as_tensor(g_couple))
+
+        # Linear layer for coupling weights
+        if linear is None:
+            self.linear = torch.nn.Linear(self.size, self.size, bias=False)
+            torch.nn.init.uniform_(self.linear.weight)
+        else:
+            self.linear = linear
+
+    def extra_repr(self) -> str:
+        return (
+            f"n_neuron={self.n_neuron}, g_couple={self.g_couple.item():.4g}, "
+            f"step_mode={self.step_mode}"
+        )
+
+    def forward(
+        self,
+        v: Float[Tensor, "*batch n_neuron"],
+    ) -> Float[Tensor, "*batch n_neuron"]:
+        """Compute coupling current from voltage.
+
+        Args:
+            v: Membrane potential (mV).
+
+        Returns:
+            Coupling current I_couple = g_couple * linear(v) (pA).
+        """
+        v_flat, leading = flatten_neuron(v, self.n_neuron, self.size)
+
+        # Current is proportional to weighted voltage
+        i_couple_flat = self.g_couple * self.linear(v_flat)
+
+        return unflatten_neuron(i_couple_flat, leading, self.n_neuron)
+
+    def single_step_forward(
+        self,
+        v: Float[Tensor, "*batch n_neuron"],
+    ) -> Float[Tensor, "*batch n_neuron"]:
+        """Single step forward (alias for forward)."""
+        return self.forward(v)
+
+    def multi_step_forward(
+        self,
+        v_seq: Float[Tensor, "T *batch n_neuron"],
+    ) -> Float[Tensor, "T *batch n_neuron"]:
+        """Multi-step forward over time dimension.
+
+        Args:
+            v_seq: Voltage sequence (T, *batch, n_neuron).
+
+        Returns:
+            Coupling current sequence (T, *batch, n_neuron).
+        """
+        T = v_seq.shape[0]
+        i_seq = []
+        for t in range(T):
+            i_couple = self.forward(v_seq[t])
+            i_seq.append(i_couple)
+        return torch.stack(i_seq)

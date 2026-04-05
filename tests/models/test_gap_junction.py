@@ -1,12 +1,17 @@
-"""GapJunction electrical synapse use cases and examples.
+"""Electrical coupling use cases and examples.
+
+This module tests both GapJunction (electrical synapses) and VoltageCoupling
+(multicompartment models) using parametrized tests where applicable.
 
 Gap junctions are electrical synapses that allow direct ion flow between neurons,
 creating instantaneous, bidirectional coupling. Common use cases include:
-
 1. Synchronizing neuronal populations (e.g., interneuron networks)
 2. Modeling specific circuits (retinal ganglion cells, thalamic relay neurons)
 3. Rapid signal propagation without synaptic delay
 4. Bidirectional coupling between neuron pairs
+
+VoltageCoupling is used for multicompartment neuron models where coupling currents
+are computed as W*V rather than W*(V_post - V_pre).
 """
 
 import platform
@@ -15,8 +20,13 @@ import matplotlib.pyplot as plt
 import pytest
 import torch
 
-from btorch.models.synapse import GapJunction
+from btorch.models.synapse import GapJunction, VoltageCoupling
 from btorch.utils.file import save_fig
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
 
 
 def _identity_linear(n: int) -> torch.nn.Linear:
@@ -26,54 +36,234 @@ def _identity_linear(n: int) -> torch.nn.Linear:
     return linear
 
 
-def test_gap_junction_basic_coupling():
-    """Basic use case: two neurons with electrical coupling.
+# =============================================================================
+# Parametrized Tests (Shared between GapJunction and VoltageCoupling)
+# =============================================================================
 
-    When neuron A is at higher potential than neuron B, current flows from
-    A to B, pulling their voltages toward each other. This is the fundamental
-    mechanism for electrical coupling in networks.
+
+CouplingClass = GapJunction | VoltageCoupling
+
+
+@pytest.mark.parametrize(
+    "cls,conductance_attr,kwargs",
+    [
+        (GapJunction, "g_gap", {"g_gap": 0.5}),
+        (VoltageCoupling, "g_couple", {"g_couple": 0.5}),
+    ],
+)
+def test_basic_identity(cls: type[CouplingClass], conductance_attr: str, kwargs: dict):
+    """Basic use case: identity weights produce predictable output.
+
+    For GapJunction: I = g * (v_post - v_pre)
+    For VoltageCoupling: I = g * v
     """
-    # Two neurons with symmetric coupling (identity weights for predictable output)
-    gap = GapJunction(n_neuron=2, g_gap=0.5, linear=_identity_linear(2))
+    # Two neurons with identity weights for predictable output
+    instance = cls(n_neuron=2, linear=_identity_linear(2), **kwargs)
 
-    # Neuron 0 at 10mV, neuron 1 at 0mV
-    v_pre = torch.tensor([[10.0, 0.0]])
-    v_post = torch.tensor([[0.0, 0.0]])
+    if cls is GapJunction:
+        # Neuron 0 at 10mV, neuron 1 at 0mV
+        v_pre = torch.tensor([[10.0, 0.0]])
+        v_post = torch.tensor([[0.0, 0.0]])
+        i_out = instance(v_pre, v_post)
+        # delta_v = [0-10, 0-0] = [-10, 0]
+        # I = 0.5 * [-10, 0] = [-5, 0]
+        expected = torch.tensor([[-5.0, 0.0]])
+    else:
+        # Compartment 0 at 10mV, compartment 1 at 0mV
+        v = torch.tensor([[10.0, 0.0]])
+        i_out = instance(v)
+        # I = 0.5 * [10, 0] = [5, 0]
+        expected = torch.tensor([[5.0, 0.0]])
 
-    i_gap = gap(v_pre, v_post)
+    torch.testing.assert_close(i_out, expected, atol=1e-6, rtol=0.0)
 
-    # Current flows out of neuron 0 (negative), into neuron 1 would be from
-    # another gap junction with reversed pre/post
-    # Here: delta_v = [0-10, 0-0] = [-10, 0]
-    # I_gap = 0.5 * [-10, 0] = [-5, 0]
-    expected = torch.tensor([[-5.0, 0.0]])
-    torch.testing.assert_close(i_gap, expected, atol=1e-6, rtol=0.0)
 
-    # Visualize the coupling: voltage difference drives current
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+@pytest.mark.parametrize(
+    "cls,conductance_attr,kwargs",
+    [
+        (GapJunction, "g_gap", {"g_gap": 0.5}),
+        (VoltageCoupling, "g_couple", {"g_couple": 0.5}),
+    ],
+)
+def test_learnable_conductance(
+    cls: type[CouplingClass], conductance_attr: str, kwargs: dict
+):
+    """Use case: training conductances as network parameters."""
+    instance = cls(n_neuron=3, **kwargs)
 
-    # Voltage state
-    ax = axes[0]
-    neurons = ["Neuron 0", "Neuron 1"]
-    v_vals = v_pre[0].tolist()
-    colors = ["#d62728", "#2ca02c"]  # red for high, green for low
-    ax.bar(neurons, v_vals, color=colors, edgecolor="black")
-    ax.set_ylabel("Voltage (mV)")
-    ax.set_title("Pre-synaptic Voltage State")
-    ax.axhline(y=0, color="k", linestyle="--", alpha=0.3)
+    # Make conductance trainable
+    g_param = torch.nn.Parameter(getattr(instance, conductance_attr))
+    setattr(instance, conductance_attr, g_param)
 
-    # Current flow
-    ax = axes[1]
-    i_vals = i_gap[0].tolist()
-    colors_i = ["#d62728" if i < 0 else "#2ca02c" for i in i_vals]
-    ax.bar(neurons, i_vals, color=colors_i, edgecolor="black")
-    ax.set_ylabel("Gap Junction Current (pA)")
-    ax.set_title("Current Flow (negative = losing charge)")
-    ax.axhline(y=0, color="k", linestyle="--", alpha=0.3)
+    if cls is GapJunction:
+        v_input = torch.tensor([[10.0, 5.0, 0.0]], requires_grad=True)
+        v_post = torch.tensor([[0.0, 0.0, 0.0]], requires_grad=True)
+        i_out = instance(v_input, v_post)
+    else:
+        v_input = torch.tensor([[10.0, 5.0, 0.0]], requires_grad=True)
+        i_out = instance(v_input)
 
-    fig.tight_layout()
-    save_fig(fig, name="gap_junction_basic_coupling")
-    plt.close(fig)
+    loss = (i_out**2).sum()
+    loss.backward()
+
+    g_grad = getattr(instance, conductance_attr).grad
+    assert g_grad is not None
+    assert g_grad.item() != 0
+
+
+@pytest.mark.parametrize(
+    "cls,conductance_attr,kwargs",
+    [
+        (GapJunction, "g_gap", {"g_gap": 0.0}),
+        (VoltageCoupling, "g_couple", {"g_couple": 0.0}),
+    ],
+)
+def test_zero_conductance(
+    cls: type[CouplingClass], conductance_attr: str, kwargs: dict
+):
+    """Edge case: zero conductance produces no current."""
+    instance = cls(n_neuron=3, **kwargs)
+
+    v = torch.randn(2, 3)
+    if cls is GapJunction:
+        v_post = torch.randn(2, 3)
+        i_out = instance(v, v_post)
+    else:
+        i_out = instance(v)
+
+    assert torch.allclose(i_out, torch.zeros_like(i_out))
+
+
+@pytest.mark.parametrize(
+    "cls,conductance_attr,kwargs",
+    [
+        (GapJunction, "g_gap", {"g_gap": 0.2}),
+        (VoltageCoupling, "g_couple", {"g_couple": 0.2}),
+    ],
+)
+def test_batch_processing(
+    cls: type[CouplingClass], conductance_attr: str, kwargs: dict
+):
+    """Use case: processing multiple neurons across batch dimension."""
+    instance = cls(n_neuron=4, linear=_identity_linear(4), **kwargs)
+
+    batch_size = 8
+    v = torch.randn(batch_size, 4)
+
+    if cls is GapJunction:
+        v_post = torch.randn(batch_size, 4)
+        i_out = instance(v, v_post)
+        # Each batch element computed independently
+        for b in range(batch_size):
+            expected = 0.2 * (v_post[b] - v[b])
+            torch.testing.assert_close(i_out[b], expected, atol=1e-6, rtol=0.0)
+    else:
+        i_out = instance(v)
+        assert i_out.shape == (batch_size, 4)
+        # Each batch element computed independently
+        for b in range(batch_size):
+            expected = 0.2 * v[b]
+            torch.testing.assert_close(i_out[b], expected, atol=1e-6, rtol=0.0)
+
+
+@pytest.mark.parametrize(
+    "cls,conductance_attr,kwargs",
+    [
+        (GapJunction, "g_gap", {"g_gap": 0.5}),
+        (VoltageCoupling, "g_couple", {"g_couple": 0.5}),
+    ],
+)
+def test_time_series(cls: type[CouplingClass], conductance_attr: str, kwargs: dict):
+    """Use case: coupling currents in time-series simulations."""
+    instance = cls(n_neuron=2, linear=_identity_linear(2), **kwargs)
+
+    T = 100
+    t = torch.arange(T, dtype=torch.float32)
+    v_seq = torch.stack(
+        [
+            torch.sin(t * 0.1),
+            torch.cos(t * 0.1),
+        ],
+        dim=1,
+    ).unsqueeze(1)  # (T, 1, 2)
+
+    if cls is GapJunction:
+        v_post_seq = torch.zeros_like(v_seq)
+        i_seq = instance.multi_step_forward(v_seq, v_post_seq)
+        # With identity and g=0.5: I = 0.5 * (0 - sin(t)) = -0.5 * sin(t)
+        assert i_seq.shape == (T, 1, 2)
+        expected = 0.5 * (v_post_seq - v_seq)
+        torch.testing.assert_close(i_seq, expected, atol=1e-6, rtol=0.0)
+    else:
+        i_seq = instance.multi_step_forward(v_seq)
+        # With identity and g=0.5: I = 0.5 * V
+        assert i_seq.shape == (T, 1, 2)
+        expected = 0.5 * v_seq
+        torch.testing.assert_close(i_seq, expected, atol=1e-6, rtol=0.0)
+
+
+@pytest.mark.parametrize(
+    "cls,conductance_attr,kwargs",
+    [
+        (GapJunction, "g_gap", {"g_gap": 0.1}),
+        (VoltageCoupling, "g_couple", {"g_couple": 0.1}),
+    ],
+)
+def test_2d_spatial_layout(
+    cls: type[CouplingClass], conductance_attr: str, kwargs: dict
+):
+    """Use case: 2D spatial arrangement of neurons/compartments."""
+    instance = cls(n_neuron=(4, 4), **kwargs)
+
+    # 2D voltage map
+    v = torch.zeros(1, 4, 4)
+    v[0, 1:3, 1:3] = 10.0
+
+    if cls is GapJunction:
+        v_post = torch.zeros(1, 4, 4)
+        i_out = instance(v, v_post)
+        assert i_out.shape == (1, 4, 4)
+        assert torch.all(i_out[0, 1:3, 1:3] < 0), "Hotspot should lose current"
+    else:
+        i_out = instance(v)
+        assert i_out.shape == (1, 4, 4)
+
+
+@pytest.mark.skipif(
+    not platform.system() == "Linux", reason="Only Linux supports torch.compile"
+)
+@pytest.mark.parametrize(
+    "cls,conductance_attr,kwargs",
+    [
+        (GapJunction, "g_gap", {"g_gap": 0.3}),
+        (VoltageCoupling, "g_couple", {"g_couple": 0.3}),
+    ],
+)
+def test_compile_compatibility(
+    cls: type[CouplingClass], conductance_attr: str, kwargs: dict
+):
+    """Test that coupling classes work with torch.compile."""
+    from tests.utils.compile import compile_or_skip
+
+    instance = cls(n_neuron=4, **kwargs)
+    compiled = compile_or_skip(instance)
+
+    v = torch.randn(2, 4)
+
+    if cls is GapJunction:
+        v_post = torch.randn(2, 4)
+        i_eager = instance(v, v_post)
+        i_compiled = compiled(v, v_post)
+    else:
+        i_eager = instance(v)
+        i_compiled = compiled(v)
+
+    torch.testing.assert_close(i_eager, i_compiled, atol=1e-6, rtol=0.0)
+
+
+# =============================================================================
+# GapJunction-Specific Tests
+# =============================================================================
 
 
 def test_gap_junction_bidirectional_symmetry():
@@ -110,9 +300,6 @@ def test_gap_junction_synchronization():
     v_pre = torch.tensor([[10.0, 0.0]])
     v_post = torch.tensor([[0.0, 0.0]])
 
-    # Current from neuron 0's perspective (receiving from network at v_post)
-    # delta_v = [0-10, 0-0] = [-10, 0]
-    # I_gap = 0.5 * [-10, 0] = [-5, 0]
     i_gap = gap(v_pre, v_post)
 
     # Neuron 0 receives negative current (loses charge to the network)
@@ -122,8 +309,6 @@ def test_gap_junction_synchronization():
 
     # Reverse: if we swap pre/post, neuron 1 now receives from neuron 0
     i_gap_reverse = gap(v_post, v_pre)
-    # delta_v = [10-0, 0-0] = [10, 0]
-    # I_gap = 0.5 * [10, 0] = [5, 0]
     # Neuron 0 receives positive current (gains charge from network)
     assert (
         i_gap_reverse[0, 0] > 0
@@ -131,286 +316,6 @@ def test_gap_junction_synchronization():
 
     # The currents are equal and opposite, demonstrating synchronization
     torch.testing.assert_close(i_gap[0, 0], -i_gap_reverse[0, 0], atol=1e-6, rtol=0.0)
-
-    # Visualize bidirectional current flow
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    scenarios = ["Neuron 0\n(higher V)", "Neuron 1\n(lower V)"]
-    current_0_to_1 = [i_gap[0, 0].item(), i_gap[0, 1].item()]
-    current_1_to_0 = [i_gap_reverse[0, 0].item(), i_gap_reverse[0, 1].item()]
-
-    x = range(len(scenarios))
-    width = 0.35
-
-    ax.bar(
-        [i - width / 2 for i in x],
-        current_0_to_1,
-        width,
-        label="View from V=[0,0]",
-        color="#1f77b4",
-    )
-    ax.bar(
-        [i + width / 2 for i in x],
-        current_1_to_0,
-        width,
-        label="View from V=[10,0]",
-        color="#ff7f0e",
-    )
-
-    ax.set_ylabel("Gap Junction Current (pA)")
-    ax.set_title("Bidirectional Current Flow Demonstrates Symmetry")
-    ax.set_xticks(x)
-    ax.set_xticklabels(scenarios)
-    ax.legend()
-    ax.axhline(y=0, color="k", linestyle="--", alpha=0.3)
-
-    fig.tight_layout()
-    save_fig(fig, name="gap_junction_bidirectional_symmetry")
-    plt.close(fig)
-
-
-def test_gap_junction_ring_network():
-    """Use case: ring network with nearest-neighbor coupling.
-
-    Common in modeling electrically coupled interneuron networks where each
-    neuron connects to its neighbors (e.g., cortical fast-spiking interneurons).
-    """
-    n = 4
-    # Create coupling matrix: each neuron connects to neighbors
-    # Weight matrix with off-diagonal coupling
-    linear = torch.nn.Linear(n, n, bias=False)
-    with torch.no_grad():
-        # Nearest-neighbor coupling in a ring
-        w = torch.zeros(n, n)
-        for i in range(n):
-            w[i, (i - 1) % n] = 0.5  # left neighbor
-            w[i, (i + 1) % n] = 0.5  # right neighbor
-        linear.weight.copy_(w)
-
-    gap = GapJunction(n_neuron=n, g_gap=1.0, linear=linear)
-
-    # One neuron at high voltage, others at rest (simulating neuron 0 spiking)
-    v_pre = torch.zeros(1, n)
-    v_pre[0, 0] = 10.0
-    v_post = torch.zeros(1, n)  # Other neurons at rest
-
-    # Compute gap current: I = g * W * (v_post - v_pre)
-    # With our setup: delta_v = [0-10, 0-0, 0-0, 0-0] = [-10, 0, 0, 0]
-    # W @ delta_v gives current to each neuron
-    i_gap = gap(v_pre, v_post)
-
-    # With delta_v = v_post - v_pre = [0-10, 0-0, 0-0, 0-0] = [-10, 0, 0, 0]
-    # W[i,:] @ delta_v gives current to neuron i
-    # i_0 = 0 (no neighbors with non-zero voltage difference)
-    # i_1 = 0.5 * (-10) = -5 (receives from neuron 0)
-    # i_3 = 0.5 * (-10) = -5 (receives from neuron 0)
-    # Verify neighbors receive equal current from neuron 0
-    assert (
-        abs(i_gap[0, 1] - i_gap[0, 3]) < 1e-6
-    ), "Neighbors should receive equal current"
-    assert (
-        abs(i_gap[0, 1]) > 0
-    ), f"Neighbor 1 should have current, got {i_gap[0, 1].item()}"
-    assert (
-        abs(i_gap[0, 3]) > 0
-    ), f"Neighbor 3 should have current, got {i_gap[0, 3].item()}"
-    # Distant neuron (2) should have no direct coupling
-    assert (
-        abs(i_gap[0, 2]) < 1e-6
-    ), f"Distant neuron should have no current, got {i_gap[0, 2].item()}"
-
-    # Visualize ring network current distribution
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-    # Voltage input
-    ax = axes[0]
-    neuron_labels = [f"N{i}" for i in range(n)]
-    v_vals = v_pre[0].tolist()
-    colors_v = ["#d62728" if v > 0 else "#cccccc" for v in v_vals]
-    bars = ax.bar(neuron_labels, v_vals, color=colors_v, edgecolor="black")
-    ax.set_ylabel("Voltage (mV)")
-    ax.set_title("Ring Network: Neuron 0 Active (10mV)")
-    ax.axhline(y=0, color="k", linestyle="--", alpha=0.3)
-
-    # Add ring connection visualization
-    for i, bar in enumerate(bars):
-        height = bar.get_height()
-        ax.annotate(
-            f"N{i}",
-            xy=(bar.get_x() + bar.get_width() / 2, height),
-            xytext=(0, 3),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=9,
-        )
-
-    # Current distribution
-    ax = axes[1]
-    i_vals = i_gap[0].tolist()
-    colors_i = [
-        "#d62728" if i < 0 else "#2ca02c" if i > 0 else "#cccccc" for i in i_vals
-    ]
-    ax.bar(neuron_labels, i_vals, color=colors_i, edgecolor="black")
-    ax.set_ylabel("Gap Junction Current (pA)")
-    ax.set_title("Current Distribution (neighbors N1,N3 receive from N0)")
-    ax.axhline(y=0, color="k", linestyle="--", alpha=0.3)
-
-    fig.tight_layout()
-    save_fig(fig, name="gap_junction_ring_network")
-    plt.close(fig)
-
-
-def test_gap_junction_learnable_conductance():
-    """Use case: training gap junction conductances as network parameters.
-
-    In some models, gap junction strengths are learned during training to
-    optimize network synchronization or information flow.
-    """
-    gap = GapJunction(n_neuron=3, g_gap=0.5)
-
-    # Make g_gap trainable
-    gap.g_gap = torch.nn.Parameter(gap.g_gap)
-
-    v_pre = torch.tensor([[10.0, 5.0, 0.0]], requires_grad=True)
-    v_post = torch.tensor([[0.0, 0.0, 0.0]], requires_grad=True)
-
-    i_gap = gap(v_pre, v_post)
-    loss = (i_gap**2).sum()
-    loss.backward()
-
-    # Gradient should flow to g_gap
-    assert gap.g_gap.grad is not None
-    # Gradient should push toward reducing current magnitude
-    assert gap.g_gap.grad.item() != 0
-
-
-def test_gap_junction_multi_neuron_batch():
-    """Use case: processing multiple neurons across batch dimension.
-
-    In batched simulations, we often compute gap junction currents for
-    multiple network instances simultaneously (e.g., different trials
-    or parameter sets).
-    """
-    # Use identity weights for predictable output verification
-    gap = GapJunction(n_neuron=4, g_gap=0.2, linear=_identity_linear(4))
-
-    batch_size = 8
-    v_pre = torch.randn(batch_size, 4)
-    v_post = torch.randn(batch_size, 4)
-
-    i_gap = gap(v_pre, v_post)
-
-    assert i_gap.shape == (batch_size, 4)
-
-    # Each batch element computed independently
-    for b in range(batch_size):
-        expected = 0.2 * (v_post[b] - v_pre[b])
-        torch.testing.assert_close(i_gap[b], expected, atol=1e-6, rtol=0.0)
-
-
-def test_gap_junction_time_series():
-    """Use case: gap junction currents in time-series simulations.
-
-    In spiking neural network simulations, gap junction currents are
-    computed at each timestep based on instantaneous voltage differences.
-    Uses identity weights for predictable current calculation.
-    """
-    # Use identity weights: I_gap = g_gap * (v_post - v_pre)
-    gap = GapJunction(n_neuron=2, g_gap=0.5, linear=_identity_linear(2))
-
-    T = 100  # timesteps
-    dt = 0.1  # ms per timestep
-    # Simulate oscillating voltages
-    t = torch.arange(T, dtype=torch.float32)
-    v_pre_seq = torch.stack(
-        [
-            torch.sin(t * 0.1),  # Neuron 0 oscillates
-            torch.cos(t * 0.1),  # Neuron 1 oscillates with phase shift
-        ],
-        dim=1,
-    ).unsqueeze(1)  # (T, 1, 2)
-    v_post_seq = torch.zeros_like(v_pre_seq)
-
-    i_gap_seq = gap.multi_step_forward(v_pre_seq, v_post_seq)
-
-    assert i_gap_seq.shape == (T, 1, 2)
-
-    # With identity weights and g_gap=0.5: I_gap = 0.5 * (0 - sin(t)) = -0.5 * sin(t)
-    # Peak current magnitude should be 0.5 (when sin(t) = 1 or -1)
-    # Verify at peaks of oscillation, current is maximal
-    # Peak of sine is at t=~16 (pi/2 / 0.1)
-    peak_idx = int(3.14159 / 2 / 0.1)
-    expected_peak_current = 0.5  # g_gap * 1.0 (max voltage difference)
-    actual = i_gap_seq[peak_idx, 0, 0].item()
-    assert (
-        abs(i_gap_seq[peak_idx, 0, 0]) > 0.4
-    ), f"Current should be ~{expected_peak_current} at peak, got {actual}"
-
-    # Visualize time series: voltage and current over time
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-
-    time_ms = (t * dt).numpy()
-
-    # Voltage traces
-    ax = axes[0]
-    ax.plot(
-        time_ms,
-        v_pre_seq[:, 0, 0].detach().numpy(),
-        label="Neuron 0 (sin)",
-        color="#1f77b4",
-    )
-    ax.plot(
-        time_ms,
-        v_pre_seq[:, 0, 1].detach().numpy(),
-        label="Neuron 1 (cos)",
-        color="#ff7f0e",
-    )
-    ax.set_ylabel("Voltage (mV)")
-    ax.set_title("Oscillating Neuron Voltages")
-    ax.legend()
-    ax.axhline(y=0, color="k", linestyle="--", alpha=0.3)
-    ax.grid(True, alpha=0.3)
-
-    # Gap junction current
-    ax = axes[1]
-    ax.plot(
-        time_ms,
-        i_gap_seq[:, 0, 0].detach().numpy(),
-        label="Neuron 0 current",
-        color="#1f77b4",
-    )
-    ax.plot(
-        time_ms,
-        i_gap_seq[:, 0, 1].detach().numpy(),
-        label="Neuron 1 current",
-        color="#ff7f0e",
-    )
-    ax.set_xlabel("Time (ms)")
-    ax.set_ylabel("Gap Junction Current (pA)")
-    ax.set_title("Gap Junction Current (I = g * (V_post - V_pre))")
-    ax.legend()
-    ax.axhline(y=0, color="k", linestyle="--", alpha=0.3)
-    ax.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    save_fig(fig, name="gap_junction_time_series")
-    plt.close(fig)
-
-
-def test_gap_junction_zero_conductance_no_effect():
-    """Edge case: zero conductance should produce no coupling.
-
-    Useful for ablation studies or conditionally disabling gap junctions.
-    """
-    gap = GapJunction(n_neuron=3, g_gap=0.0)
-
-    v_pre = torch.randn(2, 3)
-    v_post = torch.randn(2, 3)
-
-    i_gap = gap(v_pre, v_post)
-
-    assert torch.allclose(i_gap, torch.zeros_like(i_gap))
 
 
 def test_gap_junction_equal_voltage_no_current():
@@ -427,87 +332,265 @@ def test_gap_junction_equal_voltage_no_current():
     assert torch.allclose(i_gap, torch.zeros_like(i_gap), atol=1e-6)
 
 
-def test_gap_junction_2d_spatial_layout():
-    """Use case: 2D spatial arrangement of neurons (e.g., retinal mosaic).
+def test_gap_junction_ring_network():
+    """Use case: ring network with nearest-neighbor coupling.
 
-    Retinal neurons are often arranged in 2D mosaics with gap junction
-    coupling between nearby cells. This tests spatial layout handling.
+    Common in modeling electrically coupled interneuron networks where each
+    neuron connects to its neighbors (e.g., cortical fast-spiking interneurons).
     """
-    gap = GapJunction(n_neuron=(4, 4), g_gap=0.1)
+    n = 4
+    # Create coupling matrix: each neuron connects to neighbors
+    linear = torch.nn.Linear(n, n, bias=False)
+    with torch.no_grad():
+        w = torch.zeros(n, n)
+        for i in range(n):
+            w[i, (i - 1) % n] = 0.5  # left neighbor
+            w[i, (i + 1) % n] = 0.5  # right neighbor
+        linear.weight.copy_(w)
 
-    # 2D voltage map with a hotspot
-    v_pre = torch.zeros(1, 4, 4)
-    v_pre[0, 1:3, 1:3] = 10.0  # 2x2 hotspot
-    v_post = torch.zeros(1, 4, 4)
+    gap = GapJunction(n_neuron=n, g_gap=1.0, linear=linear)
+
+    # One neuron at high voltage, others at rest
+    v_pre = torch.zeros(1, n)
+    v_pre[0, 0] = 10.0
+    v_post = torch.zeros(1, n)
 
     i_gap = gap(v_pre, v_post)
 
-    # Current should flow out of the hotspot
-    assert i_gap.shape == (1, 4, 4)
-    assert torch.all(i_gap[0, 1:3, 1:3] < 0), "Hotspot should lose current"
+    # Verify neighbors receive equal current from neuron 0
+    assert (
+        abs(i_gap[0, 1] - i_gap[0, 3]) < 1e-6
+    ), "Neighbors should receive equal current"
+    assert (
+        abs(i_gap[0, 1]) > 0
+    ), f"Neighbor 1 should have current, got {i_gap[0, 1].item()}"
+    assert (
+        abs(i_gap[0, 3]) > 0
+    ), f"Neighbor 3 should have current, got {i_gap[0, 3].item()}"
+    # Distant neuron (2) should have no direct coupling
+    assert (
+        abs(i_gap[0, 2]) < 1e-6
+    ), f"Distant neuron should have no current, got {i_gap[0, 2].item()}"
 
-    # Visualize 2D spatial layout
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-    # Voltage heatmap
-    ax = axes[0]
-    im = ax.imshow(v_pre[0].detach().numpy(), cmap="RdYlGn_r", vmin=-2, vmax=12)
-    ax.set_title("2D Voltage Map (Hotspot Center)")
-    ax.set_xlabel("X position")
-    ax.set_ylabel("Y position")
-    for i in range(4):
-        for j in range(4):
-            ax.text(
-                j,
-                i,
-                f"{v_pre[0, i, j].item():.1f}",
-                ha="center",
-                va="center",
-                color="white" if v_pre[0, i, j] > 5 else "black",
-            )
-    plt.colorbar(im, ax=ax, label="Voltage (mV)")
+# =============================================================================
+# Visualization Tests for Complex Network Dynamics
+# =============================================================================
 
-    # Current heatmap
-    ax = axes[1]
-    im = ax.imshow(i_gap[0].detach().numpy(), cmap="RdBu_r", vmin=-1, vmax=1)
-    ax.set_title("Gap Junction Current Map")
-    ax.set_xlabel("X position")
-    ax.set_ylabel("Y position")
-    for i in range(4):
-        for j in range(4):
-            ax.text(
-                j,
-                i,
-                f"{i_gap[0, i, j].item():.2f}",
-                ha="center",
-                va="center",
-                color="white" if abs(i_gap[0, i, j]) > 0.5 else "black",
-            )
-    plt.colorbar(im, ax=ax, label="Current (pA)")
+
+def test_gap_junction_ring_network_visualization():
+    """Visualize wave propagation in a ring network.
+
+    Shows how an input pulse at one neuron propagates through
+    electrically coupled neurons in a ring topology.
+    """
+    n = 4
+    # Create ring coupling: each neuron connects to neighbors
+    linear = torch.nn.Linear(n, n, bias=False)
+    with torch.no_grad():
+        w = torch.zeros(n, n)
+        for i in range(n):
+            w[i, (i - 1) % n] = 0.5  # Left neighbor
+            w[i, (i + 1) % n] = 0.5  # Right neighbor
+        linear.weight.copy_(w)
+
+    gap = GapJunction(n_neuron=n, g_gap=1.0, linear=linear)
+
+    # Simulation parameters
+    T = 800
+    dt = 0.1  # ms
+    time_ms = torch.arange(T, dtype=torch.float32) * dt
+    tau = 20.0  # ms
+    R = 0.5
+    v_rest = -65.0
+
+    # Initialize all neurons at rest
+    v = torch.zeros(T, n)
+    v[0, :] = v_rest
+
+    # Inject current into neuron 0 at specific times
+    i_inject = torch.zeros(T, n)
+    for pulse_time in [10.0, 40.0, 70.0]:
+        mask = (time_ms >= pulse_time) & (time_ms < pulse_time + 5.0)
+        i_inject[mask, 0] = 50.0  # pA injection into neuron 0
+
+    # Simulate with gap junction coupling
+    # Gap junction current into neuron i: I_i = g * sum_j W[i,j] * (V_j - V_i)
+    # This can be computed as: I = g * (W @ V - diag(sum_j W[i,j]) @ V)
+    # For our symmetric ring: sum_j W[i,j] = 1.0 for all i
+    for t in range(T - 1):
+        # Compute gap junction currents using the weight matrix
+        # I_gap[i] = g * sum_j W[i,j] * (V[j] - V[i])
+        with torch.no_grad():
+            v_flat = v[t : t + 1, :]  # (1, n)
+            # neighbor_contrib = W @ V gives sum of weighted neighbor voltages
+            neighbor_contrib = torch.nn.functional.linear(v_flat, linear.weight)
+            # total_weight[i] = sum_j W[i,j] = degree of node i
+            total_weight = linear.weight.sum(dim=1)
+            # I = g * (neighbor_contrib - total_weight * V)
+            i_gap = gap.g_gap * (neighbor_contrib[0] - total_weight * v_flat[0])
+
+        # Update voltages
+        for i in range(n):
+            leak = -(v[t, i] - v_rest) / tau
+            dv = (leak + R * (i_gap[i] + i_inject[t, i])) * dt
+            v[t + 1, i] = v[t, i] + dv
+
+    # Create figure with voltage traces for all neurons
+    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+
+    # Plot voltages
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
+    for i in range(n):
+        axes[0].plot(
+            time_ms.numpy(),
+            v[:, i].numpy(),
+            label=f"Neuron {i}",
+            color=colors[i],
+            lw=1.5,
+        )
+    axes[0].axhline(y=v_rest, color="k", linestyle="--", alpha=0.3)
+    axes[0].set_ylabel("Voltage (mV)")
+    axes[0].set_title("Ring Network: Pulse Propagation via Gap Junctions")
+    axes[0].legend(loc="upper right", ncol=n)
+    axes[0].grid(True, alpha=0.3)
+
+    # Plot input current
+    axes[1].plot(time_ms.numpy(), i_inject[:, 0].numpy(), color="red", lw=2)
+    axes[1].set_xlabel("Time (ms)")
+    axes[1].set_ylabel("Input Current (pA)")
+    axes[1].set_title("Current Injection (Neuron 0 only)")
+    axes[1].grid(True, alpha=0.3)
 
     fig.tight_layout()
-    save_fig(fig, name="gap_junction_2d_spatial")
+    save_fig(fig, name="gap_junction_ring_network")
     plt.close(fig)
 
 
-@pytest.mark.skipif(
-    not platform.system() == "Linux", reason="Only Linux supports torch.compile"
-)
-def test_gap_junction_compile_compatibility():
-    """Test that GapJunction works with torch.compile for performance.
+def test_gap_junction_2d_spatial_visualization():
+    """Visualize 2D spatial coupling with propagating waves.
 
-    Important for large-scale simulations where compilation can provide
-    significant speedups.
+    Shows how a localized input spreads through a 2D grid of
+    electrically coupled neurons.
     """
-    from tests.utils.compile import compile_or_skip
+    size = 5  # 5x5 grid
+    gap = GapJunction(n_neuron=(size, size))
 
-    gap = GapJunction(n_neuron=4, g_gap=0.3)
-    gap_compiled = compile_or_skip(gap)
+    T = 600
+    dt = 0.1
+    time_ms = torch.arange(T, dtype=torch.float32) * dt
+    tau = 20.0
+    v_rest = -70.0
 
-    v_pre = torch.randn(2, 4)
-    v_post = torch.randn(2, 4)
+    # Initialize voltage grid
+    v = torch.zeros(T, 1, size, size)
+    v[0, 0, :, :] = v_rest
 
-    i_eager = gap(v_pre, v_post)
-    i_compiled = gap_compiled(v_pre, v_post)
+    # Input pulse at center neuron
+    center = size // 2
+    i_inject = torch.zeros(T, 1, size, size)
+    pulse_start = 10.0
+    pulse_end = 30.0
+    mask = (time_ms >= pulse_start) & (time_ms < pulse_end)
+    i_inject[mask, 0, center, center] = 100.0  # Strong pulse at center
 
-    torch.testing.assert_close(i_eager, i_compiled, atol=1e-6, rtol=0.0)
+    # Simulate with proper gap junction coupling
+    # Gap junction current: I_i = g * sum_j W[i,j] * (V_j - V_i)
+    for t in range(T - 1):
+        with torch.no_grad():
+            v_flat = v[t].reshape(1, -1)  # (1, size*size)
+            # neighbor_contrib = W @ V
+            neighbor_contrib = torch.nn.functional.linear(v_flat, gap.linear.weight)
+            # total_weight[i] = sum_j W[i,j]
+            total_weight = gap.linear.weight.sum(dim=1)
+            # I = g * (neighbor_contrib - total_weight * V)
+            i_gap_flat = gap.g_gap * (neighbor_contrib[0] - total_weight * v_flat[0])
+            i_gap = i_gap_flat.reshape(1, size, size)
+
+        # Update voltages
+        leak = -(v[t] - v_rest) / tau
+        dv = (leak + i_gap * 0.2 + i_inject[t] * 0.05) * dt
+        v[t + 1] = v[t] + dv
+
+    # Select representative neurons: center, neighbors, edge
+    center_idx = center * size + center
+    neighbor_idx = center * size + (center + 1)
+    edge_idx = 0  # Corner
+
+    # Flatten spatial dimensions for plotting
+    v_flat = v[:, 0, :, :].reshape(T, size * size)
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
+
+    # Plot selected neuron voltages
+    axes[0].plot(
+        time_ms.numpy(),
+        v_flat[:, center_idx].numpy(force=True),
+        label=f"Center ({center},{center})",
+        lw=2,
+    )
+    axes[0].plot(
+        time_ms.numpy(),
+        v_flat[:, neighbor_idx].numpy(force=True),
+        label=f"Neighbor ({center},{center + 1})",
+        lw=2,
+    )
+    axes[0].plot(
+        time_ms.numpy(),
+        v_flat[:, edge_idx].numpy(force=True),
+        label="Corner (0,0)",
+        lw=2,
+    )
+    axes[0].axhline(y=v_rest, color="k", linestyle="--", alpha=0.3)
+    axes[0].set_ylabel("Voltage (mV)")
+    axes[0].set_title("2D Grid: Wave Propagation from Center")
+    axes[0].legend(loc="upper right")
+    axes[0].grid(True, alpha=0.3)
+
+    # Plot input current
+    axes[1].plot(
+        time_ms.numpy(), i_inject[:, 0, center, center].numpy(), color="red", lw=2
+    )
+    axes[1].set_xlabel("Time (ms)")
+    axes[1].set_ylabel("Input Current (pA)")
+    axes[1].set_title("Current Injection (Center only)")
+    axes[1].grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    save_fig(fig, name="gap_junction_2d_wave")
+    plt.close(fig)
+
+
+# =============================================================================
+# VoltageCoupling-Specific Tests
+# =============================================================================
+
+
+def test_voltage_coupling_multicompartment_dendrite():
+    """Use case: dendritic compartments coupled to soma.
+
+    Models a neuron with soma and dendritic compartments where coupling
+    currents flow based on absolute voltages, not differences.
+    """
+    # 3-compartment model: soma + 2 dendrites
+    linear = torch.nn.Linear(3, 3, bias=False)
+    with torch.no_grad():
+        w = torch.zeros(3, 3)
+        w[0, 1] = 0.3  # Soma receives from dendrite 1
+        w[0, 2] = 0.3  # Soma receives from dendrite 2
+        w[1, 0] = 0.5  # Dendrite 1 receives from soma
+        w[2, 0] = 0.5  # Dendrite 2 receives from soma
+        linear.weight.copy_(w)
+
+    couple = VoltageCoupling(n_neuron=3, g_couple=1.0, linear=linear)
+
+    # Soma at rest, dendrites depolarized
+    v = torch.tensor([[0.0, 10.0, 10.0]])
+
+    i_couple = couple(v)
+
+    # Soma receives current from both dendrites
+    assert i_couple[0, 0] > 0, "Soma should receive current from dendrites"
+    # Dendrites receive from soma (but soma is at 0, so minimal current)
+    torch.testing.assert_close(i_couple[0, 1], torch.tensor(0.0), atol=1e-6, rtol=0.0)
+    torch.testing.assert_close(i_couple[0, 2], torch.tensor(0.0), atol=1e-6, rtol=0.0)
