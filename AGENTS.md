@@ -23,6 +23,50 @@ Btorch is a brain-inspired Torch library for neuromorphic research. Follow the p
 - Use English for code, comments, and docstrings; conversation can be in other languages.
 - In tests, include thorough explanatory comments so they are understandable and can serve as examples.
 
+## Documentation format
+
+Use **Google style** docstrings (preferred) with this structure:
+
+```python
+"""One-line summary (imperative, no period).
+
+Extended description. Explain what, not how. Use math notation for equations:
+
+.. math::
+    \tau \frac{dv}{dt} = -(v - v_{reset}) + R \cdot I(t)
+
+Args:
+    param1: Description with type inferred from annotation.
+    param2: Multi-line descriptions
+        should indent.
+
+Returns:
+    Description of return value.
+
+Raises:
+    ValueError: When input is invalid.
+
+Examples:
+    Basic usage:
+
+    >>> result = function_name(arg1, arg2)
+    >>> print(result)
+    expected_output
+
+Notes:
+    Additional implementation details.
+
+References:
+    [1] Author, Title, Journal, Year.
+"""
+```
+
+Key patterns:
+
+- Document `__init__` parameters in class docstring, not `__init__` method
+- Include mathematical model equations in `.. math::` blocks
+- Include cross-references with `:func:` and `:class:`
+
 ## Tests and checks
 
 - Lint: `ruff check .`
