@@ -9,9 +9,10 @@ from btorch.models.functional import (
     set_hidden_states,
     set_memory_reset_values,
 )
-from btorch.models.init import build_sparse_mat, uniform_v_
+from btorch.models.init import uniform_v_
 from btorch.models.neurons.glif import GLIF3
 from btorch.models.neurons.lif import LIF
+from tests.utils.conn import build_sparse_mat
 
 
 # --- Fixtures and helpers --- #

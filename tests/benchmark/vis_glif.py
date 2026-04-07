@@ -6,9 +6,10 @@ from torchviz import make_dot
 
 from btorch.models import environ, linear, rnn, synapse
 from btorch.models.functional import init_net_state
-from btorch.models.init import build_dense_mat, uniform_v_
+from btorch.models.init import uniform_v_
 from btorch.models.neurons.glif import GLIF3
 from btorch.utils.file import fig_path
+from tests.utils.conn import build_dense_mat
 
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")

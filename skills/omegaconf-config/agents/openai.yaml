@@ -1,0 +1,4 @@
+interface:
+  display_name: "OmegaConf Config"
+  short_description: "Configuration management with OmegaConf and dataclasses"
+  default_prompt: "Set up OmegaConf configuration for this project with hierarchical dataclass configs, YAML file support, and CLI overrides. Follow the patterns from SKILL.md."

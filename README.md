@@ -116,6 +116,8 @@ pre-commit install --install-hooks
 Highly recommended to use [jaxtyping](https://docs.kidger.site/jaxtyping/) to mark expected array shape,
 see [good example of using jaxtyping](https://fullstackdeeplearning.com/blog/posts/rwkv-explainer)
 
+When using AI coding assistants, pls use [`desloppify`](https://github.com/peteromallet/desloppify) to verify code quality before submitting PRs. Consider installing it as a pre-push git hook to catch issues early.
+
 ### run the tests
 
 ```bash
@@ -143,6 +145,10 @@ If you want a clean rebuild:
 rm -rf docs/_build docs/api/generated
 python -m sphinx.cmd.build docs docs/_build/html
 ```
+
+## Skills
+
+The `skills/` directory contains usage patterns and tips for using btorch with AI agent. These are provided as reference and may not represent optimal configurations for every use case.
 
 ## TODO List
 
