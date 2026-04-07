@@ -34,6 +34,7 @@ def agg_by_neuropil(
     agg: Literal["mean", "sum", "std"] = "mean",
     use_polars: bool = False,
 ):
+    """Aggregate activations by neuropil under a validated aggregation mode."""
     agg_func = getattr(np, agg) if isinstance(y, np.ndarray) else getattr(torch, agg)
     if use_polars:
         try:
@@ -74,7 +75,7 @@ def agg_by_neuropil(
             for post, group in tmp.groupby("post", dropna=True):
                 post_ret[post] = agg_func(y[..., group.simple_id], -1)
         return pre_ret, post_ret
-    elif mode == "all_innervated":
+    if mode == "all_innervated":
         assert (
             connections is not None
         ), "connections must be provided for all_innervated mode"
@@ -104,6 +105,11 @@ def agg_by_neuropil(
                 )
         return pre_ret, post_ret
 
+    raise ValueError(
+        "Invalid `mode` for `agg_by_neuropil`. "
+        "Expected one of: {'top_innervated', 'all_innervated'}."
+    )
+
 
 def agg_conn(
     y,
@@ -114,6 +120,7 @@ def agg_conn(
     neuron_type_column: str = "cell_type",
     agg: Literal["mean", "sum", "std"] = "mean",
 ):
+    """Aggregate connectivity weights by neuropil or neuron-type pairs."""
     if conn_weight is not None:
         conn_weight = conn_weight.tocoo()
         conn = conn.merge(
@@ -129,7 +136,7 @@ def agg_conn(
         )
     if mode == "neuropil":
         return conn.groupby("neuropil")["weight"].agg(agg)
-    elif mode == "neuron":
+    if mode == "neuron":
         assert neurons is not None, "neurons must be provided for neuron mode"
         conn = conn.merge(
             neurons[["simple_id", neuron_type_column]].rename(
@@ -154,6 +161,10 @@ def agg_conn(
         return conn.groupby(
             [f"pre_{neuron_type_column}", f"post_{neuron_type_column}"]
         )["weight"].agg(agg)
+
+    raise ValueError(
+        "Invalid `mode` for `agg_conn`. Expected one of: {'neuropil', 'neuron'}."
+    )
 
 
 def build_group_frame(

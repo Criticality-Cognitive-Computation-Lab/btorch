@@ -83,8 +83,6 @@ from .timeseries import (
 
 
 __all__ = [
-    "animate_3d_activity",
-    "animate_mem_potential",
     "hex_heatmap",
     "plot_network",
     "plot_group_box",
@@ -93,9 +91,6 @@ __all__ = [
     "plot_group_violin",
     "plot_neuropil_timeseries_overview",
     "plot_neuropil_timeseries_panels",
-    "plot_agg_by_neuropil",
-    "plot_neuropil_comparison",
-    "plot_3d_activities",
     "plot_log_hist",
     "plot_raster",
     "plot_spectrum",

@@ -943,145 +943,20 @@ def convert_connection_layer_from_checkpoint(
     For dense sources, topology is inferred from ``state_dict['weight']`` unless
     ``in_features``/``out_features`` are explicitly supplied.
     """
-    if source_class is DenseConn:
-        if "weight" not in state_dict:
-            raise ValueError(
-                "DenseConn checkpoint must include 'weight' in state_dict."
-            )
-        weight_sd = state_dict["weight"]
-        if not isinstance(weight_sd, torch.Tensor):
-            raise ValueError("state_dict['weight'] must be a torch.Tensor.")
-        out_from_sd, in_from_sd = weight_sd.shape
-        in_features = in_from_sd if in_features is None else in_features
-        out_features = out_from_sd if out_features is None else out_features
-        if in_features != in_from_sd or out_features != out_from_sd:
-            raise ValueError(
-                "Provided in_features/out_features do not match checkpoint weight."
-            )
-
-        if enforce_dale is None:
-            enforce_dale = "initial_sign" in state_dict
-
-        if bias is None and "bias" in state_dict:
-            bias = torch.zeros(
-                out_features,
-                dtype=state_dict["bias"].dtype,
-                device=state_dict["bias"].device,
-            )
-
-        if mask is None and "mask" in state_dict:
-            state_mask = state_dict["mask"]
-            if not isinstance(state_mask, torch.Tensor):
-                raise ValueError(
-                    "state_dict['mask'] must be a torch.Tensor when present."
-                )
-            mask = torch.ones_like(state_mask)
-
-        source_layer: ConnectionLayer = DenseConn(
-            in_features=in_features,
-            out_features=out_features,
-            bias=bias,
-            mask=mask,
-            enforce_dale=enforce_dale,
-            device=device,
-            dtype=dtype,
-        )
-        source_layer.load_state_dict(state_dict)
-    elif source_class is SparseConn:
-        if conn is None:
-            raise ValueError("conn must be provided when source_class='SparseConn'.")
-        conn = _as_coo(conn)
-        if enforce_dale is None:
-            enforce_dale = "initial_sign" in state_dict
-        if bias is None and "bias" in state_dict:
-            bias = torch.zeros(
-                conn.shape[1],
-                dtype=state_dict["bias"].dtype,
-                device=state_dict["bias"].device,
-            )
-        source_layer = SparseConn(
-            conn=conn,
-            bias=bias,
-            enforce_dale=enforce_dale,
-            sparse_backend=sparse_backend,
-            device=device,
-            dtype=dtype,
-        )
-        source_layer.load_state_dict(state_dict)
-    elif source_class is SparseConstrainedConn:
-        if constraint is None:
-            raise ValueError(
-                "constraint must be provided when source_class='SparseConstrainedConn'."
-            )
-        if conn is not None:
-            # conn is authoritative for constrained initial weights when present.
-            conn = _as_coo(conn)
-        else:
-            init_weight = state_dict.get("initial_weight")
-            indices_sd = state_dict.get("indices")
-            if init_weight is None or indices_sd is None:
-                raise ValueError(
-                    "SparseConstrainedConn conversion requires either conn, or both "
-                    "state_dict['initial_weight'] and state_dict['indices']."
-                )
-            if not isinstance(init_weight, torch.Tensor):
-                raise ValueError("state_dict['initial_weight'] must be a torch.Tensor.")
-            if not isinstance(indices_sd, torch.Tensor):
-                raise ValueError("state_dict['indices'] must be a torch.Tensor.")
-            if indices_sd.ndim != 2 or indices_sd.shape[0] != 2:
-                raise ValueError(
-                    "state_dict['indices'] must have shape (2, nnz) for "
-                    "SparseConstrainedConn."
-                )
-            if indices_sd.shape[1] != init_weight.numel():
-                raise ValueError(
-                    "state_dict indices/value mismatch for SparseConstrainedConn. "
-                    f"Got indices nnz={indices_sd.shape[1]} vs "
-                    f"initial_weight nnz={init_weight.numel()}."
-                )
-
-            pre = indices_sd[1].detach().cpu().numpy().astype(np.int64)
-            post = indices_sd[0].detach().cpu().numpy().astype(np.int64)
-            values = init_weight.detach().cpu().reshape(-1).numpy()
-            shape = constraint.shape
-            if pre.size > 0:
-                if pre.max(initial=0) >= shape[0] or post.max(initial=0) >= shape[1]:
-                    raise ValueError(
-                        "state_dict indices are out of bounds for constraint shape "
-                        f"{shape}."
-                    )
-            conn = scipy.sparse.coo_array((values, (pre, post)), shape=shape)
-            conn.sum_duplicates()
-        if enforce_dale is None:
-            enforce_dale = True
-        if bias is None and "bias" in state_dict:
-            bias = torch.zeros(
-                conn.shape[1],
-                dtype=state_dict["bias"].dtype,
-                device=state_dict["bias"].device,
-            )
-        source_layer = SparseConstrainedConn(
-            conn=conn,
-            constraint=constraint,
-            enforce_dale=enforce_dale,
-            bias=bias,
-            sparse_backend=sparse_backend,
-            device=device,
-            dtype=dtype,
-            persist_initial_weight=True,
-        )
-        state_for_load = dict(state_dict)
-        # Topology and initial weights are reconstructed from conn/constraint.
-        # Keep constructor indices to avoid stale sparse backend tensors.
-        state_for_load.pop("initial_weight", None)
-        state_for_load.pop("indices", None)
-        source_layer.load_state_dict(state_for_load, strict=False)
-    else:
-        raise ValueError(
-            "source_class must be one of "
-            "(DenseConn, SparseConn, SparseConstrainedConn), got "
-            f"{source_class!r}"
-        )
+    source_layer = _build_source_layer_from_checkpoint(
+        state_dict=state_dict,
+        source_class=source_class,
+        conn=conn,
+        constraint=constraint,
+        in_features=in_features,
+        out_features=out_features,
+        mask=mask,
+        bias=bias,
+        enforce_dale=enforce_dale,
+        sparse_backend=sparse_backend,
+        device=device,
+        dtype=dtype,
+    )
 
     return convert_connection_layer(
         layer=source_layer,
@@ -1100,3 +975,230 @@ def convert_connection_layer_from_checkpoint(
         device=device,
         dtype=dtype,
     )
+
+
+def _build_source_layer_from_checkpoint(
+    *,
+    state_dict: dict[str, Any],
+    source_class: SourceLayerClass,
+    conn: scipy.sparse.sparray | None,
+    constraint: scipy.sparse.sparray | None,
+    in_features: int | None,
+    out_features: int | None,
+    mask: float | torch.Tensor | None,
+    bias: torch.Tensor | None,
+    enforce_dale: bool | None,
+    sparse_backend: SparseBackend | None,
+    device,
+    dtype,
+) -> ConnectionLayer:
+    if source_class is DenseConn:
+        return _build_dense_source_layer_from_checkpoint(
+            state_dict=state_dict,
+            in_features=in_features,
+            out_features=out_features,
+            mask=mask,
+            bias=bias,
+            enforce_dale=enforce_dale,
+            device=device,
+            dtype=dtype,
+        )
+    if source_class is SparseConn:
+        return _build_sparse_source_layer_from_checkpoint(
+            state_dict=state_dict,
+            conn=conn,
+            bias=bias,
+            enforce_dale=enforce_dale,
+            sparse_backend=sparse_backend,
+            device=device,
+            dtype=dtype,
+        )
+    if source_class is SparseConstrainedConn:
+        return _build_sparse_constrained_source_layer_from_checkpoint(
+            state_dict=state_dict,
+            conn=conn,
+            constraint=constraint,
+            bias=bias,
+            enforce_dale=enforce_dale,
+            sparse_backend=sparse_backend,
+            device=device,
+            dtype=dtype,
+        )
+    raise ValueError(
+        "source_class must be one of "
+        "(DenseConn, SparseConn, SparseConstrainedConn), got "
+        f"{source_class!r}"
+    )
+
+
+def _build_dense_source_layer_from_checkpoint(
+    *,
+    state_dict: dict[str, Any],
+    in_features: int | None,
+    out_features: int | None,
+    mask: float | torch.Tensor | None,
+    bias: torch.Tensor | None,
+    enforce_dale: bool | None,
+    device,
+    dtype,
+) -> ConnectionLayer:
+    if "weight" not in state_dict:
+        raise ValueError("DenseConn checkpoint must include 'weight' in state_dict.")
+    weight_sd = state_dict["weight"]
+    if not isinstance(weight_sd, torch.Tensor):
+        raise ValueError("state_dict['weight'] must be a torch.Tensor.")
+
+    out_from_sd, in_from_sd = weight_sd.shape
+    in_features = in_from_sd if in_features is None else in_features
+    out_features = out_from_sd if out_features is None else out_features
+    if in_features != in_from_sd or out_features != out_from_sd:
+        raise ValueError(
+            "Provided in_features/out_features do not match checkpoint weight."
+        )
+
+    if enforce_dale is None:
+        enforce_dale = "initial_sign" in state_dict
+
+    if bias is None and "bias" in state_dict:
+        bias = torch.zeros(
+            out_features,
+            dtype=state_dict["bias"].dtype,
+            device=state_dict["bias"].device,
+        )
+
+    if mask is None and "mask" in state_dict:
+        state_mask = state_dict["mask"]
+        if not isinstance(state_mask, torch.Tensor):
+            raise ValueError("state_dict['mask'] must be a torch.Tensor when present.")
+        mask = torch.ones_like(state_mask)
+
+    source_layer: ConnectionLayer = DenseConn(
+        in_features=in_features,
+        out_features=out_features,
+        bias=bias,
+        mask=mask,
+        enforce_dale=enforce_dale,
+        device=device,
+        dtype=dtype,
+    )
+    source_layer.load_state_dict(state_dict)
+    return source_layer
+
+
+def _build_sparse_source_layer_from_checkpoint(
+    *,
+    state_dict: dict[str, Any],
+    conn: scipy.sparse.sparray | None,
+    bias: torch.Tensor | None,
+    enforce_dale: bool | None,
+    sparse_backend: SparseBackend | None,
+    device,
+    dtype,
+) -> ConnectionLayer:
+    if conn is None:
+        raise ValueError("conn must be provided when source_class='SparseConn'.")
+    conn = _as_coo(conn)
+
+    if enforce_dale is None:
+        enforce_dale = "initial_sign" in state_dict
+    if bias is None and "bias" in state_dict:
+        bias = torch.zeros(
+            conn.shape[1],
+            dtype=state_dict["bias"].dtype,
+            device=state_dict["bias"].device,
+        )
+
+    source_layer: ConnectionLayer = SparseConn(
+        conn=conn,
+        bias=bias,
+        enforce_dale=enforce_dale,
+        sparse_backend=sparse_backend,
+        device=device,
+        dtype=dtype,
+    )
+    source_layer.load_state_dict(state_dict)
+    return source_layer
+
+
+def _build_sparse_constrained_source_layer_from_checkpoint(
+    *,
+    state_dict: dict[str, Any],
+    conn: scipy.sparse.sparray | None,
+    constraint: scipy.sparse.sparray | None,
+    bias: torch.Tensor | None,
+    enforce_dale: bool | None,
+    sparse_backend: SparseBackend | None,
+    device,
+    dtype,
+) -> ConnectionLayer:
+    if constraint is None:
+        raise ValueError(
+            "constraint must be provided when source_class='SparseConstrainedConn'."
+        )
+
+    if conn is not None:
+        # conn is authoritative for constrained initial weights when present.
+        conn = _as_coo(conn)
+    else:
+        init_weight = state_dict.get("initial_weight")
+        indices_sd = state_dict.get("indices")
+        if init_weight is None or indices_sd is None:
+            raise ValueError(
+                "SparseConstrainedConn conversion requires either conn, or both "
+                "state_dict['initial_weight'] and state_dict['indices']."
+            )
+        if not isinstance(init_weight, torch.Tensor):
+            raise ValueError("state_dict['initial_weight'] must be a torch.Tensor.")
+        if not isinstance(indices_sd, torch.Tensor):
+            raise ValueError("state_dict['indices'] must be a torch.Tensor.")
+        if indices_sd.ndim != 2 or indices_sd.shape[0] != 2:
+            raise ValueError(
+                "state_dict['indices'] must have shape (2, nnz) for "
+                "SparseConstrainedConn."
+            )
+        if indices_sd.shape[1] != init_weight.numel():
+            raise ValueError(
+                "state_dict indices/value mismatch for SparseConstrainedConn. "
+                f"Got indices nnz={indices_sd.shape[1]} vs "
+                f"initial_weight nnz={init_weight.numel()}."
+            )
+
+        pre = indices_sd[1].detach().cpu().numpy().astype(np.int64)
+        post = indices_sd[0].detach().cpu().numpy().astype(np.int64)
+        values = init_weight.detach().cpu().reshape(-1).numpy()
+        shape = constraint.shape
+        if pre.size > 0 and (
+            pre.max(initial=0) >= shape[0] or post.max(initial=0) >= shape[1]
+        ):
+            raise ValueError(
+                "state_dict indices are out of bounds for constraint shape " f"{shape}."
+            )
+        conn = scipy.sparse.coo_array((values, (pre, post)), shape=shape)
+        conn.sum_duplicates()
+
+    if enforce_dale is None:
+        enforce_dale = True
+    if bias is None and "bias" in state_dict:
+        bias = torch.zeros(
+            conn.shape[1],
+            dtype=state_dict["bias"].dtype,
+            device=state_dict["bias"].device,
+        )
+
+    source_layer: ConnectionLayer = SparseConstrainedConn(
+        conn=conn,
+        constraint=constraint,
+        enforce_dale=enforce_dale,
+        bias=bias,
+        sparse_backend=sparse_backend,
+        device=device,
+        dtype=dtype,
+        persist_initial_weight=True,
+    )
+    state_for_load = dict(state_dict)
+    # Topology and initial weights are reconstructed from conn/constraint.
+    # Keep constructor indices to avoid stale sparse backend tensors.
+    state_for_load.pop("initial_weight", None)
+    state_for_load.pop("indices", None)
+    source_layer.load_state_dict(state_for_load, strict=False)
+    return source_layer

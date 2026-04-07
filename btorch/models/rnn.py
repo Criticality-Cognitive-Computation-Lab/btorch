@@ -331,6 +331,10 @@ def make_rnn(
     obj=None,
     allow_buffer=False,
     **rnn_kwargs,
+) -> (
+    type[RecurrentNNAbstract]
+    | RecurrentNNAbstract
+    | Callable[[type[base.MemoryModule]], type[RecurrentNNAbstract]]
 ):
     """RNN wrapper."""
 
@@ -368,6 +372,11 @@ def make_rnn(
             return _build_rnn_class(cls)
 
         return decorator
+
+    raise TypeError(
+        "`make_rnn` expects a MemoryModule class, a MemoryModule instance, "
+        "or `None` when used as a decorator."
+    )
 
 
 class RecurrentNN(RecurrentNNAbstract):

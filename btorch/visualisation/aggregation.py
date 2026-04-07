@@ -129,23 +129,12 @@ def plot_group_violin(
     group_by: str,
     **kwargs,
 ) -> tuple[Figure, Axes]:
-    """Plot grouped value distributions as violin plots.
-
-    Convenience wrapper around `plot_group_distribution` with `kind="violin"`.
-
-    Args:
-        values: Per-neuron values with shape (neurons,) or (time, neurons).
-        neurons_df: DataFrame with neuron metadata.
-        group_by: Column name to group by.
-        **kwargs: Additional arguments passed to `plot_group_distribution`.
-
-    Returns:
-        Tuple of (figure, axes) containing the violin plot.
-    """
-    return plot_group_distribution(
-        values,
-        neurons_df,
-        group_by,
+    """Convenience wrapper for `plot_group_distribution(...,
+    kind='violin')`."""
+    return _plot_group_distribution_kind(
+        values=values,
+        neurons_df=neurons_df,
+        group_by=group_by,
         kind="violin",
         **kwargs,
     )
@@ -157,23 +146,11 @@ def plot_group_box(
     group_by: str,
     **kwargs,
 ) -> tuple[Figure, Axes]:
-    """Plot grouped value distributions as box plots.
-
-    Convenience wrapper around `plot_group_distribution` with `kind="box"`.
-
-    Args:
-        values: Per-neuron values with shape (neurons,) or (time, neurons).
-        neurons_df: DataFrame with neuron metadata.
-        group_by: Column name to group by.
-        **kwargs: Additional arguments passed to `plot_group_distribution`.
-
-    Returns:
-        Tuple of (figure, axes) containing the box plot.
-    """
-    return plot_group_distribution(
-        values,
-        neurons_df,
-        group_by,
+    """Convenience wrapper for `plot_group_distribution(..., kind='box')`."""
+    return _plot_group_distribution_kind(
+        values=values,
+        neurons_df=neurons_df,
+        group_by=group_by,
         kind="box",
         **kwargs,
     )
@@ -185,24 +162,29 @@ def plot_group_ecdf(
     group_by: str,
     **kwargs,
 ) -> tuple[Figure, Axes]:
-    """Plot grouped value distributions as ECDF curves.
-
-    Convenience wrapper around `plot_group_distribution` with `kind="ecdf"`.
-
-    Args:
-        values: Per-neuron values with shape (neurons,) or (time, neurons).
-        neurons_df: DataFrame with neuron metadata.
-        group_by: Column name to group by.
-        **kwargs: Additional arguments passed to `plot_group_distribution`.
-
-    Returns:
-        Tuple of (figure, axes) containing the ECDF plot.
-    """
-    return plot_group_distribution(
-        values,
-        neurons_df,
-        group_by,
+    """Convenience wrapper for `plot_group_distribution(..., kind='ecdf')`."""
+    return _plot_group_distribution_kind(
+        values=values,
+        neurons_df=neurons_df,
+        group_by=group_by,
         kind="ecdf",
+        **kwargs,
+    )
+
+
+def _plot_group_distribution_kind(
+    values: TensorLike,
+    neurons_df: pd.DataFrame,
+    group_by: str,
+    *,
+    kind: GroupPlotKind,
+    **kwargs,
+) -> tuple[Figure, Axes]:
+    return plot_group_distribution(
+        values=values,
+        neurons_df=neurons_df,
+        group_by=group_by,
+        kind=kind,
         **kwargs,
     )
 

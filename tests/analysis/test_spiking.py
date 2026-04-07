@@ -13,11 +13,13 @@ from btorch.analysis.spiking import (
     compute_raster,
     cv_temporal,
     fano,
+    fano_population,
     fano_sweep,
     fano_temporal,
     firing_rate,
     isi_cv,
     kurtosis,
+    kurtosis_population,
     local_variation,
 )
 
@@ -556,6 +558,27 @@ class TestKurtosisWithStochasticProcesses:
         kurt_torch, _ = kurtosis(torch.from_numpy(spikes), window=50, fisher=True)
 
         np.testing.assert_allclose(kurt_np, kurt_torch.cpu().numpy(), rtol=1e-4)
+
+    def test_population_metric_contract_consistency(self):
+        """Population metrics should share `(value, info)` return contracts.
+
+        This test locks in the API decision that both population-level
+        irregularity metrics expose matching metadata fields. Keeping
+        this contract stable helps downstream analysis pipelines swap
+        metrics without adapter code.
+        """
+        np.random.seed(42)
+        spikes = generate_poisson_spikes(rate_hz=40.0, duration_ms=5000.0, n_neurons=8)
+
+        fano_val, fano_info = fano_population(spikes, window=100, overlap=20)
+        kurt_val, kurt_info = kurtosis_population(spikes, window=100, overlap=20)
+
+        assert np.asarray(fano_val).ndim == 0
+        assert np.asarray(kurt_val).ndim == 0
+        assert set(fano_info.keys()) == {"window", "n_windows"}
+        assert set(kurt_info.keys()) == {"window", "n_windows"}
+        assert fano_info["window"] == kurt_info["window"] == 100
+        assert fano_info["n_windows"] == kurt_info["n_windows"]
 
 
 # =============================================================================

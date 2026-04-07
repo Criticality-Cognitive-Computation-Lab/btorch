@@ -789,7 +789,7 @@ def _kurtosis_population_numpy(
     if fisher:
         kurt = kurt - 3.0
 
-    return np.array(kurt)
+    return np.array(kurt), {"window": window, "n_windows": len(counts)}
 
 
 def _kurtosis_population_torch(
@@ -832,7 +832,10 @@ def _kurtosis_population_torch(
         kurt = kurt - 3.0
 
     kurt_val = kurt.item() if isinstance(kurt, torch.Tensor) else kurt
-    return torch.tensor(kurt_val, device=device)
+    return torch.tensor(kurt_val, device=device), {
+        "window": window,
+        "n_windows": len(counts),
+    }
 
 
 def kurtosis_population(
@@ -854,6 +857,7 @@ def kurtosis_population(
 
     Returns:
         kurt_pop: Single scalar kurtosis for the population.
+        info: Dictionary with 'window' and 'n_windows'.
     """
     if isinstance(spike, torch.Tensor):
         return _kurtosis_population_torch(spike, window, overlap, fisher)

@@ -21,6 +21,46 @@ from btorch.analysis.spiking import (
 )
 
 
+def _run_benchmark(
+    *,
+    label: str,
+    input_shape: tuple[int, int, int],
+    output_shape: torch.Size | tuple[int, ...] | None,
+    value_unit: str,
+    warmup_fn,
+    run_fn,
+    extra_result: str | None = None,
+) -> float:
+    """Run a benchmark with consistent warmup/timing/reporting."""
+    T, B, N = input_shape
+    print(f"\n{'=' * 60}")
+    print(f"Benchmarking {label}: T={T}, B={B}, N={N}")
+    print(f"{'=' * 60}")
+
+    warmup_fn()
+
+    start = time.time()
+    run_fn()
+    elapsed = time.time() - start
+
+    if output_shape is not None:
+        print(f"  Shape: {input_shape} -> {label} shape: {tuple(output_shape)}")
+    else:
+        print(f"  Shape: {input_shape}")
+    print(f"  Time: {elapsed:.3f}s")
+    print(f"  Throughput: {(T * B * N) / elapsed / 1e6:.2f}M {value_unit}/sec")
+    if extra_result is not None:
+        print(f"  Results: {extra_result}")
+
+    return elapsed
+
+
+def _benchmark_header(name: str, T: int, B: int, N: int, device, dtype) -> None:
+    print(f"\n{'=' * 60}")
+    print(f"Benchmarking {name}: T={T}, B={B}, N={N}, device={device}, dtype={dtype}")
+    print(f"{'=' * 60}")
+
+
 def generate_spike_data(T, B, N, rate=0.05, device="cpu", dtype=torch.float32):
     """Generate synthetic spike data.
 
@@ -61,175 +101,178 @@ def generate_current_data(T, B, N, device="cpu", dtype=torch.float32):
 
 def benchmark_cv(T=1000, B=8, N=100000, device="cpu", dtype=torch.float32):
     """Benchmark ISI CV computation."""
-    print(f"\n{'='*60}")
-    print(f"Benchmarking CV: T={T}, B={B}, N={N}, device={device}, dtype={dtype}")
-    print(f"{'='*60}")
+    _benchmark_header("CV", T, B, N, device, dtype)
 
     spikes = generate_spike_data(T, B, N, device=device, dtype=dtype)
+    cv_values = None
 
-    # Warmup
-    _ = isi_cv(spikes, dt_ms=1.0, batch_axis=(1,))
+    def warmup():
+        isi_cv(spikes, dt_ms=1.0, batch_axis=(1,))
 
-    # Benchmark
-    start = time.time()
-    cv_values, info = isi_cv(spikes, dt_ms=1.0, batch_axis=(1,))
-    elapsed = time.time() - start
+    def run():
+        nonlocal cv_values
+        cv_values, _ = isi_cv(spikes, dt_ms=1.0, batch_axis=(1,))
 
-    print(f"  Shape: {spikes.shape} -> CV shape: {cv_values.shape}")
-    print(f"  Time: {elapsed:.3f}s")
-    print(f"  Throughput: {(T * B * N) / elapsed / 1e6:.2f}M spikes/sec")
-
-    return elapsed
+    return _run_benchmark(
+        label="CV",
+        input_shape=(T, B, N),
+        output_shape=cv_values.shape if cv_values is not None else spikes.shape[1:],
+        value_unit="spikes",
+        warmup_fn=warmup,
+        run_fn=run,
+    )
 
 
 def benchmark_fano(T=1000, B=8, N=100000, device="cpu", dtype=torch.float32):
     """Benchmark Fano factor computation."""
-    print(f"\n{'='*60}")
-    print(f"Benchmarking Fano: T={T}, B={B}, N={N}, device={device}, dtype={dtype}")
-    print(f"{'='*60}")
+    _benchmark_header("Fano", T, B, N, device, dtype)
 
     spikes = generate_spike_data(T, B, N, device=device, dtype=dtype)
+    fano_values = None
 
-    # Warmup
-    _ = fano(spikes, window=100, batch_axis=(1,))
+    def warmup():
+        fano(spikes, window=100, batch_axis=(1,))
 
-    # Benchmark
-    start = time.time()
-    fano_values, info = fano(spikes, window=100, batch_axis=(1,))
-    elapsed = time.time() - start
+    def run():
+        nonlocal fano_values
+        fano_values, _ = fano(spikes, window=100, batch_axis=(1,))
 
-    print(f"  Shape: {spikes.shape} -> Fano shape: {fano_values.shape}")
-    print(f"  Time: {elapsed:.3f}s")
-    print(f"  Throughput: {(T * B * N) / elapsed / 1e6:.2f}M spikes/sec")
-
-    return elapsed
+    return _run_benchmark(
+        label="Fano",
+        input_shape=(T, B, N),
+        output_shape=fano_values.shape if fano_values is not None else spikes.shape[1:],
+        value_unit="spikes",
+        warmup_fn=warmup,
+        run_fn=run,
+    )
 
 
 def benchmark_kurtosis(T=1000, B=8, N=100000, device="cpu", dtype=torch.float32):
     """Benchmark Kurtosis computation."""
-    print(f"\n{'='*60}")
-    print(f"Benchmarking Kurtosis: T={T}, B={B}, N={N}, device={device}, dtype={dtype}")
-    print(f"{'='*60}")
+    _benchmark_header("Kurtosis", T, B, N, device, dtype)
 
     spikes = generate_spike_data(T, B, N, device=device, dtype=dtype)
+    kurt_values = None
 
-    # Warmup
-    _ = kurtosis(spikes, window=100, batch_axis=(1,))
+    def warmup():
+        kurtosis(spikes, window=100, batch_axis=(1,))
 
-    # Benchmark
-    start = time.time()
-    kurt_values, info = kurtosis(spikes, window=100, batch_axis=(1,))
-    elapsed = time.time() - start
+    def run():
+        nonlocal kurt_values
+        kurt_values, _ = kurtosis(spikes, window=100, batch_axis=(1,))
 
-    print(f"  Shape: {spikes.shape} -> Kurt shape: {kurt_values.shape}")
-    print(f"  Time: {elapsed:.3f}s")
-    print(f"  Throughput: {(T * B * N) / elapsed / 1e6:.2f}M spikes/sec")
-
-    return elapsed
+    return _run_benchmark(
+        label="Kurtosis",
+        input_shape=(T, B, N),
+        output_shape=kurt_values.shape if kurt_values is not None else spikes.shape[1:],
+        value_unit="spikes",
+        warmup_fn=warmup,
+        run_fn=run,
+    )
 
 
 def benchmark_lv(T=1000, B=8, N=100000, device="cpu", dtype=torch.float32):
     """Benchmark Local Variation computation."""
-    print(f"\n{'='*60}")
-    print(f"Benchmarking LV: T={T}, B={B}, N={N}, device={device}, dtype={dtype}")
-    print(f"{'='*60}")
+    _benchmark_header("LV", T, B, N, device, dtype)
 
     spikes = generate_spike_data(T, B, N, device=device, dtype=dtype)
+    lv_values = None
 
-    # Warmup
-    _ = local_variation(spikes, dt_ms=1.0, batch_axis=(1,))
+    def warmup():
+        local_variation(spikes, dt_ms=1.0, batch_axis=(1,))
 
-    # Benchmark
-    start = time.time()
-    lv_values, info = local_variation(spikes, dt_ms=1.0, batch_axis=(1,))
-    elapsed = time.time() - start
+    def run():
+        nonlocal lv_values
+        lv_values, _ = local_variation(spikes, dt_ms=1.0, batch_axis=(1,))
 
-    print(f"  Shape: {spikes.shape} -> LV shape: {lv_values.shape}")
-    print(f"  Time: {elapsed:.3f}s")
-    print(f"  Throughput: {(T * B * N) / elapsed / 1e6:.2f}M spikes/sec")
-
-    return elapsed
+    return _run_benchmark(
+        label="LV",
+        input_shape=(T, B, N),
+        output_shape=lv_values.shape if lv_values is not None else spikes.shape[1:],
+        value_unit="spikes",
+        warmup_fn=warmup,
+        run_fn=run,
+    )
 
 
 def benchmark_eci(T=1000, B=8, N=100000, device="cpu", dtype=torch.float32):
     """Benchmark ECI computation."""
-    print(f"\n{'='*60}")
-    print(f"Benchmarking ECI: T={T}, B={B}, N={N}, device={device}, dtype={dtype}")
-    print(f"{'='*60}")
+    _benchmark_header("ECI", T, B, N, device, dtype)
 
     I_e, I_i = generate_current_data(T, B, N, device=device, dtype=dtype)
+    eci = None
 
-    # Warmup
-    _ = compute_eci(I_e, I_i, batch_axis=(1,))
+    def warmup():
+        compute_eci(I_e, I_i, batch_axis=(1,))
 
-    # Benchmark
-    start = time.time()
-    eci, info = compute_eci(I_e, I_i, batch_axis=(1,))
-    elapsed = time.time() - start
+    def run():
+        nonlocal eci
+        eci, _ = compute_eci(I_e, I_i, batch_axis=(1,))
 
-    print(f"  Shape: {I_e.shape} -> ECI shape: {eci.shape}")
-    print(f"  Time: {elapsed:.3f}s")
-    print(f"  Throughput: {(T * B * N) / elapsed / 1e6:.2f}M values/sec")
-
-    return elapsed
+    return _run_benchmark(
+        label="ECI",
+        input_shape=(T, B, N),
+        output_shape=eci.shape if eci is not None else I_e.shape[1:],
+        value_unit="values",
+        warmup_fn=warmup,
+        run_fn=run,
+    )
 
 
 def benchmark_lag_correlation(T=1000, B=8, N=100000, device="cpu", dtype=torch.float32):
     """Benchmark lag correlation computation."""
-    print(f"\n{'='*60}")
-    print(
-        f"Benchmarking Lag Correlation: T={T}, B={B}, N={N}, "
-        f"device={device}, dtype={dtype}"
-    )
-    print(f"{'='*60}")
+    _benchmark_header("Lag Correlation", T, B, N, device, dtype)
 
     I_e, I_i = generate_current_data(T, B, N, device=device, dtype=dtype)
+    peak_corr = None
 
-    # Warmup
-    _ = compute_lag_correlation(I_e, -I_i, dt=1.0, max_lag_ms=30.0, batch_axis=(1,))
+    def warmup():
+        compute_lag_correlation(I_e, -I_i, dt=1.0, max_lag_ms=30.0, batch_axis=(1,))
 
-    # Benchmark
-    start = time.time()
-    peak_corr, best_lag_ms, info = compute_lag_correlation(
-        I_e, -I_i, dt=1.0, max_lag_ms=30.0, batch_axis=(1,)
+    def run():
+        nonlocal peak_corr
+        peak_corr, _, _ = compute_lag_correlation(
+            I_e, -I_i, dt=1.0, max_lag_ms=30.0, batch_axis=(1,)
+        )
+
+    return _run_benchmark(
+        label="Lag Correlation",
+        input_shape=(T, B, N),
+        output_shape=peak_corr.shape if peak_corr is not None else I_e.shape[1:],
+        value_unit="values",
+        warmup_fn=warmup,
+        run_fn=run,
     )
-    elapsed = time.time() - start
-
-    print(f"  Shape: {I_e.shape} -> Corr shape: {peak_corr.shape}")
-    print(f"  Time: {elapsed:.3f}s")
-    print(f"  Throughput: {(T * B * N) / elapsed / 1e6:.2f}M values/sec")
-
-    return elapsed
 
 
 def benchmark_ei_full(T=1000, B=8, N=100000, device="cpu", dtype=torch.float32):
     """Benchmark full E/I balance computation."""
-    print(f"\n{'='*60}")
-    print(
-        f"Benchmarking E/I Balance Full: T={T}, B={B}, N={N}, "
-        f"device={device}, dtype={dtype}"
-    )
-    print(f"{'='*60}")
+    _benchmark_header("E/I Balance Full", T, B, N, device, dtype)
 
     I_e, I_i = generate_current_data(T, B, N, device=device, dtype=dtype)
+    eci = None
+    peak_corr = None
 
-    # Warmup
-    _ = compute_ei_balance(I_e, I_i, batch_axis=(1,))
+    def warmup():
+        compute_ei_balance(I_e, I_i, batch_axis=(1,))
 
-    # Benchmark
-    start = time.time()
-    eci, peak_corr, best_lag_ms, info = compute_ei_balance(I_e, I_i, batch_axis=(1,))
-    elapsed = time.time() - start
+    def run():
+        nonlocal eci, peak_corr
+        eci, peak_corr, _, _ = compute_ei_balance(I_e, I_i, batch_axis=(1,))
 
-    print(f"  Shape: {I_e.shape}")
-    print(f"  Time: {elapsed:.3f}s")
-    print(f"  Throughput: {(T * B * N) / elapsed / 1e6:.2f}M values/sec")
-    print(
-        f"  Results: eci_mean={eci.mean():.3f}, "
-        f"peak_corr_mean={peak_corr.mean():.3f}"
+    return _run_benchmark(
+        label="E/I Balance Full",
+        input_shape=(T, B, N),
+        output_shape=None,
+        value_unit="values",
+        warmup_fn=warmup,
+        run_fn=run,
+        extra_result=(
+            f"eci_mean={eci.mean():.3f}, peak_corr_mean={peak_corr.mean():.3f}"
+            if eci is not None and peak_corr is not None
+            else None
+        ),
     )
-
-    return elapsed
 
 
 def compare_dtypes(T=1000, B=8, N=100000, device="cpu"):

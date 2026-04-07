@@ -229,12 +229,40 @@ def sample_by_column_expand_none(
 
 
 def sample_neuron_representative(
-    neurons,
+    neurons: pd.DataFrame,
     k: int = 1,
     j: int | dict = 2,
     random_state: int | None = None,
     product_sample: bool = True,
-):
+) -> pd.DataFrame:
+    """Sample representative neurons across canonical taxonomy columns.
+
+    This wrapper intentionally standardizes grouping to connectome taxonomy
+    fields used throughout this package: ``flow``, ``super_class``, ``class``,
+    and ``nt_type``.
+
+    Args:
+        neurons: Neuron metadata table containing taxonomy columns.
+        k: Samples per fully specified taxonomy group.
+        j: Sampling budget for partially specified rows.
+        random_state: Random seed for reproducibility.
+        product_sample: Whether to sample partial rows per product subgroup.
+
+    Returns:
+        Sampled neuron metadata as a DataFrame.
+
+    Raises:
+        ValueError: If required taxonomy columns are missing.
+    """
+    required_cols = {"flow", "super_class", "class", "nt_type"}
+    missing_cols = required_cols.difference(neurons.columns)
+    if missing_cols:
+        missing = ", ".join(sorted(missing_cols))
+        raise ValueError(
+            "sample_neuron_representative requires columns: "
+            f"{', '.join(sorted(required_cols))}. Missing: {missing}."
+        )
+
     return sample_by_column_expand_none(
         neurons,
         ["flow", "super_class", "class", "nt_type"],
