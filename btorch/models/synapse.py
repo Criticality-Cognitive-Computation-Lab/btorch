@@ -14,6 +14,7 @@ from .base import (
     normalize_n_neuron,
     unflatten_neuron,
 )
+from .history import SpikeHistory
 from .ode import exp_euler_step
 
 
@@ -34,12 +35,19 @@ class BasePSC(MemoryModule):
     Provides infrastructure for synaptic dynamics including weight
     application, delay buffering, and PSC state management.
 
+    Uses SpikeHistory for delay handling. By default uses torch.cat mode
+    for torch.compile compatibility. For simulation efficiency, set
+    use_circular_buffer=True.
+
     Args:
         n_neuron: Number of post-synaptic neurons.
         linear: Linear layer for weight application.
         latency: Synaptic delay (ms). Default: 0.0.
         step_mode: Step mode. Default: "s".
         backend: Compute backend. Default: "torch".
+        use_circular_buffer: If False (default), use torch.cat for
+            torch.compile compatibility. If True, use circular buffer
+            for memory-efficient simulation.
     """
 
     n_neuron: tuple[int, ...]
@@ -53,6 +61,7 @@ class BasePSC(MemoryModule):
         latency: float = 0.0,
         step_mode="s",
         backend="torch",
+        use_circular_buffer: bool = False,
     ):
         super().__init__()
 
@@ -64,13 +73,17 @@ class BasePSC(MemoryModule):
 
         self.register_memory("psc", 0.0, self.n_neuron)
 
+        # Use SpikeHistory for delay handling
         if latency > 0:
             self.latency_steps = round(latency / environ.get("dt"))
-            self.register_memory(
-                "delay_buffer",
-                0,
-                (self.latency_steps + 1, *self.n_neuron),
+            self.history = SpikeHistory(
+                n_neuron,
+                max_delay_steps=self.latency_steps + 1,
+                use_circular_buffer=use_circular_buffer,
             )
+        else:
+            self.latency_steps = 0
+            self.history = None
 
     def init_state(
         self,
@@ -85,22 +98,10 @@ class BasePSC(MemoryModule):
             dtype,
             device,
             persistent,
-            skip_mem_name=("delay_buffer",) + skip_mem_name,
+            skip_mem_name=skip_mem_name,
         )
-        if self.latency > 0:
-            delay_buffer_sizes = self._memories_rv["delay_buffer"].sizes
-            if batch_size is not None:
-                if isinstance(batch_size, int):
-                    batch_size = (batch_size,)
-                delay_buffer_sizes = (
-                    delay_buffer_sizes[0],
-                    *batch_size,
-                    *delay_buffer_sizes[1:],
-                )
-            self.register_buffer(
-                "delay_buffer",
-                torch.zeros(delay_buffer_sizes, dtype=dtype, device=device),
-            )
+        if self.history is not None:
+            self.history.init_state(batch_size, dtype, device, persistent)
 
     def reset(
         self,
@@ -113,28 +114,14 @@ class BasePSC(MemoryModule):
             batch_size,
             dtype,
             device,
-            skip_mem_name=("delay_buffer",) + skip_mem_name,
+            skip_mem_name=skip_mem_name,
         )
-        if self.latency > 0:
-            delay_buffer_sizes = self._memories_rv["delay_buffer"].sizes
-            if batch_size is None:
-                extra_dims = self.delay_buffer.ndim - len(delay_buffer_sizes)
-                if extra_dims > 0:
-                    batch_size = self.delay_buffer.shape[1 : 1 + extra_dims]
-            if batch_size is not None:
-                if isinstance(batch_size, int):
-                    batch_size = (batch_size,)
-                delay_buffer_sizes = (
-                    delay_buffer_sizes[0],
-                    *batch_size,
-                    *delay_buffer_sizes[1:],
-                )
-            self.delay_buffer = torch.zeros(
-                delay_buffer_sizes, dtype=dtype, device=device
-            )
+        if self.history is not None:
+            self.history.reset(batch_size, dtype, device)
 
     def extra_repr(self):
-        return f" step_mode={self.step_mode}, backend={self.backend}"
+        latency_str = f", latency={self.latency}ms" if self.latency > 0 else ""
+        return f"step_mode={self.step_mode}, backend={self.backend}{latency_str}"
 
     def _flatten_neuron(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
         return flatten_neuron(x, self.n_neuron, self.size)
@@ -161,11 +148,11 @@ class BasePSC(MemoryModule):
             return self.psc
 
     def single_step_forward(self, z: torch.Tensor):
-        if self.latency > 0:
-            self.delay_buffer = torch.cat(
-                (z.unsqueeze(dim=0), self.delay_buffer[:-1]), dim=0
-            )
-            spike = self.delay_buffer[-1]
+        if self.history is not None:
+            # Update history with current spike and retrieve delayed spike
+            self.history.update(z)
+            # Get spike from latency_steps ago
+            spike = self.history.get_delay(self.latency_steps)
         else:
             spike = z
 
@@ -197,6 +184,9 @@ class ExponentialPSC(BasePSC):
         latency: Synaptic delay (ms). Default: 0.0.
         step_mode: Step mode. Default: "s".
         backend: Compute backend. Default: "torch".
+        use_circular_buffer: If False (default), use torch.cat for
+            torch.compile compatibility. If True, use circular buffer
+            for memory-efficient simulation.
     """
 
     tau_syn: torch.Tensor | torch.nn.Parameter
@@ -209,6 +199,7 @@ class ExponentialPSC(BasePSC):
         latency: float = 0.0,
         step_mode="s",
         backend="torch",
+        use_circular_buffer: bool = False,
     ):
         super().__init__(
             n_neuron,
@@ -216,6 +207,7 @@ class ExponentialPSC(BasePSC):
             latency=latency,
             step_mode=step_mode,
             backend=backend,
+            use_circular_buffer=use_circular_buffer,
         )
 
         self.register_buffer("tau_syn", torch.as_tensor(tau_syn), persistent=False)

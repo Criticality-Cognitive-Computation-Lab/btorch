@@ -223,9 +223,11 @@ def make_hetersynapse_conn(
     return_dict: bool = False,
     dropna: Literal["error", "filter", "unknown"] = "error",
     ignore_post_type: bool = False,
+    delay_col: str | None = None,
+    n_delay_bins: int = 5,
 ) -> tuple[scipy.sparse.sparray, pd.DataFrame] | tuple[OrderedDict, pd.DataFrame]:
     """Transforms a connectivity matrix to represent heterosynaptic connections
-    based on receptor types.
+    based on receptor types, with optional delay support.
 
     This function can handle two modes:
     1. **'neuron' mode**: Receptor types are properties of the pre- and post-synaptic
@@ -237,6 +239,10 @@ def make_hetersynapse_conn(
        `num_neurons` rows and `num_neurons * num_receptor_types` columns, where
        each block of `n_receptor_type` columns corresponds to all receptors of a
        single neuron.
+
+    When delay_col is provided (DataFrame only), the output matrix rows are
+    expanded to include delay bins: shape becomes
+    (n_neurons * n_delay_bins, n_neurons * n_receptors).
 
     Args:
         neurons: DataFrame with neuron information. It must contain the
@@ -260,13 +266,18 @@ def make_hetersynapse_conn(
         ignore_post_type: If True, clusters connections only by pre-synaptic
             receptor type, ignoring post-synaptic receptor type. Resulting matrix
             will have fewer columns. Only valid for 'neuron' mode.
+        delay_col: Optional column name in connections DataFrame containing
+            delay values (in dt steps). If provided, expands matrix rows for
+            delays. Only works with DataFrame connections.
+        n_delay_bins: Number of delay bins when delay_col is provided
+            (default: 1, meaning no delay expansion).
 
     Returns:
         A tuple containing:
             - The transformed sparse array (`scipy.sparse.sparray`) or OrderedDict
-              of sparse arrays (if return_dict=True) in (pre_neuron,
-              post_neuron * receptor_type).
-            - A DataFrame mapping the new rows to receptor types. For 'neuron'
+              of sparse arrays (if return_dict=True). With delays, shape is
+              (n_neurons * n_delay_bins, n_neurons * n_receptors).
+            - A DataFrame mapping the new columns to receptor types. For 'neuron'
               mode, this will include 'pre_receptor_type' and
               'post_receptor_type'. For 'connection' mode, it will just have
               'receptor_type'.
@@ -274,18 +285,68 @@ def make_hetersynapse_conn(
     Raises:
         ValueError: If `connections` is not a DataFrame or a sparse array, or if
                     the `receptor_type_mode` is 'connection' but the input is a
-                    sparse array, or if NaN values found and dropna='error'.
+                    sparse array, or if NaN values found and dropna='error', or
+                    if delay_col provided with sparse array connections.
 
     Note:
         The neuron count is always preserved (based on simple_id indexing).
         When dropna='filter', only connections are removed, not neurons.
         When dropna='unknown', NaN becomes a valid receptor type.
     """
+    # Validate delay_col can only be used with DataFrame connections
+    if delay_col is not None and not isinstance(connections, pd.DataFrame):
+        raise ValueError("delay_col can only be used with DataFrame connections")
+
+    # Handle delays-only case (no heterosynapse expansion)
+    if receptor_type_col is None:
+        if not isinstance(connections, pd.DataFrame):
+            raise ValueError(
+                "receptor_type_col=None only supported with DataFrame connections"
+            )
+        if delay_col is None:
+            raise ValueError(
+                "Must provide either receptor_type_col or delay_col (or both)"
+            )
+        # Just do delay expansion without heterosynapse
+        shape = (len(neurons), len(neurons))
+        conn_sparse = make_sparse_mat(connections, shape)
+        # Extract and aggregate delay values
+        tmp_conn = connections.groupby(
+            ["pre_simple_id", "post_simple_id"], as_index=False
+        ).agg({"syn_count": "sum", delay_col: "mean"})
+        delay_vals = tmp_conn[delay_col].values.astype(int)
+        # Create simple index
+        index_df = pd.DataFrame({"simple_id": range(len(neurons))})
+        if n_delay_bins > 1:
+            conn_sparse = expand_conn_for_delays(conn_sparse, delay_vals, n_delay_bins)
+            # Add delay index
+            index_df["delay_index"] = 0
+        return conn_sparse, index_df
 
     if isinstance(connections, pd.DataFrame):
+        # Extract delay values early if delay_col is provided
+        delay_vals = None
+        if delay_col is not None:
+            if delay_col not in connections.columns:
+                raise KeyError(
+                    f"delay_col '{delay_col}' not found in connections DataFrame"
+                )
+            delay_vals = connections[delay_col].values.astype(int)
+
         if receptor_type_mode == "neuron":
-            connections = make_sparse_mat(connections, (len(neurons), len(neurons)))
-            return make_hetersynapse_conn(
+            # For delays, we need to aggregate while preserving delay info
+            if delay_vals is not None:
+                # Group by pre/post and aggregate syn_count, taking mean delay
+                tmp_conn = connections.groupby(
+                    ["pre_simple_id", "post_simple_id"], as_index=False
+                ).agg({"syn_count": "sum", delay_col: "mean"})
+                connections = make_sparse_mat(tmp_conn, (len(neurons), len(neurons)))
+                # Re-extract delay values aligned with aggregated connections
+                delay_vals = tmp_conn[delay_col].values.astype(int)
+            else:
+                connections = make_sparse_mat(connections, (len(neurons), len(neurons)))
+
+            result, index_df = make_hetersynapse_conn(
                 neurons,
                 connections,
                 receptor_type_col,
@@ -294,6 +355,10 @@ def make_hetersynapse_conn(
                 dropna=dropna,
                 ignore_post_type=ignore_post_type,
             )
+            # Apply delay expansion if needed
+            if delay_vals is not None and n_delay_bins > 1:
+                result = expand_conn_for_delays(result, delay_vals, n_delay_bins)
+            return result, index_df
 
         # create sparse mat for each connection's receptor_type
         # major difference from neuron receptor_type is that we don't need
@@ -310,7 +375,17 @@ def make_hetersynapse_conn(
             receptor_type_index, columns=["receptor_index", "receptor_type"]
         )
         if return_dict:
-            return conn_receptor_type_groups, receptor_type_index
+            result = conn_receptor_type_groups
+            if delay_vals is not None and n_delay_bins > 1:
+                # Apply delay expansion to each matrix in the dict
+                result = OrderedDict(
+                    {
+                        k: expand_conn_for_delays(v, delay_vals, n_delay_bins)
+                        for k, v in result.items()
+                    }
+                )
+            return result, receptor_type_index
+
         receptor_type_index_groups = list(enumerate(conn_receptor_type_groups.values()))
 
         n_receptor_type = len(conn_receptor_type_groups)
@@ -324,16 +399,17 @@ def make_hetersynapse_conn(
             new_col.append(conn_mat.col * n_receptor_type + i)
             new_val.append(conn_mat.data)
 
-        return (
-            scipy.sparse.coo_array(
-                (
-                    np.concatenate(new_val),
-                    (np.concatenate(new_row), np.concatenate(new_col)),
-                ),
-                shape=new_shape,
+        result = scipy.sparse.coo_array(
+            (
+                np.concatenate(new_val),
+                (np.concatenate(new_row), np.concatenate(new_col)),
             ),
-            receptor_type_index,
+            shape=new_shape,
         )
+        # Apply delay expansion if needed
+        if delay_vals is not None and n_delay_bins > 1:
+            result = expand_conn_for_delays(result, delay_vals, n_delay_bins)
+        return result, receptor_type_index
 
     elif isinstance(connections, scipy.sparse.sparray):
         assert receptor_type_mode == "neuron"
@@ -892,3 +968,60 @@ def stack_hetersynapse(
         "(pre_receptor_type, post_receptor_type) "
         "or receptor_type columns"
     )
+
+
+def expand_conn_for_delays(
+    conn: scipy.sparse.sparray,
+    delays: np.ndarray,
+    n_delay_bins: int = 5,
+) -> scipy.sparse.sparray:
+    """Expand connection matrix for delay dimension.
+
+    Expands the ROW dimension (pre-synaptic neurons) to accommodate
+    spike history. Each pre-neuron gets n_delay_bins "virtual" neurons
+    representing its spike at different delays.
+
+    The output matrix shape is (n_neurons * n_delay_bins, n_neurons),
+    where row i * n_delay_bins + d corresponds to neuron i at delay d.
+
+    Args:
+        conn: Base connection matrix of shape (n_neurons, n_neurons).
+        delays: Per-connection delay values in dt steps, array of length
+            conn.nnz (number of non-zero connections).
+        n_delay_bins: Number of delay bins (0 to n_delay_bins-1).
+
+    Returns:
+        Expanded sparse matrix of shape (n_neurons * n_delay_bins, n_neurons).
+
+    Raises:
+        ValueError: If delays contains negative values.
+
+    Example:
+        >>> import scipy.sparse
+        >>> import numpy as np
+        >>> conn = scipy.sparse.coo_array(
+        ...     ([1.0, 2.0], ([0, 1], [1, 2])),
+        ...     shape=(3, 3)
+        ... )
+        >>> delays = np.array([1, 3])  # conn[0,1] has delay 1, conn[1,2] has delay 3
+        >>> conn_d = expand_conn_for_delays(conn, delays, n_delay_bins=5)
+        >>> conn_d.shape
+        (15, 3)  # 3 neurons * 5 delays, 3 neurons
+        >>> # conn[0,1]=1.0 with delay 1 -> conn_d[0*5+1, 1] = 1.0
+        >>> # conn[1,2]=2.0 with delay 3 -> conn_d[1*5+3, 2] = 2.0
+    """
+    if np.any(delays < 0):
+        raise ValueError("delays must be non-negative")
+
+    conn_coo = conn.tocoo()
+    n_pre, n_post = conn.shape
+
+    # Clip delays to valid range and convert to integers
+    delay_bins = np.clip(delays, 0, n_delay_bins - 1).astype(int)
+
+    # Expand rows: each pre neuron gets n_delay_bins slots
+    new_row = conn_coo.row * n_delay_bins + delay_bins
+    new_col = conn_coo.col  # Post neurons unchanged
+
+    new_shape = (n_pre * n_delay_bins, n_post)
+    return scipy.sparse.coo_array((conn_coo.data, (new_row, new_col)), shape=new_shape)
