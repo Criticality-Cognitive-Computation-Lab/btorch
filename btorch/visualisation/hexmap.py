@@ -8,7 +8,7 @@ tiling.
 import pandas as pd
 import plotly.graph_objects as go
 
-from ..utils.hex_utils import hex_to_pixel
+from ..utils.hex.transform import to_pixel as hex_to_pixel
 
 
 def hex_heatmap(
@@ -180,7 +180,7 @@ def hex_heatmap(
     background_hex = background_hex.drop_duplicates(subset=["p", "q"])[
         ["p", "q"]
     ].astype(float)
-    x, y = hex_to_pixel(background_hex.p, background_hex.q, mode="flat")
+    x, y = hex_to_pixel(background_hex.p, background_hex.q, orientation="flat")
     background_hex["x"], background_hex["y"] = x, y
 
     fig = go.Figure()
@@ -204,7 +204,7 @@ def hex_heatmap(
         scaleratio=1,
     )
 
-    df["x"], df["y"] = hex_to_pixel(df.p, df.q, mode="flat")
+    df["x"], df["y"] = hex_to_pixel(df.p, df.q, orientation="flat")
     x_vals, y_vals = df.x, df.y
     df = df.drop(columns=["p", "q", "x", "y"])
 
