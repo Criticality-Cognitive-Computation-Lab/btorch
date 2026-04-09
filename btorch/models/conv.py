@@ -1,88 +1,36 @@
-import numpy as np
+"""Convolution layers.
+
+Contains Conv1dSpatial for sparse spatial connections. For hexagonal
+convolution, use btorch.models.hex.Conv2dHex.
+"""
+
 import pandas as pd
 import torch
 from jaxtyping import Float
 from torch import nn
 
-from ..utils.hex_utils import get_hex_coords
 
+class Conv1dSpatial(nn.Conv1d):
+    """1D Convolution with spatial locality - each neuron connects to nearest neighbors.
 
-class Conv2dHex(nn.Conv2d):
-    """Convolution with regularly, hexagonally shaped filters (in cartesian map
-    storage).
+    A special case of sparse constrained connection where every post-synaptic neuron
+    connects to `n_neighbor` closest neighbor pre-synaptic neurons.
 
-    Reference to map storage:
-    https://www.redblobgames.com/grids/hexagons/#map-storage
-
-    Info:
-        kernel_size must be odd!
+    Connection weights from each pre-syn neuron are shared,
+    constituting the kernel of Conv1d. This is equivalent to graph
+    attention module.
 
     Args:
         in_channels: Number of input channels.
         out_channels: Number of output channels.
-        kernel_size: Size of the convolutional kernel.
-        stride: Stride of the convolution.
-        padding: Padding added to input.
-        **kwargs: Additional keyword arguments for Conv2d.
-
-    Attributes:
-        mask: Mask for hexagonal convolution.
-        _filter_to_hex: Whether to apply hexagonal filter.
+        neurons: DataFrame with 'x', 'y', 'z' columns for spatial positions.
+        n_neighbor: Number of neighbors to connect to.
+        include_self: Whether to include self-connections.
+        bias: Whether to use bias.
+        device: Device for computation.
+        dtype: Data type for parameters.
     """
 
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        stride: int = 1,
-        padding: int = 0,
-        **kwargs,
-    ):
-        super().__init__(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride=stride,
-            padding=padding,
-            **kwargs,
-        )
-
-        if not kernel_size % 2:
-            raise ValueError(f"{kernel_size} is even. Must be odd.")
-        if kernel_size > 1:
-            u, v = get_hex_coords(kernel_size // 2)
-            u -= u.min()
-            v -= v.min()
-            mask = np.zeros(tuple(self.weight.shape))
-            mask[..., u, v] = 1
-            self.register_buffer("mask", torch.tensor(mask), persistent=False)
-            self.weight.data.mul_(self.mask)
-            self._filter_to_hex = True
-        else:
-            self._filter_to_hex = False
-
-    def filter_to_hex(self):
-        """Apply hexagonal filter to weights."""
-        return self.weight.data.mul_(self.mask)
-
-    def forward(
-        self, x: Float[torch.Tensor, "... {self.in_channels} H W"]
-    ) -> Float[torch.Tensor, "... {self.out_channels} Hout Wout"]:
-        """Forward pass of the Conv2dHexSpace layer.
-
-        Args:
-            x: Input tensor.
-
-        Returns:
-            Output tensor after hexagonal convolution.
-        """
-        if self._filter_to_hex:
-            self.filter_to_hex()
-        return super().forward(x)
-
-
-class Conv1dSpatial(nn.Conv1d):
     def __init__(
         self,
         in_channels: int,
@@ -94,15 +42,6 @@ class Conv1dSpatial(nn.Conv1d):
         device=None,
         dtype=None,
     ):
-        """A special case of SparseConstraintConn, where every post-syn neuron
-        connects to `n_neighbor` closest neighbor pre-syn neurons.
-
-        Connection weights from each pre-syn neuron are shared,
-        constituting the kernel of Conv1d. This is equivalent to graph
-        attention module.
-        """
-        from ..connectome.connection import make_spatial_localised_conn
-
         self.include_self = include_self
         self.n_neighbor = n_neighbor
         self.n_neuron = len(neurons)
@@ -125,6 +64,8 @@ class Conv1dSpatial(nn.Conv1d):
         # Create connection matrix
         # interprete row as post-neuron, and col as pre-neuron
         # coo doesn't support slicing??, have to use csr
+        from ..connectome.connection import make_spatial_localised_conn
+
         conn = make_spatial_localised_conn(
             neurons, mode="num", num=n_neighbor, include_self=include_self
         ).tocsr()
