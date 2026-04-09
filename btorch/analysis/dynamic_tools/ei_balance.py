@@ -85,10 +85,22 @@ def _compute_eci(
             return torch.ones(output_shape, dtype=I_e.dtype, device=I_e.device)
         return np.ones(output_shape, dtype=I_e.dtype)
 
-    # Compute recurrent current
-    I_rec = I_e + I_i
+    # Handle I_ext by splitting into excitatory and inhibitory parts
     if I_ext is not None:
-        I_rec = I_rec + I_ext
+        if isinstance(I_e, torch.Tensor):
+            I_ext_pos = torch.clamp(I_ext, min=0)
+            I_ext_neg = torch.clamp(I_ext, max=0)
+        else:
+            I_ext_pos = np.clip(I_ext, 0, None)
+            I_ext_neg = np.clip(I_ext, None, 0)
+        I_e_eff = I_e + I_ext_pos
+        I_i_eff = I_i + I_ext_neg
+    else:
+        I_e_eff = I_e
+        I_i_eff = I_i
+
+    # Compute recurrent current
+    I_rec = I_e_eff + I_i_eff
 
     # Determine axes/dims for aggregation
     if batch_axis is not None:
@@ -98,12 +110,14 @@ def _compute_eci(
 
     if isinstance(I_e, torch.Tensor):
         numer = torch.abs(I_rec).mean(dim=agg_dims, dtype=dtype)
-        denom = (torch.abs(I_e) + torch.abs(I_i)).mean(dim=agg_dims, dtype=dtype)
+        denom = (torch.abs(I_e_eff) + torch.abs(I_i_eff)).mean(
+            dim=agg_dims, dtype=dtype
+        )
         denom = denom + torch.finfo(I_e.dtype).eps
         return numer / denom
     else:
         numer = np.abs(I_rec).mean(axis=agg_dims, dtype=dtype)
-        denom = (np.abs(I_e) + np.abs(I_i)).mean(axis=agg_dims, dtype=dtype)
+        denom = (np.abs(I_e_eff) + np.abs(I_i_eff)).mean(axis=agg_dims, dtype=dtype)
         denom = denom + np.finfo(I_e.dtype).eps
         return numer / denom
 
@@ -181,6 +195,7 @@ def _compute_lag_correlation(
     use_fft: bool = True,
     dtype: torch.dtype | np.dtype | None = None,
 ):
+    assert max_lag_ms >= dt
     if isinstance(x, torch.Tensor):
         y = torch.as_tensor(y, dtype=x.dtype, device=x.device)
     else:

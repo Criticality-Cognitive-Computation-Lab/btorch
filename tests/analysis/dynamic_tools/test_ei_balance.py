@@ -350,6 +350,41 @@ class TestECIWithKnownSignals:
         assert np.all(eci_with_ext > eci_no_ext)
         assert np.all(eci_with_ext > 0.1)  # Should be significantly increased
 
+    def test_eci_external_current_split(self):
+        """I_ext positive part adds to I_e, negative part adds to I_i.
+
+        This tests that I_ext is properly split: clamp(I_ext, min=0) is added
+        to excitatory current, clamp(I_ext, max=0) is added to inhibitory.
+        """
+        np.random.seed(42)
+        T, N = 1000, 10
+        # Start with balanced E/I
+        I_e = np.ones((T, N), dtype=np.float32) * 1.0
+        I_i = np.ones((T, N), dtype=np.float32) * -1.0
+
+        # Pure positive external current should behave like adding to I_e
+        I_ext_pos = np.ones((T, N), dtype=np.float32) * 0.5
+        eci_with_pos, _ = compute_eci(I_e, I_i, I_ext=I_ext_pos)
+        eci_equiv, _ = compute_eci(I_e + 0.5, I_i)
+        np.testing.assert_allclose(eci_with_pos, eci_equiv, rtol=1e-5)
+
+        # Pure negative external current should behave like adding to I_i
+        I_ext_neg = np.ones((T, N), dtype=np.float32) * -0.5
+        eci_with_neg, _ = compute_eci(I_e, I_i, I_ext=I_ext_neg)
+        eci_equiv, _ = compute_eci(I_e, I_i - 0.5)
+        np.testing.assert_allclose(eci_with_neg, eci_equiv, rtol=1e-5)
+
+        # Mixed I_ext (both pos and neg values)
+        I_ext_mixed = np.concatenate(
+            [np.ones((T // 2, N)) * 0.3, np.ones((T // 2, N)) * -0.7], axis=0
+        ).astype(np.float32)
+        eci_with_mixed, _ = compute_eci(I_e, I_i, I_ext=I_ext_mixed)
+        # Equivalent: add positive part to I_e, negative part to I_i
+        I_ext_pos_part = np.clip(I_ext_mixed, 0, None)
+        I_ext_neg_part = np.clip(I_ext_mixed, None, 0)
+        eci_equiv_mixed, _ = compute_eci(I_e + I_ext_pos_part, I_i + I_ext_neg_part)
+        np.testing.assert_allclose(eci_with_mixed, eci_equiv_mixed, rtol=1e-5)
+
     def test_eci_torch_numpy_consistency(self):
         """Torch and numpy implementations should give same results."""
         np.random.seed(42)
