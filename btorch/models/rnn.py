@@ -48,31 +48,6 @@ class RecurrentNNAbstract(base.MemoryModule):
         loop_args = tuple(i for i, s in enumerate(shapes) if s == T)
         return T, loop_args
 
-    def _slice_args(self, args, loop_args, t: int):
-        out = []
-        for i, a in enumerate(args):
-            if i in loop_args:
-                out.append(a[t])
-            else:
-                out.append(a)
-        return out
-
-    @partial(torch.compiler.disable, recursive=True)
-    def _slice_args_range(self, args, loop_args, t):
-        def normalize_index(t):
-            if t == Ellipsis or t == "...":
-                return ...
-            return t
-
-        t = normalize_index(t)
-        out = []
-        for i, a in enumerate(args):
-            if i in loop_args:
-                out.append(a[t])
-            else:
-                out.append(a)
-        return out
-
     def single_step_forward(
         *args, **kwargs
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]: ...
@@ -135,25 +110,31 @@ class RecurrentNNAbstract(base.MemoryModule):
         This function is NOT checkpointed itself, but is the body of the
         checkpoint.
         """
-        T_chunk = chunk_args[loop_args[0]].shape[0]
-
-        # Calculate number of small blocks
-        num_blocks = (T_chunk + unroll_size - 1) // unroll_size
+        # Split loop args into unroll-sized chunks using torch.split
+        # torch.split returns views of the original tensor (zero-copy)
+        split_tensors = {
+            i: torch.split(chunk_args[i], unroll_size, dim=0) for i in loop_args
+        }
 
         chunk_z = []
         chunk_states = {}
 
-        for i in range(num_blocks):
-            start = i * unroll_size
-            end = min(start + unroll_size, T_chunk)
-
-            # Slice args for small chunk
-            sub_indices = slice(start, end)
-            sub_args = self._slice_args_range(chunk_args, loop_args, sub_indices)
+        # Iterate over the split chunks (all loop args have same number of chunks)
+        num_blocks = len(split_tensors[loop_args[0]])
+        for block_id in range(num_blocks):
+            # Build sub_args preserving original arg positions
+            # Split tensors get their chunk, scalars pass through unchanged
+            sub_args = tuple(
+                split_tensors[i][block_id] if i in loop_args else chunk_args[i]
+                for i in range(len(chunk_args))
+            )
 
             # Process small chunk
             z_sub, states_sub = self._process_small_chunk(
-                *sub_args, loop_args=loop_args, unroll_steps=end - start, **kwargs
+                *sub_args,
+                loop_args=loop_args,
+                unroll_steps=sub_args[loop_args[0]].shape[0],
+                **kwargs,
             )
 
             chunk_z.extend(z_sub)
@@ -245,13 +226,19 @@ class RecurrentNNAbstract(base.MemoryModule):
         # ------------------------------------------------------------------
         # Outer Loop: Large Chunks (Checkpointing & CPU Offloading)
         # ------------------------------------------------------------------
-        for chunk_id in range(num_large_chunks):
-            start = chunk_id * large_chunk_size
-            end = min(start + large_chunk_size, T)
+        # Split only loop args into large chunks using torch.split
+        # torch.split returns views of the original tensor (zero-copy)
+        split_tensors = {
+            i: torch.split(args[i], large_chunk_size, dim=0) for i in loop_args
+        }
 
-            # Slice args for large chunk
-            chunk_indices = slice(start, end)
-            chunk_args = self._slice_args_range(args, loop_args, chunk_indices)
+        for chunk_id in range(num_large_chunks):
+            # Build chunk_args preserving original arg positions
+            # Split tensors get their chunk, scalars pass through unchanged
+            chunk_args = tuple(
+                split_tensors[i][chunk_id] if i in loop_args else args[i]
+                for i in range(len(args))
+            )
 
             # Process Large Chunk
             if use_checkpoint:

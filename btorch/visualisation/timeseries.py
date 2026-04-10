@@ -1926,9 +1926,8 @@ def plot_neuron_traces(
     label_height_ratio = 0.22
     max_label_chars_per_line = 0
     if use_top_label_rows and max_label_len > 0:
-        min_slot_width = max(10.0, 0.06 * max_label_len)
-        base_width = max(base_width, min_slot_width / max(neurons_per_row, 1))
-        max_label_chars_per_line = max(36, int(min_slot_width * 8))
+        # Rough estimate for wrapping purposes only (not for sizing)
+        max_label_chars_per_line = max(36, int(base_width * 8))
         label_line_count = max(
             1,
             int(ceil(max_label_len / max(max_label_chars_per_line, 1))),
@@ -2155,6 +2154,23 @@ def plot_neuron_traces(
                 plot_idx = r * neurons_per_row + slot_idx
                 if plot_idx >= n_plot:
                     label_axes[(r, slot_idx)].set_visible(False)
+
+    # Adjust figure width based on actual label widths if using top labels
+    if use_top_label_rows and label_axes:
+        fig.canvas.draw()  # Ensure text is rendered
+        max_label_width_inches = 0.0
+        for (row_idx, slot_idx), label_ax in label_axes.items():
+            for text in label_ax.texts:
+                bbox = text.get_window_extent(renderer=fig.canvas.get_renderer())
+                width_inches = bbox.width / fig.dpi
+                max_label_width_inches = max(max_label_width_inches, width_inches)
+        if max_label_width_inches > 0:
+            # Add padding and account for column count per slot
+            required_slot_width = max_label_width_inches * 1.2 + 1.0  # 20% pad + margin
+            min_fig_width = required_slot_width * neurons_per_row
+            current_width = fig.get_figwidth()
+            if min_fig_width > current_width:
+                fig.set_figwidth(min_fig_width)
 
     right_margin = 0.96 if neuron_label_position == "side" else 1.0
     with warnings.catch_warnings():
