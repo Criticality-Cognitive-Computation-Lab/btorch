@@ -33,21 +33,14 @@ class BasePSC(MemoryModule):
     """Base class for post-synaptic current models.
 
     Provides infrastructure for synaptic dynamics including weight
-    application, delay buffering, and PSC state management.
-
-    Uses SpikeHistory for delay handling. By default uses torch.cat mode
-    for torch.compile compatibility. For simulation efficiency, set
-    use_circular_buffer=True.
+    application and PSC state management. Delay handling is managed
+    externally (e.g. via :class:`DelayedPSC`).
 
     Args:
         n_neuron: Number of post-synaptic neurons.
         linear: Linear layer for weight application.
-        latency: Synaptic delay (ms). Default: 0.0.
         step_mode: Step mode. Default: "s".
         backend: Compute backend. Default: "torch".
-        use_circular_buffer: If False (default), use torch.cat for
-            torch.compile compatibility. If True, use circular buffer
-            for memory-efficient simulation.
     """
 
     n_neuron: tuple[int, ...]
@@ -58,70 +51,20 @@ class BasePSC(MemoryModule):
         self,
         n_neuron: int | Sequence[int],
         linear: torch.nn.Module,
-        latency: float = 0.0,
         step_mode="s",
         backend="torch",
-        use_circular_buffer: bool = False,
     ):
         super().__init__()
 
         self.n_neuron, self.size = normalize_n_neuron(n_neuron)
         self.step_mode = step_mode
         self.backend = backend
-        self.latency = latency
         self.linear = linear
 
         self.register_memory("psc", 0.0, self.n_neuron)
 
-        # Use SpikeHistory for delay handling
-        if latency > 0:
-            self.latency_steps = round(latency / environ.get("dt"))
-            self.history = SpikeHistory(
-                n_neuron,
-                max_delay_steps=self.latency_steps + 1,
-                use_circular_buffer=use_circular_buffer,
-            )
-        else:
-            self.latency_steps = 0
-            self.history = None
-
-    def init_state(
-        self,
-        batch_size=None,
-        dtype=None,
-        device=None,
-        persistent=True,
-        skip_mem_name: Iterable[str] = (),
-    ):
-        super().init_state(
-            batch_size,
-            dtype,
-            device,
-            persistent,
-            skip_mem_name=skip_mem_name,
-        )
-        if self.history is not None:
-            self.history.init_state(batch_size, dtype, device, persistent)
-
-    def reset(
-        self,
-        batch_size=None,
-        dtype=None,
-        device=None,
-        skip_mem_name: Iterable[str] = (),
-    ):
-        super().reset(
-            batch_size,
-            dtype,
-            device,
-            skip_mem_name=skip_mem_name,
-        )
-        if self.history is not None:
-            self.history.reset(batch_size, dtype, device)
-
     def extra_repr(self):
-        latency_str = f", latency={self.latency}ms" if self.latency > 0 else ""
-        return f"step_mode={self.step_mode}, backend={self.backend}{latency_str}"
+        return f"step_mode={self.step_mode}, backend={self.backend}"
 
     def _flatten_neuron(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
         return flatten_neuron(x, self.n_neuron, self.size)
@@ -135,7 +78,11 @@ class BasePSC(MemoryModule):
         raise NotImplementedError()
 
     def adaptation_charge(self, z: torch.Tensor):
-        raise NotImplementedError()
+        # Flatten only when input still carries multi-dimensional neuron dims
+        z_flat, leading = flatten_neuron(z, self.n_neuron, self.size)
+        wz = self.linear(z_flat)
+        wz = unflatten_neuron(wz, leading, self.n_neuron)
+        self.psc = self.psc + wz
 
     def current_charge(self, v=None):
         if v is not None:
@@ -148,16 +95,8 @@ class BasePSC(MemoryModule):
             return self.psc
 
     def single_step_forward(self, z: torch.Tensor):
-        if self.history is not None:
-            # Update history with current spike and retrieve delayed spike
-            self.history.update(z)
-            # Get spike from latency_steps ago
-            spike = self.history.get_delay(self.latency_steps)
-        else:
-            spike = z
-
         self.conductance_charge()
-        self.adaptation_charge(spike)
+        self.adaptation_charge(z)
         current = self.current_charge()
         return current
 
@@ -181,12 +120,8 @@ class ExponentialPSC(BasePSC):
         n_neuron: Number of neurons.
         tau_syn: Synaptic time constant (ms).
         linear: Linear layer for weights.
-        latency: Synaptic delay (ms). Default: 0.0.
         step_mode: Step mode. Default: "s".
         backend: Compute backend. Default: "torch".
-        use_circular_buffer: If False (default), use torch.cat for
-            torch.compile compatibility. If True, use circular buffer
-            for memory-efficient simulation.
     """
 
     tau_syn: torch.Tensor | torch.nn.Parameter
@@ -196,18 +131,14 @@ class ExponentialPSC(BasePSC):
         n_neuron: int | Sequence[int],
         tau_syn: float | TensorLike,
         linear,
-        latency: float = 0.0,
         step_mode="s",
         backend="torch",
-        use_circular_buffer: bool = False,
     ):
         super().__init__(
             n_neuron,
             linear,
-            latency=latency,
             step_mode=step_mode,
             backend=backend,
-            use_circular_buffer=use_circular_buffer,
         )
 
         self.register_buffer("tau_syn", torch.as_tensor(tau_syn), persistent=False)
@@ -220,12 +151,6 @@ class ExponentialPSC(BasePSC):
     def conductance_charge(self):
         self.psc = exp_euler_step(self.dpsc, self.psc, dt=environ.get("dt"))
         return self.psc
-
-    def adaptation_charge(self, z: torch.Tensor):
-        z_flat, leading = self._flatten_neuron(z)
-        wz = self.linear(z_flat)
-        wz = self._unflatten_neuron(wz, leading)
-        self.psc = self.psc + wz
 
 
 class _Adaptive2VarPSC(BasePSC):
@@ -282,9 +207,15 @@ class AlphaPSCBilleh(_Adaptive2VarPSC):
         return self.psc
 
     def adaptation_charge(self, z: torch.Tensor):
-        z_flat, leading = self._flatten_neuron(z)
+        # Flatten only when input still carries multi-dimensional neuron dims
+        if len(self.n_neuron) > 1 and z.shape[-len(self.n_neuron) :] == self.n_neuron:
+            z_flat, leading = flatten_neuron(z, self.n_neuron, self.size)
+        else:
+            z_flat = z
+            leading = z.shape[:-1]
         wz = self.linear(z_flat)
-        wz = self._unflatten_neuron(wz, leading)
+        if len(self.n_neuron) > 1 and z_flat is not z:
+            wz = unflatten_neuron(wz, leading, self.n_neuron)
         self.h = self.syn_decay * self.h + torch.e / self.tau_syn * wz
 
 
@@ -322,9 +253,15 @@ class AlphaPSC(_Adaptive2VarPSC):
         self.psc = exp_euler_step(self.dg, self.psc, self.h, dt=environ.get("dt"))
 
     def adaptation_charge(self, z: torch.Tensor):
-        z_flat, leading = self._flatten_neuron(z)
+        # Flatten only when input still carries multi-dimensional neuron dims
+        if len(self.n_neuron) > 1 and z.shape[-len(self.n_neuron) :] == self.n_neuron:
+            z_flat, leading = flatten_neuron(z, self.n_neuron, self.size)
+        else:
+            z_flat = z
+            leading = z.shape[:-1]
         wz = self.g_max * self.linear(z_flat)
-        wz = self._unflatten_neuron(wz, leading)
+        if len(self.n_neuron) > 1 and z_flat is not z:
+            wz = unflatten_neuron(wz, leading, self.n_neuron)
         self.h = exp_euler_step(self.dh, self.h, dt=environ.get("dt")) + wz
 
 
@@ -341,7 +278,6 @@ class DualExponentialPSC(BasePSC):
         tau_decay: float | TensorLike,
         tau_rise: float | TensorLike,
         linear: torch.nn.Module,
-        latency: float = 0.0,
         A: float | TensorLike | None = None,
         step_mode="s",
         backend="torch",
@@ -351,7 +287,6 @@ class DualExponentialPSC(BasePSC):
         super().__init__(
             n_neuron=n_neuron,
             linear=linear,
-            latency=latency,
             step_mode=step_mode,
             backend=backend,
         )
@@ -388,15 +323,156 @@ class DualExponentialPSC(BasePSC):
         self.g_decay = exp_euler_step(self.dg_decay, self.g_decay, dt=environ.get("dt"))
 
     def adaptation_charge(self, z: torch.Tensor):
-        z_flat, leading = self._flatten_neuron(z)
+        # Flatten only when input still carries multi-dimensional neuron dims
+        if len(self.n_neuron) > 1 and z.shape[-len(self.n_neuron) :] == self.n_neuron:
+            z_flat, leading = flatten_neuron(z, self.n_neuron, self.size)
+        else:
+            z_flat = z
+            leading = z.shape[:-1]
         wz = self.linear(z_flat)
-        wz = self._unflatten_neuron(wz, leading)
+        if len(self.n_neuron) > 1 and z_flat is not z:
+            wz = unflatten_neuron(wz, leading, self.n_neuron)
         self.g_rise = self.g_rise + wz
         self.g_decay = self.g_decay + wz
         self.psc = self.a * (self.g_decay - self.g_rise)
 
 
+class DelayedPSC(MemoryModule):
+    """Wrapper that adds delay buffering to any BasePSC subclass.
+
+    Delays are managed orthogonally to synaptic dynamics via SpikeHistory.
+    This replaces the legacy ``latency=`` parameter on BasePSC subclasses.
+
+    Args:
+        psc: BasePSC subclass instance (e.g. ExponentialPSC, AlphaPSC).
+        max_delay_steps: Maximum delay steps to buffer. Default: 1.
+        use_circular_buffer: If False (default), use torch.cat for
+            torch.compile compatibility. If True, use circular buffer
+            for memory-efficient simulation.
+
+    Example:
+        >>> psc = AlphaPSC(n_neuron=100, tau_syn=5.0, linear=linear)
+        >>> delayed = DelayedPSC(psc, max_delay_steps=5)
+    """
+
+    def __init__(
+        self,
+        psc: BasePSC,
+        max_delay_steps: int = 1,
+        use_circular_buffer: bool = False,
+    ):
+        super().__init__()
+        self.psc_module = psc
+        self.max_delay_steps = max_delay_steps
+        self.use_circular_buffer = use_circular_buffer
+
+        if max_delay_steps > 1:
+            self.history = SpikeHistory(
+                n_neuron=psc.n_neuron,
+                max_delay_steps=max_delay_steps + 1,
+                use_circular_buffer=use_circular_buffer,
+            )
+        else:
+            self.history = None
+
+    def init_state(
+        self,
+        batch_size=None,
+        dtype=None,
+        device=None,
+        persistent=True,
+        skip_mem_name: Iterable[str] = (),
+    ):
+        self.psc_module.init_state(
+            batch_size,
+            dtype,
+            device,
+            persistent,
+            skip_mem_name=skip_mem_name,
+        )
+        if self.history is not None:
+            self.history.init_state(batch_size, dtype, device, persistent)
+
+    def reset(
+        self,
+        batch_size=None,
+        dtype=None,
+        device=None,
+        skip_mem_name: Iterable[str] = (),
+    ):
+        self.psc_module.reset(
+            batch_size,
+            dtype,
+            device,
+            skip_mem_name=skip_mem_name,
+        )
+        if self.history is not None:
+            self.history.reset(batch_size, dtype, device)
+
+    @property
+    def n_neuron(self) -> tuple[int, ...]:
+        return self.psc_module.n_neuron
+
+    @property
+    def size(self) -> int:
+        return self.psc_module.size
+
+    @property
+    def step_mode(self) -> str:
+        return self.psc_module.step_mode
+
+    @property
+    def backend(self) -> str:
+        return self.psc_module.backend
+
+    @property
+    def psc(self) -> torch.Tensor:
+        return self.psc_module.psc
+
+    def single_step_forward(self, z: torch.Tensor):
+        if self.history is not None:
+            self.history.update(z)
+            z_delayed = self.history.get_delay(self.max_delay_steps)
+        else:
+            z_delayed = z
+        return self.psc_module.single_step_forward(z_delayed)
+
+    def multi_step_forward(self, z_seq: torch.Tensor):
+        T = z_seq.shape[0]
+        y_seq = []
+        for t in range(T):
+            y = self.single_step_forward(z_seq[t])
+            y_seq.append(y)
+        return torch.stack(y_seq)
+
+    def extra_repr(self):
+        return (
+            f"max_delay_steps={self.max_delay_steps}, "
+            f"circular={self.use_circular_buffer}"
+        )
+
+
 class HeterSynapsePSC(BasePSC):
+    """Heterogeneous synapse PSC supporting multiple receptor types.
+
+    Manages its own delay buffering when ``max_delay_steps > 1``,
+    making it compatible with delay-expanded connection matrices from
+    ``make_hetersynapse_conn(..., delay_col=..., n_delay_bins=...)``.
+
+    Args:
+        n_neuron: Number of neurons.
+        n_receptor: Number of receptor types.
+        receptor_type_index: DataFrame mapping receptor types to indices.
+        linear: Linear layer for weight application.
+        base_psc: BasePSC subclass to use for dynamics. Default: AlphaPSC.
+        max_delay_steps: Maximum delay steps to buffer. Default: 1.
+        use_circular_buffer: If False (default), use torch.cat for
+            torch.compile compatibility. If True, use circular buffer.
+        step_mode: Step mode. Default: "s".
+        backend: Compute backend. Default: "torch".
+        **kwargs: Passed to ``base_psc`` constructor.
+    """
+
     def __init__(
         self,
         n_neuron: int | Sequence[int],
@@ -404,13 +480,25 @@ class HeterSynapsePSC(BasePSC):
         receptor_type_index: pd.DataFrame,
         linear: torch.nn.Module,
         base_psc: type[BasePSC] = AlphaPSC,
+        max_delay_steps: int = 1,
+        use_circular_buffer: bool = False,
         step_mode="s",
         backend="torch",
         **kwargs,
     ):
-        super().__init__(
-            n_neuron, linear, latency=0, step_mode=step_mode, backend=backend
-        )
+        super().__init__(n_neuron, linear, step_mode=step_mode, backend=backend)
+
+        self.max_delay_steps = max_delay_steps
+        self.use_circular_buffer = use_circular_buffer
+
+        if max_delay_steps > 1:
+            self.history = SpikeHistory(
+                n_neuron=n_neuron,
+                max_delay_steps=max_delay_steps,
+                use_circular_buffer=use_circular_buffer,
+            )
+        else:
+            self.history = None
 
         self.base_psc = base_psc(
             n_neuron=self.size * n_receptor,
@@ -420,12 +508,47 @@ class HeterSynapsePSC(BasePSC):
             **kwargs,
         )
         self.n_receptor = n_receptor
-        self.receptor_type_index = (
-            receptor_type_index  # Store as-is, get_psc will handle indexing
+        self.receptor_type_index = receptor_type_index
+
+    def init_state(
+        self,
+        batch_size=None,
+        dtype=None,
+        device=None,
+        persistent=True,
+        skip_mem_name: Iterable[str] = (),
+    ):
+        super().init_state(
+            batch_size,
+            dtype,
+            device,
+            persistent,
+            skip_mem_name=skip_mem_name,
         )
+        if self.history is not None:
+            self.history.init_state(batch_size, dtype, device, persistent)
+
+    def reset(
+        self,
+        batch_size=None,
+        dtype=None,
+        device=None,
+        skip_mem_name: Iterable[str] = (),
+    ):
+        super().reset(
+            batch_size,
+            dtype,
+            device,
+            skip_mem_name=skip_mem_name,
+        )
+        if self.history is not None:
+            self.history.reset(batch_size, dtype, device)
 
     def single_step_forward(self, z: torch.Tensor):
         z_flat, leading = self._flatten_neuron(z)
+        if self.history is not None:
+            self.history.update(z_flat)
+            z_flat = self.history.get_flattened(self.max_delay_steps)
         psc = self.base_psc.single_step_forward(z_flat)
         self.psc = psc.view(*psc.shape[:-1], *self.n_neuron, self.n_receptor).sum(-1)
         return self.psc

@@ -105,7 +105,7 @@ functional.set_memory_reset_values(model, checkpoint["memories_rv"])
 
 | Topic | Core Idea | Reference |
 |-------|-----------|-----------|
-| **Delays** | Expand rows with `expand_conn_for_delays`, buffer spikes with `SpikeHistory`, matmul via `get_flattened` | [references/heter_delays.md](references/heter_delays.md) |
+| **Delays** | Simple delays with `DelayedPSC`; heterogeneous delays with `expand_conn_for_delays` + `SpikeHistory` + `get_flattened` | [references/heter_delays.md](references/heter_delays.md) |
 | **Receptor-split synapses** | Expand columns with `make_hetersynapse_conn`, run dynamics with `HeterSynapsePSC` | [references/heter_synapses.md](references/heter_synapses.md) |
 | **Group-aware weight stacking** | Build per-receptor sparse matrices, stack with `stack_hetersynapse`, map weights with `map_weight_to_conn` | [references/heter_syn_weights.md](references/heter_syn_weights.md) |
 

@@ -51,15 +51,16 @@ The same Fashion-MNIST model factored into a PyTorch Lightning `LightningModule`
 
 ## `delayed_synapse_demo.py` — Synaptic Delays
 
-Demonstrates heterogeneous synaptic delays using `SpikeHistory` and `DelayedSynapse`.
+Demonstrates synaptic delays using `SpikeHistory`, `DelayedPSC`, and `HeterSynapsePSC`.
 
 **Key patterns:**
 - `SpikeHistory` as a rolling spike buffer
-- `DelayedSynapse` for history + linear transformation
+- `DelayedPSC` for adding scalar delays to any PSC model
+- `HeterSynapsePSC(..., max_delay_steps=...)` for delay + receptor combinations
 - `expand_conn_for_delays` for delay-aware connection matrices
 
 **See also:**
-- API: [`btorch.models.history`](api/models.md)
+- API: [`btorch.models.history`](api/models.md) and [`btorch.models.synapse`](api/models.md)
 - Tests: [`tests/connectome/test_delay_expansion.py`](https://github.com/Criticality-Cognitive-Computation-Lab/btorch/blob/main/tests/connectome/test_delay_expansion.py)
 
 ## Tests as Examples

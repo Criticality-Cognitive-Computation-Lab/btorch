@@ -76,8 +76,38 @@ linear = SparseConstrainedConn.from_hetersynapse(
 )
 ```
 
+## Heterosynapse + Heterogeneous Delays
+
+When the connection matrix is also delay-expanded (via `make_hetersynapse_conn(..., delay_col="delay_steps")`), pass `max_delay_steps` and `use_circular_buffer` to `HeterSynapsePSC`. The linear layer must match the expanded input size (`n_neurons * n_delay_bins`):
+
+```python
+conn, receptor_idx = make_hetersynapse_conn(
+    neurons=neurons_df,
+    connections=conn_df,
+    receptor_type_col="EI",
+    receptor_type_mode="neuron",
+    delay_col="delay_steps",
+    n_delay_bins=5,
+)
+
+linear = SparseConn(conn, enforce_dale=False)
+
+with environ.context(dt=1.0):
+    psc = HeterSynapsePSC(
+        n_neuron=n_neuron,
+        n_receptor=len(receptor_idx),
+        receptor_type_index=receptor_idx,
+        linear=linear,
+        base_psc=AlphaPSC,
+        tau_syn=5.0,
+        max_delay_steps=5,
+        use_circular_buffer=False,
+    )
+```
+
 ## Common Pitfalls
 
 1. **Wrong `get_psc` argument type** — In neuron mode, `get_psc` expects a tuple `(pre_type, post_type)`. In connection mode, it expects a string. Passing the wrong type raises `ValueError`.
 2. **Mismatched linear output size** — The `linear` layer must map to `n_neurons * n_receptor` (or use the expanded conn directly). `SparseConn` handles this automatically when initialized with the expanded matrix.
-3. **Confusing `return_dict=True`** — `make_hetersynapse_conn(..., return_dict=True)` returns an `OrderedDict` of per-receptor matrices. If you want a single stacked matrix, use `return_dict=False` (default).
+3. **Delay-expanded linear size** — When using `max_delay_steps > 1` in `HeterSynapsePSC`, ensure the linear layer accepts `n_neurons * max_delay_steps` inputs (e.g. via `expand_conn_for_delays`).
+4. **Confusing `return_dict=True`** — `make_hetersynapse_conn(..., return_dict=True)` returns an `OrderedDict` of per-receptor matrices. If you want a single stacked matrix, use `return_dict=False` (default).

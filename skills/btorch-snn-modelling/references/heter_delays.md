@@ -7,7 +7,8 @@ Use `expand_conn_for_delays` to expand the **row** dimension of a sparse connect
 | Use Case | Component |
 |----------|-----------|
 | Simulation only (memory-efficient) | `SpikeHistory(..., use_circular_buffer=True)` |
-| Training with `torch.compile` | `SpikeHistory(..., use_circular_buffer=False)` or `DelayedSynapse(..., use_circular_buffer=False)` |
+| Training with `torch.compile` | `SpikeHistory(..., use_circular_buffer=False)` or `DelayedPSC(..., use_circular_buffer=False)` |
+| Simple scalar delay on any PSC | `DelayedPSC(psc, max_delay_steps=...)` |
 | Delays + receptor split together | `make_hetersynapse_conn(..., delay_col="delay_steps", n_delay_bins=5)` |
 
 ## Basic Delay Pattern
@@ -37,7 +38,16 @@ for t in range(T):
     psc = linear(z_delayed)  # (batch, n_neuron)
 ```
 
-## Convenience Wrapper
+## PSC with Scalar Delay
+
+```python
+from btorch.models.synapse import AlphaPSC, DelayedPSC
+
+psc = AlphaPSC(n_neuron=100, tau_syn=5.0, linear=linear)
+delayed = DelayedPSC(psc, max_delay_steps=5, use_circular_buffer=False)
+```
+
+## Convenience Wrapper (no synaptic dynamics)
 
 ```python
 from btorch.models.history import DelayedSynapse
@@ -51,6 +61,7 @@ psc = synapse(spike)  # updates history and computes PSC
 
 ```python
 from btorch.connectome.connection import make_hetersynapse_conn
+from btorch.models.synapse import HeterSynapsePSC, AlphaPSC
 
 conn, receptor_idx = make_hetersynapse_conn(
     neurons=neurons_df,
@@ -61,11 +72,22 @@ conn, receptor_idx = make_hetersynapse_conn(
     n_delay_bins=5,
 )
 # conn shape: (n_neurons * n_delay_bins, n_neurons * n_receptors)
+
+psc = HeterSynapsePSC(
+    n_neuron=n_neurons,
+    n_receptor=len(receptor_idx),
+    receptor_type_index=receptor_idx,
+    linear=SparseConn(conn, enforce_dale=False),
+    base_psc=AlphaPSC,
+    tau_syn=5.0,
+    max_delay_steps=5,
+    use_circular_buffer=False,
+)
 ```
 
 ## Common Pitfalls
 
 1. **Mismatched delay sizes** — `n_delay_bins`, `max_delay_steps`, and the `n_delays` argument to `get_flattened` must match. Mismatches silently truncate or raise `IndexError`.
-2. **Forgetting to call `init_state`** — `SpikeHistory` and `DelayedSynapse` require `init_state(batch_size=...)` before the first `update()`.
+2. **Forgetting to call `init_state`** — `SpikeHistory`, `DelayedSynapse`, and `DelayedPSC` require `init_state(batch_size=...)` before the first `update()`.
 3. **Wrong buffer mode for training** — `use_circular_buffer=True` is efficient for simulation but can break `torch.compile`. Use `False` when compiling the model for training.
-4. **`dt` needed at instantiation** — Because `dt` is read from `environ`, modules that use delays (e.g., `DelayedSynapse` wrapped inside a synapse model) may need `with environ.context(dt=1.0):` even during model construction or `init_net_state()` calls. If `dt` is missing, instantiation or state initialization can raise.
+4. **State-init requirements for delay wrappers** — `DelayedPSC` and `HeterSynapsePSC` both hold internal `SpikeHistory` buffers. Always call `init_net_state(..., batch_size=...)` or `init_state(..., batch_size=...)` before the first forward pass.

@@ -6,7 +6,7 @@ import torch
 
 from btorch.models import environ
 from btorch.models.functional import init_net_state
-from btorch.models.synapse import ExponentialPSC
+from btorch.models.synapse import DelayedPSC, ExponentialPSC
 from btorch.utils.file import save_fig
 from tests.utils.compile import compile_or_skip
 
@@ -60,7 +60,7 @@ def test_exponential_psc_latency_matches_manual():
     # Use identity weights to isolate delay + exponential decay behavior.
     dt = 1.0
     tau_syn = 2.0
-    latency = 3.0
+    max_delay_steps = 3
     n_neuron = 3
 
     z_seq = torch.tensor(
@@ -78,12 +78,14 @@ def test_exponential_psc_latency_matches_manual():
     torch.nn.init.eye_(linear.weight)
 
     with environ.context(dt=dt):
-        synapse = ExponentialPSC(
-            n_neuron=n_neuron,
-            tau_syn=tau_syn,
-            linear=linear,
-            latency=latency,
-            step_mode="m",
+        synapse = DelayedPSC(
+            ExponentialPSC(
+                n_neuron=n_neuron,
+                tau_syn=tau_syn,
+                linear=linear,
+                step_mode="m",
+            ),
+            max_delay_steps=max_delay_steps,
         )
         init_net_state(synapse, dtype=torch.float32)
         out = synapse(z_seq)
@@ -92,7 +94,7 @@ def test_exponential_psc_latency_matches_manual():
         z_seq,
         dt=dt,
         tau_syn=tau_syn,
-        latency_steps=round(latency / dt),
+        latency_steps=max_delay_steps,
     )
 
     # _plot_exponential_psc(out, expected, dt=dt, name="exponential_psc_latency")
@@ -109,7 +111,7 @@ def test_exponential_psc_latency_grad_matches_compile():
 
     dt = 1.0
     tau_syn = 3.0
-    latency = 3.0
+    max_delay_steps = 3
     n_neuron = 4
     steps = 6
 
@@ -117,22 +119,28 @@ def test_exponential_psc_latency_grad_matches_compile():
     z_seq_compiled = z_seq.clone().detach().requires_grad_(True)
 
     with environ.context(dt=dt):
-        eager = ExponentialPSC(
-            n_neuron=n_neuron,
-            tau_syn=tau_syn,
-            linear=torch.nn.Linear(n_neuron, n_neuron, bias=False),
-            latency=latency,
-            step_mode="m",
+        eager = DelayedPSC(
+            ExponentialPSC(
+                n_neuron=n_neuron,
+                tau_syn=tau_syn,
+                linear=torch.nn.Linear(n_neuron, n_neuron, bias=False),
+                step_mode="m",
+            ),
+            max_delay_steps=max_delay_steps,
+            use_circular_buffer=False,
         )
-        compiled = ExponentialPSC(
-            n_neuron=n_neuron,
-            tau_syn=tau_syn,
-            linear=torch.nn.Linear(n_neuron, n_neuron, bias=False),
-            latency=latency,
-            step_mode="m",
+        compiled = DelayedPSC(
+            ExponentialPSC(
+                n_neuron=n_neuron,
+                tau_syn=tau_syn,
+                linear=torch.nn.Linear(n_neuron, n_neuron, bias=False),
+                step_mode="m",
+            ),
+            max_delay_steps=max_delay_steps,
+            use_circular_buffer=False,
         )
 
-    compiled.linear.weight.data.copy_(eager.linear.weight.data)
+    compiled.psc_module.linear.weight.data.copy_(eager.psc_module.linear.weight.data)
 
     compiled = compile_or_skip(compiled)
 
@@ -153,8 +161,8 @@ def test_exponential_psc_latency_grad_matches_compile():
 
     torch.testing.assert_close(z_seq.grad, z_seq_compiled.grad, atol=1e-5, rtol=0.0)
     torch.testing.assert_close(
-        eager.linear.weight.grad,
-        compiled.linear.weight.grad,
+        eager.psc_module.linear.weight.grad,
+        compiled.psc_module.linear.weight.grad,
         atol=1e-5,
         rtol=0.0,
     )

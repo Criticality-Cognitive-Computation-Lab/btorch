@@ -4,7 +4,7 @@ from btorch.models import environ
 from btorch.models.functional import init_net_state, reset_net_state
 from btorch.models.neurons.glif import GLIF3
 from btorch.models.neurons.lif import LIF
-from btorch.models.synapse import DualExponentialPSC
+from btorch.models.synapse import DelayedPSC, DualExponentialPSC
 
 
 def test_lif_multi_dim_batch_and_neuron_axes():
@@ -96,23 +96,25 @@ def test_synapse_delay_buffer_multi_dim_axes():
     # Delay buffers keep time first, then batch, then neuron axes.
     batch_shape = (2, 1)
     neuron_shape = (3, 4)
-    latency = 2.0
+    max_delay_steps = 3
     linear = torch.nn.Identity()
 
     with environ.context(dt=1.0):
-        synapse = DualExponentialPSC(
-            n_neuron=neuron_shape,
-            tau_decay=5.0,
-            tau_rise=1.0,
-            linear=linear,
-            latency=latency,
+        synapse = DelayedPSC(
+            DualExponentialPSC(
+                n_neuron=neuron_shape,
+                tau_decay=5.0,
+                tau_rise=1.0,
+                linear=linear,
+            ),
+            max_delay_steps=max_delay_steps,
         )
 
     init_net_state(synapse, batch_size=batch_shape)
 
     # Access delay buffer through SpikeHistory interface
     # History stores buffer as (*batch, max_delay, *n_neuron)
-    latency_steps = round(latency / 1.0)
-    expected_history_shape = (*batch_shape, latency_steps + 1, *neuron_shape)
+    # DelayedPSC allocates max_delay_steps + 1 to support get_delay(max_delay_steps)
+    expected_history_shape = (*batch_shape, max_delay_steps + 1, *neuron_shape)
     assert synapse.history.history.shape == expected_history_shape
     assert synapse.psc.shape == batch_shape + neuron_shape

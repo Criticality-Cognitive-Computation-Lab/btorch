@@ -7,19 +7,66 @@ configuration management workflows.
 
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar, overload
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
 
+ConfigT = TypeVar("ConfigT")
+
+
+@overload
 def load_config(
-    Param,
-    use_config_file=True,
-    search_path=Path("."),
+    Param: type[ConfigT] | ConfigT,
+    use_config_file: bool = True,
+    search_path: Path = Path("."),
     argv_arglist: list[str] | None = None,
-    return_cli=False,
+    return_cli: Literal[False] = False,
+    make_concrete: Literal[True] = True,
+) -> ConfigT: ...
+
+
+@overload
+def load_config(
+    Param: type[ConfigT] | ConfigT,
+    use_config_file: bool = True,
+    search_path: Path = Path("."),
+    argv_arglist: list[str] | None = None,
+    return_cli: Literal[False] = False,
+    make_concrete: Literal[False] = False,
+) -> DictConfig | ListConfig: ...
+
+
+@overload
+def load_config(
+    Param: type[ConfigT] | ConfigT,
+    use_config_file: bool = True,
+    search_path: Path = Path("."),
+    argv_arglist: list[str] | None = None,
+    return_cli: Literal[True] = True,
+    make_concrete: Literal[True] = True,
+) -> tuple[ConfigT, DictConfig | ListConfig]: ...
+
+
+@overload
+def load_config(
+    Param: type[ConfigT] | ConfigT,
+    use_config_file: bool = True,
+    search_path: Path = Path("."),
+    argv_arglist: list[str] | None = None,
+    return_cli: Literal[True] = True,
+    make_concrete: Literal[False] = False,
+) -> tuple[DictConfig | ListConfig, DictConfig | ListConfig]: ...
+
+
+def load_config(
+    Param: type[ConfigT] | ConfigT,
+    use_config_file: bool = True,
+    search_path: Path = Path("."),
+    argv_arglist: list[str] | None = None,
+    return_cli: bool = False,
     make_concrete: bool = True,
-):
+) -> Any:
     """Load structured config from defaults, file, and CLI arguments.
 
     Merges configuration in order: dataclass defaults -> config file ->
@@ -27,7 +74,7 @@ def load_config(
     arguments.
 
     Args:
-        Param: Dataclass type defining the configuration schema.
+        Param: Dataclass type or instance defining the configuration schema.
         use_config_file: Whether to load from file specified by
             ``config_path`` CLI argument.
         search_path: Directory to search for relative config paths.
