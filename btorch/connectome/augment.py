@@ -376,13 +376,8 @@ def downsample_neurons(
     return neurons, connections
 
 
-def make_ei_conn_mat(
-    conn_mats: dict[str, scipy.sparse.sparray], rebalance_ratio: float = 0.5
-):
-    # return 2 * (
-    #     rebalance_ratio * conn_mats["E"] - (1 - rebalance_ratio) * conn_mats["I"]
-    # )
-    return conn_mats["E"] - rebalance_ratio * conn_mats["I"]
+def make_ei_conn_mat(conn_mats: dict[str, scipy.sparse.sparray], g: float = 0.5):
+    return conn_mats["E"] - g * conn_mats["I"]
 
 
 def empirical_membrane_capacitance(neurons: pd.DataFrame) -> pd.Series:

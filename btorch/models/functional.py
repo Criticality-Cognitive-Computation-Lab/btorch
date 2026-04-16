@@ -14,6 +14,21 @@ def init_net_state(
     batch_size: int | Sequence[int] | None = None,
     **kwargs,
 ):
+    """Initialize state for all MemoryModule instances in a network.
+
+    Walks through every ``Module`` in ``net`` and calls ``init_state()``
+    if it is a ``base.MemoryModule`` or has an ``init_state`` method.
+    Also moves the network to the device/dtype specified in ``kwargs``.
+
+    Args:
+        net: Network to initialize.
+        batch_size: Batch size(s) for state initialization.
+        **kwargs: Passed to ``init_state()`` (e.g., ``device``, ``dtype``).
+
+    Example:
+        >>> functional.init_net_state(model, batch_size=4, device="cuda")
+    """
+
     def fn(m: nn.Module):
         if hasattr(m, "init_state") and callable(m.init_state):
             # can be a torch.compiled module
@@ -37,29 +52,19 @@ def reset_net(
     batch_size: int | Sequence[int] | None = None,
     **kwargs,
 ):
-    """
-    * :ref:`API in English <reset_net-en>`
+    """Reset state for all MemoryModule instances in a network.
 
-    .. _reset_net-cn:
+    Walks through every ``Module`` in ``net`` and calls ``reset()``
+    if it is a ``base.MemoryModule`` or has a ``reset`` method.
+    Also moves the network to the device/dtype specified in ``kwargs``.
 
-    :param net: 任何属于 ``nn.Module`` 子类的网络
+    Args:
+        net: Network to reset.
+        batch_size: Batch size(s) for state reset. If None, uses existing size.
+        **kwargs: Passed to ``reset()`` (e.g., ``device``, ``dtype``).
 
-    :return: None
-
-    将网络的状态重置。做法是遍历网络中的所有 ``Module``，若 ``m `` 为
-    ``base.MemoryModule`` 函数或者是拥有 ``reset()`` 方法，则调用 ``m.reset()``。
-
-    * :ref:`中文API <reset_net-cn>`
-
-    .. _reset_net-en:
-
-    :param net: Any network inherits from ``nn.Module``
-
-    :return: None
-
-    Reset the whole network.
-    Walk through every ``Module`` as ``m``, and call ``m.reset()``
-    if this ``m`` is ``base.MemoryModule`` or ``m`` has ``reset()``.
+    Example:
+        >>> functional.reset_net(model, batch_size=4)
     """
 
     def fn(m: nn.Module):
@@ -92,9 +97,7 @@ def _collect_memory_vars(
     names: Sequence[str] | None = None,
     allow_buffer: bool = False,
 ) -> dict[str, Any]:
-    """
-    return: a proper dotted dict flattened up to items of _memories*
-    """
+    """Return a proper dotted dict flattened up to items of _memories*."""
     ret = {}
     if names is None:
         for name, mod in mod.named_modules():
@@ -201,6 +204,21 @@ def _set_memory_vars(
 def named_hidden_states(
     mod: nn.Module, names: Sequence[str] | None = None, allow_buffer: bool = False
 ) -> dict[str, Any]:
+    """Collect hidden states (_memories) from a network as a dotted dict.
+
+    Args:
+        mod: Network module to collect from.
+        names: Optional sequence of dotted state names to filter.
+        allow_buffer: If True, also collect from non-MemoryModule buffers.
+
+    Returns:
+        Dotted dictionary mapping ``module.state_name`` to tensor values.
+
+    Example:
+        >>> states = functional.named_hidden_states(model)
+        >>> states.keys()
+        dict_keys(['neuron.v', 'synapse.psc'])
+    """
     return _collect_memory_vars(mod, "_memories", names, allow_buffer=allow_buffer)
 
 
@@ -210,6 +228,17 @@ named_memory_values = filter_hidden_states = named_hidden_states
 def set_hidden_states(
     mod: nn.Module, hidden_states: dict[str, Any], allow_buffer: bool = False
 ):
+    """Set hidden states (_memories) in a network from a dotted dict.
+
+    Args:
+        mod: Network module to update.
+        hidden_states: Dotted dictionary of states.
+        allow_buffer: If True, also set on non-MemoryModule buffers.
+
+    Example:
+        >>> functional.set_hidden_states(model, {"neuron.v": v_tensor})
+    """
+
     def set_whole(m: base.MemoryModule, v):
         m._memories = v
 
@@ -230,12 +259,35 @@ set_memory_values = set_hidden_states
 def named_memory_reset_values(
     mod: nn.Module, names: Sequence[str] | None = None
 ) -> dict[str, Any]:
+    """Collect memory reset values (_memories_rv) from a network.
+
+    Args:
+        mod: Network module to collect from.
+        names: Optional sequence of dotted state names to filter.
+
+    Returns:
+        Dotted dictionary mapping ``module.state_name`` to reset values.
+
+    Example:
+        >>> rv = functional.named_memory_reset_values(model)
+    """
     return _collect_memory_vars(mod, "_memories_rv", names, allow_buffer=False)
 
 
 def set_memory_reset_values(
     mod: nn.Module, hidden_states: dict[str, Any], strict: bool = True
 ):
+    """Set memory reset values (_memories_rv) in a network from a dotted dict.
+
+    Args:
+        mod: Network module to update.
+        hidden_states: Dotted dictionary of reset values.
+        strict: Passed through to ``set_memories_rv()``.
+
+    Example:
+        >>> functional.set_memory_reset_values(model, rv_dict)
+    """
+
     def set_whole(m: base.MemoryModule, v):
         m.set_memories_rv(v, strict=strict)
 
@@ -283,8 +335,20 @@ def scale_state(
     hidden_states: dict,
     enforce: Literal["ignore", "assert", "repeated"] = "repeated",
 ) -> dict:
-    """Expect a proper dotted dict flattened up to items of _memories* e.g. {
-    "brain.neuron.v": v_array, "brain.neuron.Iasc": i_array, }"""
+    """Scale hidden states for modules that support state scaling.
+
+    Expects a proper dotted dict flattened up to items of _memories*,
+    e.g. ``{"brain.neuron.v": v_array, "brain.neuron.Iasc": i_array}``.
+
+    Args:
+        mod: Network containing SupportScaleState modules.
+        hidden_states: Dotted dictionary of states to scale.
+        enforce: Behavior when already scaled (``ignore``, ``assert``,
+            or ``repeated``).
+
+    Returns:
+        Scaled hidden states as a dotted dictionary.
+    """
     return _scale_state(mod, hidden_states, "scale_state", enforce=enforce)
 
 
@@ -293,8 +357,20 @@ def unscale_state(
     hidden_states: dict,
     enforce: Literal["ignore", "assert", "repeated"] = "repeated",
 ) -> dict:
-    """Expect a proper dotted dict flattened up to items of _memories* e.g. {
-    "brain.neuron.v": v_array, "brain.neuron.Iasc": i_array, }"""
+    """Unscale hidden states for modules that support state scaling.
+
+    Expects a proper dotted dict flattened up to items of _memories*,
+    e.g. ``{"brain.neuron.v": v_array, "brain.neuron.Iasc": i_array}``.
+
+    Args:
+        mod: Network containing SupportScaleState modules.
+        hidden_states: Dotted dictionary of states to unscale.
+        enforce: Behavior when already unscaled (``ignore``, ``assert``,
+            or ``repeated``).
+
+    Returns:
+        Unscaled hidden states as a dotted dictionary.
+    """
     return _scale_state(
         mod,
         hidden_states,
@@ -308,6 +384,14 @@ def scale_net(
     enforce: Literal["ignore", "assert", "repeated"] = "assert",
     force_memories_rv=True,
 ):
+    """Scale all SupportScaleState modules in a network in-place.
+
+    Args:
+        mod: Network to scale.
+        enforce: Behavior on repeated scale calls.
+        force_memories_rv: If True, also scale memory reset values.
+    """
+
     def scale_net_fn(mod: nn.Module):
         if isinstance(mod, SupportScaleState):
             mod.scale_state(
@@ -324,6 +408,14 @@ def unscale_net(
     enforce: Literal["ignore", "assert", "repeated"] = "assert",
     force_memories_rv=False,
 ):
+    """Unscale all SupportScaleState modules in a network in-place.
+
+    Args:
+        mod: Network to unscale.
+        enforce: Behavior on repeated unscale calls.
+        force_memories_rv: If True, also unscale memory reset values.
+    """
+
     def unscale_net_fn(mod: nn.Module):
         if isinstance(mod, SupportScaleState):
             mod.unscale_state(enforce=enforce, force_memories_rv=force_memories_rv)
@@ -333,30 +425,17 @@ def unscale_net(
 
 
 def detach_net(net: nn.Module):
-    """
-    * :ref:`API in English <detach_net-en>`
+    """Detach the computation graph of the whole network from previous time
+    steps.
 
-    .. _detach_net-cn:
+    Walks through every ``Module`` in ``net`` and calls ``detach()``
+    if it is a ``base.MemoryModule`` or has a ``detach`` method.
 
-    :param net: 任何属于 ``nn.Module`` 子类的网络
+    Args:
+        net: Network to detach.
 
-    :return: None
-
-    将网络与之前的时间步的计算图断开。做法是遍历网络中的所有 ``Module``，若 ``m
-    `` 为 ``base.MemoryModule`` 函数或者是拥有 ``detach()`` 方法，则调用
-    ``m.detach()``。
-
-    * :ref:`中文API <detach_net-cn>`
-
-    .. _detach_net-en:
-
-    :param net: Any network inherits from ``nn.Module``
-
-    :return: None
-
-    Detach the computation graph of the whole network from previous time-steps.
-    Walk through every ``Module`` as ``m``, and call ``m.detach()`` if this
-    ``m`` is ``base.MemoryModule`` or ``m`` has ``detach()``.
+    Example:
+        >>> functional.detach_net(model)
     """
 
     for m in net.modules():

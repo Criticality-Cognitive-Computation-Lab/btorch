@@ -235,7 +235,7 @@ class EnvOutputLayer(NeuronEmbedMapLayer):
         return ret
 
 
-class FlyBrain(torch.nn.Module):
+class Brain(torch.nn.Module):
     def __init__(
         self,
         synapse_args: dict,

@@ -31,25 +31,29 @@ def uniform_state_(
     rand_batch: bool = False,
     rng: torch.Generator | int | None = None,
 ) -> base.BaseNode:
-    """Uniformly initialize **any state variable(s)** of a neuron.
+    """Uniformly initialize any state variable(s) of a neuron.
 
     Args:
         neuron: BaseNode instance.
-        name: variable name or list of names (e.g., "v", ["v", "w"]).
-        low, high:
-            Range for initialization. If None:
-                - if name == "v": uses (v_reset, v_threshold)
-                - else: uses (0, 1)
-        set_reset_value:
-            If True, also sets reset value for this variable.
-        rand_batch:
-            Distinct value per batch entry (True)
-            or shared across batch (False).
-        rng:
-            Seed or generator for reproducibility.
+        name: Variable name or list of names (e.g., ``"v"``, ``["v", "w"]``).
+        low: Lower bound for initialization. If None:
+            uses ``(v_reset, v_threshold)`` when ``name == "v"``,
+            otherwise ``(0, 1)``.
+        high: Upper bound for initialization. If None:
+            uses ``(v_reset, v_threshold)`` when ``name == "v"``,
+            otherwise ``(0, 1)``.
+        set_reset_value: If True, also stores the initialized value
+            as the memory reset value.
+        rand_batch: If True, draws a distinct value per batch entry.
+            If False, shares the same value across the batch.
+        rng: Integer seed or ``torch.Generator`` for reproducibility.
 
     Returns:
-        neuron (modified in place)
+        The modified ``neuron`` (in-place).
+
+    Example:
+        >>> from btorch.models.init import uniform_state_
+        >>> uniform_state_(neuron, "v", low=-60.0, high=-45.0)
     """
 
     # Convert names to list
@@ -105,6 +109,7 @@ def uniform_state_(
     return neuron
 
 
+@torch.no_grad()
 def uniform_v_(
     neuron: base.BaseNode,
     *,
@@ -114,6 +119,26 @@ def uniform_v_(
     rand_batch: bool = False,
     rng: torch.Generator | int | None = None,
 ):
+    """Uniformly initialize the membrane voltage ``v`` of a neuron.
+
+    This is a convenience wrapper around :func:`uniform_state_` for the
+    common case of initializing ``v``.
+
+    Args:
+        neuron: BaseNode instance.
+        low: Lower bound. Defaults to ``v_reset``.
+        high: Upper bound. Defaults to ``v_threshold``.
+        set_reset_value: If True, stores the value as the reset value.
+        rand_batch: Distinct value per batch entry.
+        rng: Seed or generator for reproducibility.
+
+    Returns:
+        The modified ``neuron`` (in-place).
+
+    Example:
+        >>> from btorch.models.init import uniform_v_
+        >>> uniform_v_(neuron, set_reset_value=True)
+    """
     return uniform_state_(
         neuron,
         "v",

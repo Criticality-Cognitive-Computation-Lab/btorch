@@ -101,6 +101,14 @@ model.load_state_dict(checkpoint["model_state_dict"], strict=False)
 functional.set_memory_reset_values(model, checkpoint["memories_rv"])
 ```
 
+## Heterogeneous Modelling
+
+| Topic | Core Idea | Reference |
+|-------|-----------|-----------|
+| **Delays** | Expand rows with `expand_conn_for_delays`, buffer spikes with `SpikeHistory`, matmul via `get_flattened` | [references/heter_delays.md](references/heter_delays.md) |
+| **Receptor-split synapses** | Expand columns with `make_hetersynapse_conn`, run dynamics with `HeterSynapsePSC` | [references/heter_synapses.md](references/heter_synapses.md) |
+| **Group-aware weight stacking** | Build per-receptor sparse matrices, stack with `stack_hetersynapse`, map weights with `map_weight_to_conn` | [references/heter_syn_weights.md](references/heter_syn_weights.md) |
+
 ## RNN Architecture Choices
 
 | Approach | Use When | Compile? |
@@ -123,3 +131,6 @@ functional.set_memory_reset_values(model, checkpoint["memories_rv"])
 - [references/scaling.md](references/scaling.md) - Neuron scaling and normalization
 - [references/regularization.md](references/regularization.md) - Regularization patterns
 - [references/performance.md](references/performance.md) - torch.compile, gradient checkpointing, chunked computation
+- [references/heter_delays.md](references/heter_delays.md) - Heterogeneous synaptic delays
+- [references/heter_synapses.md](references/heter_synapses.md) - Receptor-split (heterogeneous) synapses
+- [references/heter_syn_weights.md](references/heter_syn_weights.md) - Group-aware weight stacking and assignment

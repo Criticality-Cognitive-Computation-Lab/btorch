@@ -11,9 +11,14 @@ theme:
     - navigation.tracking
     - navigation.sections
     - navigation.expand
+    - navigation.path
+    - navigation.top
     - search.suggest
     - search.highlight
+    - search.share
     - content.code.copy
+    - content.action.edit
+    - content.action.view
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
@@ -32,6 +37,9 @@ theme:
 
 plugins:
   - search
+  - gen-files:
+      scripts:
+        - ../gen_ref_pages.py
   - mkdocstrings:
       handlers:
         python:
@@ -60,17 +68,38 @@ nav:
   - Home: index.md
   - Installation: installation.md
   - Quickstart: quickstart.md
+  - Core Concepts:
+      - concepts/stateful_modules.md
+      - concepts/dt_environment.md
+      - concepts/surrogate_gradients.md
+  - Tutorials:
+      - tutorials/building_rsnn.md
+      - tutorials/training.md
+  - Guides:
+      - guides/configuration.md
+  - FAQ: faq.md
+  - Examples: examples.md
+  - Skills: skills.md
   - Development: development.md
+  - Contributing: contributing.md
+  - Changelog: changelog.md
   - Analysis: analysis.md
   - Connection Conversion: connection_conversion.md
   - Visualisation: visualisation.md
   - API Reference:
       - api/index.md
-      - api/neurons.md
+      - api/models.md
       - api/analysis.md
+      - api/analysis_dynamic_tools.md
       - api/connectome.md
+      - api/visualisation.md
+      - api/io.md
+      - api/utils.md
+      - api/datasets.md
 
 extra:
+  version:
+    provider: mike
   social:
     - icon: fontawesome/brands/github
       link: https://github.com/Criticality-Cognitive-Computation-Lab/btorch

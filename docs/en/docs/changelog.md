@@ -20,4 +20,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Improved Google-style docstrings across `btorch.models.functional`, `environ`, `init`, `scale`, `regularizer`, and `btorch.utils.conf`.
 
 ### Removed
-- Redundant `zh/docs/api/` English mkdocstrings blocks.
+- Redundant `zh/docs/api/` English mkdocstrings blocks (cleanup pending full translation workflow update).

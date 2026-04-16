@@ -9,7 +9,20 @@ from ..types import TensorLike
 
 
 class VoltageRegularizer(nn.Module):
-    """Voltage regularization loss for spiking neurons."""
+    """Voltage regularization loss for spiking neurons.
+
+    Penalizes membrane potentials that deviate far from the reset/threshold
+    range, encouraging neurons to stay near their operating regime.
+
+    Args:
+        v_threshold: Threshold voltage (default: 1.0).
+        v_reset: Reset voltage (default: 0.0).
+        voltage_cost: Coefficient for the regularization term (default: 1e-4).
+
+    Example:
+        >>> reg = VoltageRegularizer(v_threshold=1.0, v_reset=0.0)
+        >>> loss = reg(voltages)
+    """
 
     v_offset: torch.Tensor
     v_scale: torch.Tensor
@@ -28,7 +41,14 @@ class VoltageRegularizer(nn.Module):
     def forward(
         self, voltages: Float[torch.Tensor, "... n_neuron"]
     ) -> Float[torch.Tensor, ""]:
-        """Compute voltage regularization loss."""
+        """Compute voltage regularization loss.
+
+        Args:
+            voltages: Membrane voltages of shape ``(..., n_neuron)``.
+
+        Returns:
+            Scalar regularization loss.
+        """
         voltage_32 = (voltages.float() - self.v_offset) / self.v_scale
 
         v_pos = F.relu(voltage_32 - 1.0).pow(2)
@@ -39,6 +59,22 @@ class VoltageRegularizer(nn.Module):
 
 
 class QuantileDistributionLoss(nn.Module):
+    """Quantile distribution loss supporting pinball and huber modes.
+
+    Supports arbitrary batch dimensions. Computes the loss between sorted
+    predictions and sorted targets across quantiles.
+
+    Args:
+        loss_type: ``'pinball'`` or ``'huber_pinball'``.
+        kappa: Smoothing parameter for huber loss.
+        reduction: ``'mean'``, ``'sum'``, or ``'none'`` over batch elements.
+        sorted: If True, assumes ``target`` is already sorted.
+
+    Example:
+        >>> loss_fn = QuantileDistributionLoss("huber_pinball", kappa=0.002)
+        >>> loss = loss_fn(pred, target)
+    """
+
     def __init__(
         self,
         loss_type: Literal["pinball", "huber_pinball"] = "huber_pinball",
@@ -46,14 +82,6 @@ class QuantileDistributionLoss(nn.Module):
         reduction="mean",
         sorted: bool = False,
     ):
-        """Quantile distribution loss supporting pinball and huber modes.
-        Supports arbitrary batch dimensions.
-
-        Args:
-            loss_type (str): 'pinball' or 'huber_pinball'
-            kappa (float): smoothing parameter for huber loss
-            reduction (str): 'mean', 'sum', or 'none' over batch elements
-        """
         super().__init__()
         assert loss_type in (
             "pinball",
@@ -73,11 +101,11 @@ class QuantileDistributionLoss(nn.Module):
         """Compute quantile distribution loss between pred and target.
 
         Args:
-            pred (torch.Tensor): shape (..., N)
-            target (torch.Tensor): shape (..., N)
+            pred: Predictions of shape ``(..., N)``.
+            target: Targets of shape ``(..., N)``.
 
         Returns:
-            torch.Tensor: scalar if reduction != 'none', else shape (...)
+            Scalar if ``reduction != 'none'``, else shape ``(...)``.
         """
         assert pred.shape == target.shape, "pred and target must have the same shape"
         assert pred.dim() >= 1, "Input must have at least one dimension"
@@ -124,6 +152,27 @@ class QuantileDistributionLoss(nn.Module):
 
 
 class FiringRateLoss(nn.Module):
+    """Firing rate loss for matching population activity distributions.
+
+    Uses :class:`QuantileDistributionLoss` internally to match the
+    quantile distribution of firing rates (or spike counts).
+
+    Args:
+        target: Target firing rate distribution.
+        input_type: ``'spike'`` or ``'firing_rate'``.
+        n_neuron: Optional output neuron count for interpolation.
+        loss_type: ``'pinball'`` or ``'huber'``.
+        kappa: Smoothing parameter for huber loss.
+        reduction: ``'sum'`` or ``'mean'``.
+        rng: Seed for any random operations.
+        sorted: If True, assumes ``target`` is already sorted.
+
+    Example:
+        >>> target_fr = torch.tensor([0.1, 0.3, 0.5, 0.7, 0.9])
+        >>> loss_fn = FiringRateLoss(target_fr, input_type="firing_rate")
+        >>> loss = loss_fn(rates)
+    """
+
     target: torch.Tensor
 
     def __init__(
@@ -137,14 +186,6 @@ class FiringRateLoss(nn.Module):
         rng: torch.Generator | int | None = None,
         sorted: bool = False,
     ):
-        """Firing rate loss supporting pinball and huber modes. Supports
-        arbitrary batch dimensions.
-
-        Args:
-            loss_type (str): 'pinball' or 'huber'
-            kappa (float): smoothing parameter for huber loss
-            reduction (str): 'mean', 'sum', or 'none' over batch elements
-        """
         super().__init__()
         self.loss = QuantileDistributionLoss(loss_type, kappa, reduction)
 
@@ -164,6 +205,14 @@ class FiringRateLoss(nn.Module):
         self.register_buffer("target", target_tensor)
 
     def forward(self, x: Float[torch.Tensor, "... n_neuron"]):
+        """Compute firing rate loss.
+
+        Args:
+            x: Spike tensor or firing rate tensor of shape ``(..., n_neuron)``.
+
+        Returns:
+            Scalar loss.
+        """
         if self.input_type == "spike":
             x = x.mean(0)
 
