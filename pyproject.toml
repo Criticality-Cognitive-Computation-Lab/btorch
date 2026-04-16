@@ -14,8 +14,10 @@ dynamic = ["dependencies"]
 
 [project.optional-dependencies]
 docs = [
-  "sphinx>=7.0",
-  "myst-parser>=2.0",
+  "mkdocs-material>=9.5",
+  "mkdocstrings[python]>=0.24",
+  "typer>=0.12",
+  "openai>=1.0",
 ]
 test = [
   "pytest>=8.2",

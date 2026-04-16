@@ -1,0 +1,85 @@
+site_name: Btorch
+site_url: https://btorch.readthedocs.io/
+repo_url: https://github.com/Criticality-Cognitive-Computation-Lab/btorch
+repo_name: btorch
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.expand
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [../..]
+          options:
+            docstring_style: google
+            show_source: true
+            show_root_heading: true
+            show_category_heading: true
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - admonition
+  - pymdownx.details
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Quickstart: quickstart.md
+  - Development: development.md
+  - Analysis: analysis.md
+  - Connection Conversion: connection_conversion.md
+  - Visualisation: visualisation.md
+  - API Reference:
+      - api/index.md
+      - api/neurons.md
+      - api/analysis.md
+      - api/connectome.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/Criticality-Cognitive-Computation-Lab/btorch
+  alternate:
+    - link: /
+      name: en - English
+      lang: en
+    - link: /zh/
+      name: zh - 简体中文
+      lang: zh
+
+copyright: Copyright &copy; 2026 Btorch contributors

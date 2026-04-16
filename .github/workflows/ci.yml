@@ -78,4 +78,4 @@ jobs:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Build docs
-        run: python -m sphinx.cmd.build docs docs/_build/html
+        run: python scripts/docs.py build-all

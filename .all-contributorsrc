@@ -10,12 +10,13 @@
   "commit": false,
   "commitConvention": "angular",
   "contributorsPerLine": 7,
-  "contributorsSortAlphabetically": true,
+  "contributorsSortAlphabetically": false,
+  "contributorTemplate": "<a href=\"<%= contributor.profile %>\"><img src=\"<%= contributor.avatar_url %>?s=<%= options.imageSize %>\" width=\"<%= options.imageSize %>px;\" height=\"<%= options.imageSize %>px;\" alt=\"<%= contributor.name %>\"/><br /><sub><b><%= contributor.name %></b></sub></a><br /><%= contributions %>",
   "contributors": [
     {
       "login": "alexfanqi",
       "name": "alexfanqi",
-      "avatar_url": "https://avatars.githubusercontent.com/u/8381176?v=4",
+      "avatar_url": "https://avatars.githubusercontent.com/u/8381176",
       "profile": "https://github.com/alexfanqi",
       "contributions": [
         "code"
@@ -24,7 +25,7 @@
     {
       "login": "CFXTGJD",
       "name": "CFXTGJD",
-      "avatar_url": "https://avatars.githubusercontent.com/u/97458246?v=4",
+      "avatar_url": "https://avatars.githubusercontent.com/u/97458246",
       "profile": "https://github.com/CFXTGJD",
       "contributions": [
         "code"
@@ -33,7 +34,7 @@
     {
       "login": "gaozh0814",
       "name": "gaozh0814",
-      "avatar_url": "https://avatars.githubusercontent.com/u/158576844?v=4",
+      "avatar_url": "https://avatars.githubusercontent.com/u/158576844",
       "profile": "https://github.com/gaozh0814",
       "contributions": [
         "code"
@@ -42,7 +43,7 @@
     {
       "login": "msy79lucky",
       "name": "msy79lucky",
-      "avatar_url": "https://avatars.githubusercontent.com/u/166973717?v=4",
+      "avatar_url": "https://avatars.githubusercontent.com/u/166973717",
       "profile": "https://github.com/msy79lucky",
       "contributions": [
         "code"
@@ -51,7 +52,7 @@
     {
       "login": "yulaugh",
       "name": "yulaugh",
-      "avatar_url": "https://avatars.githubusercontent.com/u/175782476?v=4",
+      "avatar_url": "https://avatars.githubusercontent.com/u/175782476",
       "profile": "https://github.com/yulaugh",
       "contributions": [
         "code"
