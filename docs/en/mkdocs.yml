@@ -1,118 +1,120 @@
 site_name: Btorch
-site_url: https://btorch.readthedocs.io/
+site_url: https://criticality-cognitive-computation-lab.github.io/btorch/
 repo_url: https://github.com/Criticality-Cognitive-Computation-Lab/btorch
 repo_name: btorch
-
 theme:
   name: material
   language: en
   features:
-    - navigation.instant
-    - navigation.tracking
-    - navigation.sections
-    - navigation.expand
-    - navigation.path
-    - navigation.top
-    - search.suggest
-    - search.highlight
-    - search.share
-    - content.code.copy
-    - content.action.edit
-    - content.action.view
+  - navigation.instant
+  - navigation.tracking
+  - navigation.sections
+  - navigation.expand
+  - navigation.path
+  - navigation.top
+  - search.suggest
+  - search.highlight
+  - search.share
+  - content.code.copy
+  - content.action.edit
+  - content.action.view
   palette:
-    - media: "(prefers-color-scheme: light)"
-      scheme: default
-      primary: indigo
-      accent: indigo
-      toggle:
-        icon: material/brightness-7
-        name: Switch to dark mode
-    - media: "(prefers-color-scheme: dark)"
-      scheme: slate
-      primary: indigo
-      accent: indigo
-      toggle:
-        icon: material/brightness-4
-        name: Switch to light mode
-
+  - media: '(prefers-color-scheme: light)'
+    scheme: default
+    primary: indigo
+    accent: indigo
+    toggle:
+      icon: material/brightness-7
+      name: Switch to dark mode
+  - media: '(prefers-color-scheme: dark)'
+    scheme: slate
+    primary: indigo
+    accent: indigo
+    toggle:
+      icon: material/brightness-4
+      name: Switch to light mode
 plugins:
-  - search
-  - gen-files:
-      scripts:
-        - ../gen_ref_pages.py
-  - mkdocstrings:
-      handlers:
-        python:
-          paths: [../..]
-          options:
-            docstring_style: google
-            show_source: true
-            show_root_heading: true
-            show_category_heading: true
-
+- search
+- gen-files:
+    scripts:
+    - ../gen_ref_pages.py
+- mkdocstrings:
+    handlers:
+      python:
+        paths:
+        - ../..
+        options:
+          docstring_style: google
+          show_source: true
+          show_root_heading: true
+          show_category_heading: true
+          source_link_prefix: https://github.com/Criticality-Cognitive-Computation-Lab/btorch/blob/main/
 markdown_extensions:
-  - pymdownx.highlight:
-      anchor_linenums: true
-  - pymdownx.inlinehilite
-  - pymdownx.snippets
-  - pymdownx.superfences
-  - pymdownx.tabbed:
-      alternate_style: true
-  - admonition
-  - pymdownx.details
-  - tables
-  - toc:
-      permalink: true
-
+- attr_list
+- md_in_html
+- pymdownx.highlight:
+    anchor_linenums: true
+- pymdownx.inlinehilite
+- pymdownx.snippets
+- pymdownx.superfences
+- pymdownx.tabbed:
+    alternate_style: true
+- admonition
+- pymdownx.details
+- pymdownx.arithmatex:
+      generic: true
+- pymdownx.emoji:
+    emoji_index: zensical.extensions.emoji.twemoji
+    emoji_generator: zensical.extensions.emoji.to_svg
+- tables
+- toc:
+    permalink: true
 nav:
-  - Home: index.md
-  - Installation: installation.md
-  - Quickstart: quickstart.md
-  - Core Concepts:
-      - concepts/stateful_modules.md
-      - concepts/dt_environment.md
-      - concepts/surrogate_gradients.md
-  - Tutorials:
-      - tutorials/building_rsnn.md
-      - tutorials/training.md
-  - Guides:
-      - guides/configuration.md
-  - FAQ: faq.md
-  - Examples: examples.md
-  - Skills: skills.md
-  - Development: development.md
-  - Contributing: contributing.md
-  - Changelog: changelog.md
-  - Analysis: analysis.md
-  - Connection Conversion: connection_conversion.md
-  - Visualisation: visualisation.md
-  - API Reference:
-      - api/index.md
-      - api/models.md
-      - api/neurons.md
-      - api/analysis.md
-      - api/analysis_dynamic_tools.md
-      - api/connectome.md
-      - api/visualisation.md
-      - api/io.md
-      - api/utils.md
-      - api/datasets.md
-
+- Home: index.md
+- Installation: installation.md
+- Quickstart: quickstart.md
+- Core Concepts:
+  - concepts/stateful_modules.md
+  - concepts/dt_environment.md
+  - concepts/surrogate_gradients.md
+- Tutorials:
+  - tutorials/building_rsnn.md
+  - tutorials/training.md
+- Guides:
+  - guides/configuration.md
+- FAQ: faq.md
+- Examples: examples.md
+- Skills: skills.md
+- Development: development.md
+- Contributing: contributing.md
+- Changelog: changelog.md
+- Analysis: analysis.md
+- Connection Conversion: connection_conversion.md
+- Visualisation: visualisation.md
+- API Reference:
+  - api/index.md
+  - api/models.md
+  - api/neurons.md
+  - api/analysis.md
+  - api/analysis_dynamic_tools.md
+  - api/connectome.md
+  - api/visualisation.md
+  - api/io.md
+  - api/utils.md
+  - api/datasets.md
 extra:
   version:
     provider: mike
   social:
-    - icon: fontawesome/brands/github
-      link: https://github.com/Criticality-Cognitive-Computation-Lab/btorch
+  - icon: fontawesome/brands/github
+    link: https://github.com/Criticality-Cognitive-Computation-Lab/btorch
   alternate:
-    - link: /
-      name: en - English
-      lang: en
-    - link: /zh/
-      name: zh - 简体中文
-      lang: zh
-
+  - link: /btorch/
+    name: en - English
+    lang: en
+  - link: /btorch/zh/
+    name: zh - 简体中文
+    lang: zh
 extra_css:
-  - stylesheets/extra.css
-
+- stylesheets/extra.css
 copyright: Copyright &copy; 2026 Btorch contributors

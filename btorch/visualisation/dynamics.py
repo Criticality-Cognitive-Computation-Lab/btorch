@@ -598,7 +598,7 @@ def plot_avalanche_analysis(
     Creates a 3-panel figure showing:
     1. Avalanche size distribution P(S) with power-law fit
     2. Avalanche duration distribution P(T) with power-law fit
-    3. Average size vs duration scaling relation <S>(T)
+    3. Average size vs duration scaling relation `<S>(T)`
 
     Criticality is indicated by power-law distributions and specific
     scaling exponents (tau, alpha, gamma).

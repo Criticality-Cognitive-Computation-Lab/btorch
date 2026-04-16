@@ -11,6 +11,7 @@ import multiprocessing
 import shutil
 import subprocess
 from pathlib import Path
+from urllib.parse import urlparse
 
 import typer
 import yaml
@@ -30,6 +31,24 @@ def _discover_languages() -> list[str]:
         if lang_dir.is_dir() and (lang_dir / "mkdocs.yml").exists():
             langs.append(lang_dir.name)
     return langs
+
+
+def _sync_shared(language: str) -> None:
+    """Copy shared assets and stylesheets from English docs to target
+    language."""
+    if language == "en":
+        return
+    en_docs = DOCS_DIR / "en" / "docs"
+    lang_docs = DOCS_DIR / language / "docs"
+    for name in ("assets", "stylesheets"):
+        src = en_docs / name
+        dest = lang_docs / name
+        if not src.exists():
+            continue
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(src, dest)
+        typer.echo(f"Synced {name}: {src} -> {dest}")
 
 
 def _get_en_nav_paths() -> list[str]:
@@ -75,6 +94,9 @@ def build_lang(
         shutil.rmtree(dest)
     if default_output.exists():
         shutil.rmtree(default_output)
+
+    # Sync shared assets/stylesheets into the target language docs
+    _sync_shared(language)
 
     # Generate API pages to disk before building
     api_script = Path(__file__).resolve().parent / "gen_api_pages.py"
@@ -129,6 +151,8 @@ def live(
         typer.echo(f"Config not found: {config_path}", err=True)
         raise typer.Exit(1)
 
+    _sync_shared(language)
+
     cmd = [
         "zensical",
         "serve",
@@ -142,8 +166,8 @@ def live(
 
 @app.command()
 def update_languages() -> None:
-    """Regenerate extra.alternate in docs/en/mkdocs.yml from
-    language_names.yml."""
+    """Regenerate extra.alternate in docs/en/mkdocs.yml using absolute links
+    derived from site_url."""
     if not LANGUAGES_FILE.exists():
         typer.echo(f"{LANGUAGES_FILE} not found", err=True)
         raise typer.Exit(1)
@@ -151,20 +175,30 @@ def update_languages() -> None:
     names = yaml.safe_load(LANGUAGES_FILE.read_text(encoding="utf-8"))
     langs = _discover_languages()
 
-    alternate = []
-    for lang in langs:
-        link = "/" if lang == "en" else f"/{lang}/"
-        name = names.get(lang, lang)
-        alternate.append({"link": link, "name": f"{lang} - {name}", "lang": lang})
-
     en_yml = DOCS_DIR / "en" / "mkdocs.yml"
-    data = yaml.safe_load(en_yml.read_text(encoding="utf-8"))
-    data.setdefault("extra", {})["alternate"] = alternate
-
-    en_yml.write_text(
-        yaml.dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8"
+    en_data = (
+        yaml.safe_load(en_yml.read_text(encoding="utf-8")) if en_yml.exists() else {}
     )
-    typer.echo("Updated language alternates in docs/en/mkdocs.yml")
+    site_url = en_data.get("site_url", "")
+    prefix = urlparse(site_url).path.rstrip("/") if site_url else ""
+
+    def _abs_link(target: str) -> str:
+        if target == "en":
+            return f"{prefix}/" if prefix else "/"
+        return f"{prefix}/{target}/" if prefix else f"/{target}/"
+
+    alternate = []
+    for other in langs:
+        link = _abs_link(other)
+        name = names.get(other, other)
+        alternate.append({"link": link, "name": f"{other} - {name}", "lang": other})
+
+    en_data.setdefault("extra", {})["alternate"] = alternate
+    en_yml.write_text(
+        yaml.dump(en_data, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    typer.echo(f"Updated language alternates in {en_yml}")
 
 
 @app.command()

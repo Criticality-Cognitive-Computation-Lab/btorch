@@ -9,6 +9,7 @@ hide:
 **A brain-inspired Torch library for neuromorphic research.**
 
 ![Btorch Overview](assets/images/btorch-overview.png)
+*[Image courtesy of @msy79lucky](https://github.com/msy79lucky)
 
 <div class="grid cards" markdown>
 

@@ -70,5 +70,3 @@ Many `tests/` files contain concise, validated usage patterns that are ideal for
 - `tests/models/test_compile.py` — `torch.compile` with `dt` context
 - `tests/utils/test_conf.py` — OmegaConf patterns
 - `tests/visualisation/*.py` — Nearly every plotting function
-
-**Tip:** When adapting test code for documentation, replace `fig_path` / `save_fig` calls with standard matplotlib patterns (e.g., `plt.show()` or returning the figure).
