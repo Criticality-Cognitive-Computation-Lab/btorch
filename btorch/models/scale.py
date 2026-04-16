@@ -188,6 +188,15 @@ class SupportScaleState(MemoryModule):
         enforce: _ENFORCE_MODE = "assert",
         force_memories_rv: bool = True,
     ):
+        """Scale neuron parameters and optionally memory reset values.
+
+        Args:
+            states: Optional state dictionary to scale in-place. If None,
+                scales the module's own parameters and reset values.
+            enforce: Behavior when already scaled (``ignore``, ``assert``,
+                or ``repeated``).
+            force_memories_rv: If True, also scale memory reset values.
+        """
         if not hasattr(self, "scaled"):
             self.init_scale_state()
         if self.scaled:
@@ -232,8 +241,17 @@ class SupportScaleState(MemoryModule):
         self,
         states: dict | None = None,
         enforce: _ENFORCE_MODE = "ignore",
-        force_memories_rv=True,
+        force_memories_rv: bool = True,
     ):
+        """Unscale neuron parameters and optionally memory reset values.
+
+        Args:
+            states: Optional state dictionary to unscale in-place. If None,
+                unscales the module's own parameters and reset values.
+            enforce: Behavior when already unscaled (``ignore``, ``assert``,
+                or ``repeated``).
+            force_memories_rv: If True, also unscale memory reset values.
+        """
         if not self.scaled:
             if enforce == "assert":
                 assert "{self} already unscaled"

@@ -89,6 +89,7 @@ nav:
   - API Reference:
       - api/index.md
       - api/models.md
+      - api/neurons.md
       - api/analysis.md
       - api/analysis_dynamic_tools.md
       - api/connectome.md
@@ -110,5 +111,8 @@ extra:
     - link: /zh/
       name: zh - 简体中文
       lang: zh
+
+extra_css:
+  - stylesheets/extra.css
 
 copyright: Copyright &copy; 2026 Btorch contributors

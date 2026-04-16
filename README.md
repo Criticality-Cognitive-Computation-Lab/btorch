@@ -72,7 +72,7 @@ Report:
 ```
 
 For setup instructions, see [docs/installation.md](docs/installation.md).  
-For development workflow and contributing guidelines, see [docs/development.md](docs/development.md).
+For development workflow and contributing guidelines, see [docs/en/docs/development.md](docs/development.md).
 
 ## Documentation
 
@@ -128,7 +128,7 @@ The `skills/` directory contains usage patterns and tips for using btorch with A
 - provide solid foundation of stateful Modules
 - usability over performance, simple over easy, and customizability over abstractions
   - single file/folder principle on network model
-  - see [Diffusers' philosophy](https://github.com/mreraser/diffusers/blob/fix-contribution.md/PHILOSOPHY.md)
+  - see [Diffusers' philosophy](https://github.com/huggingface/diffusers/blob/main/PHILOSOPHY.md)
   - WIP to align current implementation with these principles
 
 ## Contributors

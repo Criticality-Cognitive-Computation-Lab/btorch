@@ -1,13 +1,13 @@
-# Tutorial 2: Training an SNN
+# 教程 2：训练 SNN
 
-**Author:** btorch contributors  
-**Based on:** [`examples/fmnist.py`](https://github.com/Criticality-Cognitive-Computation-Lab/btorch/blob/main/examples/fmnist.py), [`skills/btorch-snn-modelling/references/training_example.md`](https://github.com/Criticality-Cognitive-Computation-Lab/btorch/blob/main/skills/btorch-snn-modelling/references/training_example.md)
+**作者：** btorch 贡献者  
+**基于：** [`examples/fmnist.py`](https://github.com/Criticality-Cognitive-Computation-Lab/btorch/blob/main/examples/fmnist.py)、[`skills/btorch-snn-modelling/references/training_example.md`](https://github.com/Criticality-Cognitive-Computation-Lab/btorch/blob/main/skills/btorch-snn-modelling/references/training_example.md)
 
-This tutorial explains how to train a spiking neural network with btorch, including state initialization, the `dt` environment, checkpointing, and truncated BPTT.
+本教程介绍如何使用 btorch 训练脉冲神经网络，包括状态初始化、`dt` 环境、检查点保存和截断时间反向传播。
 
-## Network Setup
+## 网络设置
 
-We reuse the RSNN pattern from [Tutorial 1](building_rsnn.md), but with a sparse recurrent connection and the Billeh alpha-PSC synapse used in the Fashion-MNIST example:
+我们复用 [教程 1](building_rsnn.md) 中的 RSNN 模式，但采用稀疏循环连接和 Fashion-MNIST 示例中使用的 Billeh alpha-PSC 突触：
 
 ```python
 import torch
@@ -19,8 +19,8 @@ from btorch.models.rnn import RecurrentNN
 from btorch.models.init import uniform_v_
 from btorch.models.regularizer import VoltageRegularizer
 
-# create an arbitrary sparse mat as example 
-from tests.utils.conn import build_sparse_mat  # helper from test suite
+# 创建一个任意稀疏矩阵作为示例
+from tests.utils.conn import build_sparse_mat  # 来自测试套件的辅助函数
 weights, _, _ = build_sparse_mat(n_e=80, n_i=20, i_e_ratio=1.0)
 conn = SparseConn(conn=weights)
 
@@ -38,7 +38,7 @@ neuron = GLIF3(
     backend="torch",
 )
 
-# AlphaPSCBilleh requires dt at init time
+# AlphaPSCBilleh 在初始化时需要 dt
 environ.set(dt=1.0)
 psc = AlphaPSCBilleh(
     n_neuron=100,
@@ -58,19 +58,19 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 model = model.to(device)
 ```
 
-## Initialize and Randomize State
+## 初始化并随机化状态
 
 ```python
-# 1. Register memory buffers
+# 1. 注册记忆缓冲区
 functional.init_net_state(model, batch_size=32, device=device)
 
-# 2. Randomize membrane voltage and store as reset values
+# 2. 随机化膜电压并将其存储为重置值
 uniform_v_(model.neuron, set_reset_value=True)
 ```
 
-`set_reset_value=True` is important: it tells `reset_net` to restore voltages to these randomized values at the start of each batch.
+`set_reset_value=True` 很重要：它告诉 `reset_net` 在每个批次开始时将电压恢复到这些随机化值。
 
-## Training Loop
+## 训练循环
 
 ```python
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -84,7 +84,7 @@ for epoch in range(num_epochs):
         x = x.to(device)
         target = target.to(device)
 
-        # Reset state before each batch
+        # 每个批次前重置状态
         functional.reset_net(model, batch_size=x.shape[1])
 
         optimizer.zero_grad()
@@ -92,11 +92,11 @@ for epoch in range(num_epochs):
         with environ.context(dt=1.0):
             spikes, states = model(x)
 
-            # spikes: (T, Batch, N) -> rate code
+            # spikes: (T, Batch, N) -> 速率编码
             rate = spikes.mean(dim=0)  # (Batch, N)
             task_loss = criterion(rate, target)
 
-            # Voltage regularization
+            # 电压正则化
             v_loss = voltage_reg(states["neuron.v"])
             loss = task_loss + 0.1 * v_loss
 
@@ -104,9 +104,9 @@ for epoch in range(num_epochs):
         optimizer.step()
 ```
 
-## Checkpointing
+## 检查点保存
 
-Dynamic buffers are excluded from `state_dict()`. To fully restore a model, save memory reset values alongside weights:
+动态缓冲区被排除在 `state_dict()` 之外。要完全恢复模型，需要同时保存记忆重置值和权重：
 
 ```python
 def save_checkpoint(model, optimizer, epoch, path):
@@ -120,11 +120,11 @@ def save_checkpoint(model, optimizer, epoch, path):
 def load_checkpoint(model, optimizer, path):
     ckpt = torch.load(path, map_location=device, weights_only=False)
 
-    # Load weights (dynamic keys are already excluded)
+    # 加载权重（动态键已被排除）
     model.load_state_dict(ckpt["model_state_dict"], strict=False)
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
 
-    # Restore memory reset values
+    # 恢复记忆重置值
     if "memories_rv" in ckpt:
         functional.set_memory_reset_values(model, ckpt["memories_rv"])
     if "hidden_states" in ckpt:
@@ -133,15 +133,15 @@ def load_checkpoint(model, optimizer, path):
     return ckpt["epoch"]
 ```
 
-## Truncated BPTT
+## 截断时间反向传播
 
-For long sequences, you can break BPTT into chunks with `detach_net`:
+对于长序列，你可以使用 `detach_net` 将 BPTT 分成多个片段：
 
 ```python
 chunk_size = 50
 for t in range(0, T, chunk_size):
     functional.detach_net(model)
-    # Note: do NOT call reset_net here; state should persist across chunks
+    # 注意：此处不要调用 reset_net；状态应在片段之间保持
     spikes, states = model(x[t:t+chunk_size])
     loss = criterion(spikes.mean(0), target)
     loss.backward()
@@ -149,13 +149,13 @@ for t in range(0, T, chunk_size):
     optimizer.zero_grad()
 ```
 
-`detach_net` breaks the computation graph at the current state values, preventing gradients from flowing back to earlier chunks.
+`detach_net` 在当前状态值处断开计算图，防止梯度流回更早的片段。
 
-## Key Takeaways
+## 关键要点
 
-1. **Always reset state** before a new batch with `functional.reset_net`.
-2. **Always wrap forward** in `environ.context(dt=...)`.
-3. **Save `memories_rv`** when checkpointing; `state_dict()` does not include dynamic states.
-4. **Use `detach_net`** for truncated BPTT on long sequences.
+1. **始终重置状态** — 在每个新批次前使用 `functional.reset_net`。
+2. **始终包装前向传递** — 在 `environ.context(dt=...)` 中运行。
+3. **保存 `memories_rv`** — 保存检查点时一并保存；`state_dict()` 不包含动态状态。
+4. **使用 `detach_net`** — 用于长序列的截断时间反向传播。
 
-See the [FAQ](../faq.md) for common errors and troubleshooting.
+有关常见错误和故障排除，请参阅 [FAQ](../faq.md)。

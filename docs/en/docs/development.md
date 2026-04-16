@@ -31,12 +31,21 @@ Before relying on CI/CD, the entire docs pipeline can be verified locally in ~5 
 pip install -e .[docs]
 ```
 
+or if you don't need to run ai auto generation,
+
+```bash
+pip install zensical>=0.0.32 mkdocstrings-python mkdocs-gen-files
+pip install -e .
+```
+
 ### 2. Serve English docs locally
 
 ```bash
-python scripts/docs.py live --language en
+python scripts/docs.py live en
 # open http://127.0.0.1:8000
 ```
+
+Note: `zensical serve` does not auto-reload on changes to source files outside the docs folder (e.g. `btorch/`). Refresh the browser manually when editing docstrings.
 
 ### 3. Run a single-page AI translation
 
@@ -55,7 +64,7 @@ python scripts/translate.py translate-page \
 ### 4. Serve Chinese docs locally
 
 ```bash
-python scripts/docs.py live --language zh
+python scripts/docs.py live zh
 # open http://127.0.0.1:8000/zh/
 ```
 

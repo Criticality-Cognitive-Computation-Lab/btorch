@@ -29,6 +29,10 @@ DEEP_PAGES = {
         "api/analysis_dynamic_tools.md",
         "Analysis — Dynamic Tools",
     ),
+    "btorch.models.neurons": (
+        "api/neurons.md",
+        "Neurons",
+    ),
 }
 
 
@@ -45,6 +49,10 @@ def _has_public_api(file_path: Path) -> bool:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if not node.name.startswith("_"):
                 return True
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if not alias.name.startswith("_"):
+                    return True
     return False
 
 

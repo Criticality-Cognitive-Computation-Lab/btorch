@@ -10,7 +10,6 @@ from __future__ import annotations
 import multiprocessing
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import typer
@@ -67,24 +66,34 @@ def build_lang(
 
     if language == "en":
         dest = SITE_DIR
+        default_output = DOCS_DIR / "en" / "site"
     else:
         dest = SITE_DIR / language
+        default_output = DOCS_DIR / language / "site"
 
     if dest.exists():
         shutil.rmtree(dest)
+    if default_output.exists():
+        shutil.rmtree(default_output)
+
+    # Generate API pages to disk before building
+    api_script = Path(__file__).resolve().parent / "gen_api_pages.py"
+    typer.echo("Generating API reference pages...")
+    subprocess.run(["python", str(api_script)], check=True)
 
     cmd = [
-        sys.executable,
-        "-m",
-        "mkdocs",
+        "zensical",
         "build",
         "--config-file",
         str(config_path),
-        "--site-dir",
-        str(dest),
     ]
     typer.echo(f"Building {language} -> {dest}")
     subprocess.run(cmd, check=True)
+
+    # Zensical builds into a 'site' folder next to the config file.
+    # Move it to the unified site directory.
+    if default_output.exists():
+        shutil.move(str(default_output), str(dest))
 
 
 @app.command()
@@ -121,9 +130,7 @@ def live(
         raise typer.Exit(1)
 
     cmd = [
-        sys.executable,
-        "-m",
-        "mkdocs",
+        "zensical",
         "serve",
         "--config-file",
         str(config_path),
