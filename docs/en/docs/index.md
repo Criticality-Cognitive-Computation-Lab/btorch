@@ -2,6 +2,8 @@
 
 **Btorch** is a brain-inspired Torch library for neuromorphic research, providing stateful neuron models, connectome utilities, and analysis tools.
 
+![Btorch Overview](assets/images/btorch-overview.png)
+
 ## Overview
 
 Btorch provides:
