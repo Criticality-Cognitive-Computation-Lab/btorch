@@ -2,15 +2,25 @@ name: Translate docs
 
 on:
   workflow_dispatch:
-  pull_request:
+  push:
+    branches: [main]
     paths:
       - 'docs/en/**'
+  pull_request:
+    types: [labeled, synchronize, opened, reopened]
 
 permissions:
   contents: write
 
 jobs:
   translate:
+    # Run on push to main or manual dispatch always.
+    # On PRs, only run if the 'translate-docs' label is present.
+    if: >-
+      ${{
+        github.event_name != 'pull_request' ||
+        contains(github.event.pull_request.labels.*.name, 'translate-docs')
+      }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
