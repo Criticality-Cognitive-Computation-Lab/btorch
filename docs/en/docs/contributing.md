@@ -35,7 +35,7 @@ ruff check .
 pytest tests
 
 # Docs build
-python -m sphinx.cmd.build docs docs/_build/html
+python scripts/docs.py build-all
 ```
 
 For faster feedback, run targeted subsets:

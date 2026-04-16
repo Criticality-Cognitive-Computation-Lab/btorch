@@ -38,4 +38,4 @@ If not specified, a sensible default (usually `ATan`) is used.
 - **Triangle** — Computationally cheap; bounded support.
 - **Erf** — Very smooth; sometimes helps with optimization stability.
 
-See the [Models API](../api/models.md) for constructor details.
+See the [Neurons API](../api/neurons.md) for constructor details.

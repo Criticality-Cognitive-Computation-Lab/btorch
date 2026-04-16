@@ -2,25 +2,12 @@ name: Translate docs
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - 'docs/en/**'
-  pull_request:
-    types: [labeled, synchronize, opened, reopened]
 
 permissions:
   contents: write
 
 jobs:
   translate:
-    # Run on push to main or manual dispatch always.
-    # On PRs, only run if the 'translate-docs' label is present.
-    if: >-
-      ${{
-        github.event_name != 'pull_request' ||
-        contains(github.event.pull_request.labels.*.name, 'translate-docs')
-      }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,10 +26,53 @@ jobs:
           python -m pip install torch==2.8.0 --extra-index-url https://download.pytorch.org/whl/cpu
           python -m pip install torch_sparse torch_scatter -f https://data.pyg.org/whl/torch-2.8.0+cpu.html
           python -m pip install git+https://github.com/alexfanqi/omegaconf.git
-          python -m pip install -e .[docs]
+          python -m pip install -e .[docs] torch==2.8.0 --extra-index-url https://download.pytorch.org/whl/cpu
 
-      - name: Update and add translations
-        run: python scripts/translate.py update-and-add --language zh --max-pages 20
+      - name: Detect changed files
+        id: changed
+        run: |
+          if [ "${{ github.event_name }}" == "push" ]; then
+            SINCE="${{ github.event.before }}"
+          elif [ "${{ github.event_name }}" == "pull_request" ]; then
+            SINCE="origin/${{ github.base_ref }}"
+          else
+            SINCE=""
+          fi
+          echo "since=$SINCE" >> $GITHUB_OUTPUT
+          if [ -n "$SINCE" ]; then
+            README_CHANGED=$(git diff --name-only "$SINCE" HEAD -- README.md || true)
+          else
+            README_CHANGED=""
+          fi
+          if [ -n "$README_CHANGED" ]; then
+            echo "readme_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "readme_changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Translate README
+        if: steps.changed.outputs.readme_changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: python scripts/translate.py translate-readme --language zh
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+
+      - name: Translate changed pages
+        if: steps.changed.outputs.since != '' || github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            python scripts/translate.py update-and-add --language zh --max-pages 20
+          else
+            python scripts/translate.py translate-changed --language zh --since-ref "${{ steps.changed.outputs.since }}" --max-pages 20
+          fi
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+
+      - name: Add missing translations
+        run: python scripts/translate.py add-missing --language zh --max-pages 20
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
@@ -55,10 +85,19 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/zh/
+          git add docs/zh/ README.zh.md
           if git diff --staged --quiet; then
             echo "No translation changes"
           else
             git commit -m "docs: update zh translations"
             git push origin ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
           fi
+
+  build-docs:
+    needs: translate
+    if: always() && needs.translate.result == 'success'
+    uses: ./.github/workflows/build-docs.yml
+    permissions:
+      contents: read
+      pages: write
+      id-token: write

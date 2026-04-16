@@ -30,12 +30,21 @@ python scripts/docs.py build-all
 pip install -e .[docs]
 ```
 
+或者如果你不需要运行 AI 自动生成：
+
+```bash
+pip install zensical>=0.0.32 mkdocstrings-python mkdocs-gen-files
+pip install -e .
+```
+
 ### 2. 在本地预览英文文档
 
 ```bash
-python scripts/docs.py live --language en
+python scripts/docs.py live en
 # 打开 http://127.0.0.1:8000
 ```
+
+注意：`zensical serve` 不会对文档文件夹外的源文件变更（例如 `btorch/`）自动重新加载。编辑文档字符串时请手动刷新浏览器。
 
 ### 3. 运行单页 AI 翻译
 
@@ -51,14 +60,10 @@ python scripts/translate.py translate-page \
 # 检查 docs/zh/docs/installation.md
 ```
 
-**特定提供商注意事项：**
-- **Google Gemini**：使用 `OPENAI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/` 和 `OPENAI_API_KEY=<your-gemini-key>`。**不要**在基础 URL 后附加 `?key=` —— 这会导致“Multiple authentication credentials”错误。
-- **本地代理（例如 llama-cpp-server, vLLM）**：你可以完全省略 `OPENAI_API_KEY`，只需设置 `OPENAI_BASE_URL`。
-
 ### 4. 在本地预览中文文档
 
 ```bash
-python scripts/docs.py live --language zh
+python scripts/docs.py live zh
 # 打开 http://127.0.0.1:8000/zh/
 ```
 

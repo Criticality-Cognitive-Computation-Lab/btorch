@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize, opened, reopened]
+  workflow_call:
 
 permissions:
   contents: read
@@ -16,9 +19,17 @@ concurrency:
 
 jobs:
   build:
+    if: >-
+      ${{
+        github.event_name != 'pull_request' ||
+        contains(github.event.pull_request.labels.*.name, 'build-docs')
+      }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
 
       - uses: actions/setup-python@v5
         with:
@@ -30,7 +41,7 @@ jobs:
           python -m pip install torch==2.8.0 --extra-index-url https://download.pytorch.org/whl/cpu
           python -m pip install torch_sparse torch_scatter -f https://data.pyg.org/whl/torch-2.8.0+cpu.html
           python -m pip install git+https://github.com/alexfanqi/omegaconf.git
-          python -m pip install -e .[docs]
+          python -m pip install -e .[docs] torch==2.8.0 --extra-index-url https://download.pytorch.org/whl/cpu
 
       - name: Build all languages
         run: python scripts/docs.py build-all
@@ -42,6 +53,7 @@ jobs:
 
   deploy:
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

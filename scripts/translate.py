@@ -298,6 +298,106 @@ def remove_removable(
 
 
 @app.command()
+def translate_changed(
+    language: str = typer.Option(..., help="Target language code"),
+    since_ref: str = typer.Option(..., help="Git ref to diff against"),
+    model: str = typer.Option(
+        os.environ.get("OPENAI_MODEL", "gpt-4o"), help="LLM model"
+    ),
+    max_pages: int = typer.Option(50, help="Max pages to translate"),
+) -> None:
+    """Translate only English doc pages changed since a given git ref."""
+    en_docs = DOCS_DIR / "en" / "docs"
+    try:
+        out = subprocess.check_output(
+            [
+                "git",
+                "diff",
+                "--name-only",
+                since_ref,
+                "HEAD",
+                "--",
+                str(en_docs),
+            ],
+            text=True,
+        ).strip()
+    except subprocess.CalledProcessError:
+        typer.echo("Failed to get changed files from git", err=True)
+        raise typer.Exit(1)
+
+    changed = [
+        line.strip() for line in out.splitlines() if line.strip().endswith(".md")
+    ]
+    if not changed:
+        typer.echo("No changed doc files to translate")
+        return
+
+    count = 0
+    for file in changed:
+        src = Path(file).resolve()
+        if not src.exists():
+            typer.echo(f"Skipping deleted file: {file}")
+            continue
+        rel = src.relative_to(en_docs)
+        if _is_non_translated(rel):
+            typer.echo(f"Skipping non-translated section: {rel}")
+            continue
+        result = _translate_file(src, language, model=model)
+        dest = _mirror_path(src, language)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(result, encoding="utf-8")
+        typer.echo(f"Translated: {dest}")
+        count += 1
+        if count >= max_pages:
+            typer.echo(f"Reached max_pages={max_pages}")
+            break
+    typer.echo(f"Translated {count} changed pages")
+
+
+@app.command()
+def translate_readme(
+    language: str = typer.Option(..., help="Target language code"),
+    model: str = typer.Option(
+        os.environ.get("OPENAI_MODEL", "gpt-4o"), help="LLM model"
+    ),
+    dry_run: bool = typer.Option(False, help="Print instead of writing"),
+) -> None:
+    """Translate README.md to README.<language>.md."""
+    repo_root = Path(__file__).resolve().parent.parent
+    src = repo_root / "README.md"
+    if not src.exists():
+        typer.echo("README.md not found", err=True)
+        raise typer.Exit(1)
+
+    dest = repo_root / f"README.{language}.md"
+    en_text = src.read_text(encoding="utf-8")
+    base_prompt = _load_prompt(language)
+    old_translation: str | None = None
+
+    freeze_blocks: dict[str, str] = {}
+    if dest.exists():
+        old_translation = dest.read_text(encoding="utf-8")
+        freeze_blocks = _extract_freeze_blocks(old_translation)
+        if freeze_blocks:
+            placeholder_text = old_translation
+            for key, val in freeze_blocks.items():
+                placeholder_text = placeholder_text.replace(val, key)
+            old_translation = placeholder_text
+
+    prompt = _build_prompt(base_prompt, en_text, old_translation)
+    result = _call_llm(prompt, model=model)
+
+    if freeze_blocks:
+        result = _replace_freeze_blocks(result, freeze_blocks)
+
+    if dry_run:
+        typer.echo(result)
+    else:
+        dest.write_text(result, encoding="utf-8")
+        typer.echo(f"Translated: {dest}")
+
+
+@app.command()
 def update_and_add(
     language: str = typer.Option(..., help="Target language code"),
     max_pages: int = typer.Option(50, help="Max pages to translate per step"),
