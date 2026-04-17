@@ -540,6 +540,85 @@ python sweep.py \
     output_path=./sweep_results
 ```
 
+## Pattern 7: Case Selection (Default + CLI Selectable)
+
+Use when you have named presets (cases) that users can select via CLI, with one case as the default.
+The pattern uses a `case_name` field and a `default_from_case()` method:
+
+```python
+from dataclasses import dataclass, field
+from copy import deepcopy
+
+# Case registry
+CASES: dict[str, CaseConfig] = {}
+
+@dataclass
+class CaseConfig:
+    name: str
+    sim_config: SimulationConfig
+    param_ranges: dict[str, FloatRange]
+    description: str
+
+
+@dataclass
+class OptunaSimpleConfig:
+    case_name: str = "cross_fit_ind_ee"  # default case
+    ranges: dict[str, FloatRange] = field(default_factory=dict)
+
+    def default_from_case(self):
+        if self.case_name not in CASES:
+            available = ", ".join(sorted(CASES.keys()))
+            raise KeyError(f"Unknown case '{self.case_name}'. Available: {available}")
+        self.run.sim = deepcopy(CASES[self.case_name].sim_config)
+        self.ranges = deepcopy(CASES[self.case_name].param_ranges)
+        return self
+```
+
+**`load_config_with_case`** handles case reload when `case_name` is passed via CLI:
+
+```python
+def load_config_with_case(
+    Param: type[T],
+    case_name_field: str = "case_name",
+) -> T:
+    # 1. Initialize with default case
+    param_instance = Param()
+    param_instance.default_from_case()
+    defaults = OmegaConf.structured(param_instance)
+
+    # 2. Parse CLI
+    cli_cfg = OmegaConf.from_cli()
+
+    # 3. Reload case defaults if case_name specified via CLI
+    if hasattr(cli_cfg, case_name_field):
+        setattr(param_instance, case_name_field, getattr(cli_cfg, case_name_field))
+        param_instance.default_from_case()
+        defaults = OmegaConf.structured(param_instance)
+
+    # 4. Merge: defaults <- config file <- CLI overrides
+    cfg = OmegaConf.unsafe_merge(defaults, cli_cfg)
+    return OmegaConf.to_object(cfg)
+```
+
+**CLI usage:**
+```bash
+# Uses default case
+python run_optuna_simple_metrics.py
+
+# Select different case via CLI
+python run_optuna_simple_metrics.py case_name=cross_fit_ind_all
+
+# Override case params via CLI
+python run_optuna_simple_metrics.py case_name=uni_fit_ind_ee \
+    ranges.network_param.synapse.weight_param.ee_scale="[0.5, 1.0, 2.0]"
+```
+
+**Key points:**
+- Set default case as dataclass field default: `case_name: str = "default_case"`
+- `default_from_case()` validates case_name and applies case-specific defaults
+- `load_config_with_case` detects CLI case_name and reloads defaults before merging
+- This ensures CLI case selection properly overrides all case-specific values
+
 ## Key Takeaways
 
 1. **Composition**: Split into CommonConf (shared) + TaskConf (specific)
@@ -547,3 +626,4 @@ python sweep.py \
 3. **Exclude per-item fields**: Always exclude ID fields from forwarded options
 4. **Deepcopy for sweeps**: `deepcopy(base)` before modifying for each trial
 5. **Candidates in code**: Define sweep ranges as dataclass fields with defaults
+6. **Case selection**: Use `case_name` + `default_from_case()` for CLI-selectable presets

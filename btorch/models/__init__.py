@@ -3,6 +3,7 @@ from . import (
     connection_conversion,
     constrain,
     conv,
+    dlif,
     environ,
     functional,
     history,
@@ -12,6 +13,7 @@ from . import (
     rnn,
     surrogate,
 )
+from .dlif import DBNN, DLIF, DendriticLIF
 from .neurons import alif, glif, lif
 
 
@@ -20,6 +22,7 @@ __all__ = [
     "connection_conversion",
     "constrain",
     "conv",
+    "dlif",
     "environ",
     "functional",
     "glif",
@@ -31,4 +34,7 @@ __all__ = [
     "ode",
     "rnn",
     "surrogate",
+    "DendriticLIF",
+    "DLIF",
+    "DBNN",
 ]

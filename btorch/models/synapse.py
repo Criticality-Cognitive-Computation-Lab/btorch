@@ -3,6 +3,7 @@ from typing import Protocol
 
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from jaxtyping import Float
 from torch import Tensor, nn
 
@@ -14,6 +15,7 @@ from .base import (
     normalize_n_neuron,
     unflatten_neuron,
 )
+from .bilinear import SymmetricBilinear
 from .history import SpikeHistory
 from .ode import exp_euler_step
 
@@ -100,14 +102,37 @@ class BasePSC(MemoryModule):
         current = self.current_charge()
         return current
 
-    def multi_step_forward(self, z_seq: torch.Tensor):
-        T = z_seq.shape[0]
-        y_seq = []
-        for t in range(T):
-            y = self.single_step_forward(z_seq[t])
-            y_seq.append(y)
+    def multi_step_forward(self, z_seq: torch.Tensor, kernel_len: int = 64):
+        """Full-sequence forward via grouped 1D conv.
 
-        return torch.stack(y_seq)
+        Args:
+            z_seq: (T, *batch, *n_neuron) spike sequence
+            kernel_len: length of the PSC impulse response kernel (truncation).
+                Default: 64.
+
+        Returns:
+            (T, *batch, *n_neuron) PSC sequence.
+        """
+        dt = environ.get("dt")
+
+        z_flat, leading = self._flatten_neuron(z_seq)
+        wz_seq = self.linear(z_flat)
+
+        kernel = self.get_kernel(dt, kernel_len)
+        kernel = kernel.to(wz_seq.device, wz_seq.dtype)
+
+        wz_channels = wz_seq.reshape(wz_seq.shape[0], -1).transpose(0, 1).unsqueeze(0)
+        n_channels = wz_channels.shape[1]
+
+        depthwise_kernel = (
+            kernel.flip(0).view(1, 1, kernel_len).repeat(n_channels, 1, 1)
+        )
+        wz_padded = F.pad(wz_channels, (kernel_len - 1, 0))
+        out_flat = F.conv1d(wz_padded, depthwise_kernel, groups=n_channels)
+        out_flat = out_flat.squeeze(0).transpose(0, 1)
+
+        out = out_flat.reshape(*leading, self.size)
+        return self._unflatten_neuron(out, leading)
 
 
 class ExponentialPSC(BasePSC):
@@ -151,6 +176,15 @@ class ExponentialPSC(BasePSC):
     def conductance_charge(self):
         self.psc = exp_euler_step(self.dpsc, self.psc, dt=environ.get("dt"))
         return self.psc
+
+    def get_kernel(self, dt, kernel_len):
+        """Exponential decay kernel.
+
+        k[t] = a^t for t >= 0 where a = exp(-dt/tau_syn).
+        """
+        a = torch.exp(-dt / self.tau_syn)
+        t = torch.arange(kernel_len, dtype=a.dtype, device=a.device)
+        return a**t
 
 
 class _Adaptive2VarPSC(BasePSC):
@@ -218,6 +252,24 @@ class AlphaPSCBilleh(_Adaptive2VarPSC):
             wz = unflatten_neuron(wz, leading, self.n_neuron)
         self.h = self.syn_decay * self.h + torch.e / self.tau_syn * wz
 
+    def get_kernel(self, dt, kernel_len):
+        """AlphaPSC Billeh variant kernel.
+
+        Kernel follows the exact single-step recurrence:
+        k[0] = 0,
+        k[t] = t * e/tau_syn * a^t for t >= 1,
+        where a = exp(-1/tau_syn).
+
+        NOTE: dt is assumed to be 1.0 for this model (enforced in __init__).
+        """
+        a = self.syn_decay
+        t = torch.arange(kernel_len, dtype=a.dtype, device=a.device)
+        kernel = torch.zeros_like(t, dtype=a.dtype)
+        if kernel_len > 1:
+            t_valid = t[1:]
+            kernel[1:] = t_valid * (torch.e / self.tau_syn) * (a**t_valid)
+        return kernel
+
 
 class AlphaPSC(_Adaptive2VarPSC):
     tau_syn: torch.Tensor | torch.nn.Parameter
@@ -263,6 +315,23 @@ class AlphaPSC(_Adaptive2VarPSC):
         if len(self.n_neuron) > 1 and z_flat is not z:
             wz = unflatten_neuron(wz, leading, self.n_neuron)
         self.h = exp_euler_step(self.dh, self.h, dt=environ.get("dt")) + wz
+
+    def get_kernel(self, dt, kernel_len):
+        """AlphaPSC (Brainpy variant) kernel.
+
+        Kernel follows the exact single-step recurrence:
+        k[0] = 0,
+        k[t] = t * (1 - a) * a^(t-1) for t >= 1,
+        where a = exp(-dt/tau_syn).
+        """
+        a = torch.exp(-dt / self.tau_syn)
+        t = torch.arange(kernel_len, dtype=a.dtype, device=a.device)
+        kernel = torch.zeros_like(t, dtype=a.dtype)
+        if kernel_len > 1:
+            t_valid = t[1:]
+            kernel[1:] = t_valid * (1 - a) * (a ** (t_valid - 1))
+        kernel = self.g_max.to(kernel.dtype) * kernel
+        return kernel
 
 
 class DualExponentialPSC(BasePSC):
@@ -335,6 +404,134 @@ class DualExponentialPSC(BasePSC):
         self.g_rise = self.g_rise + wz
         self.g_decay = self.g_decay + wz
         self.psc = self.a * (self.g_decay - self.g_rise)
+
+    def get_kernel(self, dt, kernel_len):
+        """Dual-exponential (alpha-shaped) kernel.
+
+        Kernel: k[t] = a * (a_d^t - a_r^t) for t >= 0
+        where a = self.a, a_d = exp(-dt/tau_decay), a_r = exp(-dt/tau_rise).
+        """
+        a_r = torch.exp(-dt / self.tau_rise)
+        a_d = torch.exp(-dt / self.tau_decay)
+        t = torch.arange(kernel_len, dtype=self.a.dtype, device=self.a.device)
+        return self.a * (a_d**t - a_r**t)
+
+
+class BilinearMixingSynapse(MemoryModule):
+    """PSC with bilinear + linear mixing across receptor/input dimensions.
+
+    Used as the dendritic stage for both DLIF (delta/exponential PSC)
+    and DBNN (dual-exponential/alpha PSC).
+
+    Dynamics (per timestep):
+        PSC per receptor: base_psc.single_step_forward(z[..., n_receptor])
+        Mix: out = bilinear(psc_per_receptor) + psc_per_receptor.sum(dim=-1)
+
+    Args:
+        n_neuron: Number of output neurons.
+        n_receptor: Number of input receptors (input dimension D).
+        base_psc: BasePSC subclass instance for synaptic dynamics.
+        bilinear_mask: Optional mask passed to SymmetricBilinear.
+        kernel_len: Default kernel length for multistep conv. Default: 64.
+    """
+
+    def __init__(
+        self,
+        n_neuron: int | Sequence[int],
+        n_receptor: int,
+        base_psc: BasePSC,
+        bilinear_mask: float | Tensor | None = None,
+        kernel_len: int = 64,
+    ):
+        super().__init__()
+        self.n_neuron, self.size = normalize_n_neuron(n_neuron)
+        self.n_receptor = n_receptor
+        self.base_psc = base_psc
+        self.kernel_len = kernel_len
+
+        self.bilinear = SymmetricBilinear(
+            in_features=n_receptor,
+            out_features=1,
+            bias=True,
+            mask=bilinear_mask,
+        )
+
+    @property
+    def psc(self) -> torch.Tensor:
+        return self._psc
+
+    @psc.setter
+    def psc(self, value: torch.Tensor):
+        self._psc = value
+
+    def init_state(
+        self,
+        batch_size=None,
+        dtype=None,
+        device=None,
+        persistent=True,
+        skip_mem_name: Iterable[str] = (),
+    ):
+        self.base_psc.init_state(
+            batch_size,
+            dtype,
+            device,
+            persistent,
+            skip_mem_name=skip_mem_name,
+        )
+        self._psc = torch.zeros(
+            *((batch_size,) if batch_size is not None else ()),
+            *self.n_neuron,
+            dtype=dtype,
+            device=device,
+        )
+
+    def reset(
+        self,
+        batch_size=None,
+        dtype=None,
+        device=None,
+        skip_mem_name: Iterable[str] = (),
+    ):
+        self.base_psc.reset(
+            batch_size,
+            dtype,
+            device,
+            skip_mem_name=skip_mem_name,
+        )
+        self._psc = torch.zeros(
+            *((batch_size,) if batch_size is not None else ()),
+            *self.n_neuron,
+            dtype=dtype,
+            device=device,
+        )
+
+    def single_step_forward(self, z: torch.Tensor):
+        z_flat, leading = flatten_neuron(z, self.n_neuron, self.size)
+        z_expanded = z_flat.reshape(*leading, self.size * self.n_receptor)
+        psc_expanded = self.base_psc.single_step_forward(z_expanded)
+        psc_per_receptor = psc_expanded.reshape(
+            *leading, *self.n_neuron, self.n_receptor
+        )
+        bilinear_term = self.bilinear(psc_per_receptor)
+        linear_term = psc_per_receptor.sum(dim=-1, keepdim=True)
+        self._psc = (bilinear_term + linear_term).squeeze(-1)
+        return self._psc
+
+    def multi_step_forward(self, z_seq: torch.Tensor, kernel_len: int | None = None):
+        if kernel_len is None:
+            kernel_len = self.kernel_len
+        T, *batch_shape, n_neuron, n_receptor = z_seq.shape
+        leading = (*batch_shape,)
+
+        z_expanded = z_seq.reshape(T, *leading, self.size * n_receptor)
+        psc_flat = self.base_psc.multi_step_forward(z_expanded, kernel_len=kernel_len)
+
+        psc_per_receptor = psc_flat.reshape(T, *leading, n_neuron, n_receptor)
+        bilinear_term = self.bilinear(psc_per_receptor)
+        linear_term = psc_per_receptor.sum(dim=-1, keepdim=True)
+        out = (bilinear_term + linear_term).squeeze(-1)
+        return out
 
 
 class DelayedPSC(MemoryModule):
@@ -437,7 +634,7 @@ class DelayedPSC(MemoryModule):
             z_delayed = z
         return self.psc_module.single_step_forward(z_delayed)
 
-    def multi_step_forward(self, z_seq: torch.Tensor):
+    def multi_step_forward(self, z_seq: torch.Tensor, kernel_len: int = 64):
         T = z_seq.shape[0]
         y_seq = []
         for t in range(T):
@@ -493,7 +690,7 @@ class HeterSynapsePSC(BasePSC):
 
         if max_delay_steps > 1:
             self.history = SpikeHistory(
-                n_neuron=n_neuron,
+                n_neuron=self.size,
                 max_delay_steps=max_delay_steps,
                 use_circular_buffer=use_circular_buffer,
             )
@@ -545,12 +742,33 @@ class HeterSynapsePSC(BasePSC):
             self.history.reset(batch_size, dtype, device)
 
     def single_step_forward(self, z: torch.Tensor):
-        z_flat, leading = self._flatten_neuron(z)
+        raw_shape = self.n_neuron
+        expanded_shape = (*self.n_neuron, self.n_receptor)
+
+        if z.shape[-len(raw_shape) :] == raw_shape:
+            leading = z.shape[: -len(raw_shape)]
+            z_flat = z.reshape(*leading, self.size)
+            has_receptor_axis = False
+        elif z.shape[-len(expanded_shape) :] == expanded_shape:
+            leading = z.shape[: -len(expanded_shape)]
+            z_flat = z.reshape(*leading, self.size * self.n_receptor)
+            has_receptor_axis = True
+        else:
+            raise RuntimeError(
+                "HeterSynapsePSC input shape mismatch. Expected trailing shape "
+                f"{raw_shape} or {expanded_shape}, got {z.shape}."
+            )
+
         if self.history is not None:
+            if has_receptor_axis:
+                raise RuntimeError(
+                    "Delayed HeterSynapsePSC expects input without receptor axis. "
+                    f"Expected trailing shape {raw_shape}, got {z.shape}."
+                )
             self.history.update(z_flat)
             z_flat = self.history.get_flattened(self.max_delay_steps)
         psc = self.base_psc.single_step_forward(z_flat)
-        self.psc = psc.view(*psc.shape[:-1], *self.n_neuron, self.n_receptor).sum(-1)
+        self.psc = psc.reshape(*leading, *self.n_neuron, self.n_receptor).sum(-1)
         return self.psc
 
     def get_psc(
@@ -622,6 +840,43 @@ class HeterSynapsePSC(BasePSC):
             raise ValueError("NaN values detected in PSC tensor")
 
         return result
+
+    def multi_step_forward(self, z_seq: torch.Tensor, kernel_len: int = 64):
+        if self.history is not None:
+            raw_shape = self.n_neuron
+            if z_seq.shape[-len(raw_shape) :] != raw_shape:
+                raise RuntimeError(
+                    "Delayed HeterSynapsePSC expects input without receptor axis. "
+                    f"Expected trailing shape {raw_shape}, got {z_seq.shape}."
+                )
+            T = z_seq.shape[0]
+            y_seq = []
+            for t in range(T):
+                y_seq.append(self.single_step_forward(z_seq[t]))
+            return torch.stack(y_seq)
+
+        raw_shape = self.n_neuron
+        expanded_shape = (*self.n_neuron, self.n_receptor)
+
+        if z_seq.shape[-len(raw_shape) :] == raw_shape:
+            leading = z_seq.shape[1 : -len(raw_shape)]
+            z_flat = z_seq.reshape(z_seq.shape[0], *leading, self.size)
+        elif z_seq.shape[-len(expanded_shape) :] == expanded_shape:
+            leading = z_seq.shape[1 : -len(expanded_shape)]
+            z_flat = z_seq.reshape(
+                z_seq.shape[0], *leading, self.size * self.n_receptor
+            )
+        else:
+            raise RuntimeError(
+                "HeterSynapsePSC input shape mismatch. Expected trailing shape "
+                f"{raw_shape} or {expanded_shape}, got {z_seq.shape}."
+            )
+
+        psc_flat = self.base_psc.multi_step_forward(z_flat, kernel_len=kernel_len)
+        psc = psc_flat.reshape(
+            z_seq.shape[0], *leading, *self.n_neuron, self.n_receptor
+        )
+        return psc.sum(dim=-1)
 
 
 class GapJunction(nn.Module):
