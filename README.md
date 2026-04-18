@@ -8,7 +8,7 @@ Use `btorch` if you need:
 - Recurrent SNN modelling
 - stateful neuron/synapse modules with explicit memory handling
 - practical support for sparse/connectome-style network structure
-- torchn native training features (`torch.compile`, checkpointing,
+- torch native training features (`torch.compile`, checkpointing,
   truncated BPTT)
 - solid runtime performance and ONNX export support
 - connectome import/export via SONATA, and flexible network definition coming soon  

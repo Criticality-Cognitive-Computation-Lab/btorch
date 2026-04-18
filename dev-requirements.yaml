@@ -37,3 +37,6 @@ dependencies:
   - jaxtyping
   - beartype
   - mypy
+  # unfortunate required for building grammer tree of omegaconf
+  # will be removed once it is upstreamed
+  - openjdk

@@ -618,9 +618,17 @@ class DelayedPSC(MemoryModule):
     def step_mode(self) -> str:
         return self.psc_module.step_mode
 
+    @step_mode.setter
+    def step_mode(self, value: str):
+        self.psc_module.step_mode = value
+
     @property
     def backend(self) -> str:
         return self.psc_module.backend
+
+    @backend.setter
+    def backend(self, value: str):
+        self.psc_module.backend = value
 
     @property
     def psc(self) -> torch.Tensor:
