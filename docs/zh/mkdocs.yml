@@ -1,2 +1,35 @@
 INHERIT: ../en/mkdocs.yml
 site_url: https://criticality-cognitive-computation-lab.github.io/btorch/zh/
+nav:
+- 首页: index.md
+- installation.md
+- quickstart.md
+- 核心概念:
+  - concepts/stateful_modules.md
+  - concepts/dt_environment.md
+  - concepts/surrogate_gradients.md
+- 教程:
+  - tutorials/building_rsnn.md
+  - tutorials/training.md
+- 指南:
+  - guides/configuration.md
+- faq.md
+- examples.md
+- skills.md
+- development.md
+- contributing.md
+- changelog.md
+- analysis.md
+- connection_conversion.md
+- visualisation.md
+- API 参考:
+  - api/index.md
+  - api/models.md
+  - api/neurons.md
+  - api/analysis.md
+  - api/analysis_dynamic_tools.md
+  - api/connectome.md
+  - api/visualisation.md
+  - api/io.md
+  - api/utils.md
+  - api/datasets.md

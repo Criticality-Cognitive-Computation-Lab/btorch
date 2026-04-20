@@ -29,14 +29,19 @@ This repository supports an enhanced fork of OmegaConf from `https://github.com/
 pip install git+https://github.com/alexfanqi/omegaconf.git
 ```
 
-### Note on `pip` and `pytorch_sparse`
+### Optional: `torch_sparse` backend
 
-If you prefer using `pip` directly, installing `pytorch_sparse` from source or default pypi can be challenging. We recommend using prebuilt wheels from the [PyG repository](https://data.pyg.org/whl/) that match your PyTorch and CUDA installation:
+By default, sparse linear layers use PyTorch's native `torch.sparse` backend. An optional `torch_sparse` backend is available for better performance on large sparse network workloads.
+
+Install the optional sparse dependencies using prebuilt wheels from the
+[PyG repository](https://data.pyg.org/whl/) matching your PyTorch and CUDA version:
 
 ```bash
 # Example for PyTorch 2.8.0 with CUDA 12.8
 pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-2.8.0+cu128.html
 ```
+
+If `torch_sparse` is not installed, layers automatically fall back to the native backend.
 
 ## 3. Install in Editable Mode
 

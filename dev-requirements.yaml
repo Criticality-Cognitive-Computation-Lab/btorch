@@ -3,10 +3,10 @@ channels:
   - pyg
 dependencies:
   - python=3.12
-  - pytorch-gpu>=2.8
+  - pytorch-gpu
   - torchvision
   - spikingjelly
-  - pytorch_sparse
+  - pytorch_sparse  # optional: btorch falls back to native torch.sparse if unavailable
   - pip
   - pip:
     # Forked omegaconf for enhanced features (required for omegaconf-config skill)

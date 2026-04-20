@@ -18,7 +18,7 @@ When using AI coding assistants, pls use [`desloppify`](https://github.com/peter
 ```bash
 ruff check .
 pytest tests
-python scripts/docs.py build-all
+python scripts/docs.py command=build-all
 ```
 
 ## Local Demonstration Workflow
@@ -41,7 +41,7 @@ pip install -e .
 ### 2. Serve English docs locally
 
 ```bash
-python scripts/docs.py live en
+python scripts/docs.py command=live language=en
 # open http://127.0.0.1:8000
 ```
 
@@ -55,23 +55,23 @@ export OPENAI_API_KEY=...
 export OPENAI_BASE_URL=https://api.deepseek.com
 # Optional: use a different model (default is gpt-4o)
 export OPENAI_MODEL=deepseek-chat
-python scripts/translate.py translate-page \
-  --language zh \
-  --en-path docs/en/docs/installation.md
+python scripts/translate.py command=translate-page \
+  language=zh \
+  en_path=docs/en/docs/installation.md
 # inspect docs/zh/docs/installation.md
 ```
 
 ### 4. Serve Chinese docs locally
 
 ```bash
-python scripts/docs.py live zh
+python scripts/docs.py command=live language=zh
 # open http://127.0.0.1:8000/zh/
 ```
 
 ### 5. Build the full unified site
 
 ```bash
-python scripts/docs.py build-all
+python scripts/docs.py command=build-all
 # site/ now contains:
 #   index.html          (English default)
 #   zh/index.html       (Chinese)
@@ -80,7 +80,7 @@ python scripts/docs.py build-all
 ### 6. Test incremental update (minimal-diff)
 
 - Edit one sentence in `docs/en/docs/installation.md`
-- Run `python scripts/translate.py update-outdated --language zh`
+- Run `python scripts/translate.py command=update-outdated language=zh`
 - Verify `git diff docs/zh/docs/installation.md` only changes the corresponding sentence
 
 ### 7. Test manual-fix preservation

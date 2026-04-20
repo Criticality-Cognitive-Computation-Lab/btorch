@@ -29,14 +29,18 @@ micromamba env create -n ml-py312 -f dev-requirements.yaml
 pip install git+https://github.com/alexfanqi/omegaconf.git
 ```
 
-### 关于 `pip` 和 `pytorch_sparse` 的说明
+### 可选：`torch_sparse` 后端
 
-如果你倾向于直接使用 `pip`，从源码或默认 pypi 安装 `pytorch_sparse` 可能会遇到困难。我们建议从 [PyG 仓库](https://data.pyg.org/whl/) 使用与你的 PyTorch 和 CUDA 版本匹配的预编译 wheel 文件：
+默认情况下，稀疏线性层使用 PyTorch 原生的 `torch.sparse` 后端。可选的 `torch_sparse` 后端在某些工作负载上提供更好的性能。
+
+使用与 PyTorch 和 CUDA 版本匹配的 [PyG 仓库](https://data.pyg.org/whl/) 预编译 wheel 安装可选的稀疏依赖：
 
 ```bash
 # 以 CUDA 12.8 对应的 PyTorch 2.8.0 为例
 pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-2.8.0+cu128.html
 ```
+
+如果未安装 `torch_sparse`，层会自动回退到原生后端。
 
 ## 3. 以可编辑模式安装
 

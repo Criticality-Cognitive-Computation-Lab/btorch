@@ -35,7 +35,7 @@ ruff check .
 pytest tests
 
 # Docs build
-python scripts/docs.py build-all
+python scripts/docs.py command=build-all
 ```
 
 For faster feedback, run targeted subsets:

@@ -8,8 +8,6 @@ import torch.nn as nn
 from jaxtyping import Float
 from torch import Tensor
 
-from btorch.config import SPARSE_BACKEND
-
 from .base import ParamBufferMixin
 from .constrain import HasConstraint
 
@@ -20,17 +18,25 @@ except ImportError:
     spmm = None
 
 SparseBackend = Literal["native", "torch_sparse"]
-DEFAULT_SPARSE_BACKEND = SPARSE_BACKEND
 
 
 def _resolve_sparse_backend(backend: str | None) -> SparseBackend:
-    backend = (backend or DEFAULT_SPARSE_BACKEND).lower()
+    if backend is None:
+        return "torch_sparse" if spmm is not None else "native"  # type: ignore[return-value]
+
+    backend = backend.lower()
     if backend not in get_args(SparseBackend):
         raise ValueError(
             f"sparse_backend must be 'native' or 'torch_sparse', got '{backend}'."
         )
     if backend == "torch_sparse" and spmm is None:
-        raise ImportError("torch_sparse is required for sparse_backend='torch_sparse'.")
+        import warnings
+
+        warnings.warn(
+            "torch_sparse not installed; falling back to native sparse backend.",
+            stacklevel=3,
+        )
+        backend = "native"
     return backend  # type: ignore[return-value]
 
 

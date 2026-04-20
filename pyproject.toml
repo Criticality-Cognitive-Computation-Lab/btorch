@@ -17,7 +17,6 @@ docs = [
   "zensical>=0.0.32",
   "mkdocstrings-python>=0.24",
   "mkdocs-gen-files>=0.5",
-  "typer>=0.12",
   "openai>=1.0",
 ]
 test = [
@@ -25,8 +24,15 @@ test = [
   "pytest-cov>=5.0",
   "matplotlib>=3.7",
 ]
+# NOTE: torch_scatter/torch_sparse require prebuilt wheels from PyG.
+# Install with: pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-<version>+<cuda>.html
+# The extras below declare the dependency but cannot install from PyPI directly.
+sparse = [
+  "torch_scatter",
+  "torch_sparse",
+]
 dev = [
-  "btorch[docs,test]",
+  "btorch[docs,test,sparse]",
   "pre-commit>=3.7",
   "ruff>=0.4",
 ]

@@ -10,14 +10,15 @@ from __future__ import annotations
 import multiprocessing
 import shutil
 import subprocess
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
-import typer
 import yaml
+from omegaconf import OmegaConf
 
-
-app = typer.Typer(help="Btorch docs build orchestrator")
 
 DOCS_DIR = Path(__file__).resolve().parent.parent / "docs"
 SITE_DIR = Path(__file__).resolve().parent.parent / "site"
@@ -48,7 +49,7 @@ def _sync_shared(language: str) -> None:
         if dest.exists():
             shutil.rmtree(dest)
         shutil.copytree(src, dest)
-        typer.echo(f"Synced {name}: {src} -> {dest}")
+        print(f"Synced {name}: {src} -> {dest}")
 
 
 def _get_en_nav_paths() -> list[str]:
@@ -73,15 +74,13 @@ def _get_en_nav_paths() -> list[str]:
     return paths
 
 
-@app.command()
-def build_lang(
-    language: str = typer.Argument(..., help="Language code to build"),
-) -> None:
+def build_lang(cfg: DocsConf) -> None:
     """Build a single language into the unified site directory."""
+    language = cfg.language
     config_path = DOCS_DIR / language / "mkdocs.yml"
     if not config_path.exists():
-        typer.echo(f"Config not found: {config_path}", err=True)
-        raise typer.Exit(1)
+        print(f"Config not found: {config_path}", file=sys.stderr)
+        raise SystemExit(1)
 
     if language == "en":
         dest = SITE_DIR
@@ -95,12 +94,22 @@ def build_lang(
     if default_output.exists():
         shutil.rmtree(default_output)
 
-    # Sync shared assets/stylesheets into the target language docs
     _sync_shared(language)
 
-    # Generate API pages to disk before building
+    if language != "en":
+        nav_script = Path(__file__).resolve().parent / "translate.py"
+        subprocess.run(
+            [
+                sys.executable,
+                str(nav_script),
+                "command=update-nav",
+                f"language={language}",
+            ],
+            check=True,
+        )
+
     api_script = Path(__file__).resolve().parent / "gen_api_pages.py"
-    typer.echo("Generating API reference pages...")
+    print("Generating API reference pages...")
     subprocess.run(["python", str(api_script)], check=True)
 
     cmd = [
@@ -109,49 +118,56 @@ def build_lang(
         "--config-file",
         str(config_path),
     ]
-    typer.echo(f"Building {language} -> {dest}")
+    print(f"Building {language} -> {dest}")
     subprocess.run(cmd, check=True)
 
-    # Zensical builds into a 'site' folder next to the config file.
-    # Move it to the unified site directory.
     if default_output.exists():
         shutil.move(str(default_output), str(dest))
 
 
-@app.command()
-def build_all() -> None:
+def build_all(cfg: DocsConf) -> None:
     """Build all languages in parallel."""
     langs = _discover_languages()
     if not langs:
-        typer.echo("No language configs found.", err=True)
-        raise typer.Exit(1)
+        print("No language configs found.", file=sys.stderr)
+        raise SystemExit(1)
 
-    # Ensure English builds first so root index exists, then parallel rest
     if "en" in langs:
-        build_lang("en")
+        build_lang(DocsConf(command="build-lang", language="en"))
         rest = [lang for lang in langs if lang != "en"]
     else:
         rest = langs
 
     if rest:
         with multiprocessing.Pool(processes=min(len(rest), 4)) as pool:
-            pool.map(build_lang, rest)
+            pool.map(
+                lambda lang: build_lang(DocsConf(command="build-lang", language=lang)),
+                rest,
+            )
 
-    typer.echo(f"All languages built into {SITE_DIR}")
+    print(f"All languages built into {SITE_DIR}")
 
 
-@app.command()
-def live(
-    language: str = typer.Argument("en", help="Language code to serve"),
-    dev_addr: str = typer.Option("127.0.0.1:8000", help="Address to bind"),
-) -> None:
+def live(cfg: DocsConf) -> None:
     """Run mkdocs serve for a language."""
-    config_path = DOCS_DIR / language / "mkdocs.yml"
+    config_path = DOCS_DIR / cfg.language / "mkdocs.yml"
     if not config_path.exists():
-        typer.echo(f"Config not found: {config_path}", err=True)
-        raise typer.Exit(1)
+        print(f"Config not found: {config_path}", file=sys.stderr)
+        raise SystemExit(1)
 
-    _sync_shared(language)
+    _sync_shared(cfg.language)
+
+    if cfg.language != "en":
+        nav_script = Path(__file__).resolve().parent / "translate.py"
+        subprocess.run(
+            [
+                sys.executable,
+                str(nav_script),
+                "command=update-nav",
+                f"language={cfg.language}",
+            ],
+            check=True,
+        )
 
     cmd = [
         "zensical",
@@ -159,18 +175,17 @@ def live(
         "--config-file",
         str(config_path),
         "--dev-addr",
-        dev_addr,
+        cfg.dev_addr,
     ]
     subprocess.run(cmd, check=True)
 
 
-@app.command()
-def update_languages() -> None:
+def update_languages(cfg: DocsConf) -> None:
     """Regenerate extra.alternate in docs/en/mkdocs.yml using absolute links
     derived from site_url."""
     if not LANGUAGES_FILE.exists():
-        typer.echo(f"{LANGUAGES_FILE} not found", err=True)
-        raise typer.Exit(1)
+        print(f"{LANGUAGES_FILE} not found", file=sys.stderr)
+        raise SystemExit(1)
 
     names = yaml.safe_load(LANGUAGES_FILE.read_text(encoding="utf-8"))
     langs = _discover_languages()
@@ -198,15 +213,12 @@ def update_languages() -> None:
         yaml.dump(en_data, sort_keys=False, allow_unicode=True),
         encoding="utf-8",
     )
-    typer.echo(f"Updated language alternates in {en_yml}")
+    print(f"Updated language alternates in {en_yml}")
 
 
-@app.command()
-def ensure_non_translated(
-    language: str = typer.Argument(..., help="Language code"),
-) -> None:
+def ensure_non_translated(cfg: DocsConf) -> None:
     """Delete translated files that should stay English-only (e.g. api/)."""
-    lang_docs = DOCS_DIR / language / "docs"
+    lang_docs = DOCS_DIR / cfg.language / "docs"
     if not lang_docs.exists():
         return
 
@@ -218,8 +230,69 @@ def ensure_non_translated(
                 shutil.rmtree(target)
             else:
                 target.unlink()
-            typer.echo(f"Removed non-translated: {target}")
+            print(f"Removed non-translated: {target}")
+
+
+# ---------------------------------------------------------------------------
+# Config dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DocsConf:
+    """Top-level config for docs commands.
+
+    Set ``command`` to select which operation to run.
+    """
+
+    command: str = ""
+    language: str = "en"
+    dev_addr: str = "127.0.0.1:8000"
+
+
+# ---------------------------------------------------------------------------
+# CLI wiring
+# ---------------------------------------------------------------------------
+
+
+_COMMANDS: dict[str, Callable] = {
+    "build-lang": build_lang,
+    "build-all": build_all,
+    "live": live,
+    "update-languages": update_languages,
+    "ensure-non-translated": ensure_non_translated,
+}
+
+
+def _print_help() -> None:
+    print("Usage: python docs.py command=<cmd> [options]")
+    print()
+    print("Commands:")
+    for name in sorted(_COMMANDS):
+        print(f"  {name}")
+    print()
+    print("Common options:")
+    print("  language=<code>  Language code (default: en)")
+    print("  dev_addr=<addr>  Address to bind (default: 127.0.0.1:8000)")
+
+
+def main() -> None:
+    defaults = OmegaConf.structured(DocsConf())
+    cli_cfg = OmegaConf.from_cli()
+
+    if "command" not in cli_cfg or not cli_cfg.command:
+        _print_help()
+        raise SystemExit(1)
+
+    cfg = OmegaConf.to_object(OmegaConf.unsafe_merge(defaults, cli_cfg))
+
+    if cfg.command not in _COMMANDS:
+        print(f"Unknown command: {cfg.command}", file=sys.stderr)
+        _print_help()
+        raise SystemExit(1)
+
+    _COMMANDS[cfg.command](cfg)
 
 
 if __name__ == "__main__":
-    app()
+    main()

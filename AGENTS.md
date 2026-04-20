@@ -71,11 +71,12 @@ Key patterns:
 
 - Lint: `ruff check .`
 - Tests: `pytest tests` or targeted subfolders
-- Docs: `python scripts/docs.py build-all` (builds all languages into `site/`)
+- Docs: `python scripts/docs.py command=build-all` (builds all languages into `site/`)
 
 ## Documentation
 
 - Update `docs/en/docs/` for user-facing changes.
+- Never touch the auto generated `docs/en/docs/api`.
 - Update `README.md` for installation or workflow changes.
 
 ## Contribution workflow

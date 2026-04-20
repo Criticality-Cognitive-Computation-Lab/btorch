@@ -1,4 +1,10 @@
 # Btorch
+<h4 align="center">
+    <p>
+        <b>English</b> |
+        <a href="README.zh.md">简体中文</a>
+    </p>
+</h4>
 
 Brain-inspired differentiable PyTorch toolkit for neuromorphic and computational
 neuroscience research.
@@ -35,29 +41,27 @@ We thank the developers of both libraries for the inspirations.
 ```text
 Install `btorch` for this repository.
 
-Before running commands, ask the user three things:
+Before running commands, ask the user four things:
 1. Does the user want `conda`/`micromamba` setup or `pip`-first setup?
 2. Which environment name should be used? (default: `ml-py312`)
 3. Do you want to install the forked version of omegaconf from https://github.com/alexfanqi/omegaconf? (default: yes)
-   - Optional but recommended. It narrows the feature gap with Tyro, including dataclass union type, `Literal`, `Sequence`. Most importantly, it allows single source of truth, dataclass centric config and domain models.
-   - If yes, install with: `pip install git+https://github.com/alexfanqi/omegaconf.git`
-   - If no, the standard PyPI version will be used (some features may not work).
+4. Do you want the optional sparse backend? It is useful for large sparse networks; note that `torch.compile` with it needs torch 2.8+, and older platforms may not support that PyTorch version.
 
 Then follow the matching path.
 
 Path A - Conda or Micromamba (recommended):
 - Create env from `dev-requirements.yaml` using the user-provided env name.
-- Activate the environment.
+- Activate the environment. (This already installs `pytorch_sparse` via conda.)
 - If user wants forked omegaconf: `pip install git+https://github.com/alexfanqi/omegaconf.git`
 - Run: `pip install -e . --config-settings editable_mode=strict`
 
 Path B - Pip-first:
 - Create and activate a virtual environment.
 - If user wants forked omegaconf: `pip install git+https://github.com/alexfanqi/omegaconf.git`
-- If `torch_scatter`/`torch_sparse` fail from PyPI, install wheels that match
-  both the installed PyTorch version and CUDA version from:
-  `https://data.pyg.org/whl/` (for example,
-  `https://data.pyg.org/whl/torch-<torch_version>+cu<cuda_version>.html`).
+- Optional: install `torch_sparse` for better sparse performance.
+  Use PyG prebuilt wheels matching your torch/CUDA version:
+  `pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-<version>+<cuda>.html`.
+- If PyG wheels are unavailable, tell the user and skip `torch.sparse`.
 - Run: `pip install -e . --config-settings editable_mode=strict`
 
 After install, verify with:
@@ -67,6 +71,7 @@ Report:
 - chosen setup path
 - environment name
 - forked omegaconf choice
+- torch_sparse choice and compatibility warning
 - install/verification output
 - any follow-up actions needed
 ```
@@ -84,7 +89,7 @@ auto-generation from docstrings.
 Build locally:
 
 ```bash
-python scripts/docs.py build-all
+python scripts/docs.py command=build-all
 ```
 
 The generated site is written to `site/`.
@@ -92,14 +97,14 @@ The generated site is written to `site/`.
 Preview a specific language:
 
 ```bash
-python scripts/docs.py live --language en
+python scripts/docs.py command=live language=en
 ```
 
 If you want a clean rebuild:
 
 ```bash
 rm -rf site/
-python scripts/docs.py build-all
+python scripts/docs.py command=build-all
 ```
 
 ## Skills

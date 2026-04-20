@@ -35,7 +35,7 @@ ruff check .
 pytest tests
 
 # 文档构建
-python scripts/docs.py build-all
+python scripts/docs.py command=build-all
 ```
 
 为了更快获得反馈，可以运行针对性的子集：

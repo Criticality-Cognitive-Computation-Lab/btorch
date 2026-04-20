@@ -17,7 +17,7 @@ pre-commit install --install-hooks
 ```bash
 ruff check .
 pytest tests
-python scripts/docs.py build-all
+python scripts/docs.py command=build-all
 ```
 
 ## 本地演示工作流
@@ -40,7 +40,7 @@ pip install -e .
 ### 2. 在本地预览英文文档
 
 ```bash
-python scripts/docs.py live en
+python scripts/docs.py command=live language=en
 # 打开 http://127.0.0.1:8000
 ```
 
@@ -54,23 +54,23 @@ export OPENAI_API_KEY=...
 export OPENAI_BASE_URL=https://api.deepseek.com
 # 可选：使用不同的模型（默认为 gpt-4o）
 export OPENAI_MODEL=deepseek-chat
-python scripts/translate.py translate-page \
-  --language zh \
-  --en-path docs/en/docs/installation.md
+python scripts/translate.py command=translate-page \
+  language=zh \
+  en_path=docs/en/docs/installation.md
 # 检查 docs/zh/docs/installation.md
 ```
 
 ### 4. 在本地预览中文文档
 
 ```bash
-python scripts/docs.py live zh
+python scripts/docs.py command=live language=zh
 # 打开 http://127.0.0.1:8000/zh/
 ```
 
 ### 5. 构建完整的统一站点
 
 ```bash
-python scripts/docs.py build-all
+python scripts/docs.py command=build-all
 # site/ 现在包含：
 #   index.html          （英文默认）
 #   zh/index.html       （中文）
@@ -79,7 +79,7 @@ python scripts/docs.py build-all
 ### 6. 测试增量更新（最小差异）
 
 - 修改 `docs/en/docs/installation.md` 中的一个句子
-- 运行 `python scripts/translate.py update-outdated --language zh`
+- 运行 `python scripts/translate.py command=update-outdated language=zh`
 - 验证 `git diff docs/zh/docs/installation.md` 仅更改了相应的句子
 
 ### 7. 测试手动修复保留

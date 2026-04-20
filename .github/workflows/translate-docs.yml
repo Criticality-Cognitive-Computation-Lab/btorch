@@ -24,9 +24,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install torch==2.8.0 --extra-index-url https://download.pytorch.org/whl/cpu
-          python -m pip install torch_sparse torch_scatter -f https://data.pyg.org/whl/torch-2.8.0+cpu.html
           python -m pip install git+https://github.com/alexfanqi/omegaconf.git
-          python -m pip install -e .[docs] torch==2.8.0 --extra-index-url https://download.pytorch.org/whl/cpu
+          python -m pip install torch_sparse torch_scatter -f https://data.pyg.org/whl/torch-2.8.0+cpu.html
+          python -m pip install -e ".[docs]" torch==2.8.0 --extra-index-url https://download.pytorch.org/whl/cpu
 
       - name: Detect changed files
         id: changed
@@ -52,7 +52,7 @@ jobs:
 
       - name: Translate README
         if: steps.changed.outputs.readme_changed == 'true' || github.event_name == 'workflow_dispatch'
-        run: python scripts/translate.py translate-readme --language zh
+        run: python scripts/translate.py command=translate-readme language=zh
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
@@ -62,9 +62,9 @@ jobs:
         if: steps.changed.outputs.since != '' || github.event_name == 'workflow_dispatch'
         run: |
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            python scripts/translate.py update-and-add --language zh --max-pages 20
+            python scripts/translate.py command=update-and-add language=zh max_pages=20
           else
-            python scripts/translate.py translate-changed --language zh --since-ref "${{ steps.changed.outputs.since }}" --max-pages 20
+            python scripts/translate.py command=translate-changed language=zh since_ref="${{ steps.changed.outputs.since }}" max_pages=20
           fi
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -72,14 +72,14 @@ jobs:
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
 
       - name: Add missing translations
-        run: python scripts/translate.py add-missing --language zh --max-pages 20
+        run: python scripts/translate.py command=add-missing language=zh max_pages=20
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
 
       - name: Remove obsolete translations
-        run: python scripts/translate.py remove-removable --language zh
+        run: python scripts/translate.py command=remove-removable language=zh
 
       - name: Commit and push
         run: |

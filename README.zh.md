@@ -1,5 +1,12 @@
 # Btorch
 
+<h4 align="center">
+    <p>
+        <a href="README.md">English</a> |
+        <b>简体中文</b>
+    </p>
+</h4>
+
 面向神经形态和计算神经科学研究的大脑启发式可微分 PyTorch 工具包。
 
 如果你需要以下功能，请使用 `btorch`：
@@ -33,28 +40,27 @@
 ```text
 为该仓库安装 `btorch`。
 
-在运行命令之前，先询问用户三件事：
+在运行命令之前，先询问用户四件事：
 1. 用户想要 `conda`/`micromamba` 安装还是优先 `pip` 安装？
 2. 应该使用什么环境名称？（默认：`ml-py312`）
 3. 是否想从 https://github.com/alexfanqi/omegaconf 安装 fork 版本的 omegaconf？（默认：是）
-   - 可选但推荐。它缩小了与 Tyro 之间的功能差距，包括数据类联合类型、`Literal`、`Sequence`。最重要的是，它支持单一事实来源、以数据类为中心的配置和领域模型。
-   - 如果是，使用：`pip install git+https://github.com/alexfanqi/omegaconf.git`
-   - 如果否，将使用标准 PyPI 版本（某些功能可能无法工作）。
+4. 是否需要可选的稀疏后端？它适合大型稀疏网络；提示：与 `torch.compile` 一起使用时需要 torch 2.8+。旧平台可能无法支持这么高的 PyTorch 版本。
 
 然后按照对应的路径进行。
 
 路径 A - Conda 或 Micromamba（推荐）：
 - 使用用户提供的环境名称从 `dev-requirements.yaml` 创建环境。
-- 激活环境。
+- 激活环境。（conda 环境已包含 `pytorch_sparse`。）
 - 如果用户想要 fork 版 omegaconf：`pip install git+https://github.com/alexfanqi/omegaconf.git`
 - 运行：`pip install -e . --config-settings editable_mode=strict`
 
 路径 B - 优先 Pip：
 - 创建并激活虚拟环境。
 - 如果用户想要 fork 版 omegaconf：`pip install git+https://github.com/alexfanqi/omegaconf.git`
-- 如果 `torch_scatter`/`torch_sparse` 从 PyPI 安装失败，请从与已安装的 PyTorch 版本和 CUDA 版本匹配的 wheel 安装：
-  `https://data.pyg.org/whl/`（例如，
-  `https://data.pyg.org/whl/torch-<torch_version>+cu<cuda_version>.html`）。
+- 可选：安装 `torch_sparse` 以获得更好的稀疏性能。
+  使用与 torch/CUDA 版本匹配的 PyG 预编译 wheel：
+  `pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-<version>+<cuda>.html`。
+- 如果 PyG wheel 不可用，告诉用户并跳过`torch_sparse`。
 - 运行：`pip install -e . --config-settings editable_mode=strict`
 
 安装后，使用以下命令验证：
@@ -64,6 +70,7 @@
 - 选择的安装路径
 - 环境名称
 - 是否选择 fork 版 omegaconf
+- `torch_sparse` 选择和兼容性提示
 - 安装/验证输出
 - 任何需要的后续操作
 ```
@@ -80,7 +87,7 @@
 本地构建：
 
 ```bash
-python scripts/docs.py build-all
+python scripts/docs.py command=build-all
 ```
 
 生成的站点写入 `site/`。
@@ -88,14 +95,14 @@ python scripts/docs.py build-all
 预览特定语言：
 
 ```bash
-python scripts/docs.py live --language en
+python scripts/docs.py command=live language=en
 ```
 
 如果需要干净重建：
 
 ```bash
 rm -rf site/
-python scripts/docs.py build-all
+python scripts/docs.py command=build-all
 ```
 
 ## 技能
