@@ -43,9 +43,14 @@ import xarray as xr
 
 
 try:
+    from zarr.codecs import BloscCodec
+except ImportError:  # Zarr v2
+    BloscCodec = None
+
+try:
     from numcodecs import Blosc
-except ImportError:
-    from zarr import Blosc
+except ImportError:  # Zarr v3-only environment
+    Blosc = None
 
 
 def _to_numpy(val: Any) -> np.ndarray | sp.spmatrix | sp.sparray:
@@ -750,10 +755,27 @@ def save_memories_to_xarray(
     )
 
     encoding = {}
-    compressor = Blosc(cname="zstd", clevel=compression_level, shuffle=Blosc.BITSHUFFLE)
+
+    if BloscCodec is not None:
+        # Zarr v3 expects native codecs in `compressors`.
+        compressor: Any = BloscCodec(cname="zstd", clevel=compression_level)
+        compressor_key = "compressors"
+        compressor_value: Any = [compressor]
+    elif Blosc is not None:
+        # Zarr v2 uses numcodecs and the `compressor` key.
+        compressor = Blosc(
+            cname="zstd", clevel=compression_level, shuffle=Blosc.BITSHUFFLE
+        )
+        compressor_key = "compressor"
+        compressor_value = compressor
+    else:
+        raise ImportError(
+            "No Blosc codec is available. Install `numcodecs` for Zarr v2, "
+            "or use Zarr v3 with `zarr.codecs.BloscCodec`."
+        )
 
     for v_name in ds.variables:
-        v_encoding: dict[str, Any] = {"compressor": compressor}
+        v_encoding: dict[str, Any] = {compressor_key: compressor_value}
         if chunks:
             v_chunks = [chunks.get(d, -1) for d in ds[v_name].dims]
             if any(c != -1 for c in v_chunks):
@@ -782,7 +804,6 @@ def load_memories_from_xarray(
     Returns:
         Nested dictionary with restored structure.
     """
-    ds = xr.open_zarr(path, consolidated=True, chunks="auto" if dask else None)
     ds = xr.open_zarr(path, consolidated=True, chunks="auto" if dask else None)
     return xarray_to_memories(ds, return_sparse_2d=return_sparse_2d)
 

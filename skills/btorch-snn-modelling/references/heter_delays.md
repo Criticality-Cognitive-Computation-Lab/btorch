@@ -47,14 +47,15 @@ psc = AlphaPSC(n_neuron=100, tau_syn=5.0, linear=linear)
 delayed = DelayedPSC(psc, max_delay_steps=5, use_circular_buffer=False)
 ```
 
-## Convenience Wrapper (no synaptic dynamics)
+## Convenience Pattern (no synaptic dynamics)
 
 ```python
-from btorch.models.history import DelayedSynapse
+from btorch.models.history import SpikeHistory
 
-synapse = DelayedSynapse(n_neuron=100, linear=linear, max_delay_steps=5)
-synapse.init_state(batch_size=4)
-psc = synapse(spike)  # updates history and computes PSC
+history = SpikeHistory(n_neuron=100, max_delay_steps=5, use_circular_buffer=False)
+history.init_state(batch_size=4)
+history.update(spike)
+psc = linear(history.get_flattened(5))
 ```
 
 ## Delays + Heterosynapse Combined
@@ -88,6 +89,6 @@ psc = HeterSynapsePSC(
 ## Common Pitfalls
 
 1. **Mismatched delay sizes** — `n_delay_bins`, `max_delay_steps`, and the `n_delays` argument to `get_flattened` must match. Mismatches silently truncate or raise `IndexError`.
-2. **Forgetting to call `init_state`** — `SpikeHistory`, `DelayedSynapse`, and `DelayedPSC` require `init_state(batch_size=...)` before the first `update()`.
+2. **Forgetting to call `init_state`** — `SpikeHistory` and `DelayedPSC` require `init_state(batch_size=...)` before the first update/forward pass.
 3. **Wrong buffer mode for training** — `use_circular_buffer=True` is efficient for simulation but can break `torch.compile`. Use `False` when compiling the model for training.
 4. **State-init requirements for delay wrappers** — `DelayedPSC` and `HeterSynapsePSC` both hold internal `SpikeHistory` buffers. Always call `init_net_state(..., batch_size=...)` or `init_state(..., batch_size=...)` before the first forward pass.

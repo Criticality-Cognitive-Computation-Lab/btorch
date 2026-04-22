@@ -749,34 +749,49 @@ class HeterSynapsePSC(BasePSC):
         if self.history is not None:
             self.history.reset(batch_size, dtype, device)
 
-    def single_step_forward(self, z: torch.Tensor):
+    def _flatten_input(
+        self, z: torch.Tensor
+    ) -> tuple[torch.Tensor, tuple[int, ...], bool]:
         raw_shape = self.n_neuron
         expanded_shape = (*self.n_neuron, self.n_receptor)
 
         if z.shape[-len(raw_shape) :] == raw_shape:
             leading = z.shape[: -len(raw_shape)]
-            z_flat = z.reshape(*leading, self.size)
-            has_receptor_axis = False
-        elif z.shape[-len(expanded_shape) :] == expanded_shape:
+            return z.reshape(*leading, self.size), leading, False
+
+        if z.shape[-len(expanded_shape) :] == expanded_shape:
             leading = z.shape[: -len(expanded_shape)]
-            z_flat = z.reshape(*leading, self.size * self.n_receptor)
-            has_receptor_axis = True
-        else:
+            return z.reshape(*leading, self.size * self.n_receptor), leading, True
+
+        raise RuntimeError(
+            "HeterSynapsePSC input shape mismatch. Expected trailing shape "
+            f"{raw_shape} or {expanded_shape}, got {z.shape}."
+        )
+
+    def _validate_delayed_input(
+        self, has_receptor_axis: bool, input_shape: torch.Size
+    ) -> None:
+        if has_receptor_axis:
             raise RuntimeError(
-                "HeterSynapsePSC input shape mismatch. Expected trailing shape "
-                f"{raw_shape} or {expanded_shape}, got {z.shape}."
+                "Delayed HeterSynapsePSC expects input without receptor axis. "
+                f"Expected trailing shape {self.n_neuron}, got {input_shape}."
             )
 
+    def _reshape_sum_receptor(
+        self, psc_flat: torch.Tensor, leading: tuple[int, ...]
+    ) -> torch.Tensor:
+        return psc_flat.reshape(*leading, *self.n_neuron, self.n_receptor).sum(-1)
+
+    def single_step_forward(self, z: torch.Tensor):
+        z_flat, leading, has_receptor_axis = self._flatten_input(z)
+
         if self.history is not None:
-            if has_receptor_axis:
-                raise RuntimeError(
-                    "Delayed HeterSynapsePSC expects input without receptor axis. "
-                    f"Expected trailing shape {raw_shape}, got {z.shape}."
-                )
+            self._validate_delayed_input(has_receptor_axis, z.shape)
             self.history.update(z_flat)
             z_flat = self.history.get_flattened(self.max_delay_steps)
+
         psc = self.base_psc.single_step_forward(z_flat)
-        self.psc = psc.reshape(*leading, *self.n_neuron, self.n_receptor).sum(-1)
+        self.psc = self._reshape_sum_receptor(psc, leading)
         return self.psc
 
     def get_psc(
@@ -851,40 +866,19 @@ class HeterSynapsePSC(BasePSC):
 
     def multi_step_forward(self, z_seq: torch.Tensor, kernel_len: int = 64):
         if self.history is not None:
-            raw_shape = self.n_neuron
-            if z_seq.shape[-len(raw_shape) :] != raw_shape:
-                raise RuntimeError(
-                    "Delayed HeterSynapsePSC expects input without receptor axis. "
-                    f"Expected trailing shape {raw_shape}, got {z_seq.shape}."
-                )
+            _, _, has_receptor_axis = self._flatten_input(z_seq)
+            self._validate_delayed_input(has_receptor_axis, z_seq.shape)
+
             T = z_seq.shape[0]
             y_seq = []
             for t in range(T):
                 y_seq.append(self.single_step_forward(z_seq[t]))
             return torch.stack(y_seq)
 
-        raw_shape = self.n_neuron
-        expanded_shape = (*self.n_neuron, self.n_receptor)
-
-        if z_seq.shape[-len(raw_shape) :] == raw_shape:
-            leading = z_seq.shape[1 : -len(raw_shape)]
-            z_flat = z_seq.reshape(z_seq.shape[0], *leading, self.size)
-        elif z_seq.shape[-len(expanded_shape) :] == expanded_shape:
-            leading = z_seq.shape[1 : -len(expanded_shape)]
-            z_flat = z_seq.reshape(
-                z_seq.shape[0], *leading, self.size * self.n_receptor
-            )
-        else:
-            raise RuntimeError(
-                "HeterSynapsePSC input shape mismatch. Expected trailing shape "
-                f"{raw_shape} or {expanded_shape}, got {z_seq.shape}."
-            )
+        z_flat, leading_with_time, _ = self._flatten_input(z_seq)
 
         psc_flat = self.base_psc.multi_step_forward(z_flat, kernel_len=kernel_len)
-        psc = psc_flat.reshape(
-            z_seq.shape[0], *leading, *self.n_neuron, self.n_receptor
-        )
-        return psc.sum(dim=-1)
+        return self._reshape_sum_receptor(psc_flat, leading_with_time)
 
 
 class GapJunction(nn.Module):
