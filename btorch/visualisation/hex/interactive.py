@@ -5,11 +5,19 @@ Supports multiple coordinate formats: axial (q,r), zigzag (x,y), pixel (px,py),
 and connectome-style string indices ("x,y" double-width coordinates).
 """
 
+from typing import Literal
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
 from ...utils.hex.doubled import doublewidth_to_pixel
+from ...utils.hex.offset import (
+    axial_to_zigzag,
+    flywire_to_pixel,
+    zigzag_to_axial,
+    zigzag_to_pixel,
+)
 from ...utils.hex.transform import to_pixel as hex_to_pixel
 
 
@@ -23,6 +31,10 @@ def heatmap(
     title: str | None = None,
     colorbar: bool = True,
     value_name: str = "value",
+    coord_format: Literal["axial", "zigzag", "flywire", "pixel"] = "axial",
+    orientation: Literal["pointy", "flat"] = "flat",
+    rotation_deg: float = 0.0,
+    include_flywire_hover: bool = True,
 ) -> go.Figure:
     """Generate an interactive hexagonal heatmap.
 
@@ -49,7 +61,18 @@ def heatmap(
         custom_colorscale: Custom Plotly colorscale. Default is white-to-blue.
         title: Optional plot title.
         colorbar: Whether to show colorbar (default: True).
+                coord_format: Coordinate interpretation for `p`,`q` columns:
+                        - "axial": `p`,`q` are axial q,r
+                        - "zigzag": `p`,`q` are zigzag x,y
+                        - "flywire": `p`,`q` are FlyWire axial coordinates rendered with
+                            the saved-page DOM-equivalent layout
+                        - "pixel": `p`,`q` are pixel x,y
+        orientation: Pixel projection orientation for hex coordinates.
+        rotation_deg: Optional global display rotation in degrees for
+            `coord_format="flywire"`.
         value_name: Name for value in hover tooltip (default: "value").
+        include_flywire_hover: Whether to include axial and zigzag coordinates
+            in hover information when available.
 
     Returns:
         Plotly Figure with hexagonal heatmap. Static for single-column input,
@@ -65,8 +88,72 @@ def heatmap(
         >>> fig.write_html("animated_hexmap.html")
     """
 
+    def coords_to_pixel(
+        c1: np.ndarray,
+        c2: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if coord_format == "axial":
+            q_arr = np.asarray(c1, dtype=float)
+            r_arr = np.asarray(c2, dtype=float)
+            x_arr, y_arr = hex_to_pixel(q_arr, r_arr, orientation=orientation)
+            zx_arr, zy_arr = axial_to_zigzag(
+                np.rint(q_arr).astype(int), np.rint(r_arr).astype(int)
+            )
+            return (
+                q_arr,
+                r_arr,
+                zx_arr.astype(float),
+                zy_arr.astype(float),
+                x_arr,
+                y_arr,
+            )
+
+        if coord_format == "zigzag":
+            zx_arr = np.asarray(c1, dtype=float)
+            zy_arr = np.asarray(c2, dtype=float)
+            q_arr, r_arr = zigzag_to_axial(
+                np.rint(zx_arr).astype(int), np.rint(zy_arr).astype(int)
+            )
+            x_arr, y_arr = zigzag_to_pixel(zx_arr, zy_arr)
+            return (
+                q_arr.astype(float),
+                r_arr.astype(float),
+                zx_arr,
+                zy_arr,
+                x_arr,
+                y_arr,
+            )
+
+        if coord_format == "flywire":
+            q_arr = np.asarray(c1, dtype=float)
+            r_arr = np.asarray(c2, dtype=float)
+            zx_arr, zy_arr = axial_to_zigzag(
+                np.rint(q_arr).astype(int), np.rint(r_arr).astype(int)
+            )
+            x_arr, y_arr = flywire_to_pixel(
+                q_arr,
+                r_arr,
+                rotation_deg=rotation_deg,
+            )
+            return (
+                q_arr.astype(float),
+                r_arr.astype(float),
+                zx_arr,
+                zy_arr,
+                x_arr,
+                y_arr,
+            )
+
+        if coord_format == "pixel":
+            x_arr = np.asarray(c1, dtype=float)
+            y_arr = np.asarray(c2, dtype=float)
+            nan_arr = np.full_like(x_arr, np.nan, dtype=float)
+            return nan_arr, nan_arr, nan_arr, nan_arr, x_arr, y_arr
+
+        raise ValueError(f"Unknown coord_format: {coord_format}")
+
     def bg_hex():
-        goscatter = go.Scatter(
+        return go.Scatter(
             x=background_hex["x"],
             y=background_hex["y"],
             mode="markers",
@@ -81,7 +168,6 @@ def heatmap(
             },
             showlegend=False,
         )
-        return goscatter
 
     def data_hex(aseries):
         marker_config = {
@@ -121,18 +207,33 @@ def heatmap(
                     "side": "right",
                 },
             }
+        if include_flywire_hover:
+            customdata = np.stack(
+                [q_vals, r_vals, zigzag_x_vals, zigzag_y_vals, aseries.values],
+                axis=-1,
+            )
+            hovertemplate = (
+                "p,q = %{customdata[0]:.0f},%{customdata[1]:.0f}<br>"
+                "x,y = %{customdata[2]:.0f},%{customdata[3]:.0f}<br>"
+                + value_name
+                + ": %{customdata[4]:.4f}<extra></extra>"
+            )
+        else:
+            customdata = np.stack([x_vals, y_vals, aseries.values], axis=-1)
+            hovertemplate = (
+                "x: %{customdata[0]:.2f}<br>y: %{customdata[1]:.2f}<br>"
+                + value_name
+                + ": %{customdata[2]:.4f}<extra></extra>"
+            )
+
         goscatter = go.Scatter(
             x=x_vals,
             y=y_vals,
             mode="markers",
             marker_symbol=symbol_number,
             marker=marker_config,
-            customdata=np.stack([x_vals, y_vals, aseries.values], axis=-1),
-            hovertemplate=(
-                "x: %{customdata[0]:.2f}<br>y: %{customdata[1]:.2f}<br>"
-                + value_name
-                + ": %{customdata[2]:.4f}<extra></extra>"
-            ),
+            customdata=customdata,
+            hovertemplate=hovertemplate,
             showlegend=False,
         )
         return goscatter
@@ -144,15 +245,14 @@ def heatmap(
         "papercolor": "rgba(255,255,255,255)",
     }
 
-    markersize = 16
-
     default_sizing = {
         "fig_width": 260,
         "fig_height": 220,
         "fig_margin": 0,
         "fsize_ticks_pt": 20,
         "fsize_title_pt": 20,
-        "markersize": markersize,
+        "markersize": None,
+        "markersize_scale": 1.0,
         "ticklen": 15,
         "tickwidth": 5,
         "axislinewidth": 3,
@@ -189,12 +289,50 @@ def heatmap(
 
     symbol_number = 15
 
-    background_hex = dataset
+    background_hex = dataset.copy()
     background_hex = background_hex.drop_duplicates(subset=["p", "q"])[
         ["p", "q"]
     ].astype(float)
-    x, y = hex_to_pixel(background_hex.p, background_hex.q, orientation="flat")
+    (
+        bg_q,
+        bg_r,
+        bg_zigzag_x,
+        bg_zigzag_y,
+        x,
+        y,
+    ) = coords_to_pixel(
+        background_hex.p.to_numpy(),
+        background_hex.q.to_numpy(),
+    )
+    background_hex["q_axial"] = bg_q
+    background_hex["r_axial"] = bg_r
+    background_hex["x_zigzag"] = bg_zigzag_x
+    background_hex["y_zigzag"] = bg_zigzag_y
     background_hex["x"], background_hex["y"] = x, y
+
+    if sizing["markersize"] is None:
+        points = np.stack(
+            [background_hex["x"].to_numpy(), background_hex["y"].to_numpy()],
+            axis=1,
+        )
+        if len(points) > 1:
+            deltas = points[:, None, :] - points[None, :, :]
+            dists = np.sqrt(np.sum(deltas * deltas, axis=-1))
+            np.fill_diagonal(dists, np.inf)
+            positive = dists[np.isfinite(dists) & (dists > 1e-9)]
+            min_dist = float(np.min(positive)) if positive.size > 0 else 1.0
+        else:
+            min_dist = 1.0
+
+        x_span = float(np.ptp(background_hex["x"].to_numpy()))
+        y_span = float(np.ptp(background_hex["y"].to_numpy()))
+        px_per_unit_x = area_width / max(x_span, 1e-9)
+        px_per_unit_y = area_height / max(y_span, 1e-9)
+        px_per_unit = min(px_per_unit_x, px_per_unit_y)
+        auto_markersize = 0.92 * min_dist * px_per_unit
+        sizing["markersize"] = max(2.0, auto_markersize) * float(
+            sizing["markersize_scale"]
+        )
 
     fig = go.Figure()
     fig.update_layout(
@@ -217,9 +355,37 @@ def heatmap(
         scaleratio=1,
     )
 
-    df["x"], df["y"] = hex_to_pixel(df.p, df.q, orientation="flat")
+    df = df.copy()
+    (
+        df_q,
+        df_r,
+        df_zigzag_x,
+        df_zigzag_y,
+        df_x,
+        df_y,
+    ) = coords_to_pixel(df.p.to_numpy(), df.q.to_numpy())
+    df["q_axial"] = df_q
+    df["r_axial"] = df_r
+    df["x_zigzag"] = df_zigzag_x
+    df["y_zigzag"] = df_zigzag_y
+    df["x"], df["y"] = df_x, df_y
     x_vals, y_vals = df.x, df.y
-    df = df.drop(columns=["p", "q", "x", "y"])
+    q_vals = df["q_axial"].to_numpy(dtype=float)
+    r_vals = df["r_axial"].to_numpy(dtype=float)
+    zigzag_x_vals = df["x_zigzag"].to_numpy(dtype=float)
+    zigzag_y_vals = df["y_zigzag"].to_numpy(dtype=float)
+    df = df.drop(
+        columns=[
+            "p",
+            "q",
+            "x",
+            "y",
+            "q_axial",
+            "r_axial",
+            "x_zigzag",
+            "y_zigzag",
+        ]
+    )
 
     if len(df.columns) == 1:
         if isinstance(df, pd.DataFrame):

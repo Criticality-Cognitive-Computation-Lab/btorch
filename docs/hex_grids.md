@@ -148,9 +148,45 @@ x, y = axial_to_zigzag(q, r)  # (4, -25)
 q_back, r_back = zigzag_to_axial(x, y)  # (-17, -8)
 ```
 
-**FlyWire coordinates**: FlyWire's visual column coordinates `(x, y)` are zigzag coordinates. FlyWire's `(p, q)` are axial `(q, r)`. Use `axial_to_zigzag` / `zigzag_to_axial` when working with FlyWire data.
+**FlyWire coordinates**: saved visual-columns pages show that FlyWire stores axial `(p, q)` and derives website display indices as:
+
+- `x = floor((q - p) / 2)`
+- `y = p + q`
+
+For website-style rendering, use `coord_format="flywire"` or `flywire_to_pixel(...)`.
+This mode then applies the saved-page DOM layout pattern: alternating half-row
+indentation plus normalized row/column spacing so matplotlib/plotly hexes keep
+the same overall footprint as the website without using raw CSS pixels.
 
 **Important**: Zigzag coordinates are purely for display/layout. They create the classic hex zigzag where adjacent cells alternate between two columns. The reverse conversion is exact because the rounding rule is consistent.
+
+### Interactive Heatmap Coordinate Formats
+
+`btorch.visualisation.hex.interactive.heatmap` supports:
+
+- `coord_format="axial"` for `(p,q)` as axial coordinates
+- `coord_format="zigzag"` for `(p,q)` as zigzag display coordinates
+- `coord_format="flywire"` for FlyWire axial `(p,q)` coordinates rendered with the website-style row-indented layout
+- `coord_format="pixel"` for direct pixel plotting
+
+Additional options:
+
+- `orientation` for axial/zigzag projection (`"pointy"` or `"flat"`)
+- `rotation_deg` for optional global display rotation in `flywire` mode
+- `include_flywire_hover=True` to show both axial `(p,q)` and zigzag `(x,y)` in tooltip
+
+Example:
+
+```python
+from btorch.visualisation.hex.interactive import heatmap
+
+fig = heatmap(
+    df=data_df,          # columns: p, q, value
+    dataset=full_grid_df,
+    coord_format="flywire",
+    include_flywire_hover=True,
+)
+```
 
 ### Flyvis Coordinate System
 
