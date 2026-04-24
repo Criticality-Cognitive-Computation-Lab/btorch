@@ -55,9 +55,12 @@ from .offset import (
     axial_to_zigzag,
     even_q_to_axial,
     even_r_to_axial,
+    flywire_to_pixel,
+    flywire_xy_to_pixel,
     odd_q_to_axial,
     odd_r_to_axial,
     zigzag_to_axial,
+    zigzag_to_pixel,
 )
 
 # Range operations
@@ -146,6 +149,9 @@ __all__ = [
     "axial_to_even_q",
     "even_q_to_axial",
     "axial_to_zigzag",
+    "flywire_xy_to_pixel",
+    "flywire_to_pixel",
+    "zigzag_to_pixel",
     "zigzag_to_axial",
     # Doubled
     "axial_to_doublewidth",

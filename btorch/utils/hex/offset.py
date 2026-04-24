@@ -227,6 +227,98 @@ def zigzag_to_axial(x: NDArray, y: NDArray) -> tuple[NDArray, NDArray]:
     return q, r
 
 
+def zigzag_to_pixel(
+    x: NDArray, y: NDArray, size: float = 1.0
+) -> tuple[NDArray, NDArray]:
+    """Convert zigzag display coordinates to flat-top pixel space.
+
+    FlyWire website-style lattice display is a staggered-column layout where
+    every second column is vertically shifted by half a cell.
+
+    Formula:
+        pixel_x = 1.5 * size * x
+        pixel_y = sqrt(3) * size * (y + 0.5 * (x mod 2))
+    """
+    x = np.asarray(x)
+    y = np.asarray(y)
+    parity = np.mod(x, 2)
+    pixel_x = 1.5 * size * x
+    pixel_y = np.sqrt(3.0) * size * (y + 0.5 * parity)
+    return pixel_x.astype(float), pixel_y.astype(float)
+
+
+def flywire_xy_to_pixel(
+    x_zigzag: NDArray,
+    y_zigzag: NDArray,
+    size: float = 1.0,
+    rotation_deg: float = 0.0,
+) -> tuple[NDArray, NDArray]:
+    """Convert FlyWire saved-page display indices `(x,y)` to pixel positions.
+
+    Saved HTML/CSS shows the retina grid is rendered on DOM rows with:
+    - row pitch of 24 px
+    - tile step of 75 px
+    - half-row indentation of 35 px on alternating rows
+
+    Values are normalized here relative to `size=1.0`.
+    """
+    x_zigzag = np.asarray(x_zigzag)
+    y_zigzag = np.asarray(y_zigzag)
+
+    css_hex_width = 45.0
+    css_full_step_x = 75.0
+    css_half_row_shift_x = 35.0
+    css_row_step_y = 24.0
+    css_radius = css_hex_width / 2.0
+
+    full_step_x = (css_full_step_x / css_radius) * size
+    half_row_shift_x = (css_half_row_shift_x / css_radius) * size
+    row_step_y = (css_row_step_y / css_radius) * size
+
+    parity = np.mod(y_zigzag, 2)
+    x = -(full_step_x * x_zigzag + half_row_shift_x * parity)
+    y = -row_step_y * y_zigzag
+
+    if rotation_deg == 0.0:
+        return x.astype(float), y.astype(float)
+
+    theta = np.deg2rad(rotation_deg)
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+    xr = cos_t * x - sin_t * y
+    yr = sin_t * x + cos_t * y
+    return xr.astype(float), yr.astype(float)
+
+
+def flywire_to_pixel(
+    p: NDArray,
+    q: NDArray,
+    size: float = 1.0,
+    rotation_deg: float = 0.0,
+) -> tuple[NDArray, NDArray]:
+    """Convert FlyWire visual-column coords `(p,q)` to pixel coordinates.
+
+    FlyWire visual columns map uses axial `(p,q)` data coordinates but displays
+    them on DOM rows using derived zigzag indices:
+
+    - `x = floor((q - p) / 2)`
+    - `y = p + q`
+
+    The saved HTML/CSS page then lays out those rows with an alternating
+    half-row indentation and fixed row pitch. This helper mirrors that display
+    logic so btorch plots can match the website layout.
+    """
+    p = np.asarray(p)
+    q = np.asarray(q)
+    x_zigzag, y_zigzag = axial_to_zigzag(p, q)
+    return flywire_xy_to_pixel(
+        x_zigzag,
+        y_zigzag,
+        size=size,
+        rotation_deg=rotation_deg,
+    )
+
+
 # Note: For offset neighbor calculations, convert to axial coordinates first:
 #   q, r = odd_r_to_axial(col, row)
 #   qn, rn = neighbors(q, r)  # Get neighbors in axial

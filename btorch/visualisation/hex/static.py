@@ -248,9 +248,10 @@ def scatter(
     c1: NDArray,
     c2: NDArray,
     values: NDArray,
-    coord_format: Literal["axial", "zigzag", "pixel"] = "axial",
+    coord_format: Literal["axial", "zigzag", "flywire", "pixel"] = "axial",
     size: float = 1.0,
     orientation: str = "pointy",
+    rotation_deg: float = 0.0,
     cmap: str = "viridis",
     vmin: float | None = None,
     vmax: float | None = None,
@@ -271,6 +272,7 @@ def scatter(
         coord_format: Which coordinate system to use
         size: Hexagon size (for axial/zigzag conversion to pixel)
         orientation: "pointy" or "flat"
+        rotation_deg: Optional global display rotation in degrees
         cmap: Matplotlib colormap name
         vmin, vmax: Color limits
         edgecolor: Hexagon edge color
@@ -291,10 +293,14 @@ def scatter(
     if coord_format == "axial":
         x, y = to_pixel(c1, c2, size=size, orientation=orientation)
     elif coord_format == "zigzag":
-        from ...utils.hex.offset import zigzag_to_axial
+        from ...utils.hex.offset import zigzag_to_pixel
 
-        qz, rz = zigzag_to_axial(c1, c2)
-        x, y = to_pixel(qz, rz, size=size, orientation=orientation)
+        x, y = zigzag_to_pixel(c1, c2, size=size)
+    elif coord_format == "flywire":
+        from ...utils.hex.offset import flywire_to_pixel
+
+        x, y = flywire_to_pixel(c1, c2, size=size, rotation_deg=rotation_deg)
+        effective_orientation = "flat"
     elif coord_format == "pixel":
         x, y = c1, c2
     else:
@@ -501,11 +507,10 @@ def grid(
         x, y = to_pixel(q, r, size=size, orientation=orientation)
         labels = [f"({qi},{ri})" for qi, ri in zip(q, r)]
     elif coord_format == "zigzag":
-        from ...utils.hex.offset import axial_to_zigzag, zigzag_to_axial
+        from ...utils.hex.offset import axial_to_zigzag, zigzag_to_pixel
 
         zx, zy = axial_to_zigzag(q, r)
-        qz, rz = zigzag_to_axial(zx, zy)
-        x, y = to_pixel(qz, rz, size=size, orientation=orientation)
+        x, y = zigzag_to_pixel(zx, zy, size=size)
         labels = [f"({zi[0]},{zi[1]})" for zi in zip(zx, zy)]
     else:
         raise ValueError(f"Unknown coord_format: {coord_format}")
