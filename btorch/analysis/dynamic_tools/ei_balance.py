@@ -9,6 +9,20 @@ from ..statistics import use_percentiles, use_stats
 # TODO: handle multidim neuron axes and batch axes correctly, it is a mess currently
 
 
+def _torch_dtype(dtype: torch.dtype | np.dtype | None) -> torch.dtype | None:
+    if isinstance(dtype, torch.dtype) or dtype is None:
+        return dtype
+    return torch.from_numpy(np.empty((), dtype=dtype)).dtype
+
+
+def _numpy_dtype(dtype: torch.dtype | np.dtype | None) -> np.dtype | None:
+    if dtype is None:
+        return None
+    if isinstance(dtype, torch.dtype):
+        return np.dtype(str(dtype).removeprefix("torch."))
+    return np.dtype(dtype)
+
+
 @use_percentiles(value_key="eci")
 @use_stats(value_key="eci")
 def compute_eci(
@@ -113,12 +127,12 @@ def _compute_eci(
         denom = (torch.abs(I_e_eff) + torch.abs(I_i_eff)).mean(
             dim=agg_dims, dtype=dtype
         )
-        denom = denom + torch.finfo(I_e.dtype).eps
+        denom = denom + torch.finfo(denom.dtype).eps
         return numer / denom
     else:
         numer = np.abs(I_rec).mean(axis=agg_dims, dtype=dtype)
         denom = (np.abs(I_e_eff) + np.abs(I_i_eff)).mean(axis=agg_dims, dtype=dtype)
-        denom = denom + np.finfo(I_e.dtype).eps
+        denom = denom + np.finfo(denom.dtype).eps
         return numer / denom
 
 
@@ -132,6 +146,7 @@ def compute_lag_correlation(
     max_lag_ms: float = 30.0,
     batch_axis: tuple[int, ...] | int | None = None,
     use_fft: bool = True,
+    dtype: torch.dtype | np.dtype | None = None,
 ):
     """Compute lagged cross-correlation between two signals.
 
@@ -150,6 +165,8 @@ def compute_lag_correlation(
         batch_axis: Axes to aggregate over (e.g., trials). If None, averages
             over all non-time dimensions.
         use_fft: If True, use FFT-based correlation (faster for long signals)
+        dtype: Data type for correlation normalization/reduction. Use this to
+            avoid float16 overflow in the variance/std normalization path.
         stat: Aggregation statistic per return position. Can be a single stat
             or dict mapping position to stat (e.g., {0: "mean", 1: "median"}).
             See [`use_stats()`](btorch/analysis/statistics.py:483).
@@ -181,7 +198,13 @@ def compute_lag_correlation(
         )
     """
     return _compute_lag_correlation(
-        x, y, dt=dt, max_lag_ms=max_lag_ms, batch_axis=batch_axis, use_fft=use_fft
+        x,
+        y,
+        dt=dt,
+        max_lag_ms=max_lag_ms,
+        batch_axis=batch_axis,
+        use_fft=use_fft,
+        dtype=dtype,
     )
 
 
@@ -225,8 +248,9 @@ def _compute_lag_correlation(
     corr_3d = corr_flat.reshape(n_lags, -1, n_neurons)
 
     if is_torch:
+        compute_dtype = _torch_dtype(dtype)
         if batch_axis is not None:
-            corr_agg = corr_3d.mean(dim=1, dtype=dtype)
+            corr_agg = corr_3d.mean(dim=1, dtype=compute_dtype)
         else:
             corr_agg = corr_3d.reshape(n_lags, -1)
 
@@ -244,8 +268,9 @@ def _compute_lag_correlation(
         }
         return peak_corr, best_lag_ms, info
     else:
+        compute_dtype = _numpy_dtype(dtype)
         if batch_axis is not None:
-            corr_agg = corr_3d.mean(axis=1)
+            corr_agg = corr_3d.mean(axis=1, dtype=compute_dtype)
         else:
             corr_agg = corr_3d.reshape(n_lags, -1)
 
@@ -253,11 +278,20 @@ def _compute_lag_correlation(
         peak_corr = corr_agg[best_lag_idx, np.arange(corr_agg.shape[1])]
         max_lag_actual = min(lag_bins, T - 1)
         best_lags = best_lag_idx - max_lag_actual
-        best_lag_ms = best_lags * dt
+        if compute_dtype is None:
+            best_lag_ms = best_lags * dt
+            lag_values_ms = np.arange(-max_lag_actual, max_lag_actual + 1) * dt
+        else:
+            best_lag_ms = best_lags.astype(compute_dtype, copy=False) * np.asarray(
+                dt, dtype=compute_dtype
+            )
+            lag_values_ms = np.arange(
+                -max_lag_actual, max_lag_actual + 1, dtype=compute_dtype
+            ) * np.asarray(dt, dtype=compute_dtype)
 
         info = {
             "corr_over_lags": corr_agg,
-            "lag_values_ms": np.arange(-max_lag_actual, max_lag_actual + 1) * dt,
+            "lag_values_ms": lag_values_ms,
         }
         return peak_corr, best_lag_ms, info
 
@@ -274,16 +308,23 @@ def _cross_correlation_fft(
     n_fft = 2 * T
 
     if is_torch:
+        compute_dtype = _torch_dtype(dtype)
+        fft_dtype = compute_dtype
+        if fft_dtype is None and x.dtype in {torch.float16, torch.bfloat16}:
+            fft_dtype = torch.float32
+        if fft_dtype is not None:
+            x = x.to(dtype=fft_dtype)
+            y = y.to(dtype=fft_dtype)
         # Demean and compute FFT
-        x_demean = x - x.mean(dim=0, keepdim=True)
-        y_demean = y - y.mean(dim=0, keepdim=True)
-        X = torch.fft.rfft(x_demean.float(), n=n_fft, dim=0)
-        Y = torch.fft.rfft(y_demean.float(), n=n_fft, dim=0)
+        x_demean = x - x.mean(dim=0, keepdim=True, dtype=fft_dtype)
+        y_demean = y - y.mean(dim=0, keepdim=True, dtype=fft_dtype)
+        X = torch.fft.rfft(x_demean, n=n_fft, dim=0)
+        Y = torch.fft.rfft(y_demean, n=n_fft, dim=0)
         cross_spec = X * Y.conj()
         corr_full = torch.fft.irfft(cross_spec, n=n_fft, dim=0)
         # Normalize
         x_std = x.std(dim=0, keepdim=True) + torch.finfo(x.dtype).eps
-        y_std = y.std(dim=0, keepdim=True) + torch.finfo(x.dtype).eps
+        y_std = y.std(dim=0, keepdim=True) + torch.finfo(y.dtype).eps
         corr_norm = corr_full / (x_std * y_std * T)
         # Extract valid lags
         max_lag_actual = min(max_lag, T - 1)
@@ -291,17 +332,24 @@ def _cross_correlation_fft(
         pos_lags = corr_norm[: max_lag_actual + 1, :]
         return torch.cat([neg_lags, pos_lags], dim=0)
     else:
+        compute_dtype = _numpy_dtype(dtype)
+        if compute_dtype is not None:
+            x = x.astype(compute_dtype, copy=False)
+            y = y.astype(compute_dtype, copy=False)
         # Demean and compute FFT
-        x_demean = x - x.mean(axis=0, keepdims=True, dtype=dtype)
-        y_demean = y - y.mean(axis=0, keepdims=True, dtype=dtype)
+        x_demean = x - x.mean(axis=0, keepdims=True, dtype=compute_dtype)
+        y_demean = y - y.mean(axis=0, keepdims=True, dtype=compute_dtype)
         X = np.fft.rfft(x_demean, n=n_fft, axis=0)
         Y = np.fft.rfft(y_demean, n=n_fft, axis=0)
         cross_spec = X * np.conj(Y)
         corr_full = np.fft.irfft(cross_spec, n=n_fft, axis=0)
         # Normalize
-        x_std = x.std(axis=0, keepdims=True, dtype=dtype) + np.finfo(x.dtype).eps
-        y_std = y.std(axis=0, keepdims=True, dtype=dtype) + np.finfo(x.dtype).eps
+        eps = np.finfo(x.dtype).eps
+        x_std = x.std(axis=0, keepdims=True, dtype=compute_dtype) + eps
+        y_std = y.std(axis=0, keepdims=True, dtype=compute_dtype) + eps
         corr_norm = corr_full / (x_std * y_std * T)
+        if compute_dtype is not None:
+            corr_norm = corr_norm.astype(compute_dtype, copy=False)
         # Extract valid lags
         neg_lags = corr_norm[-max_lag:, :]
         pos_lags = corr_norm[: max_lag + 1, :]
@@ -320,11 +368,15 @@ def _cross_correlation_direct(
 
     if is_torch:
         device = x.device
+        compute_dtype = _torch_dtype(dtype)
+        if compute_dtype is not None:
+            x = x.to(dtype=compute_dtype)
+            y = y.to(dtype=compute_dtype)
         # Normalize
-        x_mean = x.mean(dim=0, keepdim=True)
-        y_mean = y.mean(dim=0, keepdim=True)
+        x_mean = x.mean(dim=0, keepdim=True, dtype=compute_dtype)
+        y_mean = y.mean(dim=0, keepdim=True, dtype=compute_dtype)
         x_std = x.std(dim=0, keepdim=True) + torch.finfo(x.dtype).eps
-        y_std = y.std(dim=0, keepdim=True) + torch.finfo(x.dtype).eps
+        y_std = y.std(dim=0, keepdim=True) + torch.finfo(y.dtype).eps
         x_norm = (x - x_mean) / x_std
         y_norm = (y - y_mean) / y_std
         # Compute correlations for each lag
@@ -333,29 +385,37 @@ def _cross_correlation_direct(
         corr = torch.zeros(n_lags, N, device=device, dtype=x.dtype)
         for i, lag in enumerate(range(-max_lag_actual, max_lag_actual + 1)):
             if lag < 0:
-                c = (x_norm[:lag] * y_norm[-lag:]).mean(dim=0, dtype=dtype)
+                c = (x_norm[:lag] * y_norm[-lag:]).mean(dim=0, dtype=compute_dtype)
             elif lag > 0:
-                c = (x_norm[lag:] * y_norm[:-lag]).mean(dim=0, dtype=dtype)
+                c = (x_norm[lag:] * y_norm[:-lag]).mean(dim=0, dtype=compute_dtype)
             else:
-                c = (x_norm * y_norm).mean(dim=0, dtype=dtype)
+                c = (x_norm * y_norm).mean(dim=0, dtype=compute_dtype)
             corr[i, :] = c
         return corr
     else:
+        compute_dtype = _numpy_dtype(dtype)
+        if compute_dtype is not None:
+            x = x.astype(compute_dtype, copy=False)
+            y = y.astype(compute_dtype, copy=False)
         # Normalize
-        x_norm = (x - x.mean(axis=0)) / (x.std(axis=0) + np.finfo(x.dtype).eps)
-        y_norm = (y - y.mean(axis=0)) / (y.std(axis=0) + np.finfo(x.dtype).eps)
+        x_norm = (x - x.mean(axis=0, dtype=compute_dtype)) / (
+            x.std(axis=0, dtype=compute_dtype) + np.finfo(x.dtype).eps
+        )
+        y_norm = (y - y.mean(axis=0, dtype=compute_dtype)) / (
+            y.std(axis=0, dtype=compute_dtype) + np.finfo(y.dtype).eps
+        )
         # Compute correlations for each lag
         n_lags = 2 * max_lag + 1
-        corr = np.zeros((n_lags, N))
+        corr = []
         for i, lag in enumerate(range(-max_lag, max_lag + 1)):
             if lag < 0:
-                c = (x_norm[:lag] * y_norm[-lag:]).mean(axis=0, dtype=dtype)
+                c = (x_norm[:lag] * y_norm[-lag:]).mean(axis=0, dtype=compute_dtype)
             elif lag > 0:
-                c = (x_norm[lag:] * y_norm[:-lag]).mean(axis=0, dtype=dtype)
+                c = (x_norm[lag:] * y_norm[:-lag]).mean(axis=0, dtype=compute_dtype)
             else:
-                c = (x_norm * y_norm).mean(axis=0, dtype=dtype)
-            corr[i, :] = c
-        return corr
+                c = (x_norm * y_norm).mean(axis=0, dtype=compute_dtype)
+            corr.append(c)
+        return np.stack(corr, axis=0)
 
 
 @use_percentiles(
@@ -374,6 +434,7 @@ def compute_ei_balance(
     dt: float = 1.0,
     max_lag_ms: float = 30.0,
     batch_axis: tuple[int, ...] | int | None = None,
+    dtype: torch.dtype | np.dtype | None = None,
 ):
     """Compute E/I balance metrics including ECI and lag correlation.
 
@@ -389,6 +450,7 @@ def compute_ei_balance(
         max_lag_ms: Maximum lag for correlation analysis
         batch_axis: Axes to aggregate over (e.g., trials). If None, averages
             over all non-time dimensions.
+        dtype: Data type for ECI aggregation and lag-correlation normalization.
         stat: Aggregation statistic per return position.
             See [`use_stats()`](btorch/analysis/statistics.py:483).
         stat_info: Additional statistics per position.
@@ -407,11 +469,24 @@ def compute_ei_balance(
         info: Dictionary with detailed analysis results
     """
     # Compute ECI
-    eci, eci_info = compute_eci(I_e, I_i, I_ext=I_ext, batch_axis=batch_axis, stat=None)
+    eci, eci_info = compute_eci(
+        I_e,
+        I_i,
+        I_ext=I_ext,
+        batch_axis=batch_axis,
+        dtype=dtype,
+        stat=None,
+    )
 
     # Compute lag correlation between E and I
     peak_corr, best_lag_ms, lag_info = compute_lag_correlation(
-        I_e, -I_i, dt=dt, max_lag_ms=max_lag_ms, batch_axis=batch_axis, stat=None
+        I_e,
+        -I_i,
+        dt=dt,
+        max_lag_ms=max_lag_ms,
+        batch_axis=batch_axis,
+        dtype=dtype,
+        stat=None,
     )
 
     info = {

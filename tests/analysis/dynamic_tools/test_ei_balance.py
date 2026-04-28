@@ -796,6 +796,46 @@ class TestEIBalanceFull:
         assert "peak_corr_mean" in info
         assert "best_lag_ms_mean" in info
 
+    def test_ei_balance_not_float16_collapse(self):
+        """Float16 inputs should respect dtype and not collapse lag
+        correlation."""
+        T, N = 540, 4
+        t = np.arange(T, dtype=np.float32)[:, None]
+        base = 250.0 * np.sin(2.0 * np.pi * t / 40.0) + 300.0
+        I_e = np.repeat(base, N, axis=1).astype(np.float16)
+        I_i = -np.roll(I_e, 4, axis=0)
+
+        eci_np, peak_np, lag_np, info_np = compute_ei_balance(
+            I_e,
+            I_i,
+            dt=1.0,
+            max_lag_ms=8.0,
+            batch_axis=1,
+            dtype=np.float32,
+        )
+
+        assert eci_np.dtype == np.float32
+        assert peak_np.dtype == np.float32
+        assert lag_np.dtype == np.float32
+        np.testing.assert_allclose(peak_np.mean(), 0.995, atol=0.02)
+        np.testing.assert_allclose(lag_np.mean(), -4.0, atol=0.5)
+
+        if torch.cuda.is_available():
+            eci_t, peak_t, lag_t, info_t = compute_ei_balance(
+                torch.from_numpy(I_e).cuda(),
+                torch.from_numpy(I_i).cuda(),
+                dt=1.0,
+                max_lag_ms=8.0,
+                batch_axis=1,
+                dtype=torch.float32,
+            )
+
+            assert eci_t.dtype == torch.float32
+            assert peak_t.dtype == torch.float32
+            assert lag_t.dtype == torch.float32
+            np.testing.assert_allclose(peak_t.cpu().numpy(), peak_np, atol=5e-3)
+            np.testing.assert_allclose(lag_t.cpu().numpy(), lag_np, atol=1e-3)
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 class TestEIBalanceFullGPU:
