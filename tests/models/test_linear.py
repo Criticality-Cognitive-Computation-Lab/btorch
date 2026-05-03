@@ -419,3 +419,80 @@ def test_dense_conn_constraints():
     model_dale.weight.data = initial_weights * 0.5
     constrain_net(model_dale)
     torch.testing.assert_close(model_dale.weight.data, initial_weights * 0.5)
+
+
+@pytest.mark.parametrize("backend", available_sparse_backends())
+def test_sparse_conn_get_sparse_matrix(backend: str):
+    """get_sparse_matrix returns a usable sparse tensor with gradients."""
+    torch.manual_seed(42)
+
+    W = torch.tensor([[1.0, 2.0, 0.0], [0.0, 3.0, -1.0], [2.0, 0.0, 1.0]])
+    W_sparse = scipy.sparse.coo_array(W.numpy())
+
+    model = SparseConn(W_sparse, bias=None, enforce_dale=False, sparse_backend=backend)
+    sp_mat = model.get_sparse_matrix()
+
+    # Shape should match the original dense orientation.
+    assert sp_mat.shape == (3, 3)
+    assert sp_mat.layout == torch.sparse_coo
+
+    # Dense reconstruction should match the original weights.
+    torch.testing.assert_close(sp_mat.to_dense(), W, atol=1e-6, rtol=0.0)
+
+    # A backward pass through the returned matrix should reach magnitude.
+    loss = sp_mat.values().sum()
+    loss.backward()
+    assert model.magnitude.grad is not None
+
+
+@pytest.mark.parametrize("backend", available_sparse_backends())
+def test_sparse_constrained_conn_get_sparse_matrix(backend: str):
+    """get_sparse_matrix reflects constraint magnitudes and preserves
+    gradients."""
+    torch.manual_seed(42)
+
+    W_sparse = scipy.sparse.coo_array(
+        ([1.0, -2.0, -3.0, 1.0], ([0, 1, 0, 1], [0, 0, 1, 1])),
+        shape=(2, 2),
+    )
+    constraint = scipy.sparse.coo_array(
+        ([1, 2, 3, 1], ([0, 0, 1, 1], [0, 1, 0, 1])),
+        shape=(2, 2),
+    )
+
+    model = SparseConstrainedConn(
+        W_sparse, constraint, enforce_dale=False, bias=None, sparse_backend=backend
+    )
+    sp_mat = model.get_sparse_matrix()
+
+    assert sp_mat.shape == (2, 2)
+
+    # Values should equal initial_weight * magnitude[scatter_indices].
+    expected = model.initial_weight * model.magnitude[model._constraint_scatter_indices]
+    torch.testing.assert_close(sp_mat.values(), expected, atol=1e-6, rtol=0.0)
+
+    # Gradient should flow back to the learnable magnitude.
+    loss = sp_mat.values().sum()
+    loss.backward()
+    assert model.magnitude.grad is not None
+
+
+@pytest.mark.parametrize("backend", available_sparse_backends())
+def test_get_sparse_matrix_non_square(backend: str):
+    """get_sparse_matrix works for non-square sparse connections."""
+    torch.manual_seed(42)
+
+    # Wide matrix: 4 inputs -> 2 outputs.
+    W = torch.tensor([[1.0, 0.0], [2.0, 3.0], [0.0, -1.0], [-1.0, 2.0]])
+    W_sparse = scipy.sparse.coo_array(W.numpy())
+
+    model = SparseConn(W_sparse, bias=None, enforce_dale=False, sparse_backend=backend)
+    sp_mat = model.get_sparse_matrix()
+
+    assert sp_mat.shape == (4, 2)
+    torch.testing.assert_close(sp_mat.to_dense(), W, atol=1e-6, rtol=0.0)
+
+    # Gradient should flow through the returned matrix.
+    loss = sp_mat.values().sum()
+    loss.backward()
+    assert model.magnitude.grad is not None
