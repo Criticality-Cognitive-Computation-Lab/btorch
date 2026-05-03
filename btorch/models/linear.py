@@ -302,6 +302,28 @@ class BaseSparseConn(nn.Module):
         """
         raise NotImplementedError
 
+    def get_sparse_matrix(self) -> torch.Tensor:
+        """Return the sparse connection matrix as a
+        ``torch.sparse_coo_tensor``.
+
+        Values are taken from :meth:`_get_effective_weight`, so gradients
+        flow back to the underlying learnable parameters.
+
+        Returns:
+            Sparse COO tensor of shape ``(in_features, out_features)``.
+        """
+        effective_value = self._get_effective_weight()
+        # self.indices stores (dst, src) into the transposed matrix;
+        # swap back to (src, dst) for the original (in_features, out_features)
+        # orientation.
+        indices = torch.stack([self.indices[1], self.indices[0]], dim=0)
+        return torch.sparse_coo_tensor(
+            indices=indices,
+            values=effective_value,
+            size=(self.in_features, self.out_features),
+            is_coalesced=True,
+        )
+
     def forward(
         self, x: Float[torch.Tensor, "... {self.in_features}"]
     ) -> Float[torch.Tensor, "... {self.out_features}"]:
