@@ -11,6 +11,7 @@ nav:
 - 教程:
   - tutorials/building_rsnn.md
   - tutorials/training.md
+  - tutorials/mixed_neurons.md
 - 指南:
   - guides/configuration.md
 - faq.md

@@ -81,6 +81,7 @@ nav:
 - Tutorials:
   - tutorials/building_rsnn.md
   - tutorials/training.md
+  - tutorials/mixed_neurons.md
 - Guides:
   - guides/configuration.md
 - FAQ: faq.md

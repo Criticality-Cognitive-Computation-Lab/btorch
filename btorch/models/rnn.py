@@ -410,3 +410,71 @@ class RecurrentNN(RecurrentNNAbstract):
         )
 
         return z, states
+
+
+# TODO: have an easier interface,
+#   rather than having to define a new class for different input
+class ApicalRecurrentNN(RecurrentNN):
+    """Recurrent layer that supports an optional apical / top-down input.
+
+    This subclass is useful when the neuron population contains models with
+    multiple input ports (e.g.
+    :class:`~btorch.models.neurons.TwoCompartmentGLIF`).  The extra
+    ``x_apical`` tensor is forwarded to the neuron module unchanged.
+
+    .. note::
+        When calling :meth:`multi_step_forward` with a time-varying
+        ``x_apical``, pass it as a **positional** argument
+        (``brain(x, None, x_apical)``) so that the outer time-loop
+        slices it correctly.  Keyword arguments are not unrolled by
+        :class:`RecurrentNNAbstract`.
+
+    Args:
+        neuron: Neuron module (typically a
+            :class:`~btorch.models.neurons.mixed.MixedNeuronPopulation`).
+        synapse: Synapse model that provides recurrent currents.
+        syn_inp_module: Optional module applied to ``x_syn``.
+        neuron_inp_module: Optional module applied to ``x``.
+        update_state_names: Dotted state names to expose in the returned
+            state dictionary.
+        unroll: Inner unroll block size.
+        chunk_size: Outer chunk size for gradient checkpointing / offloading.
+        cpu_offload: Move chunk outputs to CPU during forward.
+        grad_checkpoint: Use ``torch.utils.checkpoint`` on large chunks.
+        allow_buffer: Allow collecting hidden states from non-MemoryModule
+            buffers.
+        **kwargs: Passed to :class:`RecurrentNNAbstract`.
+    """
+
+    def single_step_forward(
+        self,
+        x: Tensor,
+        x_syn: Tensor | None = None,
+        x_apical: Tensor | None = None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Advance one timestep with optional apical drive.
+
+        Args:
+            x: External input current of shape ``(*batch, n_neuron)``.
+            x_syn: Optional direct synaptic input.
+            x_apical: Optional apical / top-down input of the same shape as
+                ``x``.  Passed as the second argument to ``self.neuron``.
+
+        Returns:
+            ``(spikes, states)`` where ``spikes`` has shape
+            ``(*batch, n_neuron)``.
+        """
+        if self.neuron_inp_module is not None:
+            x = self.neuron_inp_module(x)
+        if self.syn_inp_module is not None:
+            x_syn = self.syn_inp_module(x_syn)
+        total_input = self.synapse.psc + x
+        if x_apical is None:
+            z = self.neuron(total_input)
+        else:
+            z = self.neuron(total_input, x_apical)
+        _ = self.synapse(z if x_syn is None else z + x_syn)
+        states = filter_hidden_states(
+            self, self.update_state_names, allow_buffer=self.allow_buffer
+        )
+        return z, states
