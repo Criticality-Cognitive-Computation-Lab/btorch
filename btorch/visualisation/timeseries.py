@@ -112,11 +112,14 @@ def _get_time_axis(
 def _sample_cmap_colors(cmap_name: str, n: int) -> list[str]:
     if n <= 1:
         cmap = plt.get_cmap(cmap_name, 1)
-        return [to_hex(cmap(0.0))]
-    # Request a colormap with N=n to avoid duplicate bins for ListedColormap
-    # (e.g., tab10) when n exceeds the base number of colors.
+        return [to_hex(cmap(0.5))]
+    if n <= 10 and cmap_name.startswith("tab"):
+        tab10 = plt.get_cmap("tab10")
+        return [to_hex(tab10.colors[i]) for i in range(n)]
+    # Sample bin centers instead of the endpoints so small group counts do not
+    # collapse onto the first/last colors of listed palettes like tab20.
     cmap = plt.get_cmap(cmap_name, n)
-    vals = np.linspace(0, 1, n, endpoint=True)
+    vals = (np.arange(n, dtype=float) + 0.5) / n
     return [to_hex(cmap(v)) for v in vals]
 
 
@@ -691,8 +694,8 @@ def plot_raster(
             "label_sep": " / ",
             "group_sep_color": "black",
             "group_sep_lw": 1.4,
-            "sub_hue_span": 0.06,
-            "sub_val_span": 0.18,
+            "sub_hue_span": 0.12,
+            "sub_val_span": 0.28,
             "left_extra_pad": 0.04,
         }
         if group_strip_kwargs:
