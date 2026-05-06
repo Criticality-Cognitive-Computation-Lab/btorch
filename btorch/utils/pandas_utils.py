@@ -10,7 +10,9 @@ import pandas as pd
 
 
 def groupby_to_dict(
-    df: pd.DataFrame, column_select: Optional[Sequence[str]] = None, **groupby_args
+    df: pd.DataFrame,
+    column_select: Optional[Sequence[str]] = None,
+    **groupby_args: Any,
 ) -> dict[Any, pd.DataFrame]:
     """Group DataFrame and return as dictionary mapping keys to subframes.
 

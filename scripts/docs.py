@@ -125,6 +125,11 @@ def build_lang(cfg: DocsConf) -> None:
         shutil.move(str(default_output), str(dest))
 
 
+def _build_lang_worker(lang: str) -> None:
+    """Worker for parallel builds — must be picklable."""
+    build_lang(DocsConf(command="build-lang", language=lang))
+
+
 def build_all(cfg: DocsConf) -> None:
     """Build all languages in parallel."""
     langs = _discover_languages()
@@ -140,10 +145,7 @@ def build_all(cfg: DocsConf) -> None:
 
     if rest:
         with multiprocessing.Pool(processes=min(len(rest), 4)) as pool:
-            pool.map(
-                lambda lang: build_lang(DocsConf(command="build-lang", language=lang)),
-                rest,
-            )
+            pool.map(_build_lang_worker, rest)
 
     print(f"All languages built into {SITE_DIR}")
 

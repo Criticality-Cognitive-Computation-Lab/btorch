@@ -1,22 +1,24 @@
 name: Desloppify Quality Check
 
+# pull_request_target is used instead of pull_request so that the
+# GITHUB_TOKEN has write permissions even for fork PRs.
+# Security: the "check" job runs PR code but has only contents:read;
+# the "comment" job has write permissions but never checks out PR code.
 on:
-  pull_request:
+  pull_request_target:
     branches: [main, master]
     types: [opened, synchronize, reopened]
 
-permissions:
-  contents: read
-  pull-requests: write
-  issues: write
-
 jobs:
-  desloppify-check:
+  check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -38,28 +40,61 @@ jobs:
           git checkout origin/${{ github.base_ref }}
           base_output=$(desloppify scan --profile ci 2>&1 || true)
           base_score=$(echo "$base_output" | grep -oP 'Scores:.*overall\s+\K[0-9.]+' || echo "")
-          echo "score=$base_score" >> $GITHUB_OUTPUT
-          # Store output for potential use
           echo "$base_output" > /tmp/base_scan.txt
-          git checkout -
+          echo "$base_score" > /tmp/base_score.txt
+          git checkout ${{ github.event.pull_request.head.sha }}
 
       - name: Get PR branch scan
         id: pr
         run: |
           pr_output=$(desloppify scan --profile ci 2>&1 || true)
           pr_score=$(echo "$pr_output" | grep -oP 'Scores:.*overall\s+\K[0-9.]+' || echo "")
-          echo "score=$pr_score" >> $GITHUB_OUTPUT
-          # Store full output
           echo "$pr_output" > /tmp/pr_scan.txt
+          echo "$pr_score" > /tmp/pr_score.txt
+
+      - name: Save PR number
+        run: echo "${{ github.event.number }}" > /tmp/pr_number.txt
+
+      - name: Upload scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: desloppify-results
+          path: |
+            /tmp/pr_number.txt
+            /tmp/base_score.txt
+            /tmp/pr_score.txt
+            /tmp/pr_scan.txt
+            /tmp/base_scan.txt
+
+  comment:
+    needs: check
+    runs-on: ubuntu-latest
+    if: always()
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Download scan results
+        uses: actions/download-artifact@v4
+        with:
+          name: desloppify-results
+          path: /tmp
 
       - name: Comment PR with desloppify results
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const baseScore = `${{ steps.base.outputs.score }}`;
-            const prScore = `${{ steps.pr.outputs.score }}`;
-            const prOutput = fs.readFileSync('/tmp/pr_scan.txt', 'utf8');
+
+            const prNumber = parseInt(
+              fs.readFileSync('/tmp/pr_number.txt', 'utf8').trim(), 10
+            );
+            const baseScore =
+              fs.readFileSync('/tmp/base_score.txt', 'utf8').trim();
+            const prScore =
+              fs.readFileSync('/tmp/pr_score.txt', 'utf8').trim();
+            const prOutput =
+              fs.readFileSync('/tmp/pr_scan.txt', 'utf8');
 
             let body = '## Desloppify Quality\n\n';
 
@@ -67,9 +102,11 @@ jobs:
               body += `**Score:** ${prScore}/100`;
 
               if (baseScore) {
-                const diff = (parseFloat(prScore) - parseFloat(baseScore)).toFixed(2);
+                const diff =
+                  (parseFloat(prScore) - parseFloat(baseScore)).toFixed(2);
                 const sign = diff > 0 ? '+' : '';
-                const emoji = diff > 0 ? '📈' : diff < 0 ? '📉' : '➡️';
+                const emoji =
+                  diff > 0 ? '📈' : diff < 0 ? '📉' : '➡️';
                 body += ` (${emoji} ${sign}${diff} vs base)`;
               }
 
@@ -82,15 +119,17 @@ jobs:
             body += '\n```\n';
             body += '</details>\n';
 
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number
-            });
+            const { data: comments } =
+              await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+              });
 
-            const botComment = comments.find(comment =>
-              comment.user.type === 'Bot' &&
-              comment.body.includes('Desloppify Quality')
+            const botComment = comments.find(
+              (comment) =>
+                comment.user.type === 'Bot' &&
+                comment.body.includes('Desloppify Quality'),
             );
 
             if (botComment) {
@@ -98,13 +137,13 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 comment_id: botComment.id,
-                body: body
+                body: body,
               });
             } else {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body: body
+                issue_number: prNumber,
+                body: body,
               });
             }

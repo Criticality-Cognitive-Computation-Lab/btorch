@@ -184,7 +184,7 @@ def pad_to_regular_hex(
         hex_scatter(*hexals, edgecolor='k', cmap=plt.cm.Blues, vmin=0, vmax=1)
         ```
     """
-    u_padded, v_padded = flyvis.utils.hex_utils.get_hex_coords(extent)
+    u_padded, v_padded = flyvis.utils.hex_utils.get_hex_coords(extent)  # noqa: F821
     slices = tuple()
     if len(values.shape) > 1:
         values_padded = np.ones([*values.shape[:-1], len(u_padded)]) * value
@@ -192,7 +192,7 @@ def pad_to_regular_hex(
             slices += (slice(None),)
     else:
         values_padded = np.ones([len(u_padded)]) * value
-    index = flyvis.utils.tensor_utils.where_equal_rows(
+    index = flyvis.utils.tensor_utils.where_equal_rows(  # noqa: F821
         np.stack((u, v), axis=1), np.stack((u_padded, v_padded), axis=1)
     )
     slices += (index,)
@@ -473,11 +473,11 @@ class Hexal:
         """Interpolates towards other.
 
         Args:
-            other (Hexal)
+            other (Hexal): Target hexal to interpolate towards.
             t (float): interpolation step, 0<t<1.
 
         Returns:
-            Hexal
+            Hexal: Interpolated hexal.
         """
 
         def hex_round(u, v):
@@ -505,7 +505,7 @@ class Hexal:
         """Returns the angle to other or the origin.
 
         Args:
-            other (Hexal)
+            other (Hexal | None): Reference hexal, or None for origin.
             non_negative (bool): add 2pi if angle is negative.
                 Default: False.
 
@@ -601,7 +601,7 @@ class HexArray(np.ndarray):
             super().__setitem__(key, value)
 
     def where_hexarray(self, hexarray):
-        return matrix_mask_by_sub(
+        return matrix_mask_by_sub(  # noqa: F821
             np.stack((hexarray.u, hexarray.v), axis=0).T,
             np.stack((self.u, self.v), axis=0).T,
         )
@@ -678,7 +678,7 @@ class HexArray(np.ndarray):
         u = np.array([h.u for h in self])
         v = np.array([h.v for h in self])
         color = np.array([h.value for h in self])
-        return flyvis.plots.hex_scatter(
+        return flyvis.plots.hex_scatter(  # noqa: F821
             u,
             v,
             color,
@@ -693,11 +693,11 @@ class HexLattice(HexArray):
     """Flat array of Hexals.
 
     Args:
-        extent: Extent of the regular hexagon grid.
-        hexals: Existing hexals to initialize with.
-        center: Center hexal of the lattice.
-        u_stride: Stride in u-direction.
-        v_stride: Stride in v-direction.
+        extent (int): Extent of the regular hexagon grid.
+        hexals (Iterable | None): Existing hexals to initialize with.
+        center (Hexal): Center hexal of the lattice.
+        u_stride (int): Stride in u-direction.
+        v_stride (int): Stride in v-direction.
     """
 
     def __new__(
@@ -748,9 +748,13 @@ class HexLattice(HexArray):
         """Draws a circle in hex coordinates.
 
         Args:
-            radius: Radius in columns of the circle.
-            center: Center of the circle.
-            as_lattice: Returns the circle on a constrained regular lattice.
+            radius (int | None): Radius in columns of the circle.
+            center (Hexal): Center of the circle.
+            as_lattice (bool): Returns the circle on a constrained
+                regular lattice.
+
+        Returns:
+            HexArray | HexLattice: The circle array or lattice.
         """
         lattice = HexLattice(extent=max(radius or 0, self.extent), center=center)
         radius = radius or self.extent
@@ -766,12 +770,16 @@ class HexLattice(HexArray):
 
     @staticmethod
     def filled_circle(radius=None, center=Hexal(0, 0, 0), as_lattice=False):
-        """Draws a circle in hex coordinates.
+        """Draws a filled circle in hex coordinates.
 
         Args:
-            radius: Radius in columns of the circle.
-            center: Center of the circle.
-            as_lattice: Returns the circle on a constrained regular lattice.
+            radius (int | None): Radius in columns of the circle.
+            center (Hexal): Center of the circle.
+            as_lattice (bool): Returns the circle on a constrained
+                regular lattice.
+
+        Returns:
+            HexArray | HexLattice: The filled circle array or lattice.
         """
         lattice = HexLattice(extent=radius or 0, center=center)
         radius = radius
@@ -793,10 +801,10 @@ class HexLattice(HexArray):
         """Returns two points spanning a line with given angle wrt. origin.
 
         Args:
-            angle: In [0, np.pi]
+            angle (float): Angle in [0, pi].
 
         Returns:
-            HexArray
+            HexArray: Two hexals spanning the line.
         """
         # To offset the line by simple addition of the offset,
         # radius=2 * self.extent spans the line in ways that each valid offset
@@ -814,12 +822,13 @@ class HexLattice(HexArray):
         """Returns a line on a HexLattice or HexArray.
 
         Args:
-            angle: In [0, np.pi]
-            center: Midpoint of the line
-            as_lattice: Returns the ring on a constrained regular lattice.
+            angle (float): Angle in [0, pi].
+            center (Hexal): Midpoint of the line.
+            as_lattice (bool): Returns the ring on a constrained
+                regular lattice.
 
         Returns:
-            HexArray or constrained HexLattice
+            HexArray | HexLattice: The line array or lattice.
         """
         line_span = self._line_span(angle)
         distance = line_span[0].distance(line_span[1])

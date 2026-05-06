@@ -35,6 +35,7 @@ theme:
       name: Switch to light mode
 plugins:
 - search
+- autorefs
 - gen-files:
     scripts:
     - ../gen_ref_pages.py

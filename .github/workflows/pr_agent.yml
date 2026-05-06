@@ -1,20 +1,30 @@
+# pull_request_target is used instead of pull_request so that the
+# GITHUB_TOKEN has write permissions even for fork PRs.
+# This is safe because qodo-ai/pr-agent fetches PR diffs via the
+# GitHub API and does NOT execute PR code — no actions/checkout is used.
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, reopened, ready_for_review]
   issue_comment:
+    types: [created]
 jobs:
   pr_agent_job:
-    if: ${{ github.event.sender.type != 'Bot' }}
+    # Only run on PR comments (not general issue comments) and skip bots.
+    if: >-
+      ${{ github.event.sender.type != 'Bot' && (
+        github.event_name != 'issue_comment' ||
+        github.event.issue.pull_request
+      ) }}
     runs-on: ubuntu-latest
     permissions:
       issues: write
       pull-requests: write
-      contents: write
+      contents: read
     name: Run pr agent on every pull request, respond to user comments
     steps:
       - name: PR Agent action step
         id: pragent
-        uses: qodo-ai/pr-agent@main
+        uses: qodo-ai/pr-agent@009ba5a116c4d3273368a6dc53a4efdb7904d519
         env:
             GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
             # Set the model to Gemini
