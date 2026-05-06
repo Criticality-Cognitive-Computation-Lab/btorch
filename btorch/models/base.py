@@ -7,12 +7,49 @@ from typing import Any
 import numpy as np
 import torch
 from jaxtyping import Float
-from spikingjelly.activation_based import base
 from torch import Tensor
 
 from ..types import TensorLike
 from .shape import expand_leading_dims
 from .surrogate import Sigmoid
+
+
+class StepModule:
+    """Mixin that provides step_mode dispatch (ported from spikingjelly).
+
+    Subclasses must implement ``single_step_forward``. Optionally override
+    ``multi_step_forward`` for a more efficient batched implementation.
+    """
+
+    def supported_step_mode(self) -> tuple[str, ...]:
+        return ("s", "m")
+
+    @property
+    def step_mode(self) -> str:
+        return self._step_mode
+
+    @step_mode.setter
+    def step_mode(self, value: str):
+        if value not in self.supported_step_mode():
+            raise ValueError(
+                f"step_mode can only be {self.supported_step_mode()}, "
+                f'but got "{value}"!'
+            )
+        self._step_mode = value
+
+    def single_step_forward(self, x: torch.Tensor, *args, **kwargs):
+        raise NotImplementedError
+
+    def multi_step_forward(self, x_seq: torch.Tensor, *args, **kwargs):
+        raise NotImplementedError
+
+    def forward(self, *args, **kwargs):
+        if self.step_mode == "s":
+            return self.single_step_forward(*args, **kwargs)
+        elif self.step_mode == "m":
+            return self.multi_step_forward(*args, **kwargs)
+        else:
+            raise ValueError(self.step_mode)
 
 
 def is_broadcastable(shape_from, shape_to):
@@ -578,7 +615,7 @@ def _memory_var(
     return v
 
 
-class MemoryModule(base.MemoryModule):
+class MemoryModule(StepModule, torch.nn.Module):
     """Base class for all stateful modules with managed memory buffers.
 
     MemoryModule provides infrastructure for managing stateful tensors
@@ -608,9 +645,39 @@ class MemoryModule(base.MemoryModule):
         >>> out = neuron(torch.randn(2, 10))
     """
 
+    @property
+    def supported_backends(self) -> tuple[str, ...]:
+        return ("torch",)
+
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+    @backend.setter
+    def backend(self, value: str):
+        if value not in self.supported_backends:
+            raise NotImplementedError(
+                f"{value} is not a supported backend of {self._get_name()}!"
+            )
+        self._backend = value
+
+    @abstractmethod
+    def single_step_forward(self, x: torch.Tensor, *args, **kwargs):
+        pass
+
+    def multi_step_forward(self, x_seq: torch.Tensor, *args, **kwargs):
+        T = x_seq.shape[0]
+        y_seq = []
+        for t in range(T):
+            y = self.single_step_forward(x_seq[t], *args, **kwargs)
+            y_seq.append(y.unsqueeze(0))
+        return torch.cat(y_seq, 0)
+
     def __init__(self):
         super().__init__()
         self._memories_rv: dict[str, ResetValue] = {}
+        self._backend = "torch"
+        self._step_mode = "s"
 
     @staticmethod
     def _format_repr_value(value: Any) -> str:

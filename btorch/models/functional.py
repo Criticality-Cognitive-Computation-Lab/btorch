@@ -442,7 +442,7 @@ def detach_net(net: nn.Module):
         if hasattr(m, "detach") and callable(m.detach):
             if not isinstance(m, base.MemoryModule):
                 logging.warning(
-                    f"Trying to call `detach()` of {m}, which is not"
-                    "spikingjelly.activation_based.base.MemoryModule"
+                    f"Trying to call `detach()` of {m}, which is not "
+                    "btorch.models.base.MemoryModule"
                 )
             m.detach()
