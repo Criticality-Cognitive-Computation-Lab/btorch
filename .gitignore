@@ -29,6 +29,9 @@ docs/**/docs/api/
 .coverage
 coverage.xml
 
+*.png
+*.json
+*.nwb
 *.log
 *.swp
 *~
