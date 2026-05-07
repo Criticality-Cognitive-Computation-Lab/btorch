@@ -17,7 +17,7 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v7
         with:
           version: "latest"
 
@@ -26,11 +26,10 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
+        env:
+          UV_SYSTEM_PYTHON: "1"
         run: |
-          uv pip install --system torch==2.8.0 --extra-index-url https://download.pytorch.org/whl/cpu
-          uv pip install --system git+https://github.com/alexfanqi/omegaconf.git
-          uv pip install --system torch_sparse torch_scatter -f https://data.pyg.org/whl/torch-2.8.0+cpu.html
-          uv sync --group docs --frozen
+          uv sync --extra docs --frozen
 
       - name: Detect changed files
         id: changed

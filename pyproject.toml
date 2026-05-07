@@ -43,9 +43,10 @@ test = [
   "pytest-cov>=5.0",
   "matplotlib>=3.7",
 ]
-# NOTE: torch_scatter/torch_sparse require prebuilt wheels from PyG.
-# Install with: pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-<version>+<cuda>.html
-# The extras below declare the dependency but cannot install from PyPI directly.
+# NOTE: torch_scatter/torch_sparse wheels are CUDA-variant-specific and cannot be locked
+# cross-platform. The [tool.uv.sources] below covers CPU (uv/pip CI only).
+# For CUDA: pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-<ver>+<cuXXX>.html
+# For conda: conda install pyg -c pyg  (no find-links needed)
 sparse = [
   "torch_scatter",
   "torch_sparse",
@@ -54,8 +55,6 @@ dev = [
   "btorch[docs,test,sparse]",
   "pre-commit>=3.7",
   "ruff>=0.4",
-  "pytest>=8.2",
-  "pytest-cov>=5.0",
 ]
 
 [project.urls]
@@ -63,13 +62,20 @@ Homepage = "https://github.com/your-org/btorch"
 Repository = "https://github.com/your-org/btorch"
 Documentation = "https://github.com/your-org/btorch/docs"
 
-# uv sources: git forks and local dependencies
 [tool.uv.sources]
 omegaconf = { git = "https://github.com/alexfanqi/omegaconf.git" }
+# torch resolved from PyTorch CPU index (uv/pip CI); CUDA users install torch separately
+torch = { index = "pytorch-cpu" }
+# torch_scatter/sparse are NOT resolved via uv — their wheel URL encodes the torch+CUDA variant.
+# uv locks them as PyPI sdist stubs but CI and end users install from PyG (see sparse extra note).
 
 [tool.uv]
 # torch_scatter and torch_sparse need torch as a build dependency
 extra-build-dependencies = { torch-scatter = ["torch"], torch-sparse = ["torch"] }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
 
 [tool.hatch.build.targets.wheel]
 packages = ["btorch"]
