@@ -72,7 +72,7 @@ jobs:
       #   uses: mxschmitt/action-tmate@v3
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v6
         with:
           files: ./coverage.xml
           flags: unittests
