@@ -324,7 +324,7 @@ scipy==1.17.1
     #   powerlaw
     #   spikingjelly
     #   torch-sparse
-setuptools==81.0.0
+setuptools==82.0.1
     # via
     #   nolds
     #   torch
