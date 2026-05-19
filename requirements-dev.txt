@@ -389,7 +389,7 @@ typing-inspection==0.4.2
     # via pydantic
 urllib3==2.6.3
     # via requests
-virtualenv==21.3.1
+virtualenv==21.3.3
     # via pre-commit
 wadler-lindig==0.1.7
     # via jaxtyping
