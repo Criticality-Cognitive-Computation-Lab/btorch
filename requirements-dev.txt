@@ -316,7 +316,7 @@ requests==2.33.1
     # via sphinx
 roman-numerals==4.1.0
     # via sphinx
-ruff==0.15.12
+ruff==0.15.13
     # via btorch (pyproject.toml)
 scipy==1.17.1
     # via
