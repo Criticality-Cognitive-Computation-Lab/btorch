@@ -211,7 +211,7 @@ nvidia-nvtx==13.0.85
     # via cuda-toolkit
 omegaconf @ git+https://github.com/alexfanqi/omegaconf.git@99361135643c4036a80cdf121980085aec447f6e
     # via btorch (pyproject.toml)
-openai==2.35.0
+openai==2.37.0
     # via btorch (pyproject.toml)
 packaging==26.2
     # via
