@@ -1,6 +1,6 @@
 import torch
 
-from btorch.models import environ
+from btorch.models import environ, functional
 from btorch.models.functional import init_net_state, reset_net
 from btorch.models.neurons import LIF
 from btorch.models.rnn import RecurrentNN
@@ -367,13 +367,13 @@ def test_delayed_psc_reset_clears_history_and_psc():
     assert delayed.psc.abs().sum() == 0
 
     # After reset, running again from the same input should give the same result
+    functional.init_net_state(delayed, batch_size=1, dtype=torch.float32)
     with environ.context(dt=dt):
-        delayed.init_state(batch_size=1, dtype=torch.float32)
         for _ in range(max_delay_steps + 1):
             out_after_reset = delayed(z)
 
     # Re-init fresh and compare
-    delayed.init_state(batch_size=1, dtype=torch.float32)
+    functional.init_net_state(delayed, batch_size=1, dtype=torch.float32)
     with environ.context(dt=dt):
         for _ in range(max_delay_steps + 1):
             out_fresh = delayed(z)

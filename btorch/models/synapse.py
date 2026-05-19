@@ -572,40 +572,6 @@ class DelayedPSC(MemoryModule):
         else:
             self.history = None
 
-    def init_state(
-        self,
-        batch_size=None,
-        dtype=None,
-        device=None,
-        persistent=True,
-        skip_mem_name: Iterable[str] = (),
-    ):
-        self.psc_module.init_state(
-            batch_size,
-            dtype,
-            device,
-            persistent,
-            skip_mem_name=skip_mem_name,
-        )
-        if self.history is not None:
-            self.history.init_state(batch_size, dtype, device, persistent)
-
-    def reset(
-        self,
-        batch_size=None,
-        dtype=None,
-        device=None,
-        skip_mem_name: Iterable[str] = (),
-    ):
-        self.psc_module.reset(
-            batch_size,
-            dtype,
-            device,
-            skip_mem_name=skip_mem_name,
-        )
-        if self.history is not None:
-            self.history.reset(batch_size, dtype, device)
-
     @property
     def n_neuron(self) -> tuple[int, ...]:
         return self.psc_module.n_neuron
