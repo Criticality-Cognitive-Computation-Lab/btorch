@@ -331,7 +331,7 @@ tqdm==4.67.3
     #   openai
     #   powerlaw
     #   spikingjelly
-triton==3.6.0
+triton==3.7.0
     # via torch
 typing-extensions==4.15.0
     # via
