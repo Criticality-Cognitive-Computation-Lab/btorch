@@ -277,7 +277,7 @@ pygments==2.20.0
     #   pytest
     #   sphinx
     #   zensical
-pymdown-extensions==10.21.2
+pymdown-extensions==10.21.3
     # via
     #   mkdocstrings
     #   zensical
