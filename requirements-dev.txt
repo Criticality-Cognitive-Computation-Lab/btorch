@@ -387,7 +387,7 @@ typing-extensions==4.15.0
     #   zarr
 typing-inspection==0.4.2
     # via pydantic
-urllib3==2.6.3
+urllib3==2.7.0
     # via requests
 virtualenv==21.3.3
     # via pre-commit
