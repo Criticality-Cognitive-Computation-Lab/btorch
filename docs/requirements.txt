@@ -222,7 +222,7 @@ packaging==26.2
     #   sphinx
     #   xarray
     #   zarr
-pandas==3.0.2
+pandas==3.0.3
     # via
     #   btorch (pyproject.toml)
     #   xarray
