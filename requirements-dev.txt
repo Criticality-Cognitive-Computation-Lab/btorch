@@ -53,7 +53,7 @@ filelock==3.29.0
     #   python-discovery
     #   torch
     #   virtualenv
-fonttools==4.62.1
+fonttools==4.63.0
     # via matplotlib
 fsspec==2026.4.0
     # via torch
