@@ -201,7 +201,10 @@ class ExponentialPSC(BasePSC):
 
     def adaptation_charge(self, z: torch.Tensor):
         z_flat, leading = self._flatten_neuron(z)
-        wz = self.linear(z_flat)
+        if hasattr(self.linear, "forward_events"):
+            wz = self.linear.forward_events(z_flat)
+        else:
+            wz = self.linear(z_flat)
         wz = self._unflatten_neuron(wz, leading)
         self.psc = self.psc + wz
 

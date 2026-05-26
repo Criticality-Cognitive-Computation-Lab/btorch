@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from btorch.backend.triton.lif import TritonSparseLIFRNN, triton_lif_single_step
+from btorch.backend.triton.lif import triton_lif_single_step
 from btorch.backend.triton.sparse import coo_spmm
 from btorch.utils.file import fig_path
 
@@ -169,6 +169,85 @@ class TorchSparseLIFRNN(torch.nn.Module):
         return torch.stack(spikes, dim=0)
 
 
+class TritonSparseLIFRNN(torch.nn.Module):
+    """Benchmark-only sparse recurrent LIF runner built on the single-step helper."""
+
+    def __init__(
+        self,
+        indices: torch.Tensor,
+        values: torch.Tensor,
+        *,
+        hidden_size: int,
+        v_threshold: float = 1.0,
+        v_reset: float = 0.0,
+        c_m: float = 1.0,
+        tau: float = 20.0,
+        hard_reset: bool = False,
+        device: str,
+        dtype: torch.dtype,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.hard_reset = hard_reset
+        self.register_buffer("indices", indices.to(device=device, dtype=torch.long))
+        self.register_buffer("values", values.to(device=device, dtype=dtype))
+        self.register_buffer(
+            "v_threshold",
+            torch.full((hidden_size,), v_threshold, device=device, dtype=dtype),
+        )
+        self.register_buffer(
+            "v_reset",
+            torch.full((hidden_size,), v_reset, device=device, dtype=dtype),
+        )
+        self.register_buffer(
+            "c_m",
+            torch.full((hidden_size,), c_m, device=device, dtype=dtype),
+        )
+        self.register_buffer(
+            "tau",
+            torch.full((hidden_size,), tau, device=device, dtype=dtype),
+        )
+        self.register_buffer("v", self.v_reset.clone())
+        self.register_buffer("spike", torch.zeros_like(self.v_reset))
+        self._state_shape = tuple(self.v.shape)
+
+    @torch.no_grad()
+    def reset_state(self, batch_size: int) -> None:
+        state_shape = (batch_size, self.hidden_size)
+        self.v = torch.broadcast_to(self.v_reset, state_shape).clone()
+        self.spike = torch.zeros_like(self.v)
+        self._state_shape = state_shape
+
+    def forward(self, x_seq: torch.Tensor, *, dt: float) -> torch.Tensor:
+        if tuple(x_seq.shape[1:]) != self._state_shape:
+            self.reset_state(x_seq.shape[1])
+
+        spikes = []
+        for t in range(x_seq.shape[0]):
+            spike_2d = self.spike.reshape(-1, self.hidden_size)
+            recurrent = coo_spmm(
+                self.indices,
+                self.values,
+                spike_2d.T.contiguous(),
+                size_m=self.hidden_size,
+            )
+            current = x_seq[t] + recurrent.T.reshape_as(self.spike)
+            spike_flat, v_next_flat = triton_lif_single_step(
+                current.reshape(-1),
+                self.v.reshape(-1),
+                torch.broadcast_to(self.v_threshold, current.shape).reshape(-1),
+                torch.broadcast_to(self.v_reset, current.shape).reshape(-1),
+                torch.broadcast_to(self.c_m, current.shape).reshape(-1),
+                torch.broadcast_to(self.tau, current.shape).reshape(-1),
+                dt=dt,
+                hard_reset=self.hard_reset,
+            )
+            self.v = v_next_flat.reshape_as(current)
+            self.spike = spike_flat.reshape_as(current)
+            spikes.append(self.spike)
+        return torch.stack(spikes, dim=0)
+
+
 class _CompiledSparseLIFWrapper(torch.nn.Module):
     def __init__(self, model: TorchSparseLIFRNN, dt: float):
         super().__init__()
@@ -294,8 +373,8 @@ def _build_triton_model(
     return TritonSparseLIFRNN(
         indices,
         values,
-        n_neuron=hidden_size,
-        device=torch.device(device),
+        hidden_size=hidden_size,
+        device=device,
         dtype=dtype,
     )
 

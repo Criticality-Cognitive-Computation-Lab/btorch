@@ -1,11 +1,7 @@
 import pytest
 import torch
 
-from btorch.backend.triton.lif import (
-    TritonMultiStepLIF,
-    TritonSparseLIFRNN,
-    triton_lif_single_step,
-)
+from btorch.backend.triton.lif import triton_lif_single_step
 from btorch.models import environ
 from btorch.models.functional import init_net_state
 from btorch.models.neurons.lif import LIF
@@ -123,7 +119,7 @@ def _triton_lif_multistep(
     c_m: float,
     tau: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    neuron = TritonMultiStepLIF(
+    neuron = LIF(
         n_neuron=x_seq.shape[-1],
         v_threshold=v_threshold,
         v_reset=v_reset,
@@ -131,11 +127,19 @@ def _triton_lif_multistep(
         tau=tau,
         tau_ref=None,
         hard_reset=False,
+        backend="triton",
+        step_mode="m",
         device=x_seq.device,
         dtype=x_seq.dtype,
     )
-    neuron.reset_state(batch_size=x_seq.shape[1])
-    spikes = neuron(x_seq, dt=dt)
+    init_net_state(
+        neuron,
+        batch_size=x_seq.shape[1],
+        device=x_seq.device,
+        dtype=x_seq.dtype,
+    )
+    with environ.context(dt=dt):
+        spikes = neuron(x_seq)
     return spikes, neuron.v
 
 
@@ -154,25 +158,6 @@ def _torch_lif_single_step(
     spike = (v_next >= v_threshold).to(v.dtype)
     v_next = v_next - (v_threshold - v_reset) * spike
     return spike, v_next
-
-
-def _torch_sparse_mm(
-    indices: torch.Tensor,
-    values: torch.Tensor,
-    spike: torch.Tensor,
-    hidden_size: int,
-) -> torch.Tensor:
-    sparse = torch.sparse_coo_tensor(
-        indices=indices,
-        values=values,
-        size=(hidden_size, hidden_size),
-        device=spike.device,
-        dtype=spike.dtype,
-    ).coalesce()
-    spike_2d = spike.reshape(-1, hidden_size)
-    recurrent = torch.sparse.mm(sparse, spike_2d.T).T
-    return recurrent.reshape_as(spike)
-
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_triton_lif_soft_reset_x_grad_matches_pytorch_and_project_lif():
@@ -315,70 +300,3 @@ def test_triton_lif_single_step_matches_torch():
         atol=1e-6,
         rtol=0.0,
     )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_triton_sparse_lif_rnn_matches_torch():
-    device = "cuda"
-    dtype = torch.float32
-    steps = 10
-    batch_size = 3
-    n_neuron = 64
-    dt = 1.0
-
-    generator = torch.Generator(device=device)
-    generator.manual_seed(4)
-
-    x_seq = 0.25 + 0.15 * torch.randn(
-        (steps, batch_size, n_neuron),
-        generator=generator,
-        device=device,
-        dtype=dtype,
-    )
-    nnz = 256
-    indices = torch.stack(
-        [
-            torch.randint(0, n_neuron, (nnz,), generator=generator, device=device),
-            torch.randint(0, n_neuron, (nnz,), generator=generator, device=device),
-        ],
-        dim=0,
-    )
-    values = 0.05 * torch.randn(
-        nnz,
-        generator=generator,
-        device=device,
-        dtype=dtype,
-    )
-
-    triton_rnn = TritonSparseLIFRNN(
-        indices,
-        values,
-        n_neuron=n_neuron,
-        device=torch.device(device),
-        dtype=dtype,
-    )
-    triton_rnn.reset_state(batch_size)
-
-    v = torch.zeros((batch_size, n_neuron), device=device, dtype=dtype)
-    spike = torch.zeros_like(v)
-    spike_seq_ref = []
-    for t in range(steps):
-        recurrent = _torch_sparse_mm(indices, values, spike, n_neuron)
-        spike, v = _torch_lif_single_step(
-            x_seq[t] + recurrent,
-            v,
-            dt=dt,
-            v_threshold=1.0,
-            v_reset=0.0,
-            c_m=1.0,
-            tau=20.0,
-        )
-        spike_seq_ref.append(spike)
-    spike_seq_ref = torch.stack(spike_seq_ref, dim=0)
-
-    with torch.no_grad():
-        spike_seq_triton = triton_rnn(x_seq, dt=dt)
-
-    torch.testing.assert_close(spike_seq_triton, spike_seq_ref, atol=0.0, rtol=0.0)
-    torch.testing.assert_close(triton_rnn.v, v, atol=1e-6, rtol=0.0)
-    torch.testing.assert_close(triton_rnn.spike, spike, atol=0.0, rtol=0.0)

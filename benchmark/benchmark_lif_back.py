@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from btorch.backend.triton.lif import TritonMultiStepLIF
 from btorch.models import environ
 from btorch.models.functional import init_net_state
 from btorch.models.neurons.lif import LIF
@@ -122,8 +121,8 @@ def _build_triton_lif(
     tau_ref: float | None,
     device: str,
     dtype: torch.dtype,
-) -> TritonMultiStepLIF:
-    return TritonMultiStepLIF(
+) -> LIF:
+    return LIF(
         n_neuron=n_neuron,
         v_threshold=1.0,
         v_reset=0.0,
@@ -131,7 +130,9 @@ def _build_triton_lif(
         tau=20.0,
         tau_ref=tau_ref,
         hard_reset=False,
-        device=torch.device(device),
+        backend="triton",
+        step_mode="m",
+        device=device,
         dtype=dtype,
     )
 

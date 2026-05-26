@@ -2,7 +2,6 @@ import argparse
 
 import torch
 
-from btorch.backend.triton.lif import TritonMultiStepLIF
 from btorch.models import environ
 from btorch.models.functional import init_net_state
 from btorch.models.neurons.lif import LIF
@@ -55,8 +54,8 @@ def _build_triton_lif(
     tau_ref: float | None,
     device: str,
     dtype: torch.dtype,
-) -> TritonMultiStepLIF:
-    return TritonMultiStepLIF(
+) -> LIF:
+    return LIF(
         n_neuron=n_neuron,
         v_threshold=1.0,
         v_reset=0.0,
@@ -64,7 +63,9 @@ def _build_triton_lif(
         tau=20.0,
         tau_ref=tau_ref,
         hard_reset=False,
-        device=torch.device(device),
+        backend="triton",
+        step_mode="s",
+        device=device,
         dtype=dtype,
     )
 
@@ -110,14 +111,13 @@ def debug_parity(
     )
 
     init_net_state(torch_lif, batch_size=batch_size, device=device, dtype=dtype)
-    triton_lif.reset_state(batch_size=batch_size)
+    init_net_state(triton_lif, batch_size=batch_size, device=device, dtype=dtype)
 
     for t in range(steps):
         x_t = x_seq[t]
         with torch.no_grad(), environ.context(dt=dt):
             spike_torch = torch_lif(x_t)
-        with torch.no_grad():
-            spike_triton = triton_lif(x_t.unsqueeze(0), dt=dt).squeeze(0)
+            spike_triton = triton_lif(x_t)
 
         mismatch = spike_torch != spike_triton
         mismatch_idx = _first_true_index(mismatch)

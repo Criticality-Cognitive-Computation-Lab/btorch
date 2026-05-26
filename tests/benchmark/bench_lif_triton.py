@@ -6,7 +6,6 @@ import torch
 import torch.nn.functional as F
 from triton.testing import Benchmark, perf_report
 
-from btorch.backend.triton.lif import TritonMultiStepLIF
 from btorch.models import environ
 from btorch.models.functional import init_net_state
 from btorch.models.neurons.lif import LIF
@@ -120,8 +119,8 @@ def _build_triton_lif(
     tau_ref: float | None,
     device: str,
     dtype: torch.dtype,
-) -> TritonMultiStepLIF:
-    return TritonMultiStepLIF(
+) -> LIF:
+    return LIF(
         n_neuron=n_neuron,
         v_threshold=1.0,
         v_reset=0.0,
@@ -129,7 +128,9 @@ def _build_triton_lif(
         tau=20.0,
         tau_ref=tau_ref,
         hard_reset=False,
-        device=torch.device(device),
+        backend="triton",
+        step_mode="m",
+        device=device,
         dtype=dtype,
     )
 
@@ -166,11 +167,11 @@ def _assert_correctness(
     )
 
     init_net_state(ref, batch_size=batch_size, device=device, dtype=dtype)
-    fused.reset_state(batch_size=batch_size)
+    init_net_state(fused, batch_size=batch_size, device=device, dtype=dtype)
 
     with torch.no_grad(), environ.context(dt=dt):
         spike_ref = ref(x_seq)
-        spike_fused = fused(x_seq, dt=dt)
+        spike_fused = fused(x_seq)
 
     torch.testing.assert_close(spike_fused, spike_ref, atol=0.0, rtol=0.0)
     torch.testing.assert_close(fused.v, ref.v, atol=1e-6, rtol=0.0)

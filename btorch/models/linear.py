@@ -384,3 +384,183 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
     def constrain(self, *args, **kwargs):
         if self.enforce_dale:
             self.magnitude.data = self.magnitude.relu()
+
+
+class SparseEventConn(nn.Module):
+    """Forward-only sparse event propagation using manual span buffers.
+
+    This module is intended for event-driven synaptic current accumulation
+    where the input has shape ``(..., n_pre)`` and the output has shape
+    ``(..., n_post)``. It supports two traversal modes over the same padded
+    CSR-like storage:
+
+    - ``pre_span``: one program works on one presynaptic row at a time.
+    - ``post_span``: GeNN-style slot-parallel traversal over the presynaptic
+      rows, which changes the kernel schedule without changing the storage.
+
+    The storage uses:
+
+    - ``row_length`` stores the valid number of edges per row
+    - ``ind`` stores column indices in a padded ``[rows, row_stride]`` table
+    - ``weight`` stores the edge weights in the same padded layout
+    """
+
+    in_features: int
+    out_features: int
+    event_mode: Literal["pre_span", "post_span"]
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        event_mode: Literal["pre_span", "post_span"] = "pre_span",
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.event_mode = event_mode
+        self.device = device
+        self.dtype = dtype
+
+        self.register_buffer("pre_row_length", None)
+        self.register_buffer("pre_ind", None)
+        self.register_buffer("pre_weight", None)
+        self.register_buffer("post_row_length", None)
+        self.register_buffer("post_ind", None)
+        self.register_buffer("post_weight", None)
+
+        self.pre_row_stride = 0
+        self.post_row_stride = 0
+
+    def set_pre_span_data(
+        self,
+        row_length: torch.Tensor,
+        ind: torch.Tensor,
+        weight: torch.Tensor,
+        row_stride: int | None = None,
+    ) -> None:
+        """Register the presynaptic span layout buffers."""
+        if row_length.ndim != 1:
+            raise ValueError("pre row_length must be 1D.")
+        if row_length.shape[0] != self.in_features:
+            raise ValueError("pre row_length must have length in_features.")
+        if ind.ndim != 2 or weight.ndim != 2:
+            raise ValueError("pre ind and weight must be 2D.")
+        if ind.shape != weight.shape:
+            raise ValueError("pre ind and weight must have identical shapes.")
+        if ind.shape[0] != self.in_features:
+            raise ValueError("pre ind must have one row per input feature.")
+
+        stride = ind.shape[1] if row_stride is None else row_stride
+        if stride != ind.shape[1]:
+            raise ValueError("pre row_stride must match ind.shape[1].")
+
+        target_device = self.device if self.device is not None else row_length.device
+        target_dtype = self.dtype if self.dtype is not None else weight.dtype
+        self.pre_row_length = row_length.to(device=target_device, dtype=torch.int64)
+        self.pre_ind = ind.to(device=target_device, dtype=torch.int64)
+        self.pre_weight = weight.to(device=target_device, dtype=target_dtype)
+        self.pre_row_stride = stride
+
+    def set_post_span_data(
+        self,
+        row_length: torch.Tensor,
+        ind: torch.Tensor,
+        weight: torch.Tensor,
+        row_stride: int | None = None,
+    ) -> None:
+        """Register the GeNN-style post-span layout buffers.
+
+        The storage remains presynaptic-row based:
+
+        - ``row_length`` has length ``in_features``
+        - ``ind`` and ``weight`` have shape ``[in_features, row_stride]``
+
+        The difference from ``pre_span`` is the kernel traversal strategy rather
+        than the underlying sparse storage.
+        """
+        if row_length.ndim != 1:
+            raise ValueError("post row_length must be 1D.")
+        if row_length.shape[0] != self.in_features:
+            raise ValueError("post row_length must have length in_features.")
+        if ind.ndim != 2 or weight.ndim != 2:
+            raise ValueError("post ind and weight must be 2D.")
+        if ind.shape != weight.shape:
+            raise ValueError("post ind and weight must have identical shapes.")
+        if ind.shape[0] != self.in_features:
+            raise ValueError("post ind must have one row per input feature.")
+
+        stride = ind.shape[1] if row_stride is None else row_stride
+        if stride != ind.shape[1]:
+            raise ValueError("post row_stride must match ind.shape[1].")
+
+        target_device = self.device if self.device is not None else row_length.device
+        target_dtype = self.dtype if self.dtype is not None else weight.dtype
+        self.post_row_length = row_length.to(device=target_device, dtype=torch.int64)
+        self.post_ind = ind.to(device=target_device, dtype=torch.int64)
+        self.post_weight = weight.to(device=target_device, dtype=target_dtype)
+        self.post_row_stride = stride
+
+    def forward_events(
+        self,
+        spike: torch.Tensor,
+        *,
+        mode: Literal["pre_span", "post_span"] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply sparse event propagation for spike-like inputs."""
+        from btorch.backend.triton import post_span_spmm, pre_span_spmm
+
+        mode = mode or self.event_mode
+        no_batch = spike.ndim == 1
+        if no_batch:
+            spike = spike.unsqueeze(0)
+        if spike.ndim != 2:
+            raise ValueError("spike must have shape (n_pre,) or (batch_size, n_pre).")
+        if spike.shape[-1] != self.in_features:
+            raise ValueError("The last spike dimension must equal in_features.")
+
+        if mode == "pre_span":
+            if (
+                self.pre_row_length is None
+                or self.pre_ind is None
+                or self.pre_weight is None
+            ):
+                raise RuntimeError("pre-span buffers are not initialized.")
+            out_tensor = pre_span_spmm(
+                spike,
+                self.pre_row_length,
+                self.pre_ind,
+                self.pre_weight,
+                size_m=self.out_features,
+                is_bool_float=False,
+                out=out,
+            )
+        elif mode == "post_span":
+            if (
+                self.post_row_length is None
+                or self.post_ind is None
+                or self.post_weight is None
+            ):
+                raise RuntimeError("post-span buffers are not initialized.")
+            out_tensor = post_span_spmm(
+                spike,
+                self.post_row_length,
+                self.post_ind,
+                self.post_weight,
+                size_m=self.out_features,
+                is_bool_float=False,
+                out=out,
+            )
+        else:
+            raise ValueError(f"Unsupported event mode '{mode}'.")
+
+        if no_batch:
+            return out_tensor[0]
+        return out_tensor
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_events(x)
