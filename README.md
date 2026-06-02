@@ -50,7 +50,7 @@ Before running commands, ask the user four things:
 Then follow the matching path.
 
 Path A - Conda or Micromamba (recommended):
-- Create env from `dev-requirements.yaml` using the user-provided env name.
+- Create env from `environment.yml` using the user-provided env name.
 - Activate the environment. (This already installs `pytorch_sparse` via conda.)
 - If user wants forked omegaconf: `pip install git+https://github.com/alexfanqi/omegaconf.git`
 - Run: `pip install -e . --config-settings editable_mode=strict`

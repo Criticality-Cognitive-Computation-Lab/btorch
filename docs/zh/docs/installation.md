@@ -15,10 +15,10 @@ cd btorch
 
 ```bash
 # 使用 Conda
-conda env create -n ml-py312 --file=dev-requirements.yaml
+conda env create -n ml-py312 --file=environment.yml
 
 # 或使用 Micromamba
-micromamba env create -n ml-py312 -f dev-requirements.yaml
+micromamba env create -n ml-py312 -f environment.yml
 ```
 
 ### Fork 版 OmegaConf（可选但推荐）

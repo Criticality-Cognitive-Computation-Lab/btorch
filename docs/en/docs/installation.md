@@ -15,10 +15,10 @@ We recommend using `conda` or `micromamba` with the provided environment file:
 
 ```bash
 # Using Conda
-conda env create -n ml-py312 --file=dev-requirements.yaml
+conda env create -n ml-py312 --file=environment.yml
 
 # or using Micromamba
-micromamba env create -n ml-py312 -f dev-requirements.yaml
+micromamba env create -n ml-py312 -f environment.yml
 ```
 
 ### Forked OmegaConf (Optional but Recommended)

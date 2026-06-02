@@ -8,16 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Added
-- Expanded API reference coverage: visualisation, io, utils, models (functional, history, environ, init, scale, regularizer, ode, connection_conversion), analysis (dynamic_tools), and connectome (connection, augment).
-- New Core Concepts guides: "Stateful Modules", "The `dt` Environment", and "Surrogate Gradients".
-- New Tutorials: "Tutorial 1: Building an RSNN" and "Tutorial 2: Training an SNN".
-- New Guides: "OmegaConf Configuration Guide".
-- New pages: FAQ, Skills Reference, Examples Gallery, Contributing.
-- MkDocs Material UX upgrades: edit/view links, breadcrumb navigation, back-to-top button, shareable search URLs, and version badge.
+- **Two-compartment neuron** (`TwoCompartmentGLIF`): soma-apical neuron with nonlinear apical plateau, bidirectional coupling, and optional adaptive threshold. See [tutorial](tutorials/mixed_neurons.md).
+- **Mixed neuron population** (`MixedNeuronPopulation`): single recurrent layer mixing multiple neuron types (e.g. GLIF3 + TwoCompartmentGLIF) with automatic current slicing and spike concatenation.
+- **Heterogeneous RNN** (`HeteroRecurrentNN`): drop-in replacement for `RecurrentNN` that accepts a `MixedNeuronPopulation`.
+- **GeNN/CUDA backend** (`btorch.backend`): experimental spike simulation backend targeting GeNN for GPU-accelerated large-scale networks.
 
 ### Changed
-- Updated `api/neurons.md` and `api/analysis.md` to expose full public APIs.
-- Improved Google-style docstrings across `btorch.models.functional`, `environ`, `init`, `scale`, `regularizer`, and `btorch.utils.conf`.
-
-### Removed
-- Redundant `zh/docs/api/` English mkdocstrings blocks (cleanup pending full translation workflow update).
+- Conda environment file renamed from `dev-requirements.yaml` to `environment.yml`.

@@ -49,7 +49,7 @@
 然后按照对应的路径进行。
 
 路径 A - Conda 或 Micromamba（推荐）：
-- 使用用户提供的环境名称从 `dev-requirements.yaml` 创建环境。
+- 使用用户提供的环境名称从 `environment.yml` 创建环境。
 - 激活环境。（conda 环境已包含 `pytorch_sparse`。）
 - 如果用户想要 fork 版 omegaconf：`pip install git+https://github.com/alexfanqi/omegaconf.git`
 - 运行：`pip install -e . --config-settings editable_mode=strict`
