@@ -2,6 +2,11 @@ name: Translate docs
 
 on:
   workflow_dispatch:
+    inputs:
+      languages:
+        description: "Space-separated language codes to translate (e.g. zh ja)"
+        default: "zh"
+        required: false
 
 permissions: {}
 
@@ -9,12 +14,16 @@ jobs:
   translate:
     permissions:
       contents: write
+      pull-requests: write
     runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+      OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -28,86 +37,42 @@ jobs:
       - name: Install dependencies
         env:
           UV_SYSTEM_PYTHON: "1"
+        run: uv sync --only-group docs --frozen
+
+      - name: Create translation branch
         run: |
-          uv sync --only-group docs --frozen
+          BRANCH="translate/update-$(date +%Y-%m-%d)"
+          git checkout -b "$BRANCH"
+          echo "branch=$BRANCH" >> $GITHUB_ENV
 
-      - name: Detect changed files
-        id: changed
+      - name: Translate languages
         run: |
-          if [ "${{ github.event_name }}" == "push" ]; then
-            SINCE="${{ github.event.before }}"
-          elif [ "${{ github.event_name }}" == "pull_request" ]; then
-            SINCE="origin/${{ github.base_ref }}"
-          else
-            SINCE=""
-          fi
-          echo "since=$SINCE" >> $GITHUB_OUTPUT
-          if [ -n "$SINCE" ]; then
-            README_CHANGED=$(git diff --name-only "$SINCE" HEAD -- README.md || true)
-          else
-            README_CHANGED=""
-          fi
-          if [ -n "$README_CHANGED" ]; then
-            echo "readme_changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "readme_changed=false" >> $GITHUB_OUTPUT
-          fi
+          for lang in ${{ inputs.languages || 'zh' }}; do
+            echo "=== Translating $lang ==="
+            uv run python scripts/translate.py command=translate-readme language=$lang
+            uv run python scripts/translate.py command=update-and-add language=$lang max_pages=20
+            uv run python scripts/translate.py command=add-missing language=$lang max_pages=20
+            uv run python scripts/translate.py command=remove-removable language=$lang
+            uv run python scripts/translate.py command=update-nav language=$lang
+          done
 
-      - name: Translate README
-        if: steps.changed.outputs.readme_changed == 'true' || github.event_name == 'workflow_dispatch'
-        run: uv run python scripts/translate.py command=translate-readme language=zh
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-
-      - name: Translate changed pages
-        if: steps.changed.outputs.since != '' || github.event_name == 'workflow_dispatch'
-        run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            python scripts/translate.py command=update-and-add language=zh max_pages=20
-          else
-            python scripts/translate.py command=translate-changed language=zh since_ref="${{ steps.changed.outputs.since }}" max_pages=20
-          fi
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-
-      - name: Add missing translations
-        run: uv run python scripts/translate.py command=add-missing language=zh max_pages=20
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-
-      - name: Remove obsolete translations
-        run: uv run python scripts/translate.py command=remove-removable language=zh
-
-      - name: Update zh nav
-        run: uv run python scripts/translate.py command=update-nav language=zh
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-
-      - name: Commit and push
+      - name: Commit and open PR
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/zh/ README.zh.md
+          for lang in ${{ inputs.languages || 'zh' }}; do
+            git add "docs/$lang/" "README.$lang.md" 2>/dev/null || true
+          done
           if git diff --staged --quiet; then
-            echo "No translation changes"
-          else
-            git commit -m "docs: update zh translations"
-            git push origin ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+            echo "No translation changes, skipping PR"
+            exit 0
           fi
-
-  build-docs:
-    needs: translate
-    if: always() && needs.translate.result == 'success'
-    uses: ./.github/workflows/build-docs.yml
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
+          git commit -m "docs: update translations"
+          git push origin "$branch"
+          gh pr create \
+            --title "docs: update translations ($(date +%Y-%m-%d))" \
+            --body "Automated translation update. Please review before merging." \
+            --base main \
+            --head "$branch"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
