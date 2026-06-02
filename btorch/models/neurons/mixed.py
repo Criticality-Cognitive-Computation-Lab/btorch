@@ -58,10 +58,12 @@ class MixedNeuronPopulation(nn.Module):
 
         counts: list[int] = []
         total = 0
+        group_names: list[str] = []
         for name, count, neuron in items:
             if count <= 0:
                 raise ValueError(f"Group {name!r} count must be positive, got {count}.")
             self.add_module(name, neuron)
+            group_names.append(name)
             counts.append(count)
             if hasattr(neuron, "size"):
                 total += int(neuron.size)
@@ -69,10 +71,39 @@ class MixedNeuronPopulation(nn.Module):
                 total += count
 
         self.counts = counts
+        self._group_names = group_names
         self._cumsum = [0] + torch.cumsum(torch.tensor(counts), dim=0).tolist()
         self.n_neuron = (total,)
         self.size = total
         self.step_mode = step_mode
+
+    def _indices(self, idx: int) -> torch.Tensor:
+        """Return global neuron indices for group *idx* (contiguous block)."""
+        start, end = self._cumsum[idx], self._cumsum[idx + 1]
+        return torch.arange(start, end, dtype=torch.long)
+
+    def _concat_attr(self, attr: str) -> Tensor:
+        """Concatenate ``attr`` from all sub-populations along neuron dim."""
+        parts: list[Tensor] = []
+        for name in self._group_names:
+            neuron = getattr(self, name)
+            val = getattr(neuron, attr, None)
+            if val is None:
+                raise AttributeError(
+                    f"{neuron.__class__.__name__} has no attribute {attr!r}"
+                )
+            if isinstance(val, nn.Parameter):
+                val = val.data
+            parts.append(val)
+        return torch.cat(parts, dim=-1)
+
+    @property
+    def v_threshold(self) -> Tensor:
+        return self._concat_attr("v_threshold")
+
+    @property
+    def v_reset(self) -> Tensor:
+        return self._concat_attr("v_reset")
 
     def _slice(self, x: Tensor, idx: int) -> Tensor:
         """Slice ``x`` along the last dimension for group *idx*."""
@@ -95,7 +126,8 @@ class MixedNeuronPopulation(nn.Module):
             Spike tensor of shape ``(*batch, n_neuron)``.
         """
         spikes: list[Tensor] = []
-        for idx, (_, neuron) in enumerate(self.named_children()):
+        for idx, name in enumerate(self._group_names):
+            neuron = getattr(self, name)
             soma = self._slice(x, idx)
             out: Tensor | tuple[Tensor, ...]
 

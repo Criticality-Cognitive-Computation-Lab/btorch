@@ -142,8 +142,8 @@ class TwoCompartmentGLIF(ParamBufferMixin, MemoryModule):
         detach_reset: bool = False,
         step_mode: Literal["s", "m"] = "s",
         backend: Literal["torch"] = "torch",
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
+        device=None,
+        dtype=None,
     ):
         super().__init__()
         self.n_neuron, self.size = normalize_n_neuron(n_neuron)

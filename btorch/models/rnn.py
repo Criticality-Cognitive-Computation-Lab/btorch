@@ -412,15 +412,18 @@ class RecurrentNN(RecurrentNNAbstract):
         return z, states
 
 
-# TODO: have an easier interface,
-#   rather than having to define a new class for different input
-class ApicalRecurrentNN(RecurrentNN):
+class HeterogeneousRecurrentNN(RecurrentNN):
     """Recurrent layer that supports an optional apical / top-down input.
 
     This subclass is useful when the neuron population contains models with
     multiple input ports (e.g.
     :class:`~btorch.models.neurons.TwoCompartmentGLIF`).  The extra
     ``x_apical`` tensor is forwarded to the neuron module unchanged.
+
+    Optionally, a second ``synapse_apical`` can be supplied so that a subset
+    of recurrent connections (e.g. SST→L5E or long-range E→L5E) drive the
+    apical compartment while the remaining connections drive the somatic
+    compartment.
 
     .. note::
         When calling :meth:`multi_step_forward` with a time-varying
@@ -432,7 +435,9 @@ class ApicalRecurrentNN(RecurrentNN):
     Args:
         neuron: Neuron module (typically a
             :class:`~btorch.models.neurons.mixed.MixedNeuronPopulation`).
-        synapse: Synapse model that provides recurrent currents.
+        synapse: Synapse model that provides recurrent currents to the soma.
+        synapse_apical: Optional second synapse that provides recurrent
+            currents to the apical compartment.
         syn_inp_module: Optional module applied to ``x_syn``.
         neuron_inp_module: Optional module applied to ``x``.
         update_state_names: Dotted state names to expose in the returned
@@ -446,6 +451,37 @@ class ApicalRecurrentNN(RecurrentNN):
         **kwargs: Passed to :class:`RecurrentNNAbstract`.
     """
 
+    def __init__(
+        self,
+        neuron: nn.Module,
+        synapse: synapse.Synapse,
+        synapse_apical: synapse.Synapse | None = None,
+        syn_inp_module: nn.Module | None = None,
+        neuron_inp_module: nn.Module | None = None,
+        *,
+        update_state_names: Sequence[str] | None = None,
+        unroll: int | bool = 8,
+        chunk_size: int | None = None,
+        cpu_offload: bool = False,
+        grad_checkpoint: bool = False,
+        allow_buffer=False,
+        **kwargs,
+    ):
+        super().__init__(
+            neuron=neuron,
+            synapse=synapse,
+            syn_inp_module=syn_inp_module,
+            neuron_inp_module=neuron_inp_module,
+            update_state_names=update_state_names,
+            unroll=unroll,
+            chunk_size=chunk_size,
+            cpu_offload=cpu_offload,
+            grad_checkpoint=grad_checkpoint,
+            allow_buffer=allow_buffer,
+            **kwargs,
+        )
+        self.synapse_apical = synapse_apical
+
     def single_step_forward(
         self,
         x: Tensor,
@@ -458,7 +494,9 @@ class ApicalRecurrentNN(RecurrentNN):
             x: External input current of shape ``(*batch, n_neuron)``.
             x_syn: Optional direct synaptic input.
             x_apical: Optional apical / top-down input of the same shape as
-                ``x``.  Passed as the second argument to ``self.neuron``.
+                ``x``.  If ``synapse_apical`` is present, the apical synaptic
+                current is *added* to this tensor before being passed to the
+                neuron.
 
         Returns:
             ``(spikes, states)`` where ``spikes`` has shape
@@ -468,12 +506,117 @@ class ApicalRecurrentNN(RecurrentNN):
             x = self.neuron_inp_module(x)
         if self.syn_inp_module is not None:
             x_syn = self.syn_inp_module(x_syn)
+
+        # Somatic input
         total_input = self.synapse.psc + x
-        if x_apical is None:
+
+        # Apical input = recurrent apical current + external teacher signal
+        apical_input = x_apical
+        if self.synapse_apical is not None:
+            if apical_input is None:
+                apical_input = self.synapse_apical.psc
+            else:
+                apical_input = self.synapse_apical.psc + apical_input
+
+        if apical_input is None:
             z = self.neuron(total_input)
         else:
-            z = self.neuron(total_input, x_apical)
+            z = self.neuron(total_input, apical_input)
+
         _ = self.synapse(z if x_syn is None else z + x_syn)
+        if self.synapse_apical is not None:
+            _ = self.synapse_apical(z if x_syn is None else z + x_syn)
+
+        states = filter_hidden_states(
+            self, self.update_state_names, allow_buffer=self.allow_buffer
+        )
+        return z, states
+
+
+class DualSynapseRecurrentNN(RecurrentNN):
+    """Recurrent layer with separate somatic and apical synapses.
+
+    This is useful for biologically-motivated two-synapse architectures where
+    recurrent connections are split into:
+
+    - **Somatic synapse** (`synapse_soma`): All recurrent connections (preserves
+      baseline network dynamics).
+    - **Apical synapse** (`synapse_apical`): A subset of connections targeting
+      the apical dendrite compartment (e.g. SST→L5E and long-range pyramidal
+      →L5E).
+
+    Both synapses receive the same spike output and are updated after each step.
+    The external input ``x`` is added to the somatic current, and ``x_apical``
+    is added to the apical current.
+
+    Args:
+        neuron: Neuron module (typically a
+            :class:`~btorch.models.neurons.mixed.MixedNeuronPopulation`
+            containing :class:`~btorch.models.neurons.TwoCompartmentGLIF`).
+        synapse_soma: Somatic synapse model.
+        synapse_apical: Apical synapse model.
+        syn_inp_module: Optional module applied to ``x_syn``.
+        neuron_inp_module: Optional module applied to ``x``.
+        update_state_names: Dotted state names to expose.
+        **kwargs: Passed to :class:`RecurrentNNAbstract`.
+    """
+
+    def __init__(
+        self,
+        neuron: nn.Module,
+        synapse_soma: synapse.Synapse,
+        synapse_apical: synapse.Synapse,
+        syn_inp_module: nn.Module | None = None,
+        neuron_inp_module: nn.Module | None = None,
+        *,
+        update_state_names: Sequence[str] | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            neuron=neuron,
+            synapse=synapse_soma,
+            syn_inp_module=syn_inp_module,
+            neuron_inp_module=neuron_inp_module,
+            update_state_names=update_state_names,
+            **kwargs,
+        )
+        self.synapse_soma = synapse_soma
+        self.synapse_apical = synapse_apical
+
+    def single_step_forward(
+        self,
+        x: Tensor,
+        x_syn: Tensor | None = None,
+        x_apical: Tensor | None = None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Advance one timestep with separate somatic and apical synapses.
+
+        Args:
+            x: External input current of shape ``(*batch, n_neuron)``.
+            x_syn: Optional direct synaptic input.
+            x_apical: Optional apical / top-down input of the same shape as
+                ``x``.  Added to the apical synapse PSC before being passed to
+                the neuron.
+
+        Returns:
+            ``(spikes, states)`` where ``spikes`` has shape
+            ``(*batch, n_neuron)``.
+        """
+        if self.neuron_inp_module is not None:
+            x = self.neuron_inp_module(x)
+        if self.syn_inp_module is not None:
+            x_syn = self.syn_inp_module(x_syn)
+
+        i_soma = self.synapse_soma.psc + x
+        i_apical = self.synapse_apical.psc
+        if x_apical is not None:
+            i_apical = i_apical + x_apical
+
+        z = self.neuron(i_soma, i_apical)
+        spike_input = z if x_syn is None else z + x_syn
+        _ = self.synapse_soma(spike_input)
+        _ = self.synapse_apical(spike_input)
+
         states = filter_hidden_states(
             self, self.update_state_names, allow_buffer=self.allow_buffer
         )
