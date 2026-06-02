@@ -412,7 +412,7 @@ class RecurrentNN(RecurrentNNAbstract):
         return z, states
 
 
-class HeterogeneousRecurrentNN(RecurrentNN):
+class ApicalRecurrentNN(RecurrentNN):
     """Recurrent layer that supports an optional apical / top-down input.
 
     This subclass is useful when the neuron population contains models with
@@ -533,32 +533,32 @@ class HeterogeneousRecurrentNN(RecurrentNN):
         return z, states
 
 
-class DualSynapseRecurrentNN(RecurrentNN):
-    """Recurrent layer with separate somatic and apical synapses.
+class SomaApicalRecurrentNN(ApicalRecurrentNN):
+    """Recurrent layer with dedicated somatic and apical synapses, both
+    required.
 
-    This is useful for biologically-motivated two-synapse architectures where
-    recurrent connections are split into:
+    A specialisation of :class:`ApicalRecurrentNN` for architectures where
+    recurrent connections are explicitly split into separate somatic and apical
+    pathways:
 
-    - **Somatic synapse** (`synapse_soma`): All recurrent connections (preserves
-      baseline network dynamics).
-    - **Apical synapse** (`synapse_apical`): A subset of connections targeting
-      the apical dendrite compartment (e.g. SST→L5E and long-range pyramidal
-      →L5E).
+    - **Somatic synapse** (``synapse_soma``): drives the somatic compartment.
+    - **Apical synapse** (``synapse_apical``): drives the apical compartment
+      (e.g. SST→L5E or long-range E→L5E connections).
 
-    Both synapses receive the same spike output and are updated after each step.
-    The external input ``x`` is added to the somatic current, and ``x_apical``
-    is added to the apical current.
+    Both synapses receive the same spike output each step.  The external input
+    ``x`` is added to the somatic current, and ``x_apical`` (if provided) is
+    added to the apical current.
 
     Args:
-        neuron: Neuron module (typically a
-            :class:`~btorch.models.neurons.mixed.MixedNeuronPopulation`
-            containing :class:`~btorch.models.neurons.TwoCompartmentGLIF`).
-        synapse_soma: Somatic synapse model.
-        synapse_apical: Apical synapse model.
+        neuron: Neuron module (e.g.
+            :class:`~btorch.models.neurons.mixed.MixedNeuronPopulation` or a
+            single :class:`~btorch.models.neurons.TwoCompartmentGLIF`).
+        synapse_soma: Synapse model for the somatic compartment.
+        synapse_apical: Synapse model for the apical compartment.
         syn_inp_module: Optional module applied to ``x_syn``.
         neuron_inp_module: Optional module applied to ``x``.
         update_state_names: Dotted state names to expose.
-        **kwargs: Passed to :class:`RecurrentNNAbstract`.
+        **kwargs: Passed to :class:`ApicalRecurrentNN`.
     """
 
     def __init__(
@@ -575,49 +575,10 @@ class DualSynapseRecurrentNN(RecurrentNN):
         super().__init__(
             neuron=neuron,
             synapse=synapse_soma,
+            synapse_apical=synapse_apical,
             syn_inp_module=syn_inp_module,
             neuron_inp_module=neuron_inp_module,
             update_state_names=update_state_names,
             **kwargs,
         )
         self.synapse_soma = synapse_soma
-        self.synapse_apical = synapse_apical
-
-    def single_step_forward(
-        self,
-        x: Tensor,
-        x_syn: Tensor | None = None,
-        x_apical: Tensor | None = None,
-    ) -> tuple[Tensor, dict[str, Tensor]]:
-        """Advance one timestep with separate somatic and apical synapses.
-
-        Args:
-            x: External input current of shape ``(*batch, n_neuron)``.
-            x_syn: Optional direct synaptic input.
-            x_apical: Optional apical / top-down input of the same shape as
-                ``x``.  Added to the apical synapse PSC before being passed to
-                the neuron.
-
-        Returns:
-            ``(spikes, states)`` where ``spikes`` has shape
-            ``(*batch, n_neuron)``.
-        """
-        if self.neuron_inp_module is not None:
-            x = self.neuron_inp_module(x)
-        if self.syn_inp_module is not None:
-            x_syn = self.syn_inp_module(x_syn)
-
-        i_soma = self.synapse_soma.psc + x
-        i_apical = self.synapse_apical.psc
-        if x_apical is not None:
-            i_apical = i_apical + x_apical
-
-        z = self.neuron(i_soma, i_apical)
-        spike_input = z if x_syn is None else z + x_syn
-        _ = self.synapse_soma(spike_input)
-        _ = self.synapse_apical(spike_input)
-
-        states = filter_hidden_states(
-            self, self.update_state_names, allow_buffer=self.allow_buffer
-        )
-        return z, states
