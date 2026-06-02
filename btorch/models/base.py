@@ -1024,57 +1024,20 @@ class BaseNode(ParamBufferMixin, MemoryModule):
 
     @abstractmethod
     def neuronal_charge(self, x: torch.Tensor):
-        """
-         * :ref:`API in English <BaseNode.neuronal_charge-en>`
+        """Define the charge difference equation.
 
-        .. _BaseNode.neuronal_charge-cn:
-
-        定义神经元的充电差分方程。子类必须实现这个函数。
-
-        * :ref:`中文API <BaseNode.neuronal_charge-cn>`
-
-        .. _BaseNode.neuronal_charge-en:
-
-
-        Define the charge difference equation.
-        The sub-class must implement this function.
+        Subclasses must implement this.
         """
         raise NotImplementedError
 
     def neuronal_fire(self):
-        """
-        * :ref:`API in English <BaseNode.neuronal_fire-en>`
-
-        .. _BaseNode.neuronal_fire-cn:
-
-        根据当前神经元的电压、阈值，计算输出脉冲。
-
-        * :ref:`中文API <BaseNode.neuronal_fire-cn>`
-
-        .. _BaseNode.neuronal_fire-en:
-
-
-        Calculate out spikes of neurons by their current membrane potential
-        and threshold voltage.
-        """
-
+        """Calculate output spikes from the current membrane potential and
+        threshold."""
         return self.surrogate_function(self.v - self.v_threshold)
 
     def neuronal_reset(self, spike):
-        """
-        * :ref:`API in English <BaseNode.neuronal_reset-en>`
-
-        .. _BaseNode.neuronal_reset-cn:
-
-        根据当前神经元释放的脉冲，对膜电位进行重置。
-
-        * :ref:`中文API <BaseNode.neuronal_reset-cn>`
-
-        .. _BaseNode.neuronal_reset-en:
-
-
-        Reset the membrane potential according to neurons' output spikes.
-        """
+        """Reset the membrane potential according to the neurons' output
+        spikes."""
         if self.detach_reset:
             spike_d = spike.detach()
         else:

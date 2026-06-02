@@ -7,7 +7,8 @@ def calculate_fr_distribution(
     spikes: np.ndarray | torch.Tensor,
     dt: float = 1.0,
 ) -> dict:
-    """计算群体中每个时刻的平均发放率，并统计其分布特征。
+    """Compute the mean population firing rate at each timestep and
+    characterize its distribution.
 
     Args:
         spikes: Spike matrix of shape ``(Time, Neurons)``.
@@ -19,17 +20,16 @@ def calculate_fr_distribution(
     if isinstance(spikes, torch.Tensor):
         spikes = spikes.detach().cpu().numpy()
 
-    # 计算每个时间点的平均发放率 (Hz)
     window_size = 5
-    kernel = np.ones(window_size) / (window_size * dt / 1000.0)  # 转换为Hz
+    kernel = np.ones(window_size) / (window_size * dt / 1000.0)  # convert to Hz
     pop_spikes = spikes.mean(axis=1)  # (T,)
     rates = np.convolve(pop_spikes, kernel, mode="same")
 
     return {
-        "rates": rates,  # 每个神经元的发放率分布
-        "mean": np.mean(rates),  # 均值
-        "skew": skew(rates),  # 偏度
-        "kurt": kurtosis(rates),  # 峰度
+        "rates": rates,
+        "mean": np.mean(rates),
+        "skew": skew(rates),
+        "kurt": kurtosis(rates),
     }
 
 
@@ -37,7 +37,8 @@ def calculate_cv_isi(
     spikes: np.ndarray | torch.Tensor,
     dt: float = 1.0,
 ) -> dict:
-    """计算群体中每个神经元的CV_ISI，并统计其分布特征。
+    """Compute the CV of the ISI for each neuron in the population and
+    characterize its distribution.
 
     Args:
         spikes: Spike matrix of shape ``(Time, Neurons)``.
@@ -53,12 +54,12 @@ def calculate_cv_isi(
     cv_isi_list = []
 
     for n in range(num_neurons):
-        spike_times = np.where(spikes[:, n] > 0)[0] * dt  # 转换为ms
+        spike_times = np.where(spikes[:, n] > 0)[0] * dt  # convert to ms
         if len(spike_times) < 2:
-            cv_isi_list.append(np.nan)  # 不足两个脉冲，无法计算ISI
+            cv_isi_list.append(np.nan)  # fewer than two spikes: ISI undefined
             continue
 
-        isis = np.diff(spike_times)  # 计算ISI
+        isis = np.diff(spike_times)
         if np.mean(isis) == 0:
             cv_isi_list.append(np.nan)
             continue
@@ -67,11 +68,11 @@ def calculate_cv_isi(
         cv_isi_list.append(cv_isi)
 
     cv_isi_array = np.array(cv_isi_list)
-    mean_cv_isi = np.nanmean(cv_isi_array)  # 忽略NaN值计算均值
+    mean_cv_isi = np.nanmean(cv_isi_array)  # ignore NaNs when averaging
 
     return {
-        "cv_isi": cv_isi_array,  # 每个神经元的CV_ISI分布
-        "mean": mean_cv_isi,  # 均值
+        "cv_isi": cv_isi_array,
+        "mean": mean_cv_isi,
     }
 
 
@@ -81,9 +82,10 @@ def calculate_spike_distance(
     subset_size: int = 100,
     seed: "int | None" = None,
 ) -> float:
-    """计算 SPIKE-distance (Kreuz et al., 2013)。
+    """Compute the SPIKE-distance (Kreuz et al., 2013).
 
-    衡量脉冲序列之间的不同步程度。0表示完全同步。
+    Measures the degree of asynchrony between spike trains. Zero means fully
+    synchronous.
 
     Args:
         spikes: Spike matrix of shape ``(Time, Neurons)``.
@@ -100,7 +102,7 @@ def calculate_spike_distance(
     T_steps, N = spikes.shape
     times = np.arange(T_steps) * dt
 
-    # 随机抽样
+    # random subsampling to keep pairwise computation tractable
     if N > subset_size:
         if seed is not None:
             np.random.seed(seed)
@@ -111,8 +113,7 @@ def calculate_spike_distance(
         selected_spikes = spikes
         N_subset = N
 
-    # 预计算每个神经元的 t_prev, t_next, isi
-    # shape: (N_subset, T_steps)
+    # precompute t_prev, t_next, and isi for each neuron; shape: (N_subset, T_steps)
     t_prev = np.zeros((N_subset, T_steps))
     t_next = np.zeros((N_subset, T_steps))
     isi = np.zeros((N_subset, T_steps))
@@ -122,41 +123,24 @@ def calculate_spike_distance(
         spike_times = spike_indices * dt
 
         if len(spike_times) == 0:
-            # 处理无脉冲情况：设为无穷大或整个区间
+            # no spikes: span the full interval as a boundary fallback
             t_prev[n, :] = 0
             t_next[n, :] = times[-1]
             isi[n, :] = times[-1]
             continue
 
-        # 使用 searchsorted 找到每个时间点的前后脉冲
-        # indices_next 指向 times 中每个 t 之后的第一个脉冲在 spike_times 中的位置
-        indices_next = np.searchsorted(spike_times, times)
+        # Use a forward scan for t_prev = max(s | s <= t)
+        # and a backward scan for t_next = min(s | s >= t).
+        # searchsorted alone does not handle ties correctly at spike times,
+        # so we fill with explicit linear scans instead.
 
-        # 处理边界
-        indices_next = np.clip(indices_next, 0, len(spike_times) - 1)
-        # indices_prev = np.clip(indices_next - 1, 0, len(spike_times) - 1)
-
-        # 修正 searchsorted 的结果，确保 t_prev <= t <= t_next
-        # 对于 t 正好在 spike_time 上的情况，searchsorted 可能返回当前或下一个
-        # 这里我们简单处理：
-        # t_next[t] 是 >= t 的第一个脉冲
-        # t_prev[t] 是 <= t 的最后一个脉冲
-
-        # 更精确的做法：
-        # t_prev: max(s | s <= t)
-        # t_next: min(s | s > t)  (SPIKE-distance 定义通常要求严格大于，或者 >=)
-
-        # 重新实现简单的循环填充（虽然慢一点但准确）或者利用 searchsorted 的性质
-        # 实际上，对于 step function，可以用 diff 填充
-
-        # 快速填充法：
         # t_prev
         curr_spike = 0.0
         spike_idx = 0
         for t_idx, t in enumerate(times):
             if spike_idx < len(spike_times) and t >= spike_times[spike_idx]:
                 curr_spike = spike_times[spike_idx]
-                # 如果不是最后一个脉冲，检查是否到了下一个
+                # advance index if we've reached the next spike
                 if spike_idx < len(spike_times) - 1 and t >= spike_times[spike_idx + 1]:
                     spike_idx += 1
                     curr_spike = spike_times[spike_idx]
@@ -178,32 +162,28 @@ def calculate_spike_distance(
 
         isi[n, isi[n, :] == 0] = dt
 
-    # 计算成对 SPIKE-distance S(t) = ( |dt_p1 - dt_p2| * isi2 + |dt_f1 - dt_f2|
-    # * isi1 ) / ( 0.5 * (isi1 + isi2)**2 )
-
+    # Pairwise SPIKE-distance:
+    # S(t) = (|dt_p1-dt_p2|*isi2 + |dt_f1-dt_f2|*isi1) / (0.5*(isi1+isi2)^2)
     dt_p = times[None, :] - t_prev  # (N, T)
     dt_f = t_next - times[None, :]  # (N, T)
 
     pairwise_distances = []
 
-    # 随机选取若干对进行计算，或者计算所有对如果 N_subset 很大，计算所有对可能较
-    # 慢。这里 N_subset 默认为 50， 50*49/2 = 1225，可以接受。
+    # All pairs: with N_subset=50, this is 1225 pairs — acceptable cost.
     for i in range(N_subset):
         for j in range(i + 1, N_subset):
             isi1 = isi[i]
             isi2 = isi[j]
 
             avg_isi_sq = 0.5 * (isi1 + isi2) ** 2
-            # 避免除以零
-            avg_isi_sq[avg_isi_sq == 0] = 1.0
+            avg_isi_sq[avg_isi_sq == 0] = 1.0  # avoid division by zero
 
             term1 = np.abs(dt_p[i] - dt_p[j]) * isi2
             term2 = np.abs(dt_f[i] - dt_f[j]) * isi1
 
             s_t = (term1 + term2) / avg_isi_sq
 
-            # 时间积分（平均）
-            dist = np.mean(s_t)
+            dist = np.mean(s_t)  # integrate over time
             pairwise_distances.append(dist)
 
     if not pairwise_distances:
