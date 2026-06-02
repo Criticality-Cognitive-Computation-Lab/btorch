@@ -63,7 +63,7 @@ Repository = "https://github.com/your-org/btorch"
 Documentation = "https://github.com/your-org/btorch/docs"
 
 [tool.uv.sources]
-omegaconf = { git = "https://github.com/alexfanqi/omegaconf.git" }
+omegaconf = { git = "https://github.com/alexfanqi/omegaconf.git", rev = "1ed16e7279e69240188f7a664bf4964e0a805805" }
 # torch resolved from PyTorch CPU index (uv/pip CI); CUDA users install torch separately
 torch = { index = "pytorch-cpu" }
 # torch_scatter/sparse are NOT resolved via uv — their wheel URL encodes the torch+CUDA variant.
