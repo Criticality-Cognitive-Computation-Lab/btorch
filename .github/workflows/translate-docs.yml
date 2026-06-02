@@ -29,7 +29,7 @@ jobs:
         env:
           UV_SYSTEM_PYTHON: "1"
         run: |
-          uv sync --extra docs --frozen
+          uv sync --only-group docs --frozen
 
       - name: Detect changed files
         id: changed
@@ -55,7 +55,7 @@ jobs:
 
       - name: Translate README
         if: steps.changed.outputs.readme_changed == 'true' || github.event_name == 'workflow_dispatch'
-        run: python scripts/translate.py command=translate-readme language=zh
+        run: uv run python scripts/translate.py command=translate-readme language=zh
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
@@ -75,14 +75,21 @@ jobs:
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
 
       - name: Add missing translations
-        run: python scripts/translate.py command=add-missing language=zh max_pages=20
+        run: uv run python scripts/translate.py command=add-missing language=zh max_pages=20
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
 
       - name: Remove obsolete translations
-        run: python scripts/translate.py command=remove-removable language=zh
+        run: uv run python scripts/translate.py command=remove-removable language=zh
+
+      - name: Update zh nav
+        run: uv run python scripts/translate.py command=update-nav language=zh
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
 
       - name: Commit and push
         run: |

@@ -96,18 +96,6 @@ def build_lang(cfg: DocsConf) -> None:
 
     _sync_shared(language)
 
-    if language != "en":
-        nav_script = Path(__file__).resolve().parent / "translate.py"
-        subprocess.run(
-            [
-                sys.executable,
-                str(nav_script),
-                "command=update-nav",
-                f"language={language}",
-            ],
-            check=True,
-        )
-
     api_script = Path(__file__).resolve().parent / "gen_api_pages.py"
     print("Generating API reference pages...")
     subprocess.run(["python", str(api_script)], check=True)
