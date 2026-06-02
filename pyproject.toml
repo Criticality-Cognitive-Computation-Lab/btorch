@@ -79,6 +79,7 @@ extra-build-dependencies = { torch-scatter = ["torch"], torch-sparse = ["torch"]
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["btorch"]
