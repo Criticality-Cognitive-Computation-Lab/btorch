@@ -4,7 +4,8 @@ updates:
     directory: "/"
     schedule:
       interval: "monthly"
-    cooldown-period: 30
+    cooldown:
+      default-days: 30
     groups:
       github-actions:
         patterns: ["*"]
@@ -15,7 +16,8 @@ updates:
     directory: "/"
     schedule:
       interval: "monthly"
-    cooldown-period: 30
+    cooldown:
+      default-days: 30
     groups:
       python-deps:
         patterns: ["*"]
@@ -26,7 +28,8 @@ updates:
     directory: "/"
     schedule:
       interval: "monthly"
-    cooldown-period: 30
+    cooldown:
+      default-days: 30
     groups:
       conda-deps:
         patterns: ["*"]

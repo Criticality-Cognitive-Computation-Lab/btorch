@@ -42,7 +42,7 @@ jobs:
         env:
           UV_SYSTEM_PYTHON: "1"
         run: |
-          uv sync --extra docs --frozen
+          uv sync --only-group docs --frozen
 
       - name: Build all languages
         run: python scripts/docs.py command=build-all
