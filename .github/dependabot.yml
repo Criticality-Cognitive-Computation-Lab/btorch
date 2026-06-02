@@ -4,6 +4,10 @@ updates:
     directory: "/"
     schedule:
       interval: "monthly"
+    cooldown-period: 30
+    groups:
+      github-actions:
+        patterns: ["*"]
     commit-message:
       prefix: "ci(deps)"
 
@@ -11,19 +15,20 @@ updates:
     directory: "/"
     schedule:
       interval: "monthly"
+    cooldown-period: 30
+    groups:
+      python-deps:
+        patterns: ["*"]
     commit-message:
       prefix: "deps"
 
-  - package-ecosystem: "pip"
+  - package-ecosystem: "conda"
     directory: "/"
     schedule:
       interval: "monthly"
+    cooldown-period: 30
+    groups:
+      conda-deps:
+        patterns: ["*"]
     commit-message:
-      prefix: "deps"
-
-  - package-ecosystem: "pip"
-    directory: "/docs"
-    schedule:
-      interval: "monthly"
-    commit-message:
-      prefix: "deps(docs)"
+      prefix: "deps(conda)"
