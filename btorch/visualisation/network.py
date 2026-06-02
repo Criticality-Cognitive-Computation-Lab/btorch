@@ -1,10 +1,11 @@
 """Network graph visualization utilities."""
 
+import scipy.sparse
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
 
-def plot_network(sparse_mat, ax: Axes | None = None) -> Figure:
+def plot_network(sparse_mat: scipy.sparse.sparray, ax: Axes | None = None) -> Figure:
     """Plot a network graph from a sparse connectivity matrix.
 
     Uses NetworkX spring layout to visualize the graph structure.

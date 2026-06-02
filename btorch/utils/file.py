@@ -7,6 +7,11 @@ within the repository structure.
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+
+if TYPE_CHECKING:
+    import matplotlib.figure
 
 from btorch.utils import conf
 
@@ -78,7 +83,9 @@ def _resolve_cfg(cfg: FigPathConfig | dict | conf.DictConfig | None):
     return conf.OmegaConf.merge(defaults, cfg)
 
 
-def fig_path(file: str | Path | None = None, cfg: FigPathConfig | dict | None = None):
+def fig_path(
+    file: str | Path | None = None, cfg: FigPathConfig | dict | None = None
+) -> Path:
     """Resolve figure output directory based on caller location.
 
     Places outputs in ``fig/benchmark/``, ``fig/tests/``, or ``fig/misc/``
@@ -122,7 +129,7 @@ def fig_path(file: str | Path | None = None, cfg: FigPathConfig | dict | None = 
 
 
 def save_fig(
-    fig,
+    fig: matplotlib.figure.Figure,
     name: str | None = None,
     path: Path | None = None,
     *,

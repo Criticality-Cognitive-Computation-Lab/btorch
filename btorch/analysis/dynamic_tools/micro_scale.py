@@ -3,14 +3,18 @@ import torch
 from scipy.stats import kurtosis, skew
 
 
-def calculate_fr_distribution(spikes, dt=1.0):
+def calculate_fr_distribution(
+    spikes: np.ndarray | torch.Tensor,
+    dt: float = 1.0,
+) -> dict:
     """计算群体中每个时刻的平均发放率，并统计其分布特征。
 
     Args:
-        spikes: (Time, Neurons) 脉冲矩阵
-        dt: 仿真步长(ms)
+        spikes: Spike matrix of shape ``(Time, Neurons)``.
+        dt: Simulation time step in ms.
+
     Returns:
-        dict: {'rates': array, 'mean': float, 'skew': float, 'kurt': float}
+        Dictionary with keys ``rates``, ``mean``, ``skew``, ``kurt``.
     """
     if isinstance(spikes, torch.Tensor):
         spikes = spikes.detach().cpu().numpy()
@@ -29,14 +33,18 @@ def calculate_fr_distribution(spikes, dt=1.0):
     }
 
 
-def calculate_cv_isi(spikes, dt=1.0):
+def calculate_cv_isi(
+    spikes: np.ndarray | torch.Tensor,
+    dt: float = 1.0,
+) -> dict:
     """计算群体中每个神经元的CV_ISI，并统计其分布特征。
 
     Args:
-        spikes: (Time, Neurons) 脉冲矩阵
-        dt: 仿真步长(ms)
+        spikes: Spike matrix of shape ``(Time, Neurons)``.
+        dt: Simulation time step in ms.
+
     Returns:
-        dict: {'cv_isi': array, 'mean': float}
+        Dictionary with keys ``cv_isi`` and ``mean``.
     """
     if isinstance(spikes, torch.Tensor):
         spikes = spikes.detach().cpu().numpy()
@@ -67,17 +75,24 @@ def calculate_cv_isi(spikes, dt=1.0):
     }
 
 
-def calculate_spike_distance(spikes, dt=1.0, subset_size=100, seed=None):
+def calculate_spike_distance(
+    spikes: np.ndarray | torch.Tensor,
+    dt: float = 1.0,
+    subset_size: int = 100,
+    seed: "int | None" = None,
+) -> float:
     """计算 SPIKE-distance (Kreuz et al., 2013)。
 
     衡量脉冲序列之间的不同步程度。0表示完全同步。
 
     Args:
-        spikes: (Time, Neurons) 脉冲矩阵
-        dt: 仿真步长(ms)
-        subset_size: 随机抽样的神经元数量，用于计算成对距离
+        spikes: Spike matrix of shape ``(Time, Neurons)``.
+        dt: Simulation time step in ms.
+        subset_size: Number of randomly sampled neurons for pairwise distance.
+        seed: Random seed for neuron sampling.
+
     Returns:
-        float: 平均 SPIKE-distance
+        Mean SPIKE-distance across all neuron pairs.
     """
     if isinstance(spikes, torch.Tensor):
         spikes = spikes.detach().cpu().numpy()

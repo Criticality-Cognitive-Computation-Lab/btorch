@@ -18,10 +18,12 @@ def calculate_ra(spike_initial: torch.Tensor, spike_final: torch.Tensor) -> floa
     firing rates.
 
     Args:
-        spike_initial (torch.Tensor): Initial spike activity. Shape (batch_size,
-        num_neurons) or (batch_size, time_steps, num_neurons). spike_final
-        (torch.Tensor): Final spike activity. Shape (batch_size, num_neurons) or
-        (batch_size, time_steps, num_neurons).
+        spike_initial (torch.Tensor): Initial spike activity. Shape
+            ``(batch_size, num_neurons)`` or
+            ``(batch_size, time_steps, num_neurons)``.
+        spike_final (torch.Tensor): Final spike activity. Shape
+            ``(batch_size, num_neurons)`` or
+            ``(batch_size, time_steps, num_neurons)``.
 
     Returns:
         float: The Representation Alignment (RA) score.
@@ -87,11 +89,11 @@ def calculate_pcist(
 
     Args:
         response (torch.Tensor): The network response to perturbation. Shape
-        (time_steps, num_neurons).
-        baseline (torch.Tensor): The baseline
-        activity before perturbation. Shape (time_steps_base, num_neurons).
+            ``(time_steps, num_neurons)``.
+        baseline (torch.Tensor): The baseline activity before perturbation.
+            Shape ``(time_steps_base, num_neurons)``.
         threshold_factor (float): Factor of baseline std dev to define
-        significant state excursion. Default 3.0.
+            significant state excursion. Default 3.0.
 
     Returns:
         float: The PCIst score.
@@ -184,8 +186,8 @@ def calculate_lyapunov_exponent(spike_train: torch.Tensor, dt: float = 0.1) -> f
     """Calculate the maximum Lyapunov exponent for a given spike train.
 
     Args:
-        spike_train (torch.Tensor): The spike train data. Shape (time_steps,
-        num_neurons).
+        spike_train (torch.Tensor): The spike train data. Shape
+            ``(time_steps, num_neurons)``.
         dt (float): Time bin size in milliseconds. Default is 0.1 ms.
 
     Returns:
@@ -212,8 +214,12 @@ def calculate_lyapunov_exponent(spike_train: torch.Tensor, dt: float = 0.1) -> f
 
 
 def calculate_gain_stability_sensitivity(
-    model, dataloader, g_values=None, dt=1.0, device="cuda"
-) -> float:
+    model: torch.nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    g_values: np.ndarray | None = None,
+    dt: float = 1.0,
+    device: str = "cuda",
+) -> tuple:
     """Calculate the Gain-Stability Sensitivity (Susceptibility) slope.
 
     Definition: The slope of the curve of the Maximum Lyapunov Exponent (lambda_max)
@@ -222,7 +228,7 @@ def calculate_gain_stability_sensitivity(
     Args:
         model: The Brain model.
         dataloader: DataLoader providing input.
-        g_values: List of gain scaling factors. Default np.linspace(0.5, 5.0, 10).
+        g_values: Array of gain scaling factors. Default np.linspace(0.5, 5.0, 10).
         dt: Simulation time step.
         device: Device to run on.
 

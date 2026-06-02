@@ -1353,7 +1353,7 @@ def plot_log_hist(
     ax: Axes | None = None,
     title: str = "Distribution",
     xlabel: str = "Value",
-    **kwargs,
+    **kwargs: Any,
 ) -> Axes:
     """Plot log-log histogram with logarithmic binning.
 

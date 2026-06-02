@@ -74,7 +74,11 @@ def describe_array(array: np.ndarray):
     print(f"75th Percentile (Q3): {q75}")
 
 
-def compute_log_hist(data, bins=1000, edge_pos: Literal["mid", "sep"] = "mid"):
+def compute_log_hist(
+    data: np.ndarray,
+    bins: int = 1000,
+    edge_pos: Literal["mid", "sep"] = "mid",
+) -> tuple:
     """Compute histogram with logarithmically-spaced bins.
 
     Useful for visualizing heavy-tailed distributions like synaptic weights

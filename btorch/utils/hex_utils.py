@@ -469,7 +469,7 @@ class Hexal:
 
     # ----- Geometric methods
 
-    def interp(self, other, t):
+    def interp(self, other: "Hexal", t: float) -> "Hexal":
         """Interpolates towards other.
 
         Args:
@@ -501,7 +501,7 @@ class Hexal:
         uprime, vprime = hex_round(uprime, vprime)
         return Hexal(uprime, vprime, 0)
 
-    def angle(self, other=None, non_negative=False):
+    def angle(self, other: "Hexal | None" = None, non_negative: bool = False) -> float:
         """Returns the angle to other or the origin.
 
         Args:
@@ -690,15 +690,7 @@ class HexArray(np.ndarray):
 
 
 class HexLattice(HexArray):
-    """Flat array of Hexals.
-
-    Args:
-        extent (int): Extent of the regular hexagon grid.
-        hexals (Iterable | None): Existing hexals to initialize with.
-        center (Hexal): Center hexal of the lattice.
-        u_stride (int): Stride in u-direction.
-        v_stride (int): Stride in v-direction.
-    """
+    """Flat array of Hexals."""
 
     def __new__(
         cls,
@@ -708,6 +700,15 @@ class HexLattice(HexArray):
         u_stride=1,
         v_stride=1,
     ):
+        """Create a new HexLattice.
+
+        Args:
+            extent (int): Extent of the regular hexagon grid.
+            hexals (Iterable | None): Existing hexals to initialize with.
+            center (Hexal): Center hexal of the lattice.
+            u_stride (int): Stride in u-direction.
+            v_stride (int): Stride in v-direction.
+        """
         if isinstance(hexals, Iterable):
             hexals = HexArray(hexals=hexals)
             u = np.array([h.u for h in hexals])
@@ -744,7 +745,12 @@ class HexLattice(HexArray):
 
     # ----- Geometry
 
-    def circle(self, radius=None, center=Hexal(0, 0, 0), as_lattice=False):
+    def circle(
+        self,
+        radius: int | None = None,
+        center: Hexal = Hexal(0, 0, 0),
+        as_lattice: bool = False,
+    ) -> "HexArray | HexLattice":
         """Draws a circle in hex coordinates.
 
         Args:
@@ -769,7 +775,11 @@ class HexLattice(HexArray):
         return HexArray(hexals=circle)
 
     @staticmethod
-    def filled_circle(radius=None, center=Hexal(0, 0, 0), as_lattice=False):
+    def filled_circle(
+        radius: int | None = None,
+        center: Hexal = Hexal(0, 0, 0),
+        as_lattice: bool = False,
+    ) -> "HexArray | HexLattice":
         """Draws a filled circle in hex coordinates.
 
         Args:
@@ -797,7 +807,7 @@ class HexLattice(HexArray):
         """Returns the hull of the regular lattice."""
         return self.circle(radius=self.extent, center=self.center)
 
-    def _line_span(self, angle):
+    def _line_span(self, angle: float) -> "HexArray":
         """Returns two points spanning a line with given angle wrt. origin.
 
         Args:
@@ -818,7 +828,9 @@ class HexLattice(HexArray):
             h.value = 1
         return HexArray(hexals=span)
 
-    def line(self, angle, center=Hexal(0, 0, 1), as_lattice=False):
+    def line(
+        self, angle: float, center: Hexal = Hexal(0, 0, 1), as_lattice: bool = False
+    ) -> "HexArray | HexLattice":
         """Returns a line on a HexLattice or HexArray.
 
         Args:

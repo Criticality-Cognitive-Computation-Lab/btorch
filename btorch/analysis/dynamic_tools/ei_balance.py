@@ -1,5 +1,7 @@
 """E/I balance analysis tools for spiking neural networks."""
 
+from typing import Any
+
 import numpy as np
 import torch
 
@@ -32,6 +34,7 @@ def compute_eci(
     I_ext: torch.Tensor | np.ndarray | None = None,
     batch_axis: tuple[int, ...] | int | None = None,
     dtype: torch.dtype | np.dtype | None = None,
+    **kwargs: Any,
 ) -> torch.Tensor | np.ndarray:
     """Compute Excitatory-Inhibitory Cancellation Index (ECI).
 
@@ -54,16 +57,20 @@ def compute_eci(
         batch_axis: Axes to aggregate over (e.g., trials) in addition to the time axis.
             If None, averages over all non-neuron dimensions.
         dtype: Data type for aggregation.
-        stat: Aggregation statistic to return instead of per-neuron values.
+
+    Keyword Args:
+        stat (str | None): Aggregation statistic to return instead of per-neuron values.
             Options: "mean", "median", "max", "min", "std", "var", "argmax",
             "argmin", "cv". See [`use_stats()`](btorch/analysis/statistics.py:483).
-        stat_info: Additional statistics to compute and store in info dict.
+        stat_info (str | list[str] | None): Additional statistics to compute
+            and store in info dict.
             See [`use_stats()`](btorch/analysis/statistics.py:483).
-        nan_policy: How to handle NaN values ("skip", "warn", "assert").
+        nan_policy (str | None): How to handle NaN values ("skip", "warn", "assert").
             See [`use_stats()`](btorch/analysis/statistics.py:483).
-        inf_policy: How to handle Inf values ("propagate", "skip", "warn",
+        inf_policy (str | None): How to handle Inf values ("propagate", "skip", "warn",
             "assert"). See [`use_stats()`](btorch/analysis/statistics.py:483).
-        percentiles: Percentile level(s) in [0, 100] to compute.
+        percentiles (float | tuple[float, ...] | None): Percentile level(s) in
+            [0, 100] to compute.
             See [`use_percentiles()`](btorch/analysis/statistics.py:777).
 
     Returns:
@@ -147,7 +154,8 @@ def compute_lag_correlation(
     batch_axis: tuple[int, ...] | int | None = None,
     use_fft: bool = True,
     dtype: torch.dtype | np.dtype | None = None,
-):
+    **kwargs: Any,
+) -> tuple:
     """Compute lagged cross-correlation between two signals.
 
     Uses FFT-based correlation for efficiency. Returns correlation values
@@ -167,18 +175,23 @@ def compute_lag_correlation(
         use_fft: If True, use FFT-based correlation (faster for long signals)
         dtype: Data type for correlation normalization/reduction. Use this to
             avoid float16 overflow in the variance/std normalization path.
-        stat: Aggregation statistic per return position. Can be a single stat
-            or dict mapping position to stat (e.g., {0: "mean", 1: "median"}).
+
+    Keyword Args:
+        stat (str | dict | None): Aggregation statistic per return position.
+            Can be a single stat or dict mapping position to stat
+            (e.g., {0: "mean", 1: "median"}).
             See [`use_stats()`](btorch/analysis/statistics.py:483).
-        stat_info: Additional statistics to compute and store in info dict.
-            Can be a single stat, iterable, or dict mapping position to stat(s).
+        stat_info (str | list[str] | dict | None): Additional statistics to
+            compute and store in info dict. Can be a single stat, iterable,
+            or dict mapping position to stat(s).
             See [`use_stats()`](btorch/analysis/statistics.py:483).
-        nan_policy: How to handle NaN values ("skip", "warn", "assert").
+        nan_policy (str | None): How to handle NaN values ("skip", "warn", "assert").
             See [`use_stats()`](btorch/analysis/statistics.py:483).
-        inf_policy: How to handle Inf values ("propagate", "skip", "warn",
+        inf_policy (str | None): How to handle Inf values ("propagate", "skip", "warn",
             "assert"). See [`use_stats()`](btorch/analysis/statistics.py:483).
-        percentiles: Percentile level(s) in [0, 100] to compute per position.
-            Can be a single value or dict mapping position to percentile(s).
+        percentiles (float | tuple[float, ...] | dict | None): Percentile level(s)
+            in [0, 100] to compute per position. Can be a single value or dict
+            mapping position to percentile(s).
             See [`use_percentiles()`](btorch/analysis/statistics.py:777).
 
     Returns:
@@ -435,7 +448,8 @@ def compute_ei_balance(
     max_lag_ms: float = 30.0,
     batch_axis: tuple[int, ...] | int | None = None,
     dtype: torch.dtype | np.dtype | None = None,
-):
+    **kwargs: Any,
+) -> tuple:
     """Compute E/I balance metrics including ECI and lag correlation.
 
     This function is decorated with `@use_stats` and `@use_percentiles`.
@@ -451,15 +465,18 @@ def compute_ei_balance(
         batch_axis: Axes to aggregate over (e.g., trials). If None, averages
             over all non-time dimensions.
         dtype: Data type for ECI aggregation and lag-correlation normalization.
-        stat: Aggregation statistic per return position.
+
+    Keyword Args:
+        stat (str | dict | None): Aggregation statistic per return position.
             See [`use_stats()`](btorch/analysis/statistics.py:483).
-        stat_info: Additional statistics per position.
+        stat_info (str | list[str] | dict | None): Additional statistics per position.
             See [`use_stats()`](btorch/analysis/statistics.py:483).
-        nan_policy: How to handle NaN values ("skip", "warn", "assert").
+        nan_policy (str | None): How to handle NaN values ("skip", "warn", "assert").
             See [`use_stats()`](btorch/analysis/statistics.py:483).
-        inf_policy: How to handle Inf values ("propagate", "skip", "warn",
+        inf_policy (str | None): How to handle Inf values ("propagate", "skip", "warn",
             "assert"). See [`use_stats()`](btorch/analysis/statistics.py:483).
-        percentiles: Percentile level(s) in [0, 100] to compute per position.
+        percentiles (float | tuple[float, ...] | dict | None): Percentile level(s)
+            in [0, 100] to compute per position.
             See [`use_percentiles()`](btorch/analysis/statistics.py:777).
 
     Returns:

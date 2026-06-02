@@ -59,7 +59,7 @@ def recurse_dict(d: dict, mapper: Callable, include_sequence: bool = False) -> d
     return _f(d, None)
 
 
-def flatten_dict(d, dot=False):
+def flatten_dict(d: dict, dot: bool = False) -> dict:
     """Flatten nested dictionary into single-level dictionary.
 
     Args:
@@ -94,7 +94,7 @@ def flatten_dict(d, dot=False):
     return dict(items)
 
 
-def unflatten_dict(flattened_dict, dot=False):
+def unflatten_dict(flattened_dict: dict, dot: bool = False) -> dict:
     """Unflatten dictionary with compound keys into nested structure.
 
     Args:

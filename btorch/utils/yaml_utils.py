@@ -5,23 +5,21 @@ automatic directory creation.
 """
 
 import os
+from typing import Any
 
 import yaml
 
 
-def save_yaml(args, folder_or_file, filename=None):
+def save_yaml(args: Any, folder_or_file: str, filename: "str | None" = None) -> None:
     """Save object to YAML file.
 
     Args:
         args: Object to serialize. Tries ``safe_dump`` first, falls back
             to dumping ``args.__dict__``.
-        folder_or_file (str): Directory path if ``filename`` is provided,
+        folder_or_file: Directory path if ``filename`` is provided,
             otherwise full file path.
-        filename (str | None): Optional filename when ``folder_or_file``
+        filename: Optional filename when ``folder_or_file``
             is a directory.
-
-    Returns:
-        None: Creates a YAML file on disk.
     """
     try:
         args_text = yaml.safe_dump(args)
@@ -37,17 +35,17 @@ def save_yaml(args, folder_or_file, filename=None):
         f.write(args_text)
 
 
-def load_yaml(folder_or_file, filename=None):
+def load_yaml(folder_or_file: str, filename: "str | None" = None) -> Any:
     """Load object from YAML file.
 
     Args:
-        folder_or_file (str): Directory path if ``filename`` is provided,
+        folder_or_file: Directory path if ``filename`` is provided,
             otherwise full file path.
-        filename (str | None): Optional filename when ``folder_or_file``
+        filename: Optional filename when ``folder_or_file``
             is a directory.
 
     Returns:
-        Any: Deserialized Python object.
+        Deserialized Python object.
     """
     file = (
         folder_or_file if filename is None else os.path.join(folder_or_file, filename)

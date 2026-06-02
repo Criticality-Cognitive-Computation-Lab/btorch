@@ -1738,7 +1738,7 @@ def _fit_two_compartment_model_staged(
 
 
 def fit_two_compartment_model(
-    model,
+    model: torch.nn.Module,
     sweeps: Iterable[AllenSweepBatch],
     *,
     method: Literal["hybrid", "global", "tbptt", "staged"] = "hybrid",

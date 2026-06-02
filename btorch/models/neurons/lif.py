@@ -96,8 +96,8 @@ class LIF(BaseNode):
         pre_spike_v: bool = False,
         step_mode: Literal["s"] = "s",
         backend: Literal["torch"] = "torch",
-        device=None,
-        dtype=None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
     ):
         super().__init__(
             n_neuron=n_neuron,

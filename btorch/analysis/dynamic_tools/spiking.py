@@ -19,7 +19,7 @@ All methods support both NumPy and PyTorch inputs following the btorch
 conventions, with GPU acceleration where applicable.
 """
 
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -1087,7 +1087,7 @@ def fano_compensated(
         "modulated_poisson",
         "flexible_overdispersion",
     ] = "operational_time",
-    **kwargs,
+    **kwargs: Any,
 ) -> tuple[np.ndarray | torch.Tensor, dict]:
     """Unified interface for compensated Fano factor computation.
 
@@ -1147,7 +1147,7 @@ def fano_compensated(
 def compare_fano_methods(
     spike_data: np.ndarray | torch.Tensor,
     dt_ms: float = 1.0,
-    **kwargs,
+    **kwargs: Any,
 ) -> dict:
     """Compare different Fano factor compensation methods.
 

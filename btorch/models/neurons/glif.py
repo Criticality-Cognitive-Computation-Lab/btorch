@@ -140,8 +140,8 @@ class GLIF3(BaseNode):
         pre_spike_v: bool = False,
         step_mode: Literal["s"] = "s",
         backend: Literal["torch"] = "torch",
-        device=None,
-        dtype=None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
     ):
         super().__init__(
             n_neuron=n_neuron,
@@ -254,7 +254,7 @@ class GLIF3(BaseNode):
         if self._v_rest is not None:
             self._v_rest = v_rest
 
-    def dIasc(self, Iasc: Float[Tensor, "*batch n_neuron {self.n_Iasc}"]):
+    def dIasc(self, Iasc: Float[Tensor, "*batch n_neuron {self.n_Iasc}"]) -> tuple:
         """Compute ASC derivative for exponential Euler integration.
 
         Args:
@@ -270,7 +270,7 @@ class GLIF3(BaseNode):
         v: Float[Tensor, "*batch n_neuron"],
         Iasc: Float[Tensor, "*batch n_neuron {self.n_Iasc}"],
         x: Float[Tensor, "*batch n_neuron"],
-    ):
+    ) -> tuple:
         """Compute membrane potential derivative for exp Euler integration.
 
         Args:

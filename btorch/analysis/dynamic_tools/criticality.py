@@ -53,7 +53,7 @@ def _fit_scaling(x, y):
         return np.nan, None
 
 
-def compute_avalanche_statistics(spike_train: np.ndarray, bin_size: int = 1):
+def compute_avalanche_statistics(spike_train: np.ndarray, bin_size: int = 1) -> dict:
     """Calculate avalanche size (S) and duration (T) distributions and their
     power-law exponents.
 
@@ -193,7 +193,7 @@ def compute_avalanche_statistics(spike_train: np.ndarray, bin_size: int = 1):
     return results
 
 
-def calculate_dfa(spike_train: np.ndarray, bin_size: int = 1):
+def calculate_dfa(spike_train: np.ndarray, bin_size: int = 1) -> float:
     """Calculate Detrended Fluctuation Analysis (DFA) exponent alpha.
 
     Meaning of alpha:

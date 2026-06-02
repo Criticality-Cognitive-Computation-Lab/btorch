@@ -191,13 +191,13 @@ class ParamBufferMixin(torch.nn.Module):
     def def_param_prepare(
         self,
         name: str,
-        val,
+        val: Any,
         *,
         sizes: tuple[int | None, ...] | None = None,
         trainable_param: bool | set[str] | None = None,
         trainable_shape: str = "auto",
         normalize_to_sizes: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> PreparedParam:
         """Build a parameter definition without registering it.
 
@@ -953,10 +953,10 @@ class BaseNode(ParamBufferMixin, MemoryModule):
         detach_reset: bool = False,
         hard_reset: bool = False,
         pre_spike_v: bool = False,
-        step_mode="s",
-        backend="torch",
-        device=None,
-        dtype=None,
+        step_mode: str = "s",
+        backend: str = "torch",
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
     ):
         """Modified spikingjelly BaseNode.
 

@@ -575,7 +575,7 @@ def diff_conf_dotlist(
     return dotlist
 
 
-def get_dotkey(obj: Any, key: str, default=None):
+def get_dotkey(obj: Any, key: str, default: Any = None) -> Any:
     """Get nested attribute by dot-separated key.
 
     Args:
@@ -596,16 +596,13 @@ def get_dotkey(obj: Any, key: str, default=None):
         return default
 
 
-def set_dotkey(obj: Any, key: str, value):
+def set_dotkey(obj: Any, key: str, value: Any) -> None:
     """Set nested attribute by dot-separated key.
 
     Args:
         obj: Object to modify (supports DictConfig/ListConfig or regular objects).
         key: Dot-separated path (e.g., "a.b.c").
         value: Value to set.
-
-    Returns:
-        None
     """
     if isinstance(obj, (DictConfig, ListConfig)):
         OmegaConf.update(obj, key, value)

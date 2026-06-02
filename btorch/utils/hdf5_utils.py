@@ -5,19 +5,20 @@ HDF5 files with optional Blosc2 compression for large arrays.
 """
 
 import os
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 import h5py
 import hdf5plugin
 
 
 def save_dict_to_hdf5(
-    folder_or_filename,
-    data,
-    compression=hdf5plugin.Blosc2(),
+    folder_or_filename: "str | Path",
+    data: dict,
+    compression: Any = hdf5plugin.Blosc2(),
     filename: Optional[str] = None,
-    compression_threshold=1024 * 1024,  # 1MiB
-):
+    compression_threshold: int = 1024 * 1024,  # 1MiB
+) -> None:
     """Save nested dictionary with array values to HDF5 file.
 
     Recursively traverses ``data`` and saves arrays as datasets.
@@ -32,9 +33,6 @@ def save_dict_to_hdf5(
         filename: Optional filename when ``folder_or_filename`` is a directory.
         compression_threshold: Minimum array size in bytes to trigger
             compression (default: 1 MiB).
-
-    Returns:
-        None
     """
 
     def save_array(h5file, path_k, v):
@@ -64,7 +62,10 @@ def save_dict_to_hdf5(
         save_group(f, "", data)
 
 
-def load_dict_from_hdf5(folder_or_filename, filename: Optional[str] = None):
+def load_dict_from_hdf5(
+    folder_or_filename: "str | Path",
+    filename: Optional[str] = None,
+) -> dict:
     """Load nested dictionary from HDF5 file.
 
     Args:

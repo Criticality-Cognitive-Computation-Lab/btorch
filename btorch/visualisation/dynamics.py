@@ -14,7 +14,7 @@ The visualization modes include:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -123,7 +123,7 @@ def plot_multiscale_fano(
     group_by: Literal["neuropil", "neuron_type", None] = None,
     neuron_type_column: str = "cell_type",
     neuron_indices: list[int] | None = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> Figure:
     """Plot multiscale Fano factor analysis.
 
@@ -392,7 +392,7 @@ def plot_dfa_analysis(
     bin_size: int = 1,
     mode: Literal["individual", "grouped", "distribution"] = "individual",
     neurons_df: pd.DataFrame | None = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> Figure:
     """Plot DFA (Detrended Fluctuation Analysis) results.
 
@@ -485,7 +485,7 @@ def plot_isi_cv(
     neurons_df: pd.DataFrame | None = None,
     group_by: Literal["neuropil", "neuron_type", None] = None,
     neuron_type_column: str = "cell_type",
-    **kwargs,
+    **kwargs: Any,
 ) -> Figure:
     """Plot ISI CV (Coefficient of Variation) distribution.
 
