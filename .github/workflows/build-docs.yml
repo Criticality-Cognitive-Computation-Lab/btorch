@@ -45,7 +45,7 @@ jobs:
           uv sync --only-group docs --frozen
 
       - name: Build all languages
-        run: python scripts/docs.py command=build-all
+        run: uv run python scripts/docs.py command=build-all
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v5

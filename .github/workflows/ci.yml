@@ -62,15 +62,15 @@ jobs:
           # uv sync handles torch (pytorch-cpu index) and omegaconf (git source) via lockfile
           uv sync --group dev --no-install-package torch-scatter --no-install-package torch-sparse --frozen
           # sparse packages are CUDA-variant-specific; install from PyG after torch is resolved
-          TORCH_VER=$(python -c "import torch; print(torch.__version__.split('+')[0])")
+          TORCH_VER=$(uv run python -c "import torch; print(torch.__version__.split('+')[0])")
           uv pip install torch-scatter torch-sparse -f "https://data.pyg.org/whl/torch-${TORCH_VER}+cpu.html"
 
       - name: Lint
-        run: ruff check .
+        run: uv run ruff check .
         continue-on-error: true
 
       - name: Tests (CPU)
-        run: pytest tests --cov=btorch --cov-report=xml
+        run: uv run pytest tests --cov=btorch --cov-report=xml
 
       # - name: Setup tmate session
       #   if: failure()
@@ -86,4 +86,4 @@ jobs:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Build docs
-        run: python scripts/docs.py command=build-all
+        run: uv run python scripts/docs.py command=build-all
