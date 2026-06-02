@@ -83,9 +83,13 @@ class MixedNeuronPopulation(nn.Module):
         return torch.arange(start, end, dtype=torch.long)
 
     def _concat_attr(self, attr: str) -> Tensor:
-        """Concatenate ``attr`` from all sub-populations along neuron dim."""
+        """Concatenate ``attr`` from all sub-populations along neuron dim.
+
+        Scalar attributes are broadcast to the group's neuron count
+        before concatenation.
+        """
         parts: list[Tensor] = []
-        for name in self._group_names:
+        for idx, name in enumerate(self._group_names):
             neuron = getattr(self, name)
             val = getattr(neuron, attr, None)
             if val is None:
@@ -94,6 +98,15 @@ class MixedNeuronPopulation(nn.Module):
                 )
             if isinstance(val, nn.Parameter):
                 val = val.data
+            # TODO: ParamBufferMixin conflates uniform (scalar) and heterogeneous
+            #   (per-neuron tensor) params. When a param is trainable it becomes an
+            #   nn.Parameter and may be scalar or per-neuron depending on how it was
+            #   initialised, so broadcasting here is fragile. ParamBufferMixin should
+            #   be extended to always expose a per-neuron view, making this broadcast
+            #   unnecessary and removing the ambiguity for downstream consumers.
+            if val.dim() == 0:
+                count = self._cumsum[idx + 1] - self._cumsum[idx]
+                val = val.expand(count)
             parts.append(val)
         return torch.cat(parts, dim=-1)
 

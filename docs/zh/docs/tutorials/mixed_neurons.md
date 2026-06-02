@@ -146,6 +146,7 @@ mixed = MixedNeuronPopulation({
 ## 另请参阅
 
 - [`RecurrentNN`][btorch.models.rnn.RecurrentNN] — 标准单输入递归包装器。
-- [`ApicalRecurrentNN`][btorch.models.rnn.ApicalRecurrentNN] — 顶端输入变体。
+- [`ApicalRecurrentNN`][btorch.models.rnn.ApicalRecurrentNN] — 带可选顶端突触的顶端输入变体。
+- [`SomaApicalRecurrentNN`][btorch.models.rnn.SomaApicalRecurrentNN] — 具有强制性的体细胞和顶端突触的顶端输入变体。
 - [`MixedNeuronPopulation`][btorch.models.neurons.mixed.MixedNeuronPopulation] — 异质种群容器。
 - [`TwoCompartmentGLIF`][btorch.models.neurons.two_compartment.TwoCompartmentGLIF] — 体细胞-顶端神经元。

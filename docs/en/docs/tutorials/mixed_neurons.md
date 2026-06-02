@@ -146,6 +146,7 @@ State keys then become `neuron.fs.v`, `neuron.pyr.i_a`, etc.
 ## See Also
 
 - [`RecurrentNN`][btorch.models.rnn.RecurrentNN] — standard single-input recurrent wrapper.
-- [`ApicalRecurrentNN`][btorch.models.rnn.ApicalRecurrentNN] — apical-input variant.
+- [`ApicalRecurrentNN`][btorch.models.rnn.ApicalRecurrentNN] — apical-input variant with optional apical synapse.
+- [`SomaApicalRecurrentNN`][btorch.models.rnn.SomaApicalRecurrentNN] — apical-input variant with mandatory somatic and apical synapses.
 - [`MixedNeuronPopulation`][btorch.models.neurons.mixed.MixedNeuronPopulation] — heterogeneous population container.
 - [`TwoCompartmentGLIF`][btorch.models.neurons.two_compartment.TwoCompartmentGLIF] — soma-apical neuron.

@@ -6,7 +6,7 @@ from btorch.models.functional import init_net_state, reset_net_state
 from btorch.models.linear import DenseConn
 from btorch.models.neurons import GLIF3, TwoCompartmentGLIF
 from btorch.models.neurons.mixed import MixedNeuronPopulation
-from btorch.models.rnn import ApicalRecurrentNN, RecurrentNN
+from btorch.models.rnn import ApicalRecurrentNN, RecurrentNN, SomaApicalRecurrentNN
 from btorch.models.synapse import AlphaPSC
 
 
@@ -275,3 +275,127 @@ def test_apical_rnn_state_consistent_across_resets():
         spikes_2, _ = brain(x)
 
     torch.testing.assert_close(spikes_1, spikes_2)
+
+
+# ---------------------------------------------------------------------------
+# SomaApicalRecurrentNN
+# ---------------------------------------------------------------------------
+
+
+def test_som_apical_rnn_basic():
+    torch.manual_seed(200)
+    T, batch_size, n = 6, 2, 10
+    n_glif, n_tc = 5, 5
+
+    glif = GLIF3(n_neuron=n_glif, step_mode="s")
+    tc = TwoCompartmentGLIF(n_neuron=n_tc, step_mode="s")
+    mixed = MixedNeuronPopulation([(n_glif, glif), (n_tc, tc)], step_mode="s")
+
+    conn_soma = DenseConn(n, n, bias=None)
+    conn_apical = DenseConn(n, n, bias=None)
+    psc_soma = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn_soma, step_mode="s")
+    psc_apical = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn_apical, step_mode="s")
+
+    brain = SomaApicalRecurrentNN(
+        neuron=mixed,
+        synapse_soma=psc_soma,
+        synapse_apical=psc_apical,
+        step_mode="m",
+        unroll=2,
+    )
+    init_net_state(brain, batch_size=batch_size, dtype=DTYPE)
+
+    x = torch.randn(T, batch_size, n, dtype=DTYPE)
+    x_a = torch.randn(T, batch_size, n, dtype=DTYPE)
+
+    with environ.context(dt=1.0):
+        spikes, states = brain(x, None, x_a)
+
+    assert spikes.shape == (T, batch_size, n)
+    assert len(states) > 0
+
+
+def test_som_apical_rnn_equivalent_to_apical_rnn_with_synapse_apical():
+    """SomaApicalRecurrentNN must match
+    ApicalRecurrentNN(synapse_apical=...)."""
+    torch.manual_seed(201)
+    T, batch_size, n = 4, 2, 8
+    n_glif, n_tc = 4, 4
+
+    def _build_neurons():
+        glif = GLIF3(n_neuron=n_glif, step_mode="s")
+        tc = TwoCompartmentGLIF(n_neuron=n_tc, step_mode="s")
+        return MixedNeuronPopulation([(n_glif, glif), (n_tc, tc)], step_mode="s")
+
+    mixed_a = _build_neurons()
+    mixed_b = _build_neurons()
+
+    conn_soma = DenseConn(n, n, bias=None)
+    conn_apical = DenseConn(n, n, bias=None)
+    psc_soma_a = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn_soma, step_mode="s")
+    psc_apical_a = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn_apical, step_mode="s")
+    psc_soma_b = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn_soma, step_mode="s")
+    psc_apical_b = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn_apical, step_mode="s")
+
+    brain_som = SomaApicalRecurrentNN(
+        neuron=mixed_a,
+        synapse_soma=psc_soma_a,
+        synapse_apical=psc_apical_a,
+        step_mode="m",
+        unroll=2,
+    )
+    brain_apical = ApicalRecurrentNN(
+        neuron=mixed_b,
+        synapse=psc_soma_b,
+        synapse_apical=psc_apical_b,
+        step_mode="m",
+        unroll=2,
+    )
+
+    x = torch.randn(T, batch_size, n, dtype=DTYPE)
+    x_a = torch.randn(T, batch_size, n, dtype=DTYPE)
+
+    init_net_state(brain_som, batch_size=batch_size, dtype=DTYPE)
+    init_net_state(brain_apical, batch_size=batch_size, dtype=DTYPE)
+
+    with environ.context(dt=1.0):
+        out_som, _ = brain_som(x, None, x_a)
+        out_apical, _ = brain_apical(x, None, x_a)
+
+    torch.testing.assert_close(out_som, out_apical)
+
+
+def test_som_apical_rnn_gradient_flows():
+    torch.manual_seed(202)
+    T, batch_size, n = 4, 2, 8
+    n_glif, n_tc = 4, 4
+
+    glif = GLIF3(n_neuron=n_glif, step_mode="s", trainable_param={"tau"})
+    tc = TwoCompartmentGLIF(n_neuron=n_tc, step_mode="s", trainable_param={"tau_s"})
+    mixed = MixedNeuronPopulation([(n_glif, glif), (n_tc, tc)], step_mode="s")
+
+    conn_soma = DenseConn(n, n, bias=None)
+    conn_apical = DenseConn(n, n, bias=None)
+    psc_soma = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn_soma, step_mode="s")
+    psc_apical = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn_apical, step_mode="s")
+
+    brain = SomaApicalRecurrentNN(
+        neuron=mixed,
+        synapse_soma=psc_soma,
+        synapse_apical=psc_apical,
+        step_mode="m",
+        unroll=2,
+    )
+    init_net_state(brain, batch_size=batch_size, dtype=DTYPE)
+
+    x = torch.randn(T, batch_size, n, dtype=DTYPE, requires_grad=True)
+    x_a = torch.randn(T, batch_size, n, dtype=DTYPE, requires_grad=True)
+
+    with environ.context(dt=1.0):
+        spikes, _ = brain(x, None, x_a)
+    spikes.sum().backward()
+
+    assert x.grad is not None
+    assert x_a.grad is not None
+    assert glif.tau.grad is not None
+    assert tc.tau_s.grad is not None

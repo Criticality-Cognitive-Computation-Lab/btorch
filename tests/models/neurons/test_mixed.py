@@ -359,3 +359,80 @@ def test_step_mode_m_with_s_mode_neurons_works():
         spikes = mixed(x)
 
     assert spikes.shape == (T, batch_size, n_glif + n_tc)
+
+
+# ---------------------------------------------------------------------------
+# _indices, _concat_attr, v_threshold, v_reset
+# ---------------------------------------------------------------------------
+
+
+def test_indices_returns_correct_global_range():
+    n_glif, n_tc = 6, 4
+    glif = GLIF3(n_neuron=n_glif, step_mode="s")
+    tc = TwoCompartmentGLIF(n_neuron=n_tc, step_mode="s")
+    mixed = MixedNeuronPopulation([(n_glif, glif), (n_tc, tc)], step_mode="s")
+
+    idx0 = mixed._indices(0)
+    idx1 = mixed._indices(1)
+
+    assert idx0.tolist() == list(range(0, n_glif))
+    assert idx1.tolist() == list(range(n_glif, n_glif + n_tc))
+
+
+def test_indices_named_groups():
+    mixed = MixedNeuronPopulation(
+        {
+            "fs": (5, GLIF3(n_neuron=5, step_mode="s")),
+            "pyr": (3, TwoCompartmentGLIF(n_neuron=3, step_mode="s")),
+        },
+        step_mode="s",
+    )
+    assert mixed._indices(0).tolist() == list(range(0, 5))
+    assert mixed._indices(1).tolist() == list(range(5, 8))
+
+
+def test_v_threshold_scalar_broadcast():
+    # Typical usage: scalar shared threshold broadcast to neuron count
+    n_glif, n_tc = 4, 3
+    glif = GLIF3(n_neuron=n_glif, step_mode="s", v_threshold=-50.0)
+    tc = TwoCompartmentGLIF(n_neuron=n_tc, step_mode="s", v_threshold=-48.0)
+    mixed = MixedNeuronPopulation([(n_glif, glif), (n_tc, tc)], step_mode="s")
+
+    vt = mixed.v_threshold
+    assert vt.shape == (n_glif + n_tc,)
+    assert (vt[:n_glif] == -50.0).all()
+    assert (vt[n_glif:] == -48.0).all()
+
+
+def test_v_threshold_per_neuron():
+    # Per-neuron threshold passed as tensor
+    n_glif, n_tc = 4, 3
+    vt_glif = torch.tensor([-50.0, -49.0, -51.0, -50.0])
+    vt_tc = torch.tensor([-48.0, -52.0, -50.0])
+    glif = GLIF3(n_neuron=n_glif, step_mode="s", v_threshold=vt_glif)
+    tc = TwoCompartmentGLIF(n_neuron=n_tc, step_mode="s", v_threshold=vt_tc)
+    mixed = MixedNeuronPopulation([(n_glif, glif), (n_tc, tc)], step_mode="s")
+
+    vt = mixed.v_threshold
+    assert vt.shape == (n_glif + n_tc,)
+    torch.testing.assert_close(vt[:n_glif], vt_glif)
+    torch.testing.assert_close(vt[n_glif:], vt_tc)
+
+
+def test_v_reset_scalar_broadcast():
+    n_glif, n_tc = 4, 3
+    glif = GLIF3(n_neuron=n_glif, step_mode="s", v_reset=-70.0)
+    tc = TwoCompartmentGLIF(n_neuron=n_tc, step_mode="s", v_reset=-65.0)
+    mixed = MixedNeuronPopulation([(n_glif, glif), (n_tc, tc)], step_mode="s")
+
+    vr = mixed.v_reset
+    assert vr.shape == (n_glif + n_tc,)
+    assert (vr[:n_glif] == -70.0).all()
+    assert (vr[n_glif:] == -65.0).all()
+
+
+def test_concat_attr_raises_on_missing_attr():
+    glif = GLIF3(n_neuron=4, step_mode="s")
+    mixed = MixedNeuronPopulation([(4, glif)], step_mode="s")
+    with pytest.raises(AttributeError):
+        mixed._concat_attr("nonexistent_attr")
