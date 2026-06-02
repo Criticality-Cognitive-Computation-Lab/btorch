@@ -29,7 +29,7 @@ dependencies = [
     "numcodecs",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 docs = [
   "zensical>=0.0.32",
   "mkdocstrings-python>=0.24",
@@ -43,6 +43,14 @@ test = [
   "pytest-cov>=5.0",
   "matplotlib>=3.7",
 ]
+dev = [
+  { include-group = "docs" },
+  { include-group = "test" },
+  "pre-commit>=3.7",
+  "ruff>=0.4",
+]
+
+[project.optional-dependencies]
 # NOTE: torch_scatter/torch_sparse wheels are CUDA-variant-specific and cannot be locked
 # cross-platform. The [tool.uv.sources] below covers CPU (uv/pip CI only).
 # For CUDA: pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-<ver>+<cuXXX>.html
@@ -50,11 +58,6 @@ test = [
 sparse = [
   "torch_scatter",
   "torch_sparse",
-]
-dev = [
-  "btorch[docs,test,sparse]",
-  "pre-commit>=3.7",
-  "ruff>=0.4",
 ]
 
 [project.urls]
@@ -89,7 +92,9 @@ include = [
 ]
 allow-direct-references = true
 
-# pip-compile equivalent: uv pip compile pyproject.toml -o requirements.txt
+# Docs: uv sync --only-group docs
+# Tests: uv sync --only-group test
+# Dev: uv sync --group dev
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "I001"]

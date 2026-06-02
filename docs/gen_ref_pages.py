@@ -9,8 +9,6 @@ Discovery rules:
 """
 
 import ast
-import importlib
-import pkgutil
 from pathlib import Path
 
 import mkdocs_gen_files
@@ -57,22 +55,22 @@ def _has_public_api(file_path: Path) -> bool:
 
 
 def _discover(package: str) -> list[str]:
-    pkg = importlib.import_module(package)
-    base_path = Path(pkg.__file__).parent
+    base_path = Path(__file__).parent.parent / package
     modules: list[str] = []
-    for _, name, ispkg in pkgutil.walk_packages([str(base_path)], prefix=f"{package}."):
+    for path in sorted(base_path.rglob("*.py")):
+        rel = path.relative_to(base_path.parent)
+        parts = (
+            rel.parts[:-1] if path.name == "__init__.py" else rel.with_suffix("").parts
+        )
+        name = ".".join(parts)
+        depth = len(name.split(".")) - 1
+        if depth == 0:
+            continue
         if not _is_public(name) or name in EXCLUDES:
             continue
-        depth = len(name.split(".")) - 1
         if depth >= 3 and not any(name.startswith(p) for p in DEEP_PAGES):
             continue
-        rel = name.split(".")[1:]
-        file_path = (
-            base_path / "/".join(rel) / "__init__.py"
-            if ispkg
-            else base_path / ("/".join(rel) + ".py")
-        )
-        if file_path.exists() and _has_public_api(file_path):
+        if _has_public_api(path):
             modules.append(name)
     return sorted(set(modules))
 
