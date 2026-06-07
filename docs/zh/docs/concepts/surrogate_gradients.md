@@ -108,6 +108,77 @@ assert abs(x.grad.item() - 0.5) < 0.02, "HWHM 约定失败"
 
 `tests/models/test_surrogate.py` 中的 `test_unit_gradient_at_threshold` 和 `test_consistent_hwhm` 测试会自动对所有内置代理梯度强制执行两个约定。
 
+## 迁移指南
+
+### 从 SpikingJelly 迁移
+
+SpikingJelly 的 `alpha` 在不同代理梯度之间含义不一致——梯度宽度和阈值处的峰值均以各自特定的方式随 `alpha` 缩放。btorch 通过两个约定统一了这两点（峰值始终为 1，HWHM 始终为 1/alpha）。
+
+要在移植时保持**相同的梯度宽度**，需按如下方式将 SpikingJelly 的 `alpha_sj` 转换为 btorch 的 `alpha_bt`：
+
+| SJ 代理梯度 | SJ HWHM | btorch 对应 | 转换关系 |
+|---|---|---|---|
+| `Sigmoid(alpha_sj)` | `1.763/alpha_sj` | `Sigmoid` | `alpha_bt = 1.763 * alpha_sj` |
+| `ATan(alpha_sj)` | `2/(π·alpha_sj)` | `ATan` | `alpha_bt = 2/π · alpha_sj ≈ 0.637 * alpha_sj` |
+| `Triangle(alpha_sj)` | `1/alpha_sj` | `Triangle` | `alpha_bt = alpha_sj`（相同） |
+
+要保持**相同的峰值幅度**，需将 `damping_factor` 设为原峰值：
+
+| SJ 代理梯度 | SJ 峰值（v=0） | btorch `damping_factor` |
+|---|---|---|
+| `Sigmoid(alpha_sj)` | `alpha_sj / 4` | `alpha_sj / 4` |
+| `ATan(alpha_sj)` | `alpha_sj / 2` | `alpha_sj / 2` |
+| `Triangle(alpha_sj)` | `alpha_sj` | `alpha_sj` |
+
+**示例**——将 SpikingJelly 的 `ATan(alpha=2)` 移植到 btorch：
+
+```python
+# SpikingJelly: HWHM = 2/(π·2) ≈ 0.318，峰值 = 2/2 = 1.0
+# btorch 等效写法（保持宽度和幅度）：
+import math
+from btorch.models.surrogate import ATan
+alpha_sj = 2.0
+surrogate = ATan(alpha=2/math.pi * alpha_sj, damping_factor=alpha_sj/2)
+# ATan(alpha≈0.637, damping_factor=1.0) — 峰值保持 1，HWHM 保持 0.318
+```
+
+### 从 braintools / brainstate 迁移
+
+braintools 使用 JAX，内部缩放与 btorch 不同。以下是代理梯度的对应关系（令 btorch 的 `alpha_bt = 1/HWHM` 即可推算）：
+
+| braintools 代理梯度 | bt HWHM | btorch 对应 | 转换关系 |
+|---|---|---|---|
+| `Sigmoid(alpha)` | `1.763/alpha` | `Sigmoid` | `alpha_bt = 1.763 * alpha` |
+| `ATan(alpha)` | `2/(π·alpha)` | `ATan` | `alpha_bt = 2/π · alpha ≈ 0.637 * alpha` |
+| `SuperSpike(alpha)` | `(√2−1)/alpha` | `SuperSpike` | `alpha_bt = (√2−1) * alpha ≈ 0.414 * alpha` |
+| `PiecewiseQuadratic(alpha)` | `1/alpha` | `Triangle` | `alpha_bt = alpha`（形状相同，名称不同） |
+| `PiecewiseExp(alpha)` | `ln2/alpha` | — | btorch 无精确对应 |
+| `Erf(alpha)` | `√ln2/alpha` | `Erf` | `alpha_bt = √ln2 * alpha ≈ 0.833 * alpha` |
+
+要保持**相同的峰值幅度**，需将 `damping_factor` 设为 braintools 的峰值：
+
+| braintools 代理梯度 | bt 峰值（v=0） | btorch `damping_factor` |
+|---|---|---|
+| `Sigmoid(alpha)` | `alpha/4` | `alpha/4` |
+| `ATan(alpha)` | `alpha/2` | `alpha/2` |
+| `SuperSpike(alpha)` | `alpha/2` | `alpha/2` |
+| `PiecewiseQuadratic(alpha)` | `alpha` | `alpha` |
+| `PiecewiseExp(alpha)` | `alpha/2` | `alpha/2` |
+| `Erf(alpha)` | `alpha/√π` | `alpha/√π` |
+
+**示例**——将 braintools 的 `Erf(alpha=2)` 移植到 btorch：
+
+```python
+# braintools: HWHM = sqrt(ln2)/2 ≈ 0.416，峰值 = 2/sqrt(pi) ≈ 1.128
+import math
+from btorch.models.surrogate import Erf
+alpha_bt_lib = 2.0
+surrogate = Erf(
+    alpha=math.sqrt(math.log(2)) * alpha_bt_lib,       # ≈ 1.665，HWHM = 0.416
+    damping_factor=alpha_bt_lib / math.sqrt(math.pi),  # ≈ 1.128
+)
+```
+
 ## 参考文献
 
 - Zenke, F., & Neftci, E. O. (2021). *The remarkable robustness of surrogate gradient learning for instilling complex function in spiking neural networks.* Neural Computation, 33(4), 899–925.

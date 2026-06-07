@@ -130,6 +130,82 @@ The tests `test_unit_gradient_at_threshold` and `test_consistent_hwhm` in
 `tests/models/test_surrogate.py` enforce both conventions for all built-in
 surrogates automatically.
 
+## Migration guide
+
+### From SpikingJelly
+
+SpikingJelly's `alpha` does not have a consistent meaning across surrogates —
+the gradient width and peak at threshold both scale with `alpha` in
+surrogate-specific ways. btorch fixes both (peak always 1, HWHM always 1/alpha).
+
+To preserve the **same gradient width** when porting, convert the SpikingJelly
+`alpha_sj` to btorch `alpha_bt` using:
+
+| SJ surrogate | SJ HWHM | btorch equivalent | Conversion |
+|---|---|---|---|
+| `Sigmoid(alpha_sj)` | `1.763/alpha_sj` | `Sigmoid` | `alpha_bt = 1.763 * alpha_sj` |
+| `ATan(alpha_sj)` | `2/(π·alpha_sj)` | `ATan` | `alpha_bt = 2/π · alpha_sj ≈ 0.637 * alpha_sj` |
+| `Triangle(alpha_sj)` | `1/alpha_sj` | `Triangle` | `alpha_bt = alpha_sj` (same) |
+
+To preserve the **same peak magnitude** at the threshold, set
+`damping_factor = old_peak / 1.0`:
+
+| SJ surrogate | SJ peak at v=0 | btorch `damping_factor` |
+|---|---|---|
+| `Sigmoid(alpha_sj)` | `alpha_sj / 4` | `alpha_sj / 4` |
+| `ATan(alpha_sj)` | `alpha_sj / 2` | `alpha_sj / 2` |
+| `Triangle(alpha_sj)` | `alpha_sj` | `alpha_sj` |
+
+**Example** — porting `ATan(alpha=2)` from SpikingJelly:
+
+```python
+# SpikingJelly: HWHM = 2/(π·2) ≈ 0.318, peak = 2/2 = 1.0
+# btorch equivalent preserving both width and magnitude:
+from btorch.models.surrogate import ATan
+import math
+alpha_sj = 2.0
+surrogate = ATan(alpha=2/math.pi * alpha_sj, damping_factor=alpha_sj/2)
+# ATan(alpha≈0.637, damping_factor=1.0) — peak stays 1, HWHM stays 0.318
+```
+
+### From braintools / brainstate
+
+braintools uses JAX and a different internal scaling. The surrogates map as
+follows (use HWHM = 1/alpha_bt to find the matching btorch alpha):
+
+| braintools surrogate | bt HWHM | btorch equivalent | Conversion |
+|---|---|---|---|
+| `Sigmoid(alpha_bt_lib)` | `1.763/alpha` | `Sigmoid` | `alpha_bt = 1.763 * alpha` |
+| `ATan(alpha_bt_lib)` | `2/(π·alpha)` | `ATan` | `alpha_bt = 2/π · alpha ≈ 0.637 * alpha` |
+| `SuperSpike(alpha_bt_lib)` | `(√2−1)/alpha` | `SuperSpike` | `alpha_bt = (√2−1) * alpha ≈ 0.414 * alpha` |
+| `PiecewiseQuadratic(alpha_bt_lib)` | `1/alpha` | `Triangle` | `alpha_bt = alpha` (same shape, different name) |
+| `PiecewiseExp(alpha_bt_lib)` | `ln2/alpha` | — | No exact btorch equivalent |
+| `Erf(alpha_bt_lib)` | `√ln2/alpha` | `Erf` | `alpha_bt = √ln2 * alpha ≈ 0.833 * alpha` |
+
+For the peak magnitude, set `damping_factor` to the braintools peak value:
+
+| braintools surrogate | bt peak at v=0 | btorch `damping_factor` |
+|---|---|---|
+| `Sigmoid(alpha)` | `alpha/4` | `alpha/4` |
+| `ATan(alpha)` | `alpha/2` | `alpha/2` |
+| `SuperSpike(alpha)` | `alpha/2` | `alpha/2` |
+| `PiecewiseQuadratic(alpha)` | `alpha` | `alpha` |
+| `PiecewiseExp(alpha)` | `alpha/2` | `alpha/2` |
+| `Erf(alpha)` | `alpha/√π` | `alpha/√π` |
+
+**Example** — porting `Erf(alpha=2)` from braintools:
+
+```python
+# braintools: HWHM = sqrt(ln2)/2 ≈ 0.416, peak = 2/sqrt(pi) ≈ 1.128
+import math
+from btorch.models.surrogate import Erf
+alpha_bt_lib = 2.0
+surrogate = Erf(
+    alpha=math.sqrt(math.log(2)) * alpha_bt_lib,   # ≈ 1.665 → HWHM = 0.416
+    damping_factor=alpha_bt_lib / math.sqrt(math.pi),  # ≈ 1.128
+)
+```
+
 ## References
 
 - Zenke, F., & Neftci, E. O. (2021). *The remarkable robustness of surrogate
