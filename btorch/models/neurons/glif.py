@@ -28,7 +28,7 @@ from .. import environ
 from ..base import BaseNode
 from ..ode import exp_euler_step
 from ..shape import expand_trailing_dims
-from ..surrogate import ATan
+from ..surrogate import Erf
 
 
 def get_rheobase(
@@ -85,7 +85,9 @@ class GLIF3(BaseNode):
             Default: [0.0].
         tau_ref: Refractory period (ms). Default: 0.0.
         trainable_param: Set of parameter names to make trainable.
-        surrogate_function: Surrogate gradient function. Default: ATan().
+        surrogate_function: Surrogate gradient function.
+            Default: ``Erf(alpha=4, damping_factor=0.5)``, matching the
+            Gaussian surrogate used in Chen et al. (2022).
         detach_reset: If True, detach reset signal. Default: False.
         hard_reset: If True, use hard reset. Default: False.
         pre_spike_v: If True, store pre-spike voltage. Default: False.
@@ -104,8 +106,13 @@ class GLIF3(BaseNode):
         n_Iasc: Number of ASC components.
 
     References:
-        Teeter et al., "Generalized leaky integrate-and-fire models
-        classify multiple neuron types," Nature Communications, 2018.
+        Teeter et al., "Generalized leaky integrate-and-fire models classify
+        multiple neuron types," *Nature Communications*, 2018.
+
+        Chen, G., Scherr, F., & Maass, W. (2022). A data-based large-scale
+        model for primary visual cortex enables brain-like robust and versatile
+        visual processing. *Science Advances*, 8(44), eabq7592.
+        https://doi.org/10.1126/sciadv.abq7592
     """
 
     # make mypy typing and autocompletion easier
@@ -134,7 +141,7 @@ class GLIF3(BaseNode):
         | Float[TensorLike, "n_neuron {self.n_Iasc}"] = [0.0],  # pA
         tau_ref: float | Float[TensorLike, " n_neuron"] | None = 0.0,  # ms
         trainable_param: set[str] = set(),
-        surrogate_function: Callable = ATan(),
+        surrogate_function: Callable = Erf(alpha=4.0, damping_factor=0.5),
         detach_reset: bool = False,
         hard_reset: bool = False,
         pre_spike_v: bool = False,
