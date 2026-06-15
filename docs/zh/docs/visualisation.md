@@ -53,6 +53,39 @@
 
 ---
 
+### `hex/static.py`
+使用 matplotlib 的静态六边形绘图。
+
+| 函数 | 描述 |
+|----------|-------------|
+| `scatter` | 带颜色映射的六边形散点图 |
+| `quiver` | 六边形网格上的矢量场（流场）绘图 |
+| `grid` | 带可选坐标标注的六边形网格 |
+| `draw_axes` | 在六边形图上叠加 q/r/s 轴箭头 |
+| `compass` | 指南针玫瑰嵌入图 |
+| `looming_stimulus` | 从中心扩展的刺激序列 |
+
+---
+
+### `hex/interactive.py`
+使用 Plotly 的交互式六边形热图。六边形多边形以 SVG 路径形状绘制在数据坐标中——无数学像素计算，Plotly 处理所有缩放。
+
+| 函数 | 描述 |
+|----------|-------------|
+| `heatmap` | 带动画滑块的交互式六边形网格热图 |
+
+---
+
+### `hex/animate.py`
+动画六边形可视化。
+
+| 类 | 描述 |
+|-------|-------------|
+| `HexScatter` | 使用 matplotlib FuncAnimation 的动画六边形散点图 |
+| `HexQuiver` | 流场动画矢量图 |
+
+---
+
 ### `aggregation.py`
 分组分布和神经毯 (neuropil) 时间序列可视化。
 

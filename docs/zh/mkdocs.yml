@@ -23,6 +23,7 @@ nav:
 - analysis.md
 - connection_conversion.md
 - visualisation.md
+- 六边形网格: hex.md
 - API 参考:
   - api/index.md
   - api/models.md
