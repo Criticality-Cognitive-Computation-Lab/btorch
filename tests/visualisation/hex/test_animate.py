@@ -54,12 +54,12 @@ def _flow_data(n_frames: int = 4, radius: int = 2):
 
 
 class TestHexScatter:
-    def test_axial_coords_mp4(self):
+    def test_axial_coords_gif(self):
         """Typical use: animate neural activity on axial hex grid."""
         values, q, r = _disk_data(n_frames=8, radius=3)
         anim = HexScatter(values, q, r, coord_format="axial", interval=100)
-        path = OUT / "scatter_axial.mp4"
-        anim.save(str(path), writer="ffmpeg", fps=5)
+        path = OUT / "scatter_axial.gif"
+        anim.save(str(path), writer="pillow", fps=5)
         assert path.exists() and path.stat().st_size > 0
 
     def test_zigzag_coords(self):
@@ -69,8 +69,8 @@ class TestHexScatter:
         anim = HexScatter(
             values, x.astype(float), y.astype(float), coord_format="zigzag"
         )
-        path = OUT / "scatter_zigzag.mp4"
-        anim.save(str(path), writer="ffmpeg", fps=5)
+        path = OUT / "scatter_zigzag.gif"
+        anim.save(str(path), writer="pillow", fps=5)
         assert path.exists()
 
     def test_pixel_coords(self):
@@ -139,12 +139,12 @@ class TestHexScatter:
 
 
 class TestHexQuiver:
-    def test_axial_coords_mp4(self):
+    def test_axial_coords_gif(self):
         """Typical use: animate optic flow vectors on hex grid."""
         flow, q, r = _flow_data(n_frames=6, radius=2)
         anim = HexQuiver(flow, q, r, coord_format="axial", interval=150)
-        path = OUT / "flow_axial.mp4"
-        anim.save(str(path), writer="ffmpeg", fps=5)
+        path = OUT / "flow_axial.gif"
+        anim.save(str(path), writer="pillow", fps=5)
         assert path.exists() and path.stat().st_size > 0
 
     def test_zigzag_coords(self):
