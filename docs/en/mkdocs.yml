@@ -93,6 +93,7 @@ nav:
 - Analysis: analysis.md
 - Connection Conversion: connection_conversion.md
 - Visualisation: visualisation.md
+- Hex Grids: hex.md
 - API Reference:
   - api/index.md
   - api/models.md

@@ -53,6 +53,40 @@ Hexagonal heatmap visualization using Plotly.
 
 ---
 
+### `hex/static.py`
+Static hex plots using matplotlib.
+
+| Function | Description |
+|----------|-------------|
+| `scatter` | Hex scatter plot with color mapping |
+| `quiver` | Quiver (vector field) plot on hex grid |
+| `grid` | Hex grid with optional coordinate annotations |
+| `draw_axes` | Overlay q/r/s axis arrows on hex plot |
+| `compass` | Compass rose inset |
+| `looming_stimulus` | Expanding stimulus sequence from center |
+
+---
+
+### `hex/interactive.py`
+Interactive hex heatmaps using Plotly. Hex polygons drawn as SVG path
+shapes in data coordinates — no pixel math, Plotly handles all scaling.
+
+| Function | Description |
+|----------|-------------|
+| `heatmap` | Interactive hex-grid heatmap with animated slider for time series |
+
+---
+
+### `hex/animate.py`
+Animated hex visualizations.
+
+| Class | Description |
+|-------|-------------|
+| `HexScatter` | Animated hex scatter with matplotlib FuncAnimation |
+| `HexQuiver` | Animated quiver plot for flow fields |
+
+---
+
 ### `aggregation.py`
 Grouped distribution and neuropil time-series visualization.
 
