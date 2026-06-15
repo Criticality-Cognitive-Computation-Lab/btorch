@@ -38,9 +38,9 @@ five plotting families:
   [`plot_spectrum`][btorch.visualisation.timeseries.plot_spectrum],
   [`plot_log_hist`][btorch.visualisation.timeseries.plot_log_hist]
 
-**Network plots** (`network`, `hexmap`):
+**Network plots** (`network`, `hex.interactive`):
 - Graph layout: [`plot_network`][btorch.visualisation.network.plot_network]
-- Hexagonal heatmaps: [`hex_heatmap`][btorch.visualisation.hexmap.hex_heatmap]
+- Hexagonal heatmaps: [`heatmap`][btorch.visualisation.hex.interactive.heatmap]
 
 **Tuning plots** (`tuning`):
 - Response curves: [`plot_fi_vi_curve`][btorch.visualisation.tuning.plot_fi_vi_curve]
@@ -69,7 +69,7 @@ from .dynamics import (
     plot_micro_dynamics,
     plot_multiscale_fano,
 )
-from .hexmap import hex_heatmap
+from .hex.interactive import heatmap as hex_heatmap
 from .network import plot_network
 from .timeseries import (
     SimulationStates,
