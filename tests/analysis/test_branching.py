@@ -121,7 +121,7 @@ class TestBranchingRatioEstimator:
         assert naive[-1] < naive[0] - 0.25
         assert np.max(np.abs(mr - true_m)) < 0.12
 
-        figure_dir = fig_path(__file__)
+        figure_dir = fig_path()
         fig, ax = plt.subplots(figsize=(6.0, 3.5))
         ax.plot(alpha_grid, naive, "o-", label="naive $r_1$")
         ax.plot(alpha_grid, mr, "s-", label=r"MR $\hat{m}$")
@@ -161,7 +161,7 @@ class TestBranchingRatioEstimator:
         m_from_log_fit = float(np.exp(slope))
         assert abs(m_from_log_fit - fit["branching_ratio"]) < 0.08
 
-        figure_dir = fig_path(__file__)
+        figure_dir = fig_path()
         fig, ax = plt.subplots(figsize=(6.0, 3.5))
         ax.semilogy(k, r_k, "o", label="$r_k$")
         ax.semilogy(k, fit["a_fit"] * fit["branching_ratio"] ** k, "-", label="fit")

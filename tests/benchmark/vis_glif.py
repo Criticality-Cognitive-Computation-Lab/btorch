@@ -18,12 +18,12 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 def show_autograd_graph(output, params, name):
     digraph = make_dot(output, params=params, show_attrs=True)
 
-    output_dir = fig_path(__file__)
+    output_dir = fig_path()
     digraph.render(format="svg", outfile=os.path.join(output_dir, f"{name}_grad.svg"))
 
 
 def show_forward_graph(model, input, name):
-    output_dir = fig_path(__file__)
+    output_dir = fig_path()
     _ = draw_graph(
         model,
         input,

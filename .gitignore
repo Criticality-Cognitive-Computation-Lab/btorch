@@ -49,3 +49,4 @@ coverage.xml
 .desloppify
 .kilocode/
 .kilo/
+.playwright-mcp/

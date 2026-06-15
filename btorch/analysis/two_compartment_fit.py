@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -15,10 +15,6 @@ from scipy.optimize import linear_sum_assignment
 from torch import Tensor
 
 from btorch.models import environ, functional
-
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 
 @dataclass

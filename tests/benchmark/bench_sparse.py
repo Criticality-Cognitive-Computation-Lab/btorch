@@ -272,6 +272,6 @@ if __name__ == "__main__":
     # https://github.com/rusty1s/pytorch_sparse/issues/400
     # test_compile_sparse()
 
-    save_path = fig_path(__file__)
+    save_path = fig_path()
     bench_spmv_forward.run(save_path=save_path, show_plots=False)
     bench_spmv_forward_backward.run(save_path=save_path, show_plots=False)

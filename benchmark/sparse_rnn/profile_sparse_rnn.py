@@ -147,7 +147,7 @@ def _parse_args() -> ProfileConfig:
     output_dir = args.output_dir
     if output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = fig_path(__file__) / timestamp
+        output_dir = fig_path() / timestamp
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 

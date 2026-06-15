@@ -96,8 +96,8 @@ def fig_path(
     Returns:
         Path object for the figure directory (created if needed).
     """
-    file_path = Path(file) if file is not None else caller_file()
-    file_path = file_path.resolve()
+    file_path = file if file is not None else caller_file()
+    file_path = Path(file_path).resolve()
     root = _repo_root()
     cfg = _resolve_cfg(cfg)
 
@@ -149,7 +149,7 @@ def save_fig(
     Returns:
         Path to the saved figure file.
     """
-    file_path = Path(file) if file is not None else caller_file()
+    file_path = Path(file) if file is not None else Path(caller_file())
     if path is None:
         path = fig_path(file_path, cfg=cfg)
     if name is None:
