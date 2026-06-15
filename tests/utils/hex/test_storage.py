@@ -43,7 +43,7 @@ def test_align_same_grid():
 def test_align_fill_value():
     """Aligning a small grid onto a large one should fill missing with fill."""
     q_src, r_src = disk(1)
-    values_src = np.array([10.0])
+    values_src = np.arange(len(q_src), dtype=float)
     q_tgt, r_tgt = disk(3)
     aligned = align(q_tgt, r_tgt, q_src, r_src, values_src, fill=-999)
     assert np.any(aligned == -999), "fill value should appear for missing hexes"

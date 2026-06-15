@@ -40,6 +40,7 @@ test = [
   "pytest>=8.2",
   "pytest-cov>=5.0",
   "matplotlib>=3.7",
+  "kaleido",
 ]
 dev = [
   { include-group = "docs" },

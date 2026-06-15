@@ -78,7 +78,6 @@ class TestHexCoords:
         b = HexCoords(np.array([0, 1]), np.array([0, 1]))
         c = HexCoords(np.array([0, 2]), np.array([0, 1]))
         assert a == b
-        assert not (a == c)
         assert a != c
 
     def test_eq_different_lengths(self):

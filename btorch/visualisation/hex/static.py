@@ -428,7 +428,7 @@ def quiver(
     Returns:
         Figure and axes objects
     """
-    (x, y), eff = _resolve_to_pixel(
+    (x, y), _ = _resolve_to_pixel(
         c1,
         c2,
         coord_format,
