@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from jaxtyping import Float
 
-from btorch.config import SPARSE_BACKEND
+from btorch.config import SPARSE_BACKEND, event_sparse_mode
 
 from .constrain import HasConstraint
 
@@ -237,6 +237,9 @@ class SparseConn(BaseSparseConn, HasConstraint):
     enforce_dale: bool
     initial_sign: torch.Tensor
     magnitude: torch.nn.Parameter
+    _event_row_length: torch.Tensor | None
+    _event_ind: torch.Tensor | None
+    _event_weight: torch.Tensor | None
 
     def __init__(
         self,
@@ -262,6 +265,10 @@ class SparseConn(BaseSparseConn, HasConstraint):
             device=device,
             dtype=dtype,
         )
+        self.register_buffer("_event_row_length", None)
+        self.register_buffer("_event_ind", None)
+        self.register_buffer("_event_weight", None)
+        self._event_weight_version = -1
 
     def _init_weights(self, value: torch.Tensor):
         if self.enforce_dale:
@@ -271,11 +278,144 @@ class SparseConn(BaseSparseConn, HasConstraint):
     def _get_effective_weight(self):
         return self.magnitude
 
+    def _build_event_span_layout(
+        self, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build presynaptic-row padded storage for event propagation."""
+        if self._event_row_length is not None and self._event_ind is not None:
+            if (
+                self._event_row_length.device == device
+                and self._event_ind.device == device
+            ):
+                return self._event_row_length, self._event_ind
+
+        if self.indices.numel() == 0:
+            row_length = torch.zeros(
+                (self.in_features,), device=device, dtype=torch.int64
+            )
+            ind = torch.empty((self.in_features, 0), device=device, dtype=torch.int64)
+            self._event_row_length = row_length
+            self._event_ind = ind
+            return row_length, ind
+
+        indices = self.indices.to(device=device)
+        post_ind = indices[0].to(dtype=torch.int64)
+        pre_ind = indices[1].to(dtype=torch.int64)
+        row_length = torch.bincount(pre_ind, minlength=self.in_features).to(torch.int64)
+        row_stride = int(row_length.max().item())
+        ind = torch.zeros(
+            (self.in_features, row_stride), device=device, dtype=torch.int64
+        )
+
+        slot = torch.zeros((self.in_features,), device=device, dtype=torch.int64)
+        for edge_idx in range(pre_ind.numel()):
+            pre = int(pre_ind[edge_idx].item())
+            edge_slot = int(slot[pre].item())
+            ind[pre, edge_slot] = post_ind[edge_idx]
+            slot[pre] += 1
+
+        self._event_row_length = row_length
+        self._event_ind = ind
+        return row_length, ind
+
+    def _event_span_weight(
+        self, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        effective_value = self._get_effective_weight()
+        version = getattr(effective_value, "_version", -1)
+        if (
+            self._event_weight is not None
+            and self._event_weight.device == device
+            and self._event_weight.dtype == dtype
+            and self._event_weight_version == version
+        ):
+            return self._event_weight
+
+        row_length, ind = self._build_event_span_layout(device)
+        row_stride = ind.shape[1]
+        weight = torch.zeros((self.in_features, row_stride), device=device, dtype=dtype)
+        if row_stride == 0:
+            self._event_weight = weight
+            self._event_weight_version = version
+            return weight
+
+        effective_value = effective_value.to(device=device, dtype=dtype)
+        pre_ind = self.indices[1].to(device=device, dtype=torch.int64)
+        slot = torch.zeros((self.in_features,), device=device, dtype=torch.int64)
+        for edge_idx in range(pre_ind.numel()):
+            pre = int(pre_ind[edge_idx].item())
+            edge_slot = int(slot[pre].item())
+            weight[pre, edge_slot] = effective_value[edge_idx]
+            slot[pre] += 1
+        self._event_weight = weight
+        self._event_weight_version = version
+        return weight
+
+    def forward_events(
+        self,
+        spike: torch.Tensor,
+        *,
+        mode: Literal["pre_span", "post_span"] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply forward-only Triton event propagation for dense spike flags."""
+        from btorch.backend.triton import (
+            dense_spike_to_spike_list,
+            post_span_spmm_from_spike_list,
+            pre_span_spmm_from_spike_list,
+        )
+
+        if self.bias is not None:
+            raise NotImplementedError("Sparse event propagation does not support bias.")
+        if not spike.is_cuda:
+            raise ValueError("Sparse event propagation requires CUDA tensors.")
+
+        mode = mode or event_sparse_mode()
+        no_batch = spike.ndim == 1
+        if no_batch:
+            spike = spike.unsqueeze(0)
+        if spike.ndim != 2:
+            raise ValueError("spike must have shape (n_pre,) or (batch_size, n_pre).")
+        if spike.shape[-1] != self.in_features:
+            raise ValueError("The last spike dimension must equal in_features.")
+
+        row_length, ind = self._build_event_span_layout(spike.device)
+        weight = self._event_span_weight(spike.device, spike.dtype)
+        spike_list = dense_spike_to_spike_list(spike)
+        if mode == "pre_span":
+            out_tensor = pre_span_spmm_from_spike_list(
+                spike_list.count,
+                spike_list.ind,
+                row_length,
+                ind,
+                weight,
+                size_m=self.out_features,
+                out=out,
+            )
+        elif mode == "post_span":
+            out_tensor = post_span_spmm_from_spike_list(
+                spike_list.count,
+                spike_list.ind,
+                row_length,
+                ind,
+                weight,
+                size_m=self.out_features,
+                out=out,
+            )
+        else:
+            raise ValueError(f"Unsupported event sparse mode '{mode}'.")
+
+        if no_batch:
+            return out_tensor[0]
+        return out_tensor
+
     def constrain(self, *args, **kwargs):
         if self.enforce_dale:
             self.magnitude.data = (self.magnitude * self.initial_sign).relu() * (
                 self.initial_sign
             )
+            self._event_weight = None
+            self._event_weight_version = -1
 
 
 class SparseConstrainedConn(BaseSparseConn, HasConstraint):
@@ -511,8 +651,8 @@ class SparseEventConn(nn.Module):
         mode: Literal["pre_span", "post_span"] | None = None,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Apply sparse event propagation for spike-like inputs."""
-        from btorch.backend.triton import post_span_spmm, pre_span_spmm
+        """Apply sparse propagation after compacting dense spike flags."""
+        from btorch.backend.triton import dense_spike_to_spike_list
 
         mode = mode or self.event_mode
         no_batch = spike.ndim == 1
@@ -523,6 +663,33 @@ class SparseEventConn(nn.Module):
         if spike.shape[-1] != self.in_features:
             raise ValueError("The last spike dimension must equal in_features.")
 
+        spike_list = dense_spike_to_spike_list(spike)
+        out_tensor = self.forward_spike_list(
+            spike_list.count,
+            spike_list.ind,
+            mode=mode,
+            out=out,
+        )
+
+        if no_batch:
+            return out_tensor[0]
+        return out_tensor
+
+    def forward_spike_list(
+        self,
+        spike_count: torch.Tensor,
+        spike_ind: torch.Tensor,
+        *,
+        mode: Literal["pre_span", "post_span"] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply sparse propagation from a compact spike list."""
+        from btorch.backend.triton import (
+            post_span_spmm_from_spike_list,
+            pre_span_spmm_from_spike_list,
+        )
+
+        mode = mode or self.event_mode
         if mode == "pre_span":
             if (
                 self.pre_row_length is None
@@ -530,37 +697,32 @@ class SparseEventConn(nn.Module):
                 or self.pre_weight is None
             ):
                 raise RuntimeError("pre-span buffers are not initialized.")
-            out_tensor = pre_span_spmm(
-                spike,
+            return pre_span_spmm_from_spike_list(
+                spike_count,
+                spike_ind,
                 self.pre_row_length,
                 self.pre_ind,
                 self.pre_weight,
                 size_m=self.out_features,
-                is_bool_float=False,
                 out=out,
             )
-        elif mode == "post_span":
+        if mode == "post_span":
             if (
                 self.post_row_length is None
                 or self.post_ind is None
                 or self.post_weight is None
             ):
                 raise RuntimeError("post-span buffers are not initialized.")
-            out_tensor = post_span_spmm(
-                spike,
+            return post_span_spmm_from_spike_list(
+                spike_count,
+                spike_ind,
                 self.post_row_length,
                 self.post_ind,
                 self.post_weight,
                 size_m=self.out_features,
-                is_bool_float=False,
                 out=out,
             )
-        else:
-            raise ValueError(f"Unsupported event mode '{mode}'.")
-
-        if no_batch:
-            return out_tensor[0]
-        return out_tensor
+        raise ValueError(f"Unsupported event mode '{mode}'.")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_events(x)

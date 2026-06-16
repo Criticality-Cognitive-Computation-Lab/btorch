@@ -3,6 +3,8 @@ from typing import Protocol
 
 import torch
 
+from btorch.config import event_sparse_enabled, event_sparse_mode
+
 from . import environ
 from .base import MemoryModule, normalize_n_neuron
 from .ode import exp_euler_step
@@ -128,6 +130,16 @@ class BasePSC(MemoryModule):
             return x
         return x.reshape(*leading_shape, *self.n_neuron)
 
+    def _apply_linear(self, z_flat: torch.Tensor) -> torch.Tensor:
+        if (
+            event_sparse_enabled()
+            and not torch.is_grad_enabled()
+            and z_flat.is_cuda
+            and hasattr(self.linear, "forward_events")
+        ):
+            return self.linear.forward_events(z_flat, mode=event_sparse_mode())
+        return self.linear(z_flat)
+
     def conductance_charge(self):
         raise NotImplementedError()
 
@@ -201,10 +213,7 @@ class ExponentialPSC(BasePSC):
 
     def adaptation_charge(self, z: torch.Tensor):
         z_flat, leading = self._flatten_neuron(z)
-        if hasattr(self.linear, "forward_events"):
-            wz = self.linear.forward_events(z_flat)
-        else:
-            wz = self.linear(z_flat)
+        wz = self._apply_linear(z_flat)
         wz = self._unflatten_neuron(wz, leading)
         self.psc = self.psc + wz
 
@@ -266,7 +275,7 @@ class AlphaPSCBilleh(_Adaptive2VarPSC):
 
     def adaptation_charge(self, z: torch.Tensor):
         z_flat, leading = self._flatten_neuron(z)
-        wz = self.linear(z_flat)
+        wz = self._apply_linear(z_flat)
         wz = self._unflatten_neuron(wz, leading)
         self.h = self.syn_decay * self.h + torch.e / self.tau_syn * wz
 
@@ -306,7 +315,7 @@ class AlphaPSC(_Adaptive2VarPSC):
 
     def adaptation_charge(self, z: torch.Tensor):
         z_flat, leading = self._flatten_neuron(z)
-        wz = self.g_max * self.linear(z_flat)
+        wz = self.g_max * self._apply_linear(z_flat)
         wz = self._unflatten_neuron(wz, leading)
         self.h = exp_euler_step(self.dh, self.h, dt=environ.get("dt")) + wz
 

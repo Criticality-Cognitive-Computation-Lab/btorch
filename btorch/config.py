@@ -14,5 +14,24 @@ def env_to_bool(name, default):
 
 JIT_ENABLED = env_to_bool("BTORCH_JIT", True)
 SPARSE_BACKEND = os.environ.get("BTORCH_SPARSE_BACKEND", "torch_sparse").lower()
+EVENT_SPARSE_MODE = os.environ.get("BTORCH_EVENT_SPARSE_MODE", "pre_span").lower()
 
-__all__ = ["_enabled", "JIT_ENABLED", "SPARSE_BACKEND"]
+
+def event_sparse_enabled() -> bool:
+    """Return whether sparse event propagation is enabled for forward passes."""
+    return env_to_bool("BTORCH_EVENT_SPARSE", False)
+
+
+def event_sparse_mode() -> str:
+    """Return the configured sparse event traversal mode."""
+    return os.environ.get("BTORCH_EVENT_SPARSE_MODE", EVENT_SPARSE_MODE).lower()
+
+
+__all__ = [
+    "_enabled",
+    "event_sparse_enabled",
+    "event_sparse_mode",
+    "EVENT_SPARSE_MODE",
+    "JIT_ENABLED",
+    "SPARSE_BACKEND",
+]

@@ -34,3 +34,4 @@ site/
 /local/
 /metadata/md5-cache
 /tags
+benchmark_formal/
