@@ -1727,7 +1727,7 @@ def _fit_two_compartment_model_staged(
 
     if not history:
         raise ValueError(
-            "No staged fitting steps ran because no stage had " "trainable parameters."
+            "No staged fitting steps ran because no stage had trainable parameters."
         )
 
     return history

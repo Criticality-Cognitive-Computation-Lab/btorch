@@ -10,8 +10,9 @@ from torch.profiler import ProfilerActivity, profile, schedule
 
 from btorch.models.base import MemoryModule
 from btorch.models.functional import reset_net_state
-from btorch.models.linear import DenseConn, SparseConn, available_sparse_backends
+from btorch.models.linear import DenseLinear, SparseLinear
 from btorch.models.rnn import make_rnn
+from btorch.sparse import CSR, available_backends
 from btorch.utils.file import fig_path
 
 
@@ -31,19 +32,22 @@ class SparseRNNCell(MemoryModule):
         self.input_size = input_size
         self.hidden_size = hidden_size
 
-        self.W_x = DenseConn(
+        self.W_x = DenseLinear(
             input_size,
             hidden_size,
             weight=W_x,
-            bias=None,
+            bias=False,
             device=W_x.device,
             dtype=W_x.dtype,
         )
-        self.W_h = SparseConn(
-            W_h_sparse,
-            bias=None,
-            enforce_dale=False,
-            sparse_backend=sparse_backend,
+        self.W_h = SparseLinear(
+            CSR.from_scipy(
+                W_h_sparse,
+                backend=sparse_backend,
+                device=W_x.device,
+                dtype=W_x.dtype,
+            ),
+            bias=False,
         )
         self.b = nn.Parameter(b.clone())
 
@@ -122,7 +126,11 @@ def _write_summary(prof, output_dir: Path, device: torch.device, row_limit: int 
 
 
 def _parse_args() -> ProfileConfig:
-    backends = available_sparse_backends()
+    backends = [
+        backend
+        for backend in available_backends()
+        if backend in {"native", "torch_sparse"}
+    ]
     parser = argparse.ArgumentParser(description="Profile a sparse RNN.")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--backend", default=backends[0], choices=backends)

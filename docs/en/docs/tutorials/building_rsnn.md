@@ -50,7 +50,7 @@ class MinimalRSNN(nn.Module):
         )
 
         # 3. Recurrent connection
-        conn = DenseConn(num_hidden, num_hidden, bias=None, device=device)
+        conn = DenseConn(num_hidden, num_hidden, bias=False, device=device)
 
         # 4. Synapse
         psc_module = synapse.AlphaPSC(

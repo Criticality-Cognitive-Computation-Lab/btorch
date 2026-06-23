@@ -1113,7 +1113,7 @@ def fano_sweep(
     if start < 1:
         raise ValueError("start must be >= 1")
     if stop > T + 1:
-        raise ValueError(f"stop must be <= T+1 ({T+1})")
+        raise ValueError(f"stop must be <= T+1 ({T + 1})")
 
     window_sizes = np.arange(start, stop, step)
     n_windows = len(window_sizes)

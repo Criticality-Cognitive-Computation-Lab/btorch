@@ -15,7 +15,8 @@ Before writing code, confirm the intended architecture when it is unclear from t
 
 - neuron model (for example: GLIF3, LIF, ALIF)
 - synapse model (for example: AlphaPSC, AlphaPSCBilleh, ExponentialPSC)
-- connection pattern (for example: SparseConn, DenseConn, E/I split, receptor split)
+- connection pattern (for example: `SparseLinear(CSR(...))`, `DenseLinear`,
+  E/I split, receptor split)
 
 If these are already explicit in user requirements/config, proceed without asking.
 
@@ -25,12 +26,13 @@ If these are already explicit in user requirements/config, proceed without askin
 from btorch.models import environ, functional
 from btorch.models.neurons import GLIF3
 from btorch.models.synapse import AlphaPSCBilleh
-from btorch.models.linear import SparseConn
+from btorch.models.linear import SparseLinear
+from btorch.sparse import CSR
 from btorch.models.rnn import RecurrentNN
 from btorch.models.init import uniform_v_
 
 # Build RSNN
-conn = SparseConn(conn=weights)
+conn = SparseLinear(CSR.from_scipy(weights))
 
 neuron = GLIF3(n_neuron=100, ...)
 psc = AlphaPSCBilleh(n_neuron=100, linear=conn, ...)

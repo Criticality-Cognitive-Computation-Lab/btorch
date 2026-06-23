@@ -30,7 +30,7 @@ Extends the basic RSNN with brain-environment interaction networks. Demonstrates
 A full training pipeline for Fashion-MNIST classification using a GLIF3-based RSNN with sparse recurrent connectivity and voltage regularization.
 
 **Key patterns:**
-- `SparseConn` for sparse recurrent weights
+- `SparseConn(CSR(...))` for sparse recurrent weights
 - `AlphaPSCBilleh` synapse with heterogeneous time constants
 - `VoltageRegularizer` for membrane-voltage regularization
 - Manual training loop with `reset_net` per batch

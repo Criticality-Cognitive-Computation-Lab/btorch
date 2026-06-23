@@ -6,6 +6,7 @@ from btorch.models.functional import init_net_state
 from btorch.models.init import build_sparse_mat, uniform_v_
 from btorch.models.neurons.glif import GLIF3
 from btorch.models.scale import scale_state_
+from btorch.sparse import CSR
 from btorch.utils.file import save_fig
 
 
@@ -279,16 +280,16 @@ def test_network(neuron_params, dtype=torch.float32):
     )
     # neuron_module = neuron_module.to(device)
     # rec_weights, _, _ = build_dense_mat(n_e_neurons, n_i_neurons)
-    # conn = linear.DenseConn(
+    # conn = linear.DenseLinear(
     #         in_features=n_neurons, out_features=n_neurons, weight=rec_weights
     # )
 
     rec_weights, _, _ = build_sparse_mat(n_e_neurons, n_i_neurons, i_e_ratio=1)
-    conn = linear.SparseConn(
-        # conn = rec_weights /
-        # (neuron_params["v_threshold"] - neuron_params["v_reset"]),
-        device=device,
-        conn=rec_weights,
+    conn = linear.SparseLinear(
+        CSR.from_scipy(
+            rec_weights,
+            device=device,
+        )
     )
 
     tau_syn = torch.cat([torch.ones(n_e_neurons) * 5.8, torch.ones(n_i_neurons) * 6.5])

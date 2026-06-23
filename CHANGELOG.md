@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Matrix-first sparse API with `CSR`, `CSC`, fixed-degree and channel-aware
+  representations, explicit event inputs, projected constraints, and
+  native/optional backend adapters.
+- `DenseLinear`, `SparseLinear`, and `ChannelLinear`, plus sparse API tutorials
+  covering representations, constraints, events, backends, custom kernels,
+  and heterogeneous channels.
 - Expanded API reference coverage: visualisation, io, utils, models (functional, history, environ, init, scale, regularizer, ode, connection_conversion), analysis (dynamic_tools), and connectome (connection, augment).
 - New Core Concepts guides: "Stateful Modules", "The `dt` Environment", and "Surrogate Gradients".
 - New Tutorials: "Tutorial 1: Building an RSNN" and "Tutorial 2: Training an SNN".
@@ -20,4 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Improved Google-style docstrings across `btorch.models.functional`, `environ`, `init`, `scale`, `regularizer`, and `btorch.utils.conf`.
 
 ### Removed
+- Legacy `DenseConn`, `SparseConn`, `SparseConstrainedConn`, event-specific
+  connection modules, and the old `btorch.backend` sparse namespace.
 - Redundant `zh/docs/api/` English mkdocstrings blocks.

@@ -15,6 +15,7 @@ from btorch.models import environ, functional
 from btorch.models.neurons import GLIF3
 from btorch.models.synapse import AlphaPSCBilleh
 from btorch.models.linear import SparseConn
+from btorch.sparse import CSR
 from btorch.models.rnn import RecurrentNN
 from btorch.models.init import uniform_v_
 from btorch.models.regularizer import VoltageRegularizer
@@ -22,7 +23,7 @@ from btorch.models.regularizer import VoltageRegularizer
 # create an arbitrary sparse mat as example 
 from tests.utils.conn import build_sparse_mat  # helper from test suite
 weights, _, _ = build_sparse_mat(n_e=80, n_i=20, i_e_ratio=1.0)
-conn = SparseConn(conn=weights)
+conn = SparseConn(CSR.from_scipy(weights))
 
 neuron = GLIF3(
     n_neuron=100,

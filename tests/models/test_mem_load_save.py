@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from btorch.models import environ, linear, rnn, synapse
+from btorch.models import environ, rnn, synapse
 from btorch.models.functional import (
     init_net_state,
     named_hidden_states,
@@ -10,8 +10,10 @@ from btorch.models.functional import (
     set_memory_reset_values,
 )
 from btorch.models.init import uniform_v_
+from btorch.models.linear import SparseLinear
 from btorch.models.neurons.glif import GLIF3
 from btorch.models.neurons.lif import LIF
+from btorch.sparse import CSR
 from tests.utils.conn import build_sparse_mat
 
 
@@ -54,7 +56,10 @@ def def_model(neuron_params, device, dtype):
     )
 
     rec_weights, _, _ = build_sparse_mat(n_e_neurons, n_i_neurons, i_e_ratio=1)
-    conn = linear.SparseConn(conn=rec_weights, device=device)
+    conn = SparseLinear(
+        CSR.from_scipy(rec_weights, device=device),
+        bias=False,
+    )
 
     tau_syn = torch.cat([torch.ones(n_e_neurons) * 5.8, torch.ones(n_i_neurons) * 6.5])
 

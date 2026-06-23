@@ -49,7 +49,7 @@ mixed = MixedNeuronPopulation(
 突触看到的是**拼接后**的脉冲，因此连接矩阵必须为 `n_neuron x n_neuron`：
 
 ```python
-conn = DenseConn(n_neuron, n_neuron, bias=None)
+conn = DenseConn(n_neuron, n_neuron, bias=False)
 psc  = AlphaPSC(
     n_neuron=n_neuron,
     tau_syn=5.0,

@@ -443,7 +443,7 @@ def main():
                 loss = F.mse_loss(out_fr, label_onehot)
                 loss.backward()
                 optimizer.step()
-            # if you use SparseConn from models.linear, and enforce Dale's law
+            # Sparse matrices can use a Dale projection after optimizer updates.
             # constrain_net(net)
 
             train_samples += label.numel()

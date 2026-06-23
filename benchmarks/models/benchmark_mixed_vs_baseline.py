@@ -17,7 +17,7 @@ import torch
 
 from btorch.models import environ
 from btorch.models.functional import init_net_state, reset_net_state
-from btorch.models.linear import DenseConn
+from btorch.models.linear import DenseLinear
 from btorch.models.neurons import GLIF3, TwoCompartmentGLIF
 from btorch.models.neurons.mixed import MixedNeuronPopulation
 from btorch.models.rnn import ApicalRecurrentNN, RecurrentNN
@@ -31,7 +31,7 @@ BENCH_REPS = 5
 
 def _build_baseline_rnn(n_neuron: int, unroll: int | bool) -> RecurrentNN:
     neuron = GLIF3(n_neuron=n_neuron, step_mode="s")
-    conn = DenseConn(n_neuron, n_neuron, bias=None)
+    conn = DenseLinear(n_neuron, n_neuron, bias=False)
     psc = AlphaPSC(n_neuron=n_neuron, tau_syn=5.0, linear=conn, step_mode="s")
     return RecurrentNN(neuron=neuron, synapse=psc, step_mode="m", unroll=unroll)
 
@@ -41,7 +41,7 @@ def _build_adapter_only_rnn(n_neuron: int, unroll: int | bool) -> ApicalRecurren
         [(n_neuron, GLIF3(n_neuron=n_neuron, step_mode="s"))],
         step_mode="s",
     )
-    conn = DenseConn(n_neuron, n_neuron, bias=None)
+    conn = DenseLinear(n_neuron, n_neuron, bias=False)
     psc = AlphaPSC(n_neuron=n_neuron, tau_syn=5.0, linear=conn, step_mode="s")
     return ApicalRecurrentNN(neuron=mixed, synapse=psc, step_mode="m", unroll=unroll)
 
@@ -56,7 +56,7 @@ def _build_mixed_rnn(n_neuron: int, unroll: int | bool) -> ApicalRecurrentNN:
         ],
         step_mode="s",
     )
-    conn = DenseConn(n_neuron, n_neuron, bias=None)
+    conn = DenseLinear(n_neuron, n_neuron, bias=False)
     psc = AlphaPSC(n_neuron=n_neuron, tau_syn=5.0, linear=conn, step_mode="s")
     return ApicalRecurrentNN(neuron=mixed, synapse=psc, step_mode="m", unroll=unroll)
 

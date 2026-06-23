@@ -80,12 +80,15 @@ def vis_network(neuron_params, dtype=torch.float32):
         )
 
         rec_weights = build_dense_mat(n_e_neurons, n_i_neurons)
-        conn = linear.DenseConn(
-            in_features=n_neurons, out_features=n_neurons, weight=rec_weights
+        conn = linear.DenseLinear(
+            in_features=n_neurons,
+            out_features=n_neurons,
+            weight=rec_weights,
+            bias=False,
         )
 
         # rec_weights = build_sparse_mat(n_e_neurons, n_i_neurons)
-        # conn = linear.SparseConn(conn=rec_weights)
+        # conn = linear.SparseLinear(CSR.from_scipy(rec_weights))
 
         tau_syn = torch.cat(
             [torch.ones(n_e_neurons) * 5.8, torch.ones(n_i_neurons) * 6.5]

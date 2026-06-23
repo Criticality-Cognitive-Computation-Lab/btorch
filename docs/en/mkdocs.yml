@@ -97,6 +97,7 @@ nav:
 - API Reference:
   - api/index.md
   - api/models.md
+  - api/sparse.md
   - api/neurons.md
   - api/analysis.md
   - api/analysis_dynamic_tools.md

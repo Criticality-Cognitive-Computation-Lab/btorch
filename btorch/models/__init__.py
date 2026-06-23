@@ -1,12 +1,10 @@
 from . import (
     base,
-    connection_conversion,
     constrain,
     conv,
     dlif,
     environ,
     functional,
-    hex,
     history,
     init,
     linear,
@@ -15,12 +13,12 @@ from . import (
     surrogate,
 )
 from .dlif import DBNN, DLIF, DendriticLIF
+from .linear import DenseConn, DenseLinear, LearnableScale, SparseConn, SparseLinear
 from .neurons import alif, glif, lif, two_compartment
 
 
 __all__ = [
     "base",
-    "connection_conversion",
     "constrain",
     "conv",
     "dlif",
@@ -30,7 +28,6 @@ __all__ = [
     "alif",
     "lif",
     "two_compartment",
-    "hex",
     "history",
     "init",
     "linear",
@@ -40,4 +37,9 @@ __all__ = [
     "DendriticLIF",
     "DLIF",
     "DBNN",
+    "DenseConn",
+    "DenseLinear",
+    "LearnableScale",
+    "SparseConn",
+    "SparseLinear",
 ]

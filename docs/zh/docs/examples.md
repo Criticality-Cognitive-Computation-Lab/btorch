@@ -30,7 +30,7 @@
 使用基于 GLIF3 的 RSNN 进行 Fashion-MNIST 分类的完整训练流程，包含稀疏循环连接和电压正则化。
 
 **关键模式：**
-- 用于稀疏循环权重的 `SparseConn`
+- 用于稀疏循环权重的 `SparseConn(CSR(...))`
 - 具有异构时间常数的 `AlphaPSCBilleh` 突触
 - 用于膜电压正则化的 `VoltageRegularizer`
 - 每批次手动调用 `reset_net` 的训练循环
