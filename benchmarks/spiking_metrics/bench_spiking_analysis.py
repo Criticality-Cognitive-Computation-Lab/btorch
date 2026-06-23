@@ -277,9 +277,9 @@ def benchmark_ei_full(T=1000, B=8, N=100000, device="cpu", dtype=torch.float32):
 
 def compare_dtypes(T=1000, B=8, N=100000, device="cpu"):
     """Compare float16 vs float32 performance."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Comparing dtypes: T={T}, B={B}, N={N}, device={device}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     for dtype in [torch.float16, torch.float32]:
         spikes = generate_spike_data(T, B, N, device=device, dtype=dtype)
