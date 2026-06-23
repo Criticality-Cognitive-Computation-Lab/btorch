@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from btorch.backend.triton.sparse import coo_spmm, coo_spmv
+from btorch.sparse.backends.triton.coo import coo_spmm, coo_spmv
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

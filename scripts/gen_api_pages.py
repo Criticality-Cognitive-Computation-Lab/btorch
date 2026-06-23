@@ -13,13 +13,17 @@ from pathlib import Path
 
 
 EXCLUDES = {
-    "btorch.backend",
+    "btorch.sparse.backends",
     "btorch.types",
     "btorch.config",
     "btorch.jit",
 }
 
 DEEP_PAGES = {
+    "btorch.sparse": (
+        "api/sparse.md",
+        "Sparse Matrices",
+    ),
     "btorch.analysis.dynamic_tools.": (
         "api/analysis_dynamic_tools.md",
         "Analysis — Dynamic Tools",
@@ -56,7 +60,9 @@ def _discover(package: str) -> list[str]:
     base_path = Path(pkg.__file__).parent
     modules: list[str] = []
     for _, name, ispkg in pkgutil.walk_packages([str(base_path)], prefix=f"{package}."):
-        if not _is_public(name) or name in EXCLUDES:
+        if not _is_public(name) or any(
+            name == excluded or name.startswith(f"{excluded}.") for excluded in EXCLUDES
+        ):
             continue
         depth = len(name.split(".")) - 1
         if depth >= 3 and not any(name.startswith(p) for p in DEEP_PAGES):

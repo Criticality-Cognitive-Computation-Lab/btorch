@@ -3,14 +3,10 @@ import scipy.sparse
 import torch
 
 from btorch.models import environ, functional
-from btorch.models.linear import (
-    DenseConn,
-    SparseConn,
-    SparseConstrainedConn,
-    available_sparse_backends,
-)
+from btorch.models.linear import DenseLinear, SparseLinear
 from btorch.models.neurons.alif import ALIF, ELIF
 from btorch.models.neurons.glif import GLIF3
+from btorch.sparse import CSR, GroupedWeights, available_backends
 from tests.utils.compile import compile_or_skip
 
 
@@ -18,7 +14,10 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA not available - skipping entire module", allow_module_level=True)
 
 
-@pytest.mark.parametrize("backend", available_sparse_backends())
+@pytest.mark.parametrize(
+    "backend",
+    [b for b in available_backends() if b in {"native", "torch_sparse"}],
+)
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_cudagraph_linear(backend: str, use_compile: bool):
     """All connection classes match dense behavior with CUDA graphs."""
@@ -39,7 +38,7 @@ def test_cudagraph_linear(backend: str, use_compile: bool):
     x_batch = torch.stack([x, x + 1.0], dim=0)
 
     # 1. Dense connection
-    dense = DenseConn(3, 3, weight=W, bias=None).to(device)
+    dense = DenseLinear(3, 3, weight=W, bias=False).to(device)
 
     # 2. Sparse COO connection (convert dense to sparse)
     W_sparse = scipy.sparse.coo_array(W.numpy())
@@ -63,11 +62,38 @@ def test_cudagraph_linear(backend: str, use_compile: bool):
         (constraint_data, (constraint_rows, constraint_cols)), shape=W.shape
     )
 
-    sparse_coo = SparseConn(
-        W_sparse, bias=None, enforce_dale=False, sparse_backend=backend
+    sparse_coo = SparseLinear(
+        CSR.from_scipy(W_sparse),
+        bias=False,
     ).to(device)
-    constrained = SparseConstrainedConn(
-        W_sparse, constraint, enforce_dale=False, bias=None, sparse_backend=backend
+    constraint_coo = constraint.tocoo()
+    group_lookup = {
+        (int(row), int(col)): int(group)
+        for row, col, group in zip(
+            constraint_coo.row,
+            constraint_coo.col,
+            constraint_coo.data,
+            strict=True,
+        )
+    }
+    weight_coo = W_sparse.tocoo()
+    groups = torch.tensor(
+        [
+            group_lookup[(int(row), int(col))]
+            for row, col in zip(weight_coo.row, weight_coo.col, strict=True)
+        ]
+    )
+    _W_csr = CSR.from_edges(
+        weight_coo.row,
+        weight_coo.col,
+        weight_coo.data,
+        shape=W_sparse.shape,
+        labels={"group": groups},
+    )
+    _group_ids = _W_csr.attributes.labels["group"]
+    constrained = SparseLinear(
+        _W_csr.with_constraint(GroupedWeights(group_ids=_group_ids)),
+        bias=False,
     ).to(device)
 
     x = x.to(device)

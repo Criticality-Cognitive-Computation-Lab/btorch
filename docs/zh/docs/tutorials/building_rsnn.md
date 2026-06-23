@@ -50,7 +50,7 @@ class MinimalRSNN(nn.Module):
         )
 
         # 3. 循环连接
-        conn = DenseConn(num_hidden, num_hidden, bias=None, device=device)
+        conn = DenseConn(num_hidden, num_hidden, bias=False, device=device)
 
         # 4. 突触
         psc_module = synapse.AlphaPSC(

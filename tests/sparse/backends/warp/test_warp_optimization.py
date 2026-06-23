@@ -3,7 +3,9 @@ import os
 
 import pytest
 import torch
-import warp as wp
+
+
+wp = pytest.importorskip("warp")
 
 
 # Initialize warp

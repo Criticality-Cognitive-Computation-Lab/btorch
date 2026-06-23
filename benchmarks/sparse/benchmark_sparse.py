@@ -5,8 +5,8 @@ import numpy as np
 import torch
 
 # Import specific backends for comparison
-from btorch.backend.triton.sparse import coo_spmm as coo_spmm_triton
-from btorch.backend.warp.sparse import coo_spmm_warp, coo_spmm_warp_tiled
+from btorch.sparse.backends.triton.coo import coo_spmm as coo_spmm_triton
+from btorch.sparse.backends.warp.coo import coo_spmm_warp, coo_spmm_warp_tiled
 from btorch.utils.file import fig_path
 
 

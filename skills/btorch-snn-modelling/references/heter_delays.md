@@ -20,13 +20,14 @@ import torch
 
 from btorch.connectome.connection import expand_conn_for_delays
 from btorch.models.history import SpikeHistory
-from btorch.models.linear import SparseConn
+from btorch.models.linear import SparseLinear
+from btorch.sparse import CSR
 
 conn = scipy.sparse.coo_array(([5.0], ([0], [1])), shape=(2, 2))
 delays = np.array([2])  # one delay per non-zero entry
 
 conn_d = expand_conn_for_delays(conn, delays, n_delay_bins=5)
-linear = SparseConn(conn_d, enforce_dale=False)
+linear = SparseLinear(CSR.from_scipy(conn_d))
 
 history = SpikeHistory(n_neuron=2, max_delay_steps=5)
 history.init_state(batch_size=1)
@@ -78,7 +79,7 @@ psc = HeterSynapsePSC(
     n_neuron=n_neurons,
     n_receptor=len(receptor_idx),
     receptor_type_index=receptor_idx,
-    linear=SparseConn(conn, enforce_dale=False),
+    linear=SparseLinear(CSR.from_scipy(conn)),
     base_psc=AlphaPSC,
     tau_syn=5.0,
     max_delay_steps=5,

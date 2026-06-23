@@ -49,7 +49,7 @@ mixed = MixedNeuronPopulation(
 The synapse sees the **concatenated** spikes, so the connection matrix must be `n_neuron x n_neuron`:
 
 ```python
-conn = DenseConn(n_neuron, n_neuron, bias=None)
+conn = DenseConn(n_neuron, n_neuron, bias=False)
 psc  = AlphaPSC(
     n_neuron=n_neuron,
     tau_syn=5.0,

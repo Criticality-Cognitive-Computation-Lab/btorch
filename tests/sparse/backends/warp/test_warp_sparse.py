@@ -1,6 +1,13 @@
+import pytest
 import torch
 
-from btorch.backend.warp.sparse import coo_spmm_warp, coo_spmv_warp
+
+pytest.importorskip("warp")
+
+from btorch.sparse.backends.warp.coo import (  # noqa: E402
+    coo_spmm_warp,
+    coo_spmv_warp,
+)
 
 
 # Check availability
@@ -8,7 +15,7 @@ HAS_CUDA = torch.cuda.is_available()
 # Triton requires CUDA
 HAS_TRITON = HAS_CUDA
 if HAS_TRITON:
-    from btorch.backend.triton.sparse import coo_spmm, coo_spmv
+    from btorch.sparse.backends.triton.coo import coo_spmm, coo_spmv
 
 DEVICE = "cuda" if HAS_CUDA else "cpu"
 
@@ -79,7 +86,7 @@ def test_warp_backward():
     )
 
     # Forward with warp
-    out = coo_spmv_warp(indices, values, B)
+    out = coo_spmm_warp(indices, values, B)
     loss = out.sum()
     loss.backward()
 

@@ -330,6 +330,19 @@ def coo_spmm_warp(indices, values, mat, is_bool_float=False, size_m=None):
     return SparseCOOMatMulWarp.apply(indices, values, mat, is_bool_float, size_m)
 
 
+def coo_spmv_warp(indices, values, vec, is_bool_float=False, size_m=None):
+    """Apply Warp COO multiplication to a single dense vector."""
+    if vec.ndim != 1:
+        raise ValueError("coo_spmv_warp expects a one-dimensional vector.")
+    return coo_spmm_warp(
+        indices,
+        values,
+        vec,
+        is_bool_float=is_bool_float,
+        size_m=size_m,
+    )
+
+
 def coo_spmm_warp_tiled(indices, values, mat, is_bool_float=False, size_m=None):
     # We can create a new Autograd function or reuse the existing one with a
     # flag? For cleanliness, new autograd function or just modify the existing

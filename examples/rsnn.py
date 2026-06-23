@@ -46,8 +46,8 @@ class MinimalRSNN(nn.Module):
             dtype=dtype,
         )
 
-        # Define the recurrent synaptic connection weights using DenseConn
-        conn = DenseConn(num_hidden, num_hidden, bias=None, device=device, dtype=dtype)
+        # Define the recurrent synaptic connection weights using DenseConn.
+        conn = DenseConn(num_hidden, num_hidden, bias=False, device=device, dtype=dtype)
 
         # Define the synaptic dynamics (Alpha Post-Synaptic Current)
         psc_module = synapse.AlphaPSC(
@@ -224,7 +224,7 @@ def train(
         loss.backward()
         optimizer.step()
 
-        print(f"Epoch {epoch+1}/{epochs} - Step Loss: {loss.item():.4f}")
+        print(f"Epoch {epoch + 1}/{epochs} - Step Loss: {loss.item():.4f}")
 
     print("Training complete!")
 

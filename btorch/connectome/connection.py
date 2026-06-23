@@ -789,7 +789,7 @@ def make_hetersynapse_constrained_conn(
     """Create both heterosynaptic connection and constraint matrices.
 
     This is a convenience function that combines make_hetersynapse_conn and
-    make_hetersynapse_constraint to produce outputs ready for SparseConstrainedConn.
+    make_hetersynapse_constraint to produce aligned connection and group data.
 
     Args:
         neurons (pd.DataFrame): Must contain 'root_id', cell_type_col,
@@ -807,10 +807,9 @@ def make_hetersynapse_constrained_conn(
         ignore_post_type: If True, ignore post-synaptic receptor distinction.
 
     Returns:
-        Tuple of (conn_matrix, constraint_matrix, receptor_type_index).
-        Can be used directly with SparseConstrainedConn.from_hetersynapse(
-            conn, constraint, receptor_idx
-        ).
+        Tuple of ``(conn_matrix, constraint_matrix, receptor_type_index)``.
+        The flattened columns remain a plain sparse matrix; the constraint
+        entries provide the group labels.
     """
     conn_mat, receptor_idx = make_hetersynapse_conn(
         neurons,
@@ -834,6 +833,27 @@ def make_hetersynapse_constrained_conn(
     )
 
     return conn_mat, constraint_mat, receptor_idx
+
+
+def make_hetersynapse_sparse(
+    neurons: pd.DataFrame,
+    connections: scipy.sparse.sparray | pd.DataFrame,
+    *,
+    receptor_type_col: str = "EI",
+    receptor_type_mode: Literal["neuron", "connection"] = "neuron",
+    cell_type_col: str = "cell_type",
+    constraint_mode: Literal["full", "cell_only", "cell_and_receptor"] | None = None,
+    nan_in_same_group: bool = True,
+    dropna: Literal["error", "filter", "unknown"] = "error",
+    ignore_post_type: bool = False,
+    delay_col: str | None = None,
+    n_delay_bins: int = 5,
+    backend: str = "auto",
+    device=None,
+    dtype=None,
+):
+    """Deferred heterosynapse helper."""
+    raise NotImplementedError("Heterosynapse sparse construction is deferred.")
 
 
 def stack_hetersynapse(

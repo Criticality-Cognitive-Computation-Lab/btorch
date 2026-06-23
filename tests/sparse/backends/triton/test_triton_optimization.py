@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from btorch.backend.triton.kernels import coo_spmm_kernel
+from btorch.sparse.backends.triton.kernels import coo_spmm_kernel
 
 
 def get_ptx(kernel, *args, **kwargs):
@@ -13,7 +13,7 @@ def get_ptx(kernel, *args, **kwargs):
     # Note: This executes the kernel, but we just want to ensure it's in cache.
     # To avoid execution overhead, we could use JIT warmup if available,
     # but execution is robust for tests.
-    kernel[*args](**kwargs)
+    kernel[tuple(args)](**kwargs)
 
     # Traverse cache
     # cache[device_id][signature] = kernel_object

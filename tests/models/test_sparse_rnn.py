@@ -7,9 +7,15 @@ from torch import nn
 
 from btorch.models.base import MemoryModule
 from btorch.models.functional import reset_net_state
-from btorch.models.linear import DenseConn, SparseConn, available_sparse_backends
+from btorch.models.linear import DenseLinear, SparseLinear
 from btorch.models.rnn import make_rnn
+from btorch.sparse import CSR, available_backends
 from tests.utils.compile import compile_or_skip
+
+
+SPARSE_RNN_BACKENDS = [
+    backend for backend in available_backends() if backend in {"native", "torch_sparse"}
+]
 
 
 class SparseConnRNNCell(MemoryModule):
@@ -30,11 +36,11 @@ class SparseConnRNNCell(MemoryModule):
         self.input_size = input_size
         self.hidden_size = hidden_size
 
-        self.W_x = DenseConn(
+        self.W_x = DenseLinear(
             input_size,
             hidden_size,
             weight=W_x,
-            bias=None,
+            bias=False,
             device=W_x.device,
             dtype=W_x.dtype,
         )
@@ -44,18 +50,20 @@ class SparseConnRNNCell(MemoryModule):
             raise ValueError("Provide only one of W_h_sparse or W_h_dense.")
 
         if W_h_sparse is not None:
-            self.W_h = SparseConn(
-                W_h_sparse,
-                bias=None,
-                enforce_dale=False,
-                sparse_backend=sparse_backend,
+            self.W_h = SparseLinear(
+                CSR.from_scipy(
+                    W_h_sparse,
+                    device=W_x.device,
+                    dtype=W_x.dtype,
+                ),
+                bias=False,
             )
         else:
-            self.W_h = DenseConn(
+            self.W_h = DenseLinear(
                 hidden_size,
                 hidden_size,
                 weight=W_h_dense,
-                bias=None,
+                bias=False,
                 device=W_h_dense.device,
                 dtype=W_h_dense.dtype,
             )
@@ -90,7 +98,7 @@ def native_rnncell_forward(cell: nn.RNNCell, x_in: torch.Tensor) -> torch.Tensor
     return torch.stack(outputs, dim=0)
 
 
-@pytest.mark.parametrize("backend", available_sparse_backends())
+@pytest.mark.parametrize("backend", SPARSE_RNN_BACKENDS)
 def test_checkpointed_sparseconn_matches_eager_dense(backend: str):
     """Checkpointed sparse recurrence matches native dense math and grads."""
     torch.manual_seed(42)
@@ -100,7 +108,7 @@ def test_checkpointed_sparseconn_matches_eager_dense(backend: str):
     # Dense input projection shared by sparse and dense cells.
     W_x_dense = torch.randn(input_size, hidden_size) * 0.1
 
-    # Sparse recurrent weights exercise SparseConn in the recurrent path.
+    # Sparse recurrent weights exercise SparseLinear in the recurrent path.
     W_h_dense = torch.eye(hidden_size) + 0.01 * torch.randn(hidden_size, hidden_size)
     mask_h = torch.rand_like(W_h_dense) > 0.5
     mask_h.fill_diagonal_(True)
@@ -142,12 +150,15 @@ def test_checkpointed_sparseconn_matches_eager_dense(backend: str):
     loss_sparse.backward()
     loss_native.backward()
 
+    W_h_sp = rnn_sparse.rnn_cell.W_h.sparse_weight
+    W_h_values_param = W_h_sp._parameters["data"]
+
     # Gradients should exist and align between sparse and native dense paths.
     assert x_sparse.grad is not None
     assert x_native.grad is not None
     assert rnn_sparse.rnn_cell.W_x.weight.grad is not None
     assert native_cell.weight_ih.grad is not None
-    assert rnn_sparse.rnn_cell.W_h.magnitude.grad is not None
+    assert W_h_values_param.grad is not None
     assert native_cell.weight_hh.grad is not None
 
     torch.testing.assert_close(x_sparse.grad, x_native.grad, atol=1e-5, rtol=0.0)
@@ -159,12 +170,12 @@ def test_checkpointed_sparseconn_matches_eager_dense(backend: str):
     )
 
     # Map sparse recurrent grads to dense matrix positions for comparison.
-    sparse_idx = rnn_sparse.rnn_cell.W_h.indices
-    rows = sparse_idx[1]
-    cols = sparse_idx[0]
+    coo = W_h_sp.to_coo()
+    rows = coo.row
+    cols = coo.col
     dense_w_h_grad = native_cell.weight_hh.grad.T
     sparse_grad_dense = torch.zeros_like(dense_w_h_grad)
-    sparse_grad_dense[rows, cols] = rnn_sparse.rnn_cell.W_h.magnitude.grad
+    sparse_grad_dense[rows, cols] = W_h_values_param.grad
 
     torch.testing.assert_close(
         sparse_grad_dense[rows, cols],
@@ -177,7 +188,7 @@ def test_checkpointed_sparseconn_matches_eager_dense(backend: str):
 @pytest.mark.skipif(
     not platform.system() == "Linux", reason="Only Linux supports torch.compile"
 )
-@pytest.mark.parametrize("backend", available_sparse_backends())
+@pytest.mark.parametrize("backend", SPARSE_RNN_BACKENDS)
 def test_sparse_rnn_compiled_matches_eager(backend: str):
     """Compiled sparse RNN matches eager outputs and gradients."""
     torch.manual_seed(42)
@@ -230,12 +241,15 @@ def test_sparse_rnn_compiled_matches_eager(backend: str):
     loss_eager.backward()
     loss_compiled.backward()
 
+    eager_W_h_vals = rnn_eager.rnn_cell.W_h.sparse_weight._parameters["data"]
+    compiled_W_h_vals = compiled.rnn_cell.W_h.sparse_weight._parameters["data"]
+
     assert x.grad is not None
     assert x_compiled.grad is not None
     assert rnn_eager.rnn_cell.W_x.weight.grad is not None
     assert compiled.rnn_cell.W_x.weight.grad is not None
-    assert rnn_eager.rnn_cell.W_h.magnitude.grad is not None
-    assert compiled.rnn_cell.W_h.magnitude.grad is not None
+    assert eager_W_h_vals.grad is not None
+    assert compiled_W_h_vals.grad is not None
 
     torch.testing.assert_close(x.grad, x_compiled.grad, atol=1e-5, rtol=0.0)
     torch.testing.assert_close(
@@ -245,8 +259,8 @@ def test_sparse_rnn_compiled_matches_eager(backend: str):
         rtol=0.0,
     )
     torch.testing.assert_close(
-        rnn_eager.rnn_cell.W_h.magnitude.grad,
-        compiled.rnn_cell.W_h.magnitude.grad,
+        eager_W_h_vals.grad,
+        compiled_W_h_vals.grad,
         atol=1e-5,
         rtol=0.0,
     )
