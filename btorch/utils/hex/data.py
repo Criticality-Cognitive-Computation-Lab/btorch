@@ -382,7 +382,8 @@ class HexGrid:
     Args:
         radius: Grid radius (extent)
         values: Optional initial values
-        center_q, center_r: Center coordinates
+        center_q: Q-coordinate of the center hex
+        center_r: R-coordinate of the center hex
 
     Example:
         >>> grid = HexGrid(radius=5)

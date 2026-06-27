@@ -665,7 +665,7 @@ def isi_cv_population(
 
 def _fano_population_numpy(
     spike: np.ndarray, window: int | None, overlap: int, dtype: np.dtype | None = None
-):
+) -> tuple[np.ndarray, dict]:
     """NumPy implementation of pooled Fano factor."""
     T = spike.shape[0]
 
@@ -705,7 +705,7 @@ def _fano_population_torch(
     window: int | None,
     overlap: int,
     dtype: torch.dtype | None = None,
-):
+) -> tuple[torch.Tensor, dict]:
     """Torch implementation of pooled Fano factor."""
     device = spike.device
     T = spike.shape[0]
@@ -750,7 +750,7 @@ def fano_population(
     spike: np.ndarray | torch.Tensor,
     window: int | None = None,
     overlap: int = 0,
-):
+) -> tuple[np.ndarray | torch.Tensor, dict]:
     """Compute Fano factor for the pooled population activity.
 
     This computes Fano factor from the summed population spike count,
@@ -773,7 +773,7 @@ def fano_population(
 
 def _kurtosis_population_numpy(
     spike: np.ndarray, window: int | None, overlap: int, fisher: bool
-):
+) -> tuple[np.ndarray, dict]:
     """NumPy implementation of pooled kurtosis."""
     T = spike.shape[0]
 
@@ -814,7 +814,7 @@ def _kurtosis_population_numpy(
 
 def _kurtosis_population_torch(
     spike: torch.Tensor, window: int | None, overlap: int, fisher: bool
-):
+) -> tuple[torch.Tensor, dict]:
     """Torch implementation of pooled kurtosis."""
     device = spike.device
     T = spike.shape[0]
@@ -863,7 +863,7 @@ def kurtosis_population(
     window: int | None = None,
     overlap: int = 0,
     fisher: bool = True,
-):
+) -> tuple[np.ndarray | torch.Tensor, dict]:
     """Compute kurtosis for the pooled population activity.
 
     This computes kurtosis from the summed population spike count,
@@ -1055,7 +1055,7 @@ def fano_sweep(
     overlap: int = 0,
     batch_axis: tuple[int, ...] | int | None = None,
     dtype: np.dtype | torch.dtype | None = None,
-):
+) -> tuple[np.ndarray | torch.Tensor, dict]:
     """Compute Fano factor sweeping over window sizes.
 
     This sweeps through window sizes and computes the Fano factor for each,
@@ -1356,7 +1356,7 @@ def firing_rate(
     width: int | float | None = 4,
     dt: int | float | None = None,
     axis: int | Sequence[int] | None = None,
-):
+) -> np.ndarray | torch.Tensor:
     """Smooth spikes into firing rates.
 
     Supports input shapes like [T, ...].

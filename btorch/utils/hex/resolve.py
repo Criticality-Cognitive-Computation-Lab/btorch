@@ -10,6 +10,8 @@ layouts via :data:`_TO_PIXEL`. Both are plain dicts mapping string
 keys to converter functions.
 """
 
+from typing import Any
+
 import numpy as np
 
 from .doubled import doubleheight_to_axial, doublewidth_to_axial
@@ -40,15 +42,25 @@ _TO_AXIAL = {
 }
 
 
-def _to_pixel_pointy(q, r, size=1.0, **_kw):
+def _to_pixel_pointy(
+    q: np.ndarray, r: np.ndarray, size: float = 1.0, **_kw: Any
+) -> tuple[np.ndarray, np.ndarray]:
     return to_pixel(q, r, size=size, orientation="pointy")
 
 
-def _to_pixel_flat(q, r, size=1.0, **_kw):
+def _to_pixel_flat(
+    q: np.ndarray, r: np.ndarray, size: float = 1.0, **_kw: Any
+) -> tuple[np.ndarray, np.ndarray]:
     return to_pixel(q, r, size=size, orientation="flat")
 
 
-def _to_pixel_flywire(q, r, size=1.0, rotation_deg=0.0, **_kw):
+def _to_pixel_flywire(
+    q: np.ndarray,
+    r: np.ndarray,
+    size: float = 1.0,
+    rotation_deg: float = 0.0,
+    **_kw: Any,
+) -> tuple[np.ndarray, np.ndarray]:
     return flywire_to_pixel(q, r, size=size, rotation_deg=rotation_deg)
 
 
@@ -66,13 +78,13 @@ _HEX_SYMBOLS = {
 
 
 def resolve_hex(
-    c1,
-    c2,
-    coord_format="axial",
-    layout="pointy",
-    size=1.0,
-    **layout_kw,
-):
+    c1: np.ndarray,
+    c2: np.ndarray,
+    coord_format: str = "axial",
+    layout: str = "pointy",
+    size: float = 1.0,
+    **layout_kw: Any,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Convert any hex input to axial and pixel coordinates.
 
     Single entry point used by all visualisation functions. Handles
