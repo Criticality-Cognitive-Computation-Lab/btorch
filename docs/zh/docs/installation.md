@@ -1,51 +1,109 @@
 # 安装
 
-由于 `btorch` 尚未在 PyPI 或 Conda-forge 上发布，必须从源码安装。这种方式也便于快速开发，因为对代码的任何修改都会立即生效。
+## pip / uv
 
-## 1. 克隆仓库
+从 PyPI 安装最新发布版：
+
+```bash
+pip install btorch
+```
+
+或
+
+```bash
+uv pip install btorch
+```
+
+### CUDA 支持
+
+`btorch` 依赖 PyTorch。PyPI 默认提供 CPU 版本的 torch。如需 CUDA，请**先**安装对应计算平台版本的 PyTorch，再安装 `btorch`：
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu1xx
+pip install btorch
+```
+
+或使用 `uv`：
+
+```bash
+uv pip install torch --torch-backend auto
+uv pip install btorch
+```
+
+详见 [PyTorch Get Started](https://pytorch.org/get-started/locally/) 页面了解其他 CUDA / ROCm 版本。
+
+## conda / mamba
+
+`environment.yml` 通过 conda-forge 和 PyG 通道捆绑了含 CUDA 的 PyTorch、`pytorch_sparse` 及所有依赖：
+
+```bash
+conda env create -n btorch -f https://github.com/Criticality-Cognitive-Computation-Lab/btorch/raw/refs/heads/main/environment.yml
+conda activate btorch
+```
+
+或使用 `mamba`：
+
+```bash
+mamba env create -n btorch -f https://github.com/Criticality-Cognitive-Computation-Lab/btorch/raw/refs/heads/main/environment.yml
+mamba activate btorch
+```
+
+## 从版本控制安装
+
+Btorch 迭代快速。如需最新的未发布改动，直接从仓库安装：
+
+```bash
+pip install git+https://github.com/Criticality-Cognitive-Computation-Lab/btorch.git
+```
+
+Gitee 镜像：
+
+```bash
+pip install git+https://gitee.com/alexfanqi/btorch.git
+```
+
+### 可编辑安装（开发）
+
+克隆仓库并以可编辑模式安装：
 
 ```bash
 git clone https://github.com/Criticality-Cognitive-Computation-Lab/btorch.git
 cd btorch
-```
-
-## 2. 环境配置
-
-我们建议使用 `conda` 或 `micromamba` 以及提供的环境文件：
-
-```bash
-# 使用 Conda
-conda env create -n ml-py312 --file=environment.yml
-
-# 或使用 Micromamba
-micromamba env create -n ml-py312 -f environment.yml
-```
-
-### Fork 版 OmegaConf（可选但推荐）
-
-本仓库支持来自 `https://github.com/alexfanqi/omegaconf` 的增强版 OmegaConf。该 fork 版本通过增加对 dataclass unions、`Literal` 和 `Sequence` 类型的支持（参见 [omegaconf#144](https://github.com/omry/omegaconf/issues/144)，[omegaconf#1233](https://github.com/omry/omegaconf/pull/1233)），缩小了与 Tyro 的功能差距，同时保留了 OmegaConf 的单一事实来源配置优先级：dataclass 默认值 → 配置文件 → CLI 覆盖。`omegaconf-config` 功能需要此 fork 版本。安装方法如下：
-
-```bash
-pip install git+https://github.com/alexfanqi/omegaconf.git
-```
-
-### 可选：`torch_sparse` 后端
-
-默认情况下，稀疏线性层使用 PyTorch 原生的 `torch.sparse` 后端。可选的 `torch_sparse` 后端在某些工作负载上提供更好的性能。
-
-使用与 PyTorch 和 CUDA 版本匹配的 [PyG 仓库](https://data.pyg.org/whl/) 预编译 wheel 安装可选的稀疏依赖：
-
-```bash
-# 以 CUDA 12.8 对应的 PyTorch 2.8.0 为例
-pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-2.8.0+cu128.html
-```
-
-如果未安装 `torch_sparse`，层会自动回退到原生后端。
-
-## 3. 以可编辑模式安装
-
-最后，以可编辑模式安装 `btorch`，以确保你的本地修改能立即生效：
-
-```bash
 pip install -e . --config-settings editable_mode=strict
+```
+
+若使用 `uv`，克隆并同步 lockfile：
+
+```bash
+git clone https://github.com/Criticality-Cognitive-Computation-Lab/btorch.git
+cd btorch
+uv sync --group dev
+source .venv/bin/activate
+pip install -e . --config-settings editable_mode=strict
+```
+
+CUDA + `uv`，先安装对应后端版本的 torch：
+
+```bash
+uv venv .venv-cuda
+uv pip install torch --torch-backend auto --python .venv-cuda/bin/python
+uv pip install -e . --python .venv-cuda/bin/python
+```
+
+## 可选：`torch_sparse` 后端
+
+稀疏线性层默认使用 PyTorch 原生 `torch.sparse` 后端。安装 `torch_sparse` 可在大型稀疏网络上获得更好性能。
+使用与 PyTorch 和 CUDA 版本匹配的 [PyG 仓库](https://data.pyg.org/whl/) 预编译 wheel：
+
+```bash
+# 以 PyTorch 2.7 + CUDA 12.6 为例
+pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-2.7.0+cu126.html
+```
+
+若未安装 `torch_sparse`，层将静默回退到原生后端。
+
+## 验证安装
+
+```bash
+python -c "import btorch; import torch; print(btorch.__version__, torch.__version__, torch.cuda.is_available())"
 ```

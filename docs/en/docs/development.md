@@ -21,7 +21,7 @@ pytest tests
 python scripts/docs.py command=build-all
 ```
 
-## Local Demonstration Workflow
+## Documentation Workflow
 
 Before relying on CI/CD, the entire docs pipeline can be verified locally in ~5 minutes.
 

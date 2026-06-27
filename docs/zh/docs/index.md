@@ -8,7 +8,7 @@ hide:
 
 **一个用于神经形态研究的大脑启发式 Torch 库。**
 
-![Btorch Overview](assets/images/btorch-overview.png)
+![Btorch Overview](assets/images/btorch-overview.webp)
 *[@msy79lucky](https://github.com/msy79lucky) 绘制
 
 <div class="grid cards" markdown>

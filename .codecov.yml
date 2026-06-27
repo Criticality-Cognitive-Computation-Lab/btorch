@@ -1,0 +1,36 @@
+# Codecov configuration for btorch
+# https://docs.codecov.com/docs/codecov-yaml
+
+coverage:
+  status:
+    project:
+      default:
+        # Allow coverage to drop by up to 2% without failing CI
+        threshold: 2%
+    patch:
+      default:
+        # Patch coverage info-only; don't block PRs on it
+        informational: true
+
+# PR comments are noisy on fast-moving repos; rely on status checks instead
+comment: false
+
+# Ignore test and doc-building infrastructure from coverage
+ignore:
+  - "tests/"
+  - "docs/"
+  - "scripts/"
+  - "benchmarks/"
+  - "examples/"
+  - "setup.py"
+  - "btorch/__init__.py"
+
+github_checks:
+  annotations: true
+
+flag_management:
+  default_rules:
+    carryforward: true
+    statuses:
+      - type: project
+        target: auto

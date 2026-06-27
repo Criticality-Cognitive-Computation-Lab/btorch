@@ -81,6 +81,23 @@ class PrimitiveUnionConf:
     item: int | str = 1
 
 
+def _supports_omegaconf_structured_dataclass_union() -> bool:
+    """Probe OmegaConf behavior instead of assuming support from versions."""
+
+    try:
+        OmegaConf.structured(StructuredUnionConf(item=UnionOptA(value=7)))
+        OmegaConf.structured(StructuredUnionConf(item=UnionOptB(value=7, tag="ok")))
+    except Exception:
+        return False
+    return True
+
+
+need_structured_dataclass_union = pytest.mark.skipif(
+    not _supports_omegaconf_structured_dataclass_union(),
+    reason="structured dataclass unions are not supported by this OmegaConf build",
+)
+
+
 def test_load_config_merges_file_and_cli(tmp_path, monkeypatch):
     """Mimics the single.py usage: config file + CLI overrides."""
     cfg_file = tmp_path / "config.yaml"
@@ -439,6 +456,7 @@ def test_diff_conf_integrates_with_to_dotlist_for_worker_overrides():
     }
 
 
+@need_structured_dataclass_union
 def test_diff_conf_records_supports_structured_union_type_switch():
     """Structured union switch should be a full subtree replacement."""
 
@@ -455,6 +473,7 @@ def test_diff_conf_records_supports_structured_union_type_switch():
     assert "item.legacy" not in records
 
 
+@need_structured_dataclass_union
 def test_diff_conf_supports_union_values_for_structured_and_primitives():
     """diff_conf should replace a switched union subtree and drop old keys."""
 

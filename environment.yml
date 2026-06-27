@@ -9,13 +9,12 @@ dependencies:
   - pytorch_sparse  # optional: btorch falls back to native torch.sparse if unavailable
   - pip
   - pip:
-    # Forked omegaconf for enhanced features (required for omegaconf-config skill)
-    - git+https://github.com/alexfanqi/omegaconf.git
     # profiling
     - tensorboard_plugin_profile
     # dynamic tools
     - nolds
     - powerlaw
+    - btorch
   - tqdm
   - matplotlib
   - scipy
@@ -37,6 +36,4 @@ dependencies:
   - jaxtyping
   - beartype
   - mypy
-  # unfortunate required for building grammer tree of omegaconf
-  # will be removed once it is upstreamed
-  - openjdk
+  - omegaconf

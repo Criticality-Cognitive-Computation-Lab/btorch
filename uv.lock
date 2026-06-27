@@ -49,7 +49,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/2d/6a/885bc91484e1aa8f6
 
 [[package]]
 name = "btorch"
-version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "hdf5plugin" },
@@ -117,7 +116,7 @@ requires-dist = [
     { name = "nolds", specifier = "!=0.6.3" },
     { name = "numcodecs" },
     { name = "numpy", specifier = ">=1.24" },
-    { name = "omegaconf", git = "https://github.com/alexfanqi/omegaconf.git?rev=1ed16e7279e69240188f7a664bf4964e0a805805" },
+    { name = "omegaconf" },
     { name = "pandas", specifier = ">=2" },
     { name = "plotly" },
     { name = "powerlaw" },
@@ -1640,9 +1639,13 @@ wheels = [
 [[package]]
 name = "omegaconf"
 version = "2.4.0.dev11"
-source = { git = "https://github.com/alexfanqi/omegaconf.git?rev=1ed16e7279e69240188f7a664bf4964e0a805805#1ed16e7279e69240188f7a664bf4964e0a805805" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pyyaml" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/99/f0/997e263fe486b17efeee4f34b327091bdadbd0707b5b90b49a01635fcfc9/omegaconf-2.4.0.dev11.tar.gz", hash = "sha256:5d65d011284160f58c734b75b33be03c7e4609f679d1bd49ce4cfe507c10ed8d", size = 3461978, upload-time = "2026-05-13T19:57:42.025Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c9/bd/21b9bfa2fa29913df9f80c78b034b8c3bf8ecee04dac7b34bb546019f195/omegaconf-2.4.0.dev11-py3-none-any.whl", hash = "sha256:943b2a01329335fa11a4d3caed06432d7023f8fb579dcbff4d28b26ee6be469e", size = 233260, upload-time = "2026-05-13T19:57:39.309Z" },
 ]
 
 [[package]]

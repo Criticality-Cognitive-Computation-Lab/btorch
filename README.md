@@ -1,10 +1,21 @@
 # Btorch
+
 <h4 align="center">
     <p>
         <b>English</b> |
         <a href="README.zh.md">简体中文</a>
     </p>
 </h4>
+
+<p align="center">
+  <a href="https://pypi.org/project/btorch/"><img src="https://img.shields.io/pypi/v/btorch?label=PyPI" alt="PyPI version"></a>
+  <a href="https://pypi.org/project/btorch/"><img src="https://img.shields.io/pypi/pyversions/btorch" alt="Python versions"></a>
+  <a href="https://github.com/Criticality-Cognitive-Computation-Lab/btorch/actions/workflows/ci.yml"><img src="https://github.com/Criticality-Cognitive-Computation-Lab/btorch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://codecov.io/gh/Criticality-Cognitive-Computation-Lab/btorch"><img src="https://codecov.io/gh/Criticality-Cognitive-Computation-Lab/btorch/branch/main/graph/badge.svg" alt="Coverage"></a>
+  <a href="https://criticality-cognitive-computation-lab.github.io/btorch/"><img src="https://img.shields.io/badge/docs-live-brightgreen" alt="Docs"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License"></a>
+  <a href="https://github.com/astral-sh/ruff"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json" alt="Ruff"></a>
+</p>
 
 Brain-inspired differentiable PyTorch toolkit for neuromorphic and computational
 neuroscience research.
@@ -34,46 +45,40 @@ We thank the developers of both libraries for the inspirations.
 - Memory state with static size and managed by torch buffer
   - onnx export is easy (note: sparse matrix is not supported by onnx)
 
-## 🤖 For AI Agents / Coding Assistants
+## Installation
 
-**Copy and paste this prompt into your coding assistant:**
+### pip/uv
 
-```text
-Install `btorch` for this repository.
+Install the latest released package from PyPI:
 
-Before running commands, ask the user four things:
-1. Does the user want `conda`/`micromamba` setup or `pip`-first setup?
-2. Which environment name should be used? (default: `ml-py312`)
-3. Do you want to install the forked version of omegaconf from https://github.com/alexfanqi/omegaconf? (default: yes)
-4. Do you want the optional sparse backend? It is useful for large sparse networks; note that `torch.compile` with it needs torch 2.8+, and older platforms may not support that PyTorch version.
+```bash
+pip install btorch
+```
 
-Then follow the matching path.
+or
 
-Path A - Conda or Micromamba (recommended):
-- Create env from `environment.yml` using the user-provided env name.
-- Activate the environment. (This already installs `pytorch_sparse` via conda.)
-- If user wants forked omegaconf: `pip install git+https://github.com/alexfanqi/omegaconf.git`
-- Run: `pip install -e . --config-settings editable_mode=strict`
+```bash
+uv pip install btorch
+```
 
-Path B - Pip-first:
-- Create and activate a virtual environment.
-- If user wants forked omegaconf: `pip install git+https://github.com/alexfanqi/omegaconf.git`
-- Optional: install `torch_sparse` for better sparse performance.
-  Use PyG prebuilt wheels matching your torch/CUDA version:
-  `pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-<version>+<cuda>.html`.
-- If PyG wheels are unavailable, tell the user and skip `torch.sparse`.
-- Run: `pip install -e . --config-settings editable_mode=strict`
+### conda or mamba
 
-After install, verify with:
-- `python -c "import btorch; print(btorch.__version__)"`
+```bash
+conda env create -n ENV_NAME -f https://github.com/Criticality-Cognitive-Computation-Lab/btorch/raw/refs/heads/main/environment.yml
+```
 
-Report:
-- chosen setup path
-- environment name
-- forked omegaconf choice
-- torch_sparse choice and compatibility warning
-- install/verification output
-- any follow-up actions needed
+### Install from source control
+
+Btorch is fast evolving. If you want the latest unreleased changes, install directly from the repository:
+
+```bash
+pip install git+https://github.com/Criticality-Cognitive-Computation-Lab/btorch.git
+```
+
+Gitee mirror alternative:
+
+```bash
+pip install git+https://gitee.com/alexfanqi/btorch.git
 ```
 
 For setup instructions, see [docs/installation.md](docs/en/docs/installation.md).  
@@ -83,7 +88,7 @@ For development workflow and contributing guidelines, see [docs/development.md](
 
 **Live docs:** [https://criticality-cognitive-computation-lab.github.io/btorch/](https://criticality-cognitive-computation-lab.github.io/btorch/)
 
-Documentation is built with **MkDocs Material** and **mkdocstrings** for API
+Documentation is built with **Zensicle** and **mkdocstrings** for API
 auto-generation from docstrings.
 
 Build locally:
@@ -109,7 +114,12 @@ python scripts/docs.py command=build-all
 
 ## Skills
 
-The `skills/` directory contains usage patterns and tips for using btorch with AI agent. These are provided as reference and may not represent optimal configurations for every use case.
+The `skills/` directory contains usage patterns and tips for using btorch with
+AI agents. Install them with `npx skills`:
+
+```bash
+npx skills add https://github.com/Criticality-Cognitive-Computation-Lab/btorch/tree/main/skills/btorch-snn-modelling
+```
 
 ## Road Map
 

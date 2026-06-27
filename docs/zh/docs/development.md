@@ -20,7 +20,7 @@ pytest tests
 python scripts/docs.py command=build-all
 ```
 
-## 本地演示工作流
+## 文档工作流
 
 在依赖 CI/CD 之前，可以在本地约 5 分钟内验证整个文档流水线。
 

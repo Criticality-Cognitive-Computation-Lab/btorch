@@ -1,15 +1,15 @@
 [build-system]
-requires = ["hatchling>=1.29.0"]
+requires = ["hatchling>=1.29.0", "uv-dynamic-versioning"]
 build-backend = "hatchling.build"
 
 [project]
 name = "btorch"
-version = "0.1.0"
 description = "Brain-inspired torch utilities and models for neuromorphic research."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [{ name = "Btorch contributors" }]
+dynamic = ["version"]
 dependencies = [
     "torch",
     "numpy>=1.24",
@@ -27,6 +27,46 @@ dependencies = [
     "xarray",
     "zarr",
     "numcodecs",
+]
+classifiers = [
+    'Natural Language :: English',
+    'Operating System :: OS Independent',
+    'Programming Language :: Python',
+    'Programming Language :: Python :: 3',
+    'Programming Language :: Python :: 3.10',
+    'Programming Language :: Python :: 3.11',
+    'Programming Language :: Python :: 3.12',
+    'Programming Language :: Python :: 3.13',
+    'Programming Language :: Python :: 3.14',
+    'Intended Audience :: Science/Research',
+    'Topic :: Scientific/Engineering :: Bio-Informatics',
+    'Topic :: Scientific/Engineering :: Mathematics',
+    'Topic :: Scientific/Engineering :: Artificial Intelligence',
+    'Topic :: Software Development :: Libraries',
+]
+keywords = [
+    'computational neuroscience',
+    'brain-inspired computing',
+    'brain simulation',
+    'brain modeling',
+    'spiking neural networks',
+    'neuromorphic computing',
+    'RSNN',
+]
+
+[project.urls]
+Homepage = "https://github.com/Criticality-Cognitive-Computation-Lab/btorch"
+Repository = "https://github.com/Criticality-Cognitive-Computation-Lab/btorch"
+Documentation = "https://criticality-cognitive-computation-lab.github.io/btorch/"
+
+[project.optional-dependencies]
+# NOTE: torch_scatter/torch_sparse wheels are CUDA-variant-specific and cannot be locked
+# cross-platform. The [tool.uv.sources] below covers CPU (uv/pip CI only).
+# For CUDA: pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-<ver>+<cuXXX>.html
+# For conda: conda install torch_scatter torch_sparse  -c pyg  (no find-links needed)
+sparse = [
+  "torch_scatter",
+  "torch_sparse",
 ]
 
 [dependency-groups]
@@ -49,23 +89,7 @@ dev = [
   "ruff>=0.4",
 ]
 
-[project.optional-dependencies]
-# NOTE: torch_scatter/torch_sparse wheels are CUDA-variant-specific and cannot be locked
-# cross-platform. The [tool.uv.sources] below covers CPU (uv/pip CI only).
-# For CUDA: pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-<ver>+<cuXXX>.html
-# For conda: conda install pyg -c pyg  (no find-links needed)
-sparse = [
-  "torch_scatter",
-  "torch_sparse",
-]
-
-[project.urls]
-Homepage = "https://github.com/your-org/btorch"
-Repository = "https://github.com/your-org/btorch"
-Documentation = "https://github.com/your-org/btorch/docs"
-
 [tool.uv.sources]
-omegaconf = { git = "https://github.com/alexfanqi/omegaconf.git", rev = "1ed16e7279e69240188f7a664bf4964e0a805805" }
 # torch resolved from PyTorch CPU index (uv/pip CI); CUDA users install torch separately
 torch = { index = "pytorch-cpu" }
 # torch_scatter/sparse are NOT resolved via uv — their wheel URL encodes the torch+CUDA variant.
@@ -74,6 +98,13 @@ torch = { index = "pytorch-cpu" }
 [tool.uv]
 # torch_scatter and torch_sparse need torch as a build dependency
 extra-build-dependencies = { torch-scatter = ["torch"], torch-sparse = ["torch"] }
+cache-keys = [{ file = "pyproject.toml" }, { git = { commit = true, tags = true } }]
+
+[tool.uv-dynamic-versioning]
+fallback-version = "0.0.0"
+
+[tool.hatch.version]
+source = "uv-dynamic-versioning"
 
 [[tool.uv.index]]
 name = "pytorch-cpu"

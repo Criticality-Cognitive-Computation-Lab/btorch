@@ -7,6 +7,16 @@
     </p>
 </h4>
 
+<p align="center">
+  <a href="https://pypi.org/project/btorch/"><img src="https://img.shields.io/pypi/v/btorch?label=PyPI" alt="PyPI 版本"></a>
+  <a href="https://pypi.org/project/btorch/"><img src="https://img.shields.io/pypi/pyversions/btorch" alt="Python 版本"></a>
+  <a href="https://github.com/Criticality-Cognitive-Computation-Lab/btorch/actions/workflows/ci.yml"><img src="https://github.com/Criticality-Cognitive-Computation-Lab/btorch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://codecov.io/gh/Criticality-Cognitive-Computation-Lab/btorch"><img src="https://codecov.io/gh/Criticality-Cognitive-Computation-Lab/btorch/branch/main/graph/badge.svg" alt="覆盖率"></a>
+  <a href="https://criticality-cognitive-computation-lab.github.io/btorch/"><img src="https://img.shields.io/badge/docs-live-brightgreen" alt="文档"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="许可证"></a>
+  <a href="https://github.com/astral-sh/ruff"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json" alt="Ruff"></a>
+</p>
+
 面向神经形态和计算神经科学研究的大脑启发式可微分 PyTorch 工具包。
 
 如果你需要以下功能，请使用 `btorch`：
@@ -33,46 +43,46 @@
 - 具有静态大小并由 torch buffer 管理的记忆状态
   - 易于导出 onnx（注意：稀疏矩阵不受 onnx 支持）
 
-## 🤖 面向 AI 智能体 / 编程助手
+## 安装
 
-**将以下提示复制到你的编程助手中：**
+### pip / uv
 
-```text
-为该仓库安装 `btorch`。
+从 PyPI 安装最新发布版：
 
-在运行命令之前，先询问用户四件事：
-1. 用户想要 `conda`/`micromamba` 安装还是优先 `pip` 安装？
-2. 应该使用什么环境名称？（默认：`ml-py312`）
-3. 是否想从 https://github.com/alexfanqi/omegaconf 安装 fork 版本的 omegaconf？（默认：是）
-4. 是否需要可选的稀疏后端？它适合大型稀疏网络；提示：与 `torch.compile` 一起使用时需要 torch 2.8+。旧平台可能无法支持这么高的 PyTorch 版本。
+```bash
+pip install btorch
+```
 
-然后按照对应的路径进行。
+或
 
-路径 A - Conda 或 Micromamba（推荐）：
-- 使用用户提供的环境名称从 `environment.yml` 创建环境。
-- 激活环境。（conda 环境已包含 `pytorch_sparse`。）
-- 如果用户想要 fork 版 omegaconf：`pip install git+https://github.com/alexfanqi/omegaconf.git`
-- 运行：`pip install -e . --config-settings editable_mode=strict`
+```bash
+uv pip install btorch
+```
 
-路径 B - 优先 Pip：
-- 创建并激活虚拟环境。
-- 如果用户想要 fork 版 omegaconf：`pip install git+https://github.com/alexfanqi/omegaconf.git`
-- 可选：安装 `torch_sparse` 以获得更好的稀疏性能。
-  使用与 torch/CUDA 版本匹配的 PyG 预编译 wheel：
-  `pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-<version>+<cuda>.html`。
-- 如果 PyG wheel 不可用，告诉用户并跳过`torch_sparse`。
-- 运行：`pip install -e . --config-settings editable_mode=strict`
+### conda / mamba
 
-安装后，使用以下命令验证：
-- `python -c "import btorch; print(btorch.__version__)"`
+```bash
+conda env create -n ENV_NAME -f https://github.com/Criticality-Cognitive-Computation-Lab/btorch/raw/refs/heads/main/environment.yml
+```
 
-报告：
-- 选择的安装路径
-- 环境名称
-- 是否选择 fork 版 omegaconf
-- `torch_sparse` 选择和兼容性提示
-- 安装/验证输出
-- 任何需要的后续操作
+或
+
+```bash
+mamba env create -n ENV_NAME -f https://github.com/Criticality-Cognitive-Computation-Lab/btorch/raw/refs/heads/main/environment.yml
+```
+
+### 从版本控制安装
+
+Btorch 迭代快速。如需最新的未发布改动，直接从仓库安装：
+
+```bash
+pip install git+https://github.com/Criticality-Cognitive-Computation-Lab/btorch.git
+```
+
+Gitee 镜像：
+
+```bash
+pip install git+https://gitee.com/alexfanqi/btorch.git
 ```
 
 安装说明请参阅 [docs/installation.md](docs/zh/docs/installation.md)。  
@@ -107,7 +117,12 @@ python scripts/docs.py command=build-all
 
 ## 技能
 
-`skills/` 目录包含与 AI 智能体一起使用 btorch 时的使用模式和技巧。这些内容仅供参考，可能并不代表所有用例的最佳配置。
+`skills/` 目录包含与 AI 智能体一起使用 btorch 时的使用模式和技巧。
+通过 `npx skills` 安装：
+
+```bash
+npx skills add https://github.com/Criticality-Cognitive-Computation-Lab/btorch/tree/main/skills/btorch-snn-modelling
+```
 
 ## 路线图
 

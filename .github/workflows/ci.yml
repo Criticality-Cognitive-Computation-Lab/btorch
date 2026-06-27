@@ -64,7 +64,7 @@ jobs:
         env:
           UV_SYSTEM_PYTHON: "1"
         run: |
-          # uv sync handles torch (pytorch-cpu index) and omegaconf (git source) via lockfile
+          # uv sync handles torch (pytorch-cpu index) via lockfile
           uv sync --group dev --no-install-package torch-scatter --no-install-package torch-sparse --frozen
           # sparse packages are CUDA-variant-specific; install from PyG after torch is resolved
           TORCH_VER=$(uv run python -c "import torch; print(torch.__version__.split('+')[0])")
@@ -92,3 +92,59 @@ jobs:
 
       - name: Build docs
         run: uv run python scripts/docs.py command=build-all
+
+  build-test-windows:
+    permissions:
+      contents: read
+    if: >-
+      ${{
+        github.event_name == 'push' ||
+        (
+          github.event_name == 'pull_request' &&
+          (
+            !contains(fromJson('["FIRST_TIMER","FIRST_TIME_CONTRIBUTOR","NONE"]'), github.event.pull_request.author_association)
+            || contains(github.event.pull_request.labels.*.name, 'run-ci')
+          )
+        ) ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.confirm == 'true')
+      }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10"]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        shell: bash
+        env:
+          UV_SYSTEM_PYTHON: "1"
+        run: |
+          uv sync --group test --no-install-package torch-scatter --no-install-package torch-sparse --frozen
+          TORCH_VER=$(uv run python -c "import torch; print(torch.__version__.split('+')[0])")
+          uv pip install torch-scatter torch-sparse -f "https://data.pyg.org/whl/torch-${TORCH_VER}+cpu.html"
+
+      - name: Tests (CPU)
+        run: uv run pytest tests --cov=btorch --cov-report=xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v6
+        with:
+          files: ./coverage.xml
+          flags: unittests-windows
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
