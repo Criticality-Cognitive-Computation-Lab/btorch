@@ -1,3 +1,8 @@
+"""Izhikevich neuron model.
+
+Efficient 2D model reproducing diverse cortical spiking patterns.
+"""
+
 from collections.abc import Callable, Sequence
 from typing import Any, Literal
 
@@ -5,16 +10,53 @@ import torch
 from jaxtyping import Float
 from torch import Tensor
 
+from ...types import TensorLike
 from .. import environ
 from ..base import BaseNode
 from ..ode import euler_step
 from ..surrogate import Sigmoid
-from ..types import TensorLike
 
 
 class Izhikevich(BaseNode):
-    """Izhikevich neuron with quadratic membrane dynamics and recovery
-    variable."""
+    """Izhikevich neuron with quadratic dynamics and recovery variable.
+
+    Efficient model reproducing diverse spiking patterns (tonic, bursting,
+    etc.) via a 2D ODE system with quadratic nonlinearity.
+
+    Dynamics:
+        dv/dt = (k*(v-v_rest)*(v-v_threshold) - u + I) / c_m
+        du/dt = a * (b*(v-v_rest) - u)
+
+    At spike: v=v_reset, u=u+d
+
+    Args:
+        n_neuron: Number of neurons.
+        v_threshold: Threshold (mV). Default: 30.0.
+        v_reset: Reset voltage (mV). Default: -65.0.
+        v_rest: Resting potential (mV). Default: -65.0.
+        v_peak: Spike cutoff (mV). Default: -40.0.
+        c_m: Capacitance (pF). Default: 100.0.
+        k: Scaling factor (nS/mV). Default: 0.7.
+        a: Recovery timescale (ms^-1). Default: 0.03.
+        b: Recovery coupling (nS). Default: -2.0.
+        d: Recovery jump (pA). Default: 100.0.
+        trainable_param: Trainable parameters. Default: ().
+        surrogate_function: Surrogate for backprop. Default: Sigmoid().
+        detach_reset: Detach reset signal. Default: False.
+        hard_reset: Hard vs soft reset. Default: False.
+        pre_spike: Store pre-spike values. Default: False.
+        step_mode: Step mode. Default: "s".
+        backend: Backend. Default: "torch".
+        device: Device. Default: None.
+        dtype: Dtype. Default: None.
+
+    Attributes:
+        v: Membrane potential (*batch, n_neuron).
+        u: Recovery variable (*batch, n_neuron).
+
+    Reference:
+        Izhikevich, IEEE Trans. Neural Networks, 2003.
+    """
 
     HIPPOCAMPOME_TO_ARGS = {
         "k": "k",
@@ -59,8 +101,8 @@ class Izhikevich(BaseNode):
         pre_spike: bool = False,
         step_mode: Literal["s"] = "s",
         backend: Literal["torch"] = "torch",
-        device=None,
-        dtype=None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
     ):
         super().__init__(
             n_neuron=n_neuron,
@@ -77,13 +119,55 @@ class Izhikevich(BaseNode):
             dtype=dtype,
         )
         _factory_kwargs: dict[str, Any] = {"device": device, "dtype": dtype}
-        self._def_param("c_m", c_m, **_factory_kwargs)
-        self._def_param("v_rest", v_rest, **_factory_kwargs)
-        self._def_param("v_peak", v_peak, **_factory_kwargs)
-        self._def_param("k", k, **_factory_kwargs)
-        self._def_param("a", a, **_factory_kwargs)
-        self._def_param("b", b, **_factory_kwargs)
-        self._def_param("d", d, **_factory_kwargs)
+        self.def_param(
+            "c_m",
+            c_m,
+            sizes=self.n_neuron,
+            trainable_param=self.trainable_param,
+            **_factory_kwargs,
+        )
+        self.def_param(
+            "v_rest",
+            v_rest,
+            sizes=self.n_neuron,
+            trainable_param=self.trainable_param,
+            **_factory_kwargs,
+        )
+        self.def_param(
+            "v_peak",
+            v_peak,
+            sizes=self.n_neuron,
+            trainable_param=self.trainable_param,
+            **_factory_kwargs,
+        )
+        self.def_param(
+            "k",
+            k,
+            sizes=self.n_neuron,
+            trainable_param=self.trainable_param,
+            **_factory_kwargs,
+        )
+        self.def_param(
+            "a",
+            a,
+            sizes=self.n_neuron,
+            trainable_param=self.trainable_param,
+            **_factory_kwargs,
+        )
+        self.def_param(
+            "b",
+            b,
+            sizes=self.n_neuron,
+            trainable_param=self.trainable_param,
+            **_factory_kwargs,
+        )
+        self.def_param(
+            "d",
+            d,
+            sizes=self.n_neuron,
+            trainable_param=self.trainable_param,
+            **_factory_kwargs,
+        )
 
         self.register_memory("u", 0, self.n_neuron)
         if pre_spike:
@@ -216,11 +300,11 @@ class Izhikevich(BaseNode):
             self.u_pre_spike = self.u.clone()
 
         if self.hard_reset:
-            self.v -= (self.v - self.v_reset) * spike_d
+            self.v = self.v - (self.v - self.v_reset) * spike_d
         else:
-            self.v -= (self.v_peak - self.v_reset) * spike_d
+            self.v = self.v - (self.v_peak - self.v_reset) * spike_d
 
-        self.u += self.d * spike_d
+        self.u = self.u + self.d * spike_d
 
     def extra_repr(self):
         parts = [

@@ -1,0 +1,42 @@
+channels:
+  - conda-forge
+  - pyg
+dependencies:
+  - python=3.12
+  - pytorch-gpu
+  - torchvision
+  - spikingjelly
+  - pytorch_sparse  # optional: btorch falls back to native torch.sparse if unavailable
+  - pip
+  - pip:
+    # Forked omegaconf for enhanced features (required for omegaconf-config skill)
+    - git+https://github.com/alexfanqi/omegaconf.git
+    # profiling
+    - tensorboard_plugin_profile
+    # dynamic tools
+    - nolds
+    - powerlaw
+  - tqdm
+  - matplotlib
+  - scipy
+  - xarray
+  - h5py
+  - hdf5plugin
+  - pandas >= 2 # assume CoW
+  - numba
+  - seaborn
+  # dev
+  - ipykernel
+  # tensorboard
+  - tensorboard
+  - etils
+  # lint and type checking
+  - pre-commit
+  - ruff
+  - docformatter
+  - jaxtyping
+  - beartype
+  - mypy
+  # unfortunate required for building grammer tree of omegaconf
+  # will be removed once it is upstreamed
+  - openjdk

@@ -5,9 +5,15 @@ from typing import Any, Literal
 import numpy as np
 import torch
 
+from ..types import TensorLike
 from .base import MemoryModule
-from .types import TensorLike
 
+
+# DECRECATED: this was designed to scale/unscale the network weight
+#   automatically. Scaling makes param values compatible with gradient learning
+#   rate. However, through practice, it seems easier to pass scaled param
+#   directly to the model.
+#   TODO: revisit for a better design.
 
 # TODO: needs rework. use scale_state_ for now.
 #   - how does it fit in states dict and memory?
@@ -27,13 +33,30 @@ def scale_state_(
     unscale: bool = False,
     store: bool = False,
 ):
+    """Scale or unscale a state dictionary in-place.
+
+    Args:
+        states: Dictionary of state tensors to scale.
+        scale: Scaling factor. If None, inferred from
+            ``states["v_threshold"] - states["v_reset"]``.
+        zeropoint: Zero point for scaling. If None, inferred from
+            ``states["v_reset"]``.
+        unscale: If True, apply unscaling instead of scaling.
+        store: If True, store ``scale``, ``zeropoint``, and ``scaled``
+            flag into ``states``.
+
+    Returns:
+        Tuple of ``(scale, zeropoint)`` used.
+
+    Raises:
+        ValueError: If required keys for inference are missing.
+    """
     if scale is None:
         if "scale" in states:
             scale = states["scale"]
         elif ("v_threshold" in states) and ("v_reset" in states):
             scale = states["v_threshold"] - states["v_reset"]
     assert scale is not None, "Must specify either scale or v_threshold and v_reset"
-    # scale = np.asarray(scale)
 
     if zeropoint is None:
         if "zeropoint" in states:
@@ -42,7 +65,6 @@ def scale_state_(
             zeropoint = states["v_reset"]
         else:
             raise ValueError("Must specify either zeropoint or v_reset")
-    # zeropoint = np.asarray(zeropoint)
 
     if not unscale:
         if "scaled" in states and states["scaled"]:
@@ -106,9 +128,10 @@ _ENFORCE_MODE = Literal["ignore", "assert", "repeated"]
 
 
 class SupportScaleState(MemoryModule):
-    """Still feel this is not a perfect idea, see scale.py for missing parts.
+    """Mixin providing automatic state scaling for neuron parameters.
 
-    You are suggested to use `scale_state_` directly for now.
+    Still experimental; see module notes for limitations.
+    You are suggested to use :func:`scale_state_` directly for now.
     """
 
     scaled: torch.Tensor
@@ -162,9 +185,18 @@ class SupportScaleState(MemoryModule):
     def scale_state(
         self,
         states: dict | None = None,
-        enforce: _ENFORCE_MODE = "assert",  # complicated, use case for repeated?
+        enforce: _ENFORCE_MODE = "assert",
         force_memories_rv: bool = True,
     ):
+        """Scale neuron parameters and optionally memory reset values.
+
+        Args:
+            states: Optional state dictionary to scale in-place. If None,
+                scales the module's own parameters and reset values.
+            enforce: Behavior when already scaled (``ignore``, ``assert``,
+                or ``repeated``).
+            force_memories_rv: If True, also scale memory reset values.
+        """
         if not hasattr(self, "scaled"):
             self.init_scale_state()
         if self.scaled:
@@ -208,9 +240,18 @@ class SupportScaleState(MemoryModule):
     def unscale_state(
         self,
         states: dict | None = None,
-        enforce: _ENFORCE_MODE = "ignore",  # complicated, use case for repeated?
-        force_memories_rv=True,
+        enforce: _ENFORCE_MODE = "ignore",
+        force_memories_rv: bool = True,
     ):
+        """Unscale neuron parameters and optionally memory reset values.
+
+        Args:
+            states: Optional state dictionary to unscale in-place. If None,
+                unscales the module's own parameters and reset values.
+            enforce: Behavior when already unscaled (``ignore``, ``assert``,
+                or ``repeated``).
+            force_memories_rv: If True, also unscale memory reset values.
+        """
         if not self.scaled:
             if enforce == "assert":
                 assert "{self} already unscaled"

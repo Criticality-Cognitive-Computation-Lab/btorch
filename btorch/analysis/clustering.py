@@ -1,13 +1,20 @@
 import numpy as np
 from fastdtw import fastdtw
 from scipy.cluster.hierarchy import fcluster, linkage
-from scipy.spatial.distance import euclidean
+from scipy.spatial.distance import euclidean as _scipy_euclidean, squareform
+
+
+def _euclidean(u, v):
+    """Euclidean distance that tolerates scalar input (for fastdtw)."""
+    u = np.atleast_1d(np.asarray(u))
+    v = np.atleast_1d(np.asarray(v))
+    return _scipy_euclidean(u, v)
 
 
 def suggest_threshold(linkage_matrix):
     """Suggest a sensible threshold for hierarchical clustering."""
     sorted_distances = sorted(linkage_matrix[:, 2], reverse=True)
-    diffs = np.diff(sorted_distances)
+    diffs = np.abs(np.diff(sorted_distances))
     potential_elbows = np.where(diffs > np.mean(diffs))[0] + 1
 
     if len(potential_elbows) == 0:
@@ -27,10 +34,14 @@ def cluster_traces(traces, threshold=10, linkage_method="average"):
     distance_matrix = np.zeros((num_traces, num_traces))
     for i in range(num_traces):
         for j in range(num_traces):
-            distance, _ = fastdtw(traces[i], traces[j], dist=euclidean)
+            distance, _ = fastdtw(traces[i], traces[j], dist=_euclidean)
             distance_matrix[i, j] = distance
 
-    Z = linkage(distance_matrix, method=linkage_method)
+    # DTW may introduce tiny numerical asymmetry; enforce symmetry
+    # so scipy.spatial.distance.squareform accepts the matrix.
+    distance_matrix = (distance_matrix + distance_matrix.T) / 2
+
+    Z = linkage(squareform(distance_matrix), method=linkage_method)
     clusters = fcluster(Z, t=threshold, criterion="distance")
 
     cluster_indices = {}

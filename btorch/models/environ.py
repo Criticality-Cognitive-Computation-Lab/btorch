@@ -22,6 +22,24 @@ DFAULT = DefaultContext()
 
 
 class context:
+    """Context manager for temporary computation environment variables.
+
+    Values pushed via ``context`` are thread-local and automatically
+    popped on exit. Can be used as a decorator, context manager, or
+    directly around forward passes.
+
+    Args:
+        **kwargs: Key-value pairs to push onto the context stack.
+
+    Example:
+        >>> with environ.context(dt=1.0):
+        ...     spikes, states = model(x)
+
+        >>> @environ.context(dt=1.0)
+        ... def forward(model, x):
+        ...     return model(x)
+    """
+
     def __init__(self, **kwargs):
         self.kwargs = kwargs
 
@@ -50,12 +68,23 @@ def context_decorator(context_instance, func):
 
 
 def get(key: str, desc: str | None = None):
-    """Get one of the default computation environment.
+    """Get a value from the current computation environment.
 
-    Returns
-    -------
-    item: Any
-      The default computation environment.
+    Checks the context stack first, then global defaults.
+
+    Args:
+        key: Environment variable name.
+        desc: Optional description to include in the error message
+            if the key is not found.
+
+    Returns:
+        The current value for ``key``.
+
+    Raises:
+        KeyError: If ``key`` is not found in context or defaults.
+
+    Example:
+        >>> dt = environ.get("dt")
     """
 
     if key in DFAULT.contexts:
@@ -80,12 +109,10 @@ def get(key: str, desc: str | None = None):
 
 
 def all() -> dict:
-    """Get all the current default computation environment.
+    """Get all current computation environment variables.
 
-    Returns
-    -------
-    r: dict
-      The current default computation environment.
+    Returns:
+        Dictionary of all active context and default settings.
     """
     r = dict()
     for k, v in DFAULT.contexts.items():
@@ -98,5 +125,15 @@ def all() -> dict:
 
 
 def set(**kwargs):
-    # set default environment
+    """Set global default computation environment variables.
+
+    These values persist until changed and are used as fallbacks when
+    a key is not present in the active context stack.
+
+    Args:
+        **kwargs: Key-value pairs to set as defaults.
+
+    Example:
+        >>> environ.set(dt=1.0)
+    """
     DFAULT.settings.update(kwargs)

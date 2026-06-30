@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from btorch.models import environ, linear, rnn, synapse
+from btorch.models import environ, rnn, synapse
 from btorch.models.functional import (
     init_net_state,
     named_hidden_states,
@@ -9,8 +9,12 @@ from btorch.models.functional import (
     set_hidden_states,
     set_memory_reset_values,
 )
-from btorch.models.init import build_sparse_mat, uniform_v_
+from btorch.models.init import uniform_v_
+from btorch.models.linear import SparseLinear
 from btorch.models.neurons.glif import GLIF3
+from btorch.models.neurons.lif import LIF
+from btorch.sparse import CSR
+from tests.utils.conn import build_sparse_mat
 
 
 # --- Fixtures and helpers --- #
@@ -52,9 +56,15 @@ def def_model(neuron_params, device, dtype):
     )
 
     rec_weights, _, _ = build_sparse_mat(n_e_neurons, n_i_neurons, i_e_ratio=1)
-    conn = linear.SparseConn(conn=rec_weights, device=device)
+    conn = SparseLinear(
+        CSR.from_scipy(rec_weights, device=device),
+        bias=False,
+    )
 
     tau_syn = torch.cat([torch.ones(n_e_neurons) * 5.8, torch.ones(n_i_neurons) * 6.5])
+
+    # AlphaPSCBilleh requires dt to be set in environment at initialization
+    environ.set(dt=1.0)
     psc_module = synapse.AlphaPSCBilleh(
         n_neurons,
         tau_syn=tau_syn,
@@ -149,3 +159,47 @@ def test_torch_save_load(tmp_path, neuron_params, device, dtype):
     assert torch.allclose(
         states_before["synapse.psc"], states_after["synapse.psc"], atol=1e-6
     ), "Synaptic current mismatch after save/load"
+
+
+def test_checkpoint_param_shape_transition_for_uniform_and_non_uniform(tmp_path):
+    """Checkpoint loading should follow uniform/non-uniform shape semantics.
+
+    This test validates the shape transition policy introduced by ParamBufferMixin:
+    1. Full but uniform checkpoint tensors can be loaded as compact scalar params.
+    2. Full non-uniform checkpoint tensors must remain full and not be collapsed.
+
+    The test persists checkpoints to disk to mirror real training/inference
+    workflows where shape mismatches appear across runs.
+    """
+
+    n_neuron = 4
+
+    # Destination model starts with compact scalar tau.
+    dest_uniform = LIF(n_neuron=n_neuron, tau=20.0)
+    assert tuple(dest_uniform.tau.shape) == ()
+
+    # Source model stores tau as full, but uniform across neurons.
+    src_full_uniform = LIF(n_neuron=n_neuron, tau=torch.full((n_neuron,), 20.0))
+    ckpt_uniform = tmp_path / "lif_uniform.pt"
+    torch.save(src_full_uniform.state_dict(), ckpt_uniform)
+    dest_uniform.load_state_dict(torch.load(ckpt_uniform, weights_only=False))
+
+    # Uniform full values are compacted to scalar storage.
+    assert tuple(dest_uniform.tau.shape) == ()
+    assert torch.allclose(
+        dest_uniform.tau, torch.tensor(20.0, dtype=dest_uniform.tau.dtype)
+    )
+
+    # Source model stores tau as full and non-uniform.
+    src_full_non_uniform = LIF(
+        n_neuron=n_neuron, tau=torch.tensor([1.0, 2.0, 3.0, 4.0])
+    )
+    ckpt_non_uniform = tmp_path / "lif_non_uniform.pt"
+    torch.save(src_full_non_uniform.state_dict(), ckpt_non_uniform)
+
+    dest_non_uniform = LIF(n_neuron=n_neuron, tau=20.0)
+    dest_non_uniform.load_state_dict(torch.load(ckpt_non_uniform, weights_only=False))
+
+    # Non-uniform values must remain full to preserve per-neuron information.
+    assert tuple(dest_non_uniform.tau.shape) == (n_neuron,)
+    assert torch.allclose(dest_non_uniform.tau, torch.tensor([1.0, 2.0, 3.0, 4.0]))

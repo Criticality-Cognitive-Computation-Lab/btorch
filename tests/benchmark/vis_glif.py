@@ -6,9 +6,10 @@ from torchviz import make_dot
 
 from btorch.models import environ, linear, rnn, synapse
 from btorch.models.functional import init_net_state
-from btorch.models.init import build_dense_mat, uniform_v_
+from btorch.models.init import uniform_v_
 from btorch.models.neurons.glif import GLIF3
 from btorch.utils.file import fig_path
+from tests.utils.conn import build_dense_mat
 
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -17,12 +18,12 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 def show_autograd_graph(output, params, name):
     digraph = make_dot(output, params=params, show_attrs=True)
 
-    output_dir = fig_path(__file__)
+    output_dir = fig_path()
     digraph.render(format="svg", outfile=os.path.join(output_dir, f"{name}_grad.svg"))
 
 
 def show_forward_graph(model, input, name):
-    output_dir = fig_path(__file__)
+    output_dir = fig_path()
     _ = draw_graph(
         model,
         input,
@@ -79,12 +80,15 @@ def vis_network(neuron_params, dtype=torch.float32):
         )
 
         rec_weights = build_dense_mat(n_e_neurons, n_i_neurons)
-        conn = linear.DenseConn(
-            in_features=n_neurons, out_features=n_neurons, weight=rec_weights
+        conn = linear.DenseLinear(
+            in_features=n_neurons,
+            out_features=n_neurons,
+            weight=rec_weights,
+            bias=False,
         )
 
         # rec_weights = build_sparse_mat(n_e_neurons, n_i_neurons)
-        # conn = linear.SparseConn(conn=rec_weights)
+        # conn = linear.SparseLinear(CSR.from_scipy(rec_weights))
 
         tau_syn = torch.cat(
             [torch.ones(n_e_neurons) * 5.8, torch.ones(n_i_neurons) * 6.5]

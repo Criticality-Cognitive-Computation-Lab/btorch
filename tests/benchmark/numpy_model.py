@@ -416,7 +416,7 @@ def test_multi_neuron(n_neuron=10):
     fig.suptitle("GLIF3 Neuron Dynamics")
     fig.legend()
 
-    output_dir = fig_path(__file__)
+    output_dir = fig_path()
     fig.savefig(output_dir / "multi_neuron.pdf")
 
 
@@ -445,8 +445,8 @@ def test_network():
     import matplotlib.pyplot as plt
 
     # network = create_example_network()
-    # save_network(network, fig_path(__file__))
-    output_dir = fig_path(__file__)
+    # save_network(network, fig_path())
+    output_dir = fig_path()
     network = load_network(output_dir)
 
     T, dt = 1000, 1.0

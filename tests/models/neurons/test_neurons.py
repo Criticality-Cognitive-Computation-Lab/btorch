@@ -2,11 +2,13 @@ import matplotlib.pyplot as plt
 import pytest
 import torch
 
+from btorch.analysis.tuning import get_fi_vi_curve
 from btorch.models import environ
 from btorch.models.functional import init_net_state
 from btorch.models.neurons.alif import ALIF, ELIF
 from btorch.models.neurons.glif import GLIF3
 from btorch.utils.file import save_fig
+from btorch.visualisation.tuning import plot_fi_vi_curve
 
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -95,16 +97,16 @@ def _plot(time, traces, v_threshold: float, title: str, adapt_label: str, name: 
             "adapt_label": "After-Spike Current",
             "v_threshold": -45.0,
             "stimulus": lambda steps: torch.cat(
-                (torch.full((steps // 2,), 2.0), torch.zeros((steps // 2,)))
+                (torch.full((steps // 2,), 250.0), torch.zeros((steps // 2,)))
             ),
             "build": lambda: GLIF3(
                 n_neuron=1,
                 v_threshold=-45.0,
                 v_reset=-65.0,
-                c_m=0.05,
+                c_m=200.0,
                 tau=20.0,
-                k=[0.1],
-                asc_amps=[1.5],
+                k=[0.05],
+                asc_amps=[-50],
                 tau_ref=2.0,
                 step_mode="s",
                 device=DEVICE,
@@ -127,7 +129,7 @@ def _plot(time, traces, v_threshold: float, title: str, adapt_label: str, name: 
                 E_leak=-70.0,
                 E_k=-80.0,
                 g_k_init=0.0,
-                tau_adapt=200.0,
+                tau_adapt=250.0,
                 dg_k=0.12,
                 tau_ref=2.0,
                 step_mode="s",
@@ -180,4 +182,82 @@ def test_draw_single_neuron(case, time_axis):
         adapt_label=case["adapt_label"],
         name=case["name"],
     )
+    plt.close("all")
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        {
+            "name": "glif3_fi_vi_curve",
+            "neuron_cls": GLIF3,
+            "neuron_params": {
+                "v_threshold": -45.0,
+                "v_reset": -65.0,
+                "c_m": 200.0,
+                "tau": 20.0,
+                "k": [0.05],
+                "asc_amps": [-50],
+                "tau_ref": 2.0,
+                "step_mode": "s",
+            },
+            "current_start": 100.0,
+            "current_end": 300.0,
+            "steps": 20,
+        },
+        {
+            "name": "alif_fi_vi_curve",
+            "neuron_cls": ALIF,
+            "neuron_params": {
+                "v_threshold": -50.0,
+                "v_reset": -65.0,
+                "c_m": 1.0,
+                "g_leak": 0.05,
+                "E_leak": -70.0,
+                "E_k": -80.0,
+                "g_k_init": 0.0,
+                "tau_adapt": 200.0,
+                "dg_k": 0.12,
+                "tau_ref": 2.0,
+                "step_mode": "s",
+            },
+            "current_start": 0.0,
+            "current_end": 30.0,
+            "steps": 20,
+        },
+        {
+            "name": "glif3_population_fi_vi",
+            "neuron_cls": GLIF3,
+            "neuron_params": {
+                "n_neuron": 5,
+                "v_threshold": -45.0,
+                "v_reset": -65.0,
+                "c_m": 200.0,
+                "tau": 20.0,
+                "k": [0.05],
+                "asc_amps": [-50],
+                "tau_ref": 2.0,
+                "step_mode": "s",
+            },
+            "current_start": 100.0,
+            "current_end": 300.0,
+            "steps": 10,
+        },
+    ],
+    ids=lambda case: case["name"],
+)
+def test_plot_fi_vi_curves(case):
+    fig = plot_fi_vi_curve(
+        get_data_func=get_fi_vi_curve,
+        data_func_kwargs={
+            "neuron_cls": case["neuron_cls"],
+            "neuron_params": case["neuron_params"],
+            "current_start": case["current_start"],
+            "current_end": case["current_end"],
+            "steps": case["steps"],
+            "device": DEVICE,
+        },
+        name=case["name"],
+    )
+    save_fig(fig, name=case["name"])
     plt.close("all")

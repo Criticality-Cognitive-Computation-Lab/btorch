@@ -12,6 +12,10 @@ import torchvision
 import torchvision.datasets
 import torchvision.transforms as transforms
 from brevitas.nn import QuantLinear
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.cli import LightningCLI
+from lightning.pytorch.loggers import TensorBoardLogger
+
 from btorch.models import (
     functional,
     glif,
@@ -21,9 +25,6 @@ from btorch.models import (
 )
 from btorch.models.regularizer import VoltageRegularizer
 from btorch.models.scale import scale_state_
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
-from lightning.pytorch.cli import LightningCLI
-from lightning.pytorch.loggers import TensorBoardLogger
 
 
 @dataclass

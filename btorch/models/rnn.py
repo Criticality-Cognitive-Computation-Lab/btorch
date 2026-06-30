@@ -17,7 +17,9 @@ class RecurrentNNAbstract(base.MemoryModule):
         self,
         update_state_names: Sequence[str] | None = None,
         step_mode="m",
-        unroll: int | bool = 8,  # Changed: now accepts False
+        unroll: int | bool = 8,
+        chunk_size: int | None = None,
+        cpu_offload: bool = False,
         grad_checkpoint: bool = False,
         save_grad_history: bool = False,
         grad_state_names: Sequence[str] | None = None,
@@ -26,6 +28,8 @@ class RecurrentNNAbstract(base.MemoryModule):
         self.step_mode = step_mode
         self.update_state_names = update_state_names
         self.unroll = unroll
+        self.chunk_size = chunk_size
+        self.cpu_offload = cpu_offload
         self.grad_checkpoint = grad_checkpoint
         self.save_grad_history = save_grad_history
         self.grad_state_names = grad_state_names
@@ -43,21 +47,6 @@ class RecurrentNNAbstract(base.MemoryModule):
         assert T is not None
         loop_args = tuple(i for i, s in enumerate(shapes) if s == T)
         return T, loop_args
-
-    def _slice_args(self, args, loop_args, t):
-        def normalize_index(t):
-            if t == Ellipsis or t == "...":
-                return ...
-            return t
-
-        t = normalize_index(t)
-        out = []
-        for i, a in enumerate(args):
-            if i in loop_args:
-                out.append(a[t])
-            else:
-                out.append(a)
-        return out
 
     def single_step_forward(
         *args, **kwargs
@@ -85,47 +74,100 @@ class RecurrentNNAbstract(base.MemoryModule):
         if tensor.requires_grad:
             tensor.register_hook(grad_hook)
 
-    def _multi_step_forward_unrolled(self, *args, loop_args=(0,), **kwargs):
-        """Unrolled inner loop for checkpoint.
+    def _process_small_chunk(
+        self, *args, loop_args=(0,), unroll_steps: int = 1, **kwargs
+    ):
+        """Inner loop for processing a small chunk.
 
-        IMPORTANT: This function now returns lists (not stacked tensors):
-            - z_seq: list[Tensor] (length = block length)
-            - states_seq: dict[str, list[Tensor]] where each list length = block length
-
-        Stacking into a single tensor is done once by the caller (multi_step_forward).
+        Returns:
+            - z_seq: list[Tensor]
+            - states_seq: dict[str, list[Tensor]]
         """
+        # Determine actual number of steps for this small chunk (might be remainder)
+        # However, args are already sliced to the correct size by caller.
         T = args[loop_args[0]].shape[0]
         z_seq = []
         states_seq = {}
 
+        loop_positions = tuple(loop_args)
+        static_args = list(args)
         for t in range(T):
-            sliced = self._slice_args(args, loop_args, t)
-            z, states = self.single_step_forward(*sliced, **kwargs)
+            for i in loop_positions:
+                static_args[i] = args[i][t]
+            z, states = self.single_step_forward(*static_args, **kwargs)
             z_seq.append(z)
             for k, v in states.items():
                 states_seq.setdefault(k, []).append(v)
 
-        # Note: don't stack here. Return lists so caller stacks once at the end.
         return z_seq, states_seq
 
-    # --- helper: checkpointed execution of a block ---
-    def _checkpointed_block_fn(self, *block_args, loop_args=(0,), **kwargs):
+    @partial(torch.compiler.disable, recursive=False)
+    def _process_large_chunk_impl(
+        self, *chunk_args, loop_args=(0,), unroll_size=1, **kwargs
+    ):
+        """Process a large chunk by splitting it into small unroll blocks.
+
+        This function is NOT checkpointed itself, but is the body of the
+        checkpoint.
+        """
+        # Split loop args into unroll-sized chunks using torch.split
+        # torch.split returns views of the original tensor (zero-copy)
+        split_tensors = {
+            i: torch.split(chunk_args[i], unroll_size, dim=0) for i in loop_args
+        }
+
+        chunk_z = []
+        chunk_states = {}
+
+        # Iterate over the split chunks (all loop args have same number of chunks)
+        num_blocks = len(split_tensors[loop_args[0]])
+        for block_id in range(num_blocks):
+            # Build sub_args preserving original arg positions
+            # Split tensors get their chunk, scalars pass through unchanged
+            sub_args = tuple(
+                split_tensors[i][block_id] if i in loop_args else chunk_args[i]
+                for i in range(len(chunk_args))
+            )
+
+            # Process small chunk
+            z_sub, states_sub = self._process_small_chunk(
+                *sub_args,
+                loop_args=loop_args,
+                unroll_steps=sub_args[loop_args[0]].shape[0],
+                **kwargs,
+            )
+
+            chunk_z.extend(z_sub)
+            for k, v in states_sub.items():
+                chunk_states.setdefault(k, []).extend(v)
+
+        return chunk_z, chunk_states
+
+    def _checkpointed_large_chunk(
+        self,
+        *chunk_args,
+        loop_args=(0,),
+        unroll_size=1,
+        **kwargs,
+    ):
         memories = named_hidden_states(self)
         env = environ.all()
 
         def _pure(env, memories, *inner_args):
             set_hidden_states(self, memories)
             with environ.context(**env):
-                return self._multi_step_forward_unrolled(
-                    *inner_args, loop_args=loop_args, **kwargs
+                return self._process_large_chunk_impl(
+                    *inner_args,
+                    loop_args=loop_args,
+                    unroll_size=unroll_size,
+                    **kwargs,
                 )
 
-        return checkpoint(_pure, env, memories, *block_args, use_reentrant=False)
+        return checkpoint(_pure, env, memories, *chunk_args, use_reentrant=False)
 
     @partial(torch.compiler.disable, recursive=False)
     def multi_step_forward(self, *args, loop_args=None, **kwargs):
-        """Unified implementation for unroll=False and unroll=int."""
-
+        """Unified implementation for chunked unrolling and CPU offloading."""
         # Reset gradient history
         if self.save_grad_history:
             self._grad_history = {}
@@ -136,63 +178,115 @@ class RecurrentNNAbstract(base.MemoryModule):
         else:
             T = args[loop_args[0]].shape[0]
 
+        self._current_T = T
+
         if self.grad_state_names:
             self._init_grad_hist(self.grad_state_names, T)
 
-        # Unified block configuration
+        # ------------------------------------------------------------------
+        # Determine Chunk Sizes
+        # ------------------------------------------------------------------
+        # Unroll size (small chunk)
         if self.unroll is False:
-            block_size = T  # no unrolling → one large block
-            use_checkpoint = False  # disable checkpointing
+            unroll_size = T  # No inner unrolling
         else:
-            block_size = int(self.unroll)
-            use_checkpoint = bool(self.grad_checkpoint)
+            unroll_size = int(self.unroll)
 
-        # Compute number of blocks
-        num_blocks = (T + block_size - 1) // block_size  # ceil(T / block_size)
+        # Large chunk size
+        # Follow legacy behavior: if chunk_size is None, check if we need
+        # block-checkpoints.
+        if self.chunk_size is None:
+            # If default (None), we treat unroll_size as the chunk unit if
+            # checkpointing is ON, to match legacy behavior where unroll was the
+            # only block size.
+            # If checkpointing is OFF, large_chunk_size = T is fine (except for
+            # offloading which needs chunks).
+            if self.grad_checkpoint:
+                large_chunk_size = unroll_size
+            else:
+                large_chunk_size = T
+        else:
+            large_chunk_size = self.chunk_size
+            if self.unroll is not False:
+                if large_chunk_size % unroll_size != 0:
+                    raise ValueError(
+                        f"chunk_size ({large_chunk_size}) must be a multiple of "
+                        f"unroll ({unroll_size})"
+                    )
 
-        # Accumulators (always lists; stack once at the end)
+        # Number of large chunks
+        num_large_chunks = (T + large_chunk_size - 1) // large_chunk_size
+
+        use_checkpoint = bool(self.grad_checkpoint)
+
+        # Accumulators
         all_z_list = []
         all_states_lists = {}
 
-        # ---- unified per-block loop ----
-        for block_id in range(num_blocks):
-            start = block_id * block_size
-            end = min(start + block_size, T)
+        # ------------------------------------------------------------------
+        # Outer Loop: Large Chunks (Checkpointing & CPU Offloading)
+        # ------------------------------------------------------------------
+        # Split only loop args into large chunks using torch.split
+        # torch.split returns views of the original tensor (zero-copy)
+        split_tensors = {
+            i: torch.split(args[i], large_chunk_size, dim=0) for i in loop_args
+        }
 
-            # Slice loop args for the block
-            block_indices = slice(start, end)
-            block_args = self._slice_args(args, loop_args, block_indices)
+        for chunk_id in range(num_large_chunks):
+            # Build chunk_args preserving original arg positions
+            # Split tensors get their chunk, scalars pass through unchanged
+            chunk_args = tuple(
+                split_tensors[i][chunk_id] if i in loop_args else args[i]
+                for i in range(len(args))
+            )
 
-            # Optionally checkpoint block function
+            # Process Large Chunk
             if use_checkpoint:
-                z_list_block, states_block = self._checkpointed_block_fn(
-                    *block_args, loop_args=loop_args, **kwargs
+                z_chunk, states_chunk = self._checkpointed_large_chunk(
+                    *chunk_args,
+                    loop_args=loop_args,
+                    unroll_size=unroll_size,
+                    **kwargs,
                 )
             else:
-                z_list_block, states_block = self._multi_step_forward_unrolled(
-                    *block_args, loop_args=loop_args, **kwargs
+                z_chunk, states_chunk = self._process_large_chunk_impl(
+                    *chunk_args,
+                    loop_args=loop_args,
+                    unroll_size=unroll_size,
+                    **kwargs,
                 )
 
-            # Accumulate z
-            all_z_list.extend(z_list_block)
+            # Offload to CPU if requested
+            if self.cpu_offload:
+                z_chunk = [z.cpu() for z in z_chunk]
+                states_chunk = {
+                    k: [v.cpu() for v in lst] for k, lst in states_chunk.items()
+                }
 
-            # Accumulate state
-            for k, lst in states_block.items():
+            # Accumulate
+            all_z_list.extend(z_chunk)
+            for k, lst in states_chunk.items():
                 all_states_lists.setdefault(k, []).extend(lst)
 
-        # ---- register gradient hooks on final per-timestep tensors ----
+        # ------------------------------------------------------------------
+        # Post-process: Register gradient hooks and stack
+        # ------------------------------------------------------------------
+        # Register hooks BEFORE stacking, on the original tensors in the lists
+        # This ensures hooks are on tensors that participate in the backward pass
         if self.save_grad_history:
             for state_name, tensors in all_states_lists.items():
                 if not self._should_save_grad(state_name):
                     continue
+                if state_name not in self._grad_history:
+                    self._grad_history[state_name] = [None] * T
                 for t, tensor in enumerate(tensors):
                     self._register_grad_hook(tensor, state_name, t)
 
-        # ---- stack once and return ----
-        return (
-            torch.stack(all_z_list, dim=0),
-            {k: torch.stack(v, dim=0) for k, v in all_states_lists.items()},
-        )
+        # Stack after registering hooks
+        stacked_outputs = torch.stack(all_z_list, dim=0)
+        stacked_states = {k: torch.stack(v, dim=0) for k, v in all_states_lists.items()}
+
+        return (stacked_outputs, stacked_states)
 
     def get_grad_history(self) -> dict[str, list]:
         """Retrieve saved gradient history."""
@@ -224,6 +318,10 @@ def make_rnn(
     obj=None,
     allow_buffer=False,
     **rnn_kwargs,
+) -> (
+    type[RecurrentNNAbstract]
+    | RecurrentNNAbstract
+    | Callable[[type[base.MemoryModule]], type[RecurrentNNAbstract]]
 ):
     """RNN wrapper."""
 
@@ -262,6 +360,11 @@ def make_rnn(
 
         return decorator
 
+    raise TypeError(
+        "`make_rnn` expects a MemoryModule class, a MemoryModule instance, "
+        "or `None` when used as a decorator."
+    )
+
 
 class RecurrentNN(RecurrentNNAbstract):
     def __init__(
@@ -272,7 +375,9 @@ class RecurrentNN(RecurrentNNAbstract):
         neuron_inp_module: nn.Module | None = None,
         *,
         update_state_names: Sequence[str] | None = None,
-        unroll: int = 8,
+        unroll: int | bool = 8,
+        chunk_size: int | None = None,
+        cpu_offload: bool = False,
         grad_checkpoint: bool = False,
         allow_buffer=False,
         **kwargs,
@@ -280,6 +385,8 @@ class RecurrentNN(RecurrentNNAbstract):
         super().__init__(
             update_state_names=update_state_names,
             unroll=unroll,
+            chunk_size=chunk_size,
+            cpu_offload=cpu_offload,
             grad_checkpoint=grad_checkpoint,
             **kwargs,
         )
@@ -303,3 +410,175 @@ class RecurrentNN(RecurrentNNAbstract):
         )
 
         return z, states
+
+
+class ApicalRecurrentNN(RecurrentNN):
+    """Recurrent layer that supports an optional apical / top-down input.
+
+    This subclass is useful when the neuron population contains models with
+    multiple input ports (e.g.
+    :class:`~btorch.models.neurons.TwoCompartmentGLIF`).  The extra
+    ``x_apical`` tensor is forwarded to the neuron module unchanged.
+
+    Optionally, a second ``synapse_apical`` can be supplied so that a subset
+    of recurrent connections (e.g. SST→L5E or long-range E→L5E) drive the
+    apical compartment while the remaining connections drive the somatic
+    compartment.
+
+    .. note::
+        When calling :meth:`multi_step_forward` with a time-varying
+        ``x_apical``, pass it as a **positional** argument
+        (``brain(x, None, x_apical)``) so that the outer time-loop
+        slices it correctly.  Keyword arguments are not unrolled by
+        :class:`RecurrentNNAbstract`.
+
+    Args:
+        neuron: Neuron module (typically a
+            :class:`~btorch.models.neurons.mixed.MixedNeuronPopulation`).
+        synapse: Synapse model that provides recurrent currents to the soma.
+        synapse_apical: Optional second synapse that provides recurrent
+            currents to the apical compartment.
+        syn_inp_module: Optional module applied to ``x_syn``.
+        neuron_inp_module: Optional module applied to ``x``.
+        update_state_names: Dotted state names to expose in the returned
+            state dictionary.
+        unroll: Inner unroll block size.
+        chunk_size: Outer chunk size for gradient checkpointing / offloading.
+        cpu_offload: Move chunk outputs to CPU during forward.
+        grad_checkpoint: Use ``torch.utils.checkpoint`` on large chunks.
+        allow_buffer: Allow collecting hidden states from non-MemoryModule
+            buffers.
+        **kwargs: Passed to :class:`RecurrentNNAbstract`.
+    """
+
+    def __init__(
+        self,
+        neuron: nn.Module,
+        synapse: synapse.Synapse,
+        synapse_apical: synapse.Synapse | None = None,
+        syn_inp_module: nn.Module | None = None,
+        neuron_inp_module: nn.Module | None = None,
+        *,
+        update_state_names: Sequence[str] | None = None,
+        unroll: int | bool = 8,
+        chunk_size: int | None = None,
+        cpu_offload: bool = False,
+        grad_checkpoint: bool = False,
+        allow_buffer=False,
+        **kwargs,
+    ):
+        super().__init__(
+            neuron=neuron,
+            synapse=synapse,
+            syn_inp_module=syn_inp_module,
+            neuron_inp_module=neuron_inp_module,
+            update_state_names=update_state_names,
+            unroll=unroll,
+            chunk_size=chunk_size,
+            cpu_offload=cpu_offload,
+            grad_checkpoint=grad_checkpoint,
+            allow_buffer=allow_buffer,
+            **kwargs,
+        )
+        self.synapse_apical = synapse_apical
+
+    def single_step_forward(
+        self,
+        x: Tensor,
+        x_syn: Tensor | None = None,
+        x_apical: Tensor | None = None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Advance one timestep with optional apical drive.
+
+        Args:
+            x: External input current of shape ``(*batch, n_neuron)``.
+            x_syn: Optional direct synaptic input.
+            x_apical: Optional apical / top-down input of the same shape as
+                ``x``.  If ``synapse_apical`` is present, the apical synaptic
+                current is *added* to this tensor before being passed to the
+                neuron.
+
+        Returns:
+            ``(spikes, states)`` where ``spikes`` has shape
+            ``(*batch, n_neuron)``.
+        """
+        if self.neuron_inp_module is not None:
+            x = self.neuron_inp_module(x)
+        if self.syn_inp_module is not None:
+            x_syn = self.syn_inp_module(x_syn)
+
+        # Somatic input
+        total_input = self.synapse.psc + x
+
+        # Apical input = recurrent apical current + external teacher signal
+        apical_input = x_apical
+        if self.synapse_apical is not None:
+            if apical_input is None:
+                apical_input = self.synapse_apical.psc
+            else:
+                apical_input = self.synapse_apical.psc + apical_input
+
+        if apical_input is None:
+            z = self.neuron(total_input)
+        else:
+            z = self.neuron(total_input, apical_input)
+
+        _ = self.synapse(z if x_syn is None else z + x_syn)
+        if self.synapse_apical is not None:
+            _ = self.synapse_apical(z if x_syn is None else z + x_syn)
+
+        states = filter_hidden_states(
+            self, self.update_state_names, allow_buffer=self.allow_buffer
+        )
+        return z, states
+
+
+class SomaApicalRecurrentNN(ApicalRecurrentNN):
+    """Recurrent layer with dedicated somatic and apical synapses, both
+    required.
+
+    A specialisation of :class:`ApicalRecurrentNN` for architectures where
+    recurrent connections are explicitly split into separate somatic and apical
+    pathways:
+
+    - **Somatic synapse** (``synapse_soma``): drives the somatic compartment.
+    - **Apical synapse** (``synapse_apical``): drives the apical compartment
+      (e.g. SST→L5E or long-range E→L5E connections).
+
+    Both synapses receive the same spike output each step.  The external input
+    ``x`` is added to the somatic current, and ``x_apical`` (if provided) is
+    added to the apical current.
+
+    Args:
+        neuron: Neuron module (e.g.
+            :class:`~btorch.models.neurons.mixed.MixedNeuronPopulation` or a
+            single :class:`~btorch.models.neurons.TwoCompartmentGLIF`).
+        synapse_soma: Synapse model for the somatic compartment.
+        synapse_apical: Synapse model for the apical compartment.
+        syn_inp_module: Optional module applied to ``x_syn``.
+        neuron_inp_module: Optional module applied to ``x``.
+        update_state_names: Dotted state names to expose.
+        **kwargs: Passed to :class:`ApicalRecurrentNN`.
+    """
+
+    def __init__(
+        self,
+        neuron: nn.Module,
+        synapse_soma: synapse.Synapse,
+        synapse_apical: synapse.Synapse,
+        syn_inp_module: nn.Module | None = None,
+        neuron_inp_module: nn.Module | None = None,
+        *,
+        update_state_names: Sequence[str] | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            neuron=neuron,
+            synapse=synapse_soma,
+            synapse_apical=synapse_apical,
+            syn_inp_module=syn_inp_module,
+            neuron_inp_module=neuron_inp_module,
+            update_state_names=update_state_names,
+            **kwargs,
+        )
+        self.synapse_soma = synapse_soma

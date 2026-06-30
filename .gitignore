@@ -22,7 +22,16 @@ nsight_report*
 .pkl_memoize*
 .pytest_cache/
 site/
+docs/_build/
+docs/api/generated/
+docs/.doctrees/
+docs/**/docs/api/
+.coverage
+coverage.xml
 
+*.png
+*.json
+*.nwb
 *.log
 *.swp
 *~
@@ -34,3 +43,10 @@ site/
 /local/
 /metadata/md5-cache
 /tags
+
+.agent/rules/env.md
+.codex
+.desloppify
+.kilocode/
+.kilo/
+.playwright-mcp/

@@ -1,9 +1,124 @@
-from typing import Literal, Optional, Sequence
+"""Data augmentation and sampling utilities for connectome data.
 
+This module provides functions for manipulating neuron and connection
+DataFrames, including:
+
+- Slicing neurons and their connections by ID subsets
+- Sampling strategies for representative neuron subsets
+- Downsampling connections while preserving network structure
+- Dropping neurons/connections and computing degrees
+- E/I connection matrix construction
+
+Expected DataFrame schemas:
+    neurons DataFrame:
+        - root_id: Unique neuron identifier (64-bit int)
+        - simple_id: Linear 0..N-1 index
+        - flow, super_class, class, nt_type: Classification columns
+        - area_nm: Surface area for capacitance computation
+
+    connections DataFrame:
+        - pre_root_id, post_root_id: Root IDs
+        - pre_simple_id, post_simple_id: Simple IDs
+        - syn_count: Synapse count
+
+Side effects:
+    Functions may modify DataFrame indices, add new columns (e.g.,
+    original_simple_id for backup), or remap IDs to local ranges.
+"""
+
+from collections.abc import Sequence
+from typing import Literal
+
+import numpy as np
 import pandas as pd
 import scipy.sparse
 
 from . import simple_id_to_root_id
+
+
+def slice_neurons_connections(
+    simple_id: int | list[int] | np.ndarray | None = None,
+    root_id: int | list[int] | np.ndarray | None = None,
+    neurons: pd.DataFrame | None = None,
+    connections: pd.DataFrame | None = None,
+    connection_mode: Literal["both", "pre", "post", "any"] = "both",
+    keep_original_ids: bool = True,
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None, np.ndarray]:
+    """Slices neuron metadata and connections while preserving input sequence
+    order.
+
+    Args:
+        simple_id: Ordered linear IDs for slicing.
+        root_id: Ordered non-linear IDs (requires `neurons` for resolution).
+        neurons: Metadata containing 'simple_id' and 'root_id'.
+        connections: Edge list containing 'pre_simple_id' and 'post_simple_id'.
+        connection_mode: Filtering logic for edges relative to selected neurons.
+        keep_original_ids: Back up global IDs before remapping to local 0..N-1 range.
+
+    Returns:
+        tuple: (ordered_neurons, filtered_connections, original_indices)
+    """
+    if (simple_id is None) == (root_id is None):
+        raise ValueError("Provide exactly one of 'simple_id' or 'root_id'.")
+
+    # 1. Resolve ordered target indices
+    if root_id is not None:
+        if neurons is None:
+            raise ValueError("`neurons` DataFrame required to resolve `root_id`.")
+        targets = np.atleast_1d(root_id)
+        # Reorder neurons to match root_id input sequence
+        sliced_neurons = neurons.set_index("root_id").loc[targets].reset_index()
+        indices = sliced_neurons["simple_id"].values
+    else:
+        indices = np.atleast_1d(simple_id)
+        sliced_neurons = (
+            neurons.set_index("simple_id").loc[indices].reset_index()
+            if neurons is not None
+            else None
+        )
+
+    # 2. Map original IDs (Only on the sliced subset to save memory)
+    if keep_original_ids:
+        if (
+            sliced_neurons is not None
+            and "original_simple_id" not in sliced_neurons.columns
+        ):
+            sliced_neurons["original_simple_id"] = indices
+
+    # 3. Create mapping for 0..N-1 reassignment
+    # pd.Series is more memory efficient than dict for large ID sets
+    mapper = pd.Series(np.arange(len(indices)), index=indices)
+
+    if sliced_neurons is not None:
+        sliced_neurons["simple_id"] = mapper.values
+
+    # 4. Filter and remap connections
+    sliced_conn = None
+    if connections is not None:
+        # Masking on global dataframe avoids premature copies
+        pre_in = connections["pre_simple_id"].isin(indices)
+        post_in = connections["post_simple_id"].isin(indices)
+
+        mask = {
+            "both": pre_in & post_in,
+            "pre": pre_in,
+            "post": post_in,
+            "any": pre_in | post_in,
+        }[connection_mode]
+
+        sliced_conn = connections[mask].copy()
+
+        if keep_original_ids:
+            if "original_pre_simple_id" not in sliced_conn.columns:
+                sliced_conn["original_pre_simple_id"] = sliced_conn["pre_simple_id"]
+                sliced_conn["original_post_simple_id"] = sliced_conn["post_simple_id"]
+
+        # Update IDs in-place using masks to prevent NaN-induced float conversion
+        for col in ["pre_simple_id", "post_simple_id"]:
+            m = sliced_conn[col].isin(indices)
+            sliced_conn.loc[m, col] = sliced_conn.loc[m, col].map(mapper)
+
+    return sliced_neurons, sliced_conn, indices
 
 
 def sample_by_column_expand_none(
@@ -114,12 +229,40 @@ def sample_by_column_expand_none(
 
 
 def sample_neuron_representative(
-    neurons,
+    neurons: pd.DataFrame,
     k: int = 1,
     j: int | dict = 2,
     random_state: int | None = None,
     product_sample: bool = True,
-):
+) -> pd.DataFrame:
+    """Sample representative neurons across canonical taxonomy columns.
+
+    This wrapper intentionally standardizes grouping to connectome taxonomy
+    fields used throughout this package: ``flow``, ``super_class``, ``class``,
+    and ``nt_type``.
+
+    Args:
+        neurons: Neuron metadata table containing taxonomy columns.
+        k: Samples per fully specified taxonomy group.
+        j: Sampling budget for partially specified rows.
+        random_state: Random seed for reproducibility.
+        product_sample: Whether to sample partial rows per product subgroup.
+
+    Returns:
+        Sampled neuron metadata as a DataFrame.
+
+    Raises:
+        ValueError: If required taxonomy columns are missing.
+    """
+    required_cols = {"flow", "super_class", "class", "nt_type"}
+    missing_cols = required_cols.difference(neurons.columns)
+    if missing_cols:
+        missing = ", ".join(sorted(missing_cols))
+        raise ValueError(
+            "sample_neuron_representative requires columns: "
+            f"{', '.join(sorted(required_cols))}. Missing: {missing}."
+        )
+
     return sample_by_column_expand_none(
         neurons,
         ["flow", "super_class", "class", "nt_type"],
@@ -134,7 +277,7 @@ def mask_neurons_in_conn_mat(
     conn_mat: scipy.sparse.sparray,
     ids: int | Sequence[int],
     id_type: Literal["root_id", "simple_id"],
-    neurons: Optional[pd.DataFrame] = None,
+    neurons: pd.DataFrame | None = None,
 ) -> scipy.sparse.sparray:
     if isinstance(ids, int):
         ids = [ids]
@@ -233,13 +376,8 @@ def downsample_neurons(
     return neurons, connections
 
 
-def make_ei_conn_mat(
-    conn_mats: dict[str, scipy.sparse.sparray], rebalance_ratio: float = 0.5
-):
-    # return 2 * (
-    #     rebalance_ratio * conn_mats["E"] - (1 - rebalance_ratio) * conn_mats["I"]
-    # )
-    return conn_mats["E"] - rebalance_ratio * conn_mats["I"]
+def make_ei_conn_mat(conn_mats: dict[str, scipy.sparse.sparray], g: float = 0.5):
+    return conn_mats["E"] - g * conn_mats["I"]
 
 
 def empirical_membrane_capacitance(neurons: pd.DataFrame) -> pd.Series:

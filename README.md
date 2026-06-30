@@ -1,4 +1,23 @@
 # Btorch
+<h4 align="center">
+    <p>
+        <b>English</b> |
+        <a href="README.zh.md">简体中文</a>
+    </p>
+</h4>
+
+Brain-inspired differentiable PyTorch toolkit for neuromorphic and computational
+neuroscience research.
+
+Use `btorch` if you need:
+
+- Recurrent SNN modelling
+- stateful neuron/synapse modules with explicit memory handling
+- practical support for sparse/connectome-style network structure
+- torch native training features (`torch.compile`, checkpointing,
+  truncated BPTT)
+- solid runtime performance and ONNX export support
+- connectome import/export via SONATA, and flexible network definition coming soon  
 
 Heavily influenced by [brainstate](https://github.com/chaobrain/brainstate).
 Evolved from [spikingjelly](https://github.com/fangwei123456/spikingjelly).
@@ -15,76 +34,97 @@ We thank the developers of both libraries for the inspirations.
 - Memory state with static size and managed by torch buffer
   - onnx export is easy (note: sparse matrix is not supported by onnx)
 
-## Installation
+## 🤖 For AI Agents / Coding Assistants
 
-Until the package is published to PyPI/conda, install from source. The upside is that edits are immediately usable.
+**Copy and paste this prompt into your coding assistant:**
 
-1) Clone:
+```text
+Install `btorch` for this repository.
 
-```bash
-git clone https://github.com/Criticality-Cognitive-Computation-Lab/btorch.git
-cd btorch
+Before running commands, ask the user four things:
+1. Does the user want `conda`/`micromamba` setup or `pip`-first setup?
+2. Which environment name should be used? (default: `ml-py312`)
+3. Do you want to install the forked version of omegaconf from https://github.com/alexfanqi/omegaconf? (default: yes)
+4. Do you want the optional sparse backend? It is useful for large sparse networks; note that `torch.compile` with it needs torch 2.8+, and older platforms may not support that PyTorch version.
+
+Then follow the matching path.
+
+Path A - Conda or Micromamba (recommended):
+- Create env from `environment.yml` using the user-provided env name.
+- Activate the environment. (This already installs `pytorch_sparse` via conda.)
+- If user wants forked omegaconf: `pip install git+https://github.com/alexfanqi/omegaconf.git`
+- Run: `pip install -e . --config-settings editable_mode=strict`
+
+Path B - Pip-first:
+- Create and activate a virtual environment.
+- If user wants forked omegaconf: `pip install git+https://github.com/alexfanqi/omegaconf.git`
+- Optional: install `torch_sparse` for better sparse performance.
+  Use PyG prebuilt wheels matching your torch/CUDA version:
+  `pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-<version>+<cuda>.html`.
+- If PyG wheels are unavailable, tell the user and skip `torch.sparse`.
+- Run: `pip install -e . --config-settings editable_mode=strict`
+
+After install, verify with:
+- `python -c "import btorch; print(btorch.__version__)"`
+
+Report:
+- chosen setup path
+- environment name
+- forked omegaconf choice
+- torch_sparse choice and compatibility warning
+- install/verification output
+- any follow-up actions needed
 ```
 
-2) Create the dev environment (choose one):
-
-```bash
-conda env create -n ml-py312 --file=dev-requirements.yaml
-# or
-micromamba env create -n ml-py312 -f dev-requirements.yaml
-```
-
-3) Install in editable mode so local changes are importable right away:
-
-```bash
-pip install -e . --config-settings editable_mode=strict
-```
-
-## Development
-
-Install precommit hooks for auto formatting.
-
-PR without precommit formatting will not be accepted!
-
-```{bash}
-pre-commit install --install-hooks
-```
-
-Highly recommended to use [jaxtyping](https://docs.kidger.site/jaxtyping/) to mark expected array shape,
-see [good example of using jaxtyping](https://fullstackdeeplearning.com/blog/posts/rwkv-explainer)
-
-Highly encouraged to put your prototyping work under [braintools-examples](https://github.com/Criticality-Cognitive-Computation-Lab/btorch-examples.git).
-In light of the nature of fast changing prototyping common in machine learning, and to avoid duplicated work scattered among multiple branches,
-we need to share "just-work" implementation as early as possible and iterate fast.
-
-### run the tests
-
-```bash
-ruff check .
-pytest tests
-mkdocs build --strict
-```
+For setup instructions, see [docs/installation.md](docs/en/docs/installation.md).  
+For development workflow and contributing guidelines, see [docs/development.md](docs/en/docs/development.md).
 
 ## Documentation
 
-Docs are scaffolded with MkDocs (Material). Edit content under `docs/` and build locally with:
+**Live docs:** [https://criticality-cognitive-computation-lab.github.io/btorch/](https://criticality-cognitive-computation-lab.github.io/btorch/)
+
+Documentation is built with **MkDocs Material** and **mkdocstrings** for API
+auto-generation from docstrings.
+
+Build locally:
 
 ```bash
-mkdocs serve
+python scripts/docs.py command=build-all
 ```
 
-## TODO List
+The generated site is written to `site/`.
 
-- [ ] support multi-dim batch size and neuron
+Preview a specific language:
+
+```bash
+python scripts/docs.py command=live language=en
+```
+
+If you want a clean rebuild:
+
+```bash
+rm -rf site/
+python scripts/docs.py command=build-all
+```
+
+## Skills
+
+The `skills/` directory contains usage patterns and tips for using btorch with AI agent. These are provided as reference and may not represent optimal configurations for every use case.
+
+## Road Map
+
+- [x] support multi-dim batch size and neuron
 - [ ] cleaner connectome import, network param management and manipulation lib
-  - [ ] compat with bmtk
   - [ ] support full SONATA format (both [BlueBrain](https://github.com/openbraininstitute/libsonata.git) and [AIBS](https://github.com/AllenInstitute/sonata) variants)
   - [ ] flexible like [neuroarch](https://github.com/fruitflybrain/neuroarch.git) and tiny to integrate. thinking about using DuckDB
 - [ ] verify numerical accuracy. align with Neuron and Brainstate
 - [ ] support automatic conversion between stateful and pure functions
   - similar to make_functional in [torchopt](https://github.com/metaopt/torchopt)
   - [ ] consider migrate to pure memory states instead of register_memory. gradient checkpointing + torch.compile struggles with mutating self
-- [ ] integrate large-scale training support with [torchtitan](https://github.com/pytorch/torchtitan.git)
+- [ ] sparse matrix multiplication optimisation on GPU
+- [ ] large scale multi-device training and simulation
+  - [ ] integrate large-scale training support with [torchtitan](https://github.com/pytorch/torchtitan.git)
+  - [ ] work distribution and balancing
 - [ ] compat with [neurobench](https://github.com/NeuroBench/neurobench.git), [Tonic](https://tonic.readthedocs.io/en/latest/)
 - [ ] [NIR](https://github.com/neuromorphs/NIR.git) import and export
 
@@ -93,5 +133,27 @@ mkdocs serve
 - provide solid foundation of stateful Modules
 - usability over performance, simple over easy, and customizability over abstractions
   - single file/folder principle on network model
-  - see [Diffusers' philosophy](https://github.com/mreraser/diffusers/blob/fix-contribution.md/PHILOSOPHY.md)
+  - see [Diffusers' philosophy](https://github.com/huggingface/diffusers/blob/main/PHILOSOPHY.md)
   - WIP to align current implementation with these principles
+
+## Contributors
+
+<!-- ALL-CONTRIBUTORS-LIST:START - Do not remove or modify this section -->
+<!-- prettier-ignore-start -->
+<!-- markdownlint-disable -->
+<table>
+  <tbody>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/alexfanqi"><img src="https://avatars.githubusercontent.com/u/8381176?s=100" width="100" height="100" alt="alexfanqi"/><br /><sub><b>alexfanqi</b></sub></a><br /><a href="https://github.com/Criticality-Cognitive-Computation-Lab/btorch/commits?author=alexfanqi" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/CFXTGJD"><img src="https://avatars.githubusercontent.com/u/97458246?s=100" width="100" height="100" alt="CFXTGJD"/><br /><sub><b>CFXTGJD</b></sub></a><br /><a href="https://github.com/Criticality-Cognitive-Computation-Lab/btorch/commits?author=CFXTGJD" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/gaozh0814"><img src="https://avatars.githubusercontent.com/u/158576844?s=100" width="100" height="100" alt="gaozh0814"/><br /><sub><b>gaozh0814</b></sub></a><br /><a href="https://github.com/Criticality-Cognitive-Computation-Lab/btorch/commits?author=gaozh0814" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/msy79lucky"><img src="https://avatars.githubusercontent.com/u/166973717?s=100" width="100" height="100" alt="msy79lucky"/><br /><sub><b>msy79lucky</b></sub></a><br /><a href="https://github.com/Criticality-Cognitive-Computation-Lab/btorch/commits?author=msy79lucky" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/yulaugh"><img src="https://avatars.githubusercontent.com/u/175782476?s=100" width="100" height="100" alt="yulaugh"/><br /><sub><b>yulaugh</b></sub></a><br /><a href="https://github.com/Criticality-Cognitive-Computation-Lab/btorch/commits?author=yulaugh" title="Code">💻</a></td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- markdownlint-restore -->
+<!-- prettier-ignore-end -->
+
+<!-- ALL-CONTRIBUTORS-LIST:END -->

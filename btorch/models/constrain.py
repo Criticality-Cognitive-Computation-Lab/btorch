@@ -9,6 +9,8 @@ class HasConstraint:
 
 def constrain_net(mod: nn.Module):
     with torch.no_grad():
-        for mod in mod.modules():
-            if isinstance(mod, HasConstraint):
-                mod.constrain()
+        for child in mod.modules():
+            if isinstance(child, HasConstraint) or getattr(
+                child, "_btorch_constraint", False
+            ):
+                child.constrain()

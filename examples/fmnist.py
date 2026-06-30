@@ -15,6 +15,9 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.datasets
 from brevitas.nn import QuantLinear
+from torch.cuda import amp
+from torch.utils.tensorboard.writer import SummaryWriter
+
 from btorch.models import (
     functional,
     glif,
@@ -23,8 +26,6 @@ from btorch.models import (
     synapse,
 )
 from btorch.models.regularizer import VoltageRegularizer
-from torch.cuda import amp
-from torch.utils.tensorboard.writer import SummaryWriter
 
 
 @dataclass
@@ -442,7 +443,7 @@ def main():
                 loss = F.mse_loss(out_fr, label_onehot)
                 loss.backward()
                 optimizer.step()
-            # if you use SparseConn from models.linear, and enforce Dale's law
+            # Sparse matrices can use a Dale projection after optimizer updates.
             # constrain_net(net)
 
             train_samples += label.numel()

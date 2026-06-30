@@ -1,0 +1,4 @@
+interface:
+  display_name: "btorch SNN Modelling"
+  short_description: "Build and train Spiking Neural Networks with btorch"
+  default_prompt: "How do I create a GLIF3 RSNN model with btorch?"

@@ -1,0 +1,80 @@
+name: Translate docs
+
+on:
+  workflow_dispatch:
+    inputs:
+      languages:
+        description: "Space-separated language codes to translate (e.g. zh ja)"
+        default: "zh"
+        required: false
+
+permissions: {}
+
+jobs:
+  translate:
+    permissions:
+      contents: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        env:
+          UV_SYSTEM_PYTHON: "1"
+        run: uv sync --only-group docs --frozen
+
+      - name: Create translation branch
+        run: |
+          BRANCH="translate/update-$(date +%Y-%m-%d)"
+          git checkout -b "$BRANCH"
+          echo "branch=$BRANCH" >> $GITHUB_ENV
+
+      - name: Translate languages
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+        run: |
+          for lang in ${{ inputs.languages || 'zh' }}; do
+            echo "=== Translating $lang ==="
+            uv run python scripts/translate.py command=translate-readme language=$lang
+            uv run python scripts/translate.py command=update-and-add language=$lang max_pages=20
+            uv run python scripts/translate.py command=add-missing language=$lang max_pages=20
+            uv run python scripts/translate.py command=remove-removable language=$lang
+            uv run python scripts/translate.py command=update-nav language=$lang
+          done
+
+      - name: Commit and open PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          for lang in ${{ inputs.languages || 'zh' }}; do
+            git add "docs/$lang/" "README.$lang.md" 2>/dev/null || true
+          done
+          if git diff --staged --quiet; then
+            echo "No translation changes, skipping PR"
+            exit 0
+          fi
+          git commit -m "docs: update translations"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git push origin "$branch"
+          gh pr create \
+            --title "docs: update translations ($(date +%Y-%m-%d))" \
+            --body "Automated translation update. Please review before merging." \
+            --base main \
+            --head "$branch"

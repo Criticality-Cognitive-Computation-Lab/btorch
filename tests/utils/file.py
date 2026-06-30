@@ -1,4 +1,4 @@
-from btorch.utils.file import caller_file, fig_path, FigPathConfig, save_fig
+from btorch.utils.file import FigPathConfig, caller_file, fig_path, save_fig
 
 
 __all__ = ["FigPathConfig", "caller_file", "fig_path", "save_fig"]

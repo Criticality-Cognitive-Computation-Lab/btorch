@@ -5,7 +5,7 @@ Btorch is a brain-inspired Torch library for neuromorphic research. Follow the p
 ## Repo focus
 
 - Primary package: `btorch/` (models, connectome tools, analysis, visualization).
-- Docs live in `docs/`; examples in `examples/`.
+- Docs live in `docs/en/docs/`; examples in `examples/`.
 - Avoid adding new heavy dependencies unless explicitly requested.
 - Connectome tooling lives under `btorch/connectome/`; keep data transforms explicit and reversible.
 - Neuron models live under `btorch/models/neurons/`; follow existing parameter/state patterns.
@@ -23,23 +23,60 @@ Btorch is a brain-inspired Torch library for neuromorphic research. Follow the p
 - Use English for code, comments, and docstrings; conversation can be in other languages.
 - In tests, include thorough explanatory comments so they are understandable and can serve as examples.
 
+## Documentation format
+
+Use **Google style** docstrings (preferred) with this structure:
+
+```python
+"""One-line summary (imperative, no period).
+
+Extended description. Explain what, not how. Use math notation for equations:
+
+.. math::
+    \tau \frac{dv}{dt} = -(v - v_{reset}) + R \cdot I(t)
+
+Args:
+    param1: Description with type inferred from annotation.
+    param2: Multi-line descriptions
+        should indent.
+
+Returns:
+    Description of return value.
+
+Raises:
+    ValueError: When input is invalid.
+
+Examples:
+    Basic usage:
+
+    >>> result = function_name(arg1, arg2)
+    >>> print(result)
+    expected_output
+
+Notes:
+    Additional implementation details.
+
+References:
+    [1] Author, Title, Journal, Year.
+"""
+```
+
+Key patterns:
+
+- Document `__init__` parameters in class docstring, not `__init__` method
+- Include mathematical model equations in `.. math::` blocks
+- Include cross-references with `:func:` and `:class:`
+
 ## Tests and checks
 
 - Lint: `ruff check .`
-- Tests: `pytest tests`
-- Docs: `mkdocs build --strict`
-
-Run the smallest relevant subset when possible; call out if tests were not run.
-Recommended targeted runs:
-
-- Neurons: `pytest tests/models -k neuron`
-- Connectome: `pytest tests/connectome`
-- Visualization: `pytest tests/visualisation`
-If unsure, run the full suite.
+- Tests: `pytest tests` or targeted subfolders
+- Docs: `python scripts/docs.py command=build-all` (builds all languages into `site/`)
 
 ## Documentation
 
-- Update `docs/` for user-facing changes.
+- Update `docs/en/docs/` for user-facing changes.
+- Never touch the auto generated `docs/en/docs/api`.
 - Update `README.md` for installation or workflow changes.
 
 ## Contribution workflow

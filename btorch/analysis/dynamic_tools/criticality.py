@@ -1,8 +1,15 @@
 import warnings
 
-import nolds
 import numpy as np
 import powerlaw
+
+
+try:
+    import nolds
+
+    HAS_NOLDS = True
+except ImportError:
+    HAS_NOLDS = False
 from scipy.optimize import curve_fit
 
 
@@ -46,7 +53,7 @@ def _fit_scaling(x, y):
         return np.nan, None
 
 
-def compute_avalanche_statistics(spike_train: np.ndarray, bin_size: int = 1):
+def compute_avalanche_statistics(spike_train: np.ndarray, bin_size: int = 1) -> dict:
     """Calculate avalanche size (S) and duration (T) distributions and their
     power-law exponents.
 
@@ -186,7 +193,7 @@ def compute_avalanche_statistics(spike_train: np.ndarray, bin_size: int = 1):
     return results
 
 
-def calculate_dfa(spike_train: np.ndarray, bin_size: int = 1):
+def calculate_dfa(spike_train: np.ndarray, bin_size: int = 1) -> float:
     """Calculate Detrended Fluctuation Analysis (DFA) exponent alpha.
 
     Meaning of alpha:
@@ -202,6 +209,12 @@ def calculate_dfa(spike_train: np.ndarray, bin_size: int = 1):
     Returns:
         float: The DFA exponent alpha.
     """
+    if not HAS_NOLDS:
+        raise ImportError(
+            "nolds package is required for DFA analysis. "
+            "Install with: pip install nolds"
+        )
+
     # Ensure input is numpy array
     spike_train = np.array(spike_train)
 

@@ -1,12 +1,29 @@
-import inspect
+"""File path utilities.
+
+Helpers for resolving figure output paths based on caller location
+within the repository structure.
+"""
+
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+import matplotlib.figure
 
 from btorch.utils import conf
 
 
 @dataclass(frozen=True)
 class FigPathConfig:
+    """Configuration for figure output directory structure.
+
+    Attributes:
+        root_dir: Root directory for all figures.
+        benchmark_dir: Subdirectory for benchmark script outputs.
+        tests_dir: Subdirectory for test script outputs.
+        other_dir: Subdirectory for other script outputs.
+    """
+
     root_dir: str = "fig"
     benchmark_dir: str = "benchmark"
     tests_dir: str = "tests"
@@ -14,10 +31,12 @@ class FigPathConfig:
 
 
 def _repo_root() -> Path:
+    """Return repository root directory."""
     return Path(__file__).resolve().parents[2]
 
 
 def _is_relative_to(path: Path, base: Path) -> bool:
+    """Check if path is within base directory."""
     try:
         path.relative_to(base)
         return True
@@ -25,12 +44,32 @@ def _is_relative_to(path: Path, base: Path) -> bool:
         return False
 
 
-def caller_file(skip: int = 2) -> Path:
-    frame = inspect.stack()[skip]
-    return Path(frame.filename).resolve()
+def caller_file(stack_level: int = 2) -> str:
+    # 0 == this frame, 1 == caller, 2 == caller of caller
+    try:
+        from IPython.core.getipython import get_ipython
+
+        shell = get_ipython()
+        if shell is not None and hasattr(shell, "kernel"):
+            # Running in a notebook - try to get the notebook path
+            ns = shell.user_ns
+            # VS Code sets this
+            if "__vsc_ipynb_file__" in ns:
+                return ns["__vsc_ipynb_file__"]
+            # Some Jupyter setups set __file__
+            if "__file__" in ns:
+                return ns["__file__"]
+            # Last resort: use cwd as a fake path for relative resolution
+            import os
+
+            return str(Path(os.getcwd()) / "__notebook__.ipynb")
+    except Exception:
+        pass
+    return sys._getframe(stack_level).f_code.co_filename
 
 
 def _resolve_cfg(cfg: FigPathConfig | dict | conf.DictConfig | None):
+    """Merge user config with defaults."""
     defaults = conf.OmegaConf.structured(FigPathConfig)
     if cfg is None:
         return defaults
@@ -41,9 +80,24 @@ def _resolve_cfg(cfg: FigPathConfig | dict | conf.DictConfig | None):
     return conf.OmegaConf.merge(defaults, cfg)
 
 
-def fig_path(file: str | Path | None = None, cfg: FigPathConfig | dict | None = None):
-    file_path = Path(file) if file is not None else caller_file()
-    file_path = file_path.resolve()
+def fig_path(
+    file: str | Path | None = None, cfg: FigPathConfig | dict | None = None
+) -> Path:
+    """Resolve figure output directory based on caller location.
+
+    Places outputs in ``fig/benchmark/``, ``fig/tests/``, or ``fig/misc/``
+    depending on whether the caller is in the benchmark, tests, or other
+    directory.
+
+    Args:
+        file: File path to use for path resolution. If None, uses caller file.
+        cfg: Configuration for directory naming.
+
+    Returns:
+        Path object for the figure directory (created if needed).
+    """
+    file_path = file if file is not None else caller_file()
+    file_path = Path(file_path).resolve()
     root = _repo_root()
     cfg = _resolve_cfg(cfg)
 
@@ -72,20 +126,35 @@ def fig_path(file: str | Path | None = None, cfg: FigPathConfig | dict | None = 
 
 
 def save_fig(
-    fig,
+    fig: matplotlib.figure.Figure,
     name: str | None = None,
     path: Path | None = None,
     *,
     file: str | Path | None = None,
     cfg: FigPathConfig | dict | None = None,
     suffix: str = "pdf",
+    transparent: bool = False,
 ) -> Path:
-    file_path = Path(file) if file is not None else caller_file()
+    """Save matplotlib figure to appropriate directory.
+
+    Args:
+        fig: Matplotlib figure object.
+        name: Output filename (without extension). If None, uses caller stem.
+        path: Output directory. If None, uses ``fig_path()``.
+        file: File path for context resolution. If None, uses caller file.
+        cfg: Configuration for directory naming.
+        suffix: File extension (default: "pdf").
+        transparent: Save with transparent background.
+
+    Returns:
+        Path to the saved figure file.
+    """
+    file_path = Path(file) if file is not None else Path(caller_file())
     if path is None:
         path = fig_path(file_path, cfg=cfg)
     if name is None:
         name = file_path.stem
     path.mkdir(parents=True, exist_ok=True)
     output_path = path / f"{name}.{suffix}"
-    fig.savefig(output_path.as_posix(), transparent=True)
+    fig.savefig(output_path.as_posix(), transparent=transparent)
     return output_path
