@@ -5,8 +5,11 @@ from dataclasses import dataclass
 import torch
 
 from btorch.backend.triton import (
+    build_event_bucket_plan,
     dense_spike_to_spike_list,
+    post_span_bucketed_spmm_from_spike_list,
     post_span_spmm_from_spike_list,
+    pre_span_bucketed_spmm_from_spike_list,
     pre_span_spmm_from_spike_list,
 )
 
@@ -82,12 +85,15 @@ def build_event_sparse_case(cfg: EventSparseBenchConfig) -> EventSparseCase:
     ind = torch.stack(ind_rows, dim=0)
     weight = torch.stack(weight_rows, dim=0)
 
-    spike_mask = torch.rand(
-        (cfg.batch_size, cfg.n_pre),
-        generator=generator,
-        device=cfg.device,
-        dtype=cfg.dtype,
-    ) < cfg.active_ratio
+    spike_mask = (
+        torch.rand(
+            (cfg.batch_size, cfg.n_pre),
+            generator=generator,
+            device=cfg.device,
+            dtype=cfg.dtype,
+        )
+        < cfg.active_ratio
+    )
     spike = spike_mask.to(cfg.dtype)
     spike_count = spike_mask.sum(dim=1, dtype=torch.int32)
     max_spikes = max(int(spike_count.max().item()), 1)
@@ -141,9 +147,9 @@ class TorchSparseEventModule(torch.nn.Module):
         super().__init__()
         rows = torch.arange(n_pre, device=ind.device, dtype=torch.int64)
         rows = rows[:, None].expand_as(ind)
-        mask = torch.arange(ind.shape[1], device=ind.device)[None, :] < row_length[
-            :, None
-        ]
+        mask = (
+            torch.arange(ind.shape[1], device=ind.device)[None, :] < row_length[:, None]
+        )
         # Store W.T so the forward path can use torch.sparse.mm(W.T, spike.T).
         indices = torch.stack([ind[mask], rows[mask]], dim=0)
         values = weight[mask]
@@ -216,6 +222,66 @@ class TritonPostSpanSpikeListModule(torch.nn.Module):
         )
 
 
+class TritonPreSpanBucketedSpikeListModule(torch.nn.Module):
+    """Benchmark wrapper for bucketed pre-span spike-list consumption."""
+
+    def __init__(
+        self,
+        row_length: torch.Tensor,
+        ind: torch.Tensor,
+        weight: torch.Tensor,
+        *,
+        n_post: int,
+    ):
+        super().__init__()
+        self.register_buffer("row_length", row_length)
+        self.register_buffer("ind", ind)
+        self.register_buffer("weight", weight)
+        self.bucket_plan = build_event_bucket_plan(row_length)
+        self.n_post = n_post
+
+    def forward(self, spike_count: torch.Tensor, spike_ind: torch.Tensor):
+        return pre_span_bucketed_spmm_from_spike_list(
+            spike_count,
+            spike_ind,
+            self.row_length,
+            self.ind,
+            self.weight,
+            self.bucket_plan,
+            size_m=self.n_post,
+        )
+
+
+class TritonPostSpanBucketedSpikeListModule(torch.nn.Module):
+    """Benchmark wrapper for bucketed post-span spike-list consumption."""
+
+    def __init__(
+        self,
+        row_length: torch.Tensor,
+        ind: torch.Tensor,
+        weight: torch.Tensor,
+        *,
+        n_post: int,
+    ):
+        super().__init__()
+        self.register_buffer("row_length", row_length)
+        self.register_buffer("ind", ind)
+        self.register_buffer("weight", weight)
+        self.bucket_plan = build_event_bucket_plan(row_length)
+        self.n_post = n_post
+
+    def forward(self, spike_count: torch.Tensor, spike_ind: torch.Tensor):
+        return post_span_bucketed_spmm_from_spike_list(
+            spike_count,
+            spike_ind,
+            self.row_length,
+            self.ind,
+            self.weight,
+            self.bucket_plan,
+            size_m=self.n_post,
+        )
+
+
 class DenseSpikeToListModule(torch.nn.Module):
     """Benchmark wrapper for dense spike compaction."""
 
@@ -252,6 +318,18 @@ def build_provider_modules(
             case.weight,
             n_post=case.n_post,
         ),
+        "triton_pre_span_bucketed_list": TritonPreSpanBucketedSpikeListModule(
+            case.row_length,
+            case.ind,
+            case.weight,
+            n_post=case.n_post,
+        ),
+        "triton_post_span_bucketed_list": TritonPostSpanBucketedSpikeListModule(
+            case.row_length,
+            case.ind,
+            case.weight,
+            n_post=case.n_post,
+        ),
     }
 
     if include_compiled and hasattr(torch, "compile"):
@@ -278,6 +356,22 @@ def build_provider_modules(
         )
         modules["triton_post_span_list_compile"] = torch.compile(
             TritonPostSpanSpikeListModule(
+                case.row_length,
+                case.ind,
+                case.weight,
+                n_post=case.n_post,
+            )
+        )
+        modules["triton_pre_span_bucketed_list_compile"] = torch.compile(
+            TritonPreSpanBucketedSpikeListModule(
+                case.row_length,
+                case.ind,
+                case.weight,
+                n_post=case.n_post,
+            )
+        )
+        modules["triton_post_span_bucketed_list_compile"] = torch.compile(
+            TritonPostSpanBucketedSpikeListModule(
                 case.row_length,
                 case.ind,
                 case.weight,

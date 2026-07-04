@@ -3,8 +3,12 @@ import scipy.sparse
 import torch
 
 from btorch.backend.triton import (
+    bucketed_spike_list_from_spike_list,
+    build_event_bucket_plan,
     dense_spike_to_spike_list,
+    post_span_bucketed_spmm_from_spike_list,
     post_span_spmm_from_spike_list,
+    pre_span_bucketed_spmm_from_spike_list,
     pre_span_spmm_from_spike_list,
 )
 from btorch.models import environ
@@ -100,6 +104,46 @@ def _build_post_span_buffers(
         dtype=dtype,
     )
     return row_length, ind, weight
+
+
+def test_event_bucket_plan_uses_tail_merge_policy():
+    row_length = torch.tensor(
+        [0, 1, 31, 32, 33, 511, 512, 513, 520, 800, 1025],
+        dtype=torch.int64,
+    )
+
+    plan = build_event_bucket_plan(row_length)
+    starts = plan.pre_segment_start.tolist()
+    counts = plan.pre_segment_count.tolist()
+    buckets = plan.segment_bucket.tolist()
+    syn_starts = plan.segment_syn_start.tolist()
+    syn_lens = plan.segment_syn_len.tolist()
+
+    # Fanouts just over a bucket boundary should merge into the next bucket
+    # when the remainder is less than 25% of the base bucket size.
+    assert plan.bucket_sizes == (32, 64, 128, 256, 512, 1024)
+    assert counts == [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2]
+
+    expected_segments = {
+        1: [(0, 0, 1)],
+        2: [(0, 0, 31)],
+        3: [(0, 0, 32)],
+        4: [(1, 0, 33)],
+        5: [(4, 0, 511)],
+        6: [(4, 0, 512)],
+        7: [(5, 0, 513)],
+        8: [(5, 0, 520)],
+        9: [(5, 0, 800)],
+        10: [(5, 0, 1024), (0, 1024, 1)],
+    }
+    for pre, expected in expected_segments.items():
+        start = starts[pre]
+        count = counts[pre]
+        actual = [
+            (buckets[idx], syn_starts[idx], syn_lens[idx])
+            for idx in range(start, start + count)
+        ]
+        assert actual == expected
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -215,6 +259,78 @@ def test_spike_list_span_kernels_match_dense_reference():
 
     torch.testing.assert_close(out_pre, expected, atol=1e-6, rtol=0.0)
     torch.testing.assert_close(out_post, expected, atol=1e-6, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_bucketed_spike_list_expansion_only_emits_spiking_pre_segments():
+    device = "cuda"
+    row_length = torch.tensor([0, 33, 520, 1025], device=device, dtype=torch.int64)
+    plan = build_event_bucket_plan(row_length)
+    spike_count = torch.tensor([2], device=device, dtype=torch.int32)
+    spike_ind = torch.tensor([[1, 3, 0, 0]], device=device, dtype=torch.int64)
+
+    bucketed = bucketed_spike_list_from_spike_list(spike_count, spike_ind, plan)
+
+    assert bucketed.bucket_counts[:, 0].cpu().tolist() == [1, 1, 0, 0, 0, 1]
+    bucket_32_work = bucketed.bucket_work[0][0, :1].cpu().tolist()
+    bucket_64_work = bucketed.bucket_work[1][0, :1].cpu().tolist()
+    bucket_1024_work = bucketed.bucket_work[5][0, :1].cpu().tolist()
+    assert bucket_32_work == [[3, 1024, 1]]
+    assert bucket_64_work == [[1, 0, 33]]
+    assert bucket_1024_work == [[3, 0, 1024]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("mode", ["pre_span", "post_span"])
+def test_bucketed_span_kernels_match_skewed_dense_reference(mode: str):
+    device = "cuda"
+    dtype = torch.float32
+    n_pre = 4
+    n_post = 1100
+    dense_weight = torch.zeros((n_pre, n_post), device=device, dtype=dtype)
+    dense_weight[1, :33] = torch.arange(33, device=device, dtype=dtype) / 100.0
+    dense_weight[2, :520] = 0.5
+    dense_weight[3, :1025] = -0.25
+
+    row_length = torch.tensor([0, 33, 520, 1025], device=device, dtype=torch.int64)
+    row_stride = int(row_length.max().item())
+    ind = torch.zeros((n_pre, row_stride), device=device, dtype=torch.int64)
+    weight = torch.zeros((n_pre, row_stride), device=device, dtype=dtype)
+    for pre in range(n_pre):
+        fanout = int(row_length[pre].item())
+        if fanout == 0:
+            continue
+        ind[pre, :fanout] = torch.arange(fanout, device=device, dtype=torch.int64)
+        weight[pre, :fanout] = dense_weight[pre, :fanout]
+
+    spike = torch.tensor(
+        [[0.0, 1.0, 1.0, 0.0], [0.0, 0.0, 1.0, 1.0]], device=device, dtype=dtype
+    )
+    spike_count, spike_ind = dense_spike_to_spike_list(spike)
+    plan = build_event_bucket_plan(row_length)
+    if mode == "pre_span":
+        actual = pre_span_bucketed_spmm_from_spike_list(
+            spike_count,
+            spike_ind,
+            row_length,
+            ind,
+            weight,
+            plan,
+            size_m=n_post,
+        )
+    else:
+        actual = post_span_bucketed_spmm_from_spike_list(
+            spike_count,
+            spike_ind,
+            row_length,
+            ind,
+            weight,
+            plan,
+            size_m=n_post,
+        )
+    expected = spike @ dense_weight
+
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

@@ -20,6 +20,8 @@ def _provider_order(include_compiled: bool) -> list[str]:
         "spike_list_build",
         "triton_pre_span_list",
         "triton_post_span_list",
+        "triton_pre_span_bucketed_list",
+        "triton_post_span_bucketed_list",
     ]
     if include_compiled:
         providers.extend(
@@ -29,13 +31,15 @@ def _provider_order(include_compiled: bool) -> list[str]:
                 "spike_list_build_compile",
                 "triton_pre_span_list_compile",
                 "triton_post_span_list_compile",
+                "triton_pre_span_bucketed_list_compile",
+                "triton_post_span_bucketed_list_compile",
             ]
         )
     return providers
 
 
 def _provider_args(provider: str, case):
-    if "span_list" in provider:
+    if "span" in provider and "list" in provider:
         return case.spike_count, case.spike_ind
     return (case.spike,)
 
@@ -105,11 +109,15 @@ def _plot_results(
         "spike_list_build": ("tab:green", "-"),
         "triton_pre_span_list": ("tab:blue", ":"),
         "triton_post_span_list": ("tab:orange", ":"),
+        "triton_pre_span_bucketed_list": ("tab:cyan", ":"),
+        "triton_post_span_bucketed_list": ("tab:purple", ":"),
         "torch_dense_compile": ("black", "--"),
         "torch_sparse_compile": ("tab:red", "--"),
         "spike_list_build_compile": ("tab:green", "--"),
         "triton_pre_span_list_compile": ("tab:blue", "-."),
         "triton_post_span_list_compile": ("tab:orange", "-."),
+        "triton_pre_span_bucketed_list_compile": ("tab:cyan", "-."),
+        "triton_post_span_bucketed_list_compile": ("tab:purple", "-."),
     }
 
     baseline = results.get("torch_dense")

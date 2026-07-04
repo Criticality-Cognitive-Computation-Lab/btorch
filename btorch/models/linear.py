@@ -268,6 +268,7 @@ class SparseConn(BaseSparseConn, HasConstraint):
         self.register_buffer("_event_row_length", None)
         self.register_buffer("_event_ind", None)
         self.register_buffer("_event_weight", None)
+        self._event_bucket_plan = None
         self._event_weight_version = -1
 
     def _init_weights(self, value: torch.Tensor):
@@ -296,6 +297,7 @@ class SparseConn(BaseSparseConn, HasConstraint):
             ind = torch.empty((self.in_features, 0), device=device, dtype=torch.int64)
             self._event_row_length = row_length
             self._event_ind = ind
+            self._event_bucket_plan = None
             return row_length, ind
 
         indices = self.indices.to(device=device)
@@ -316,7 +318,18 @@ class SparseConn(BaseSparseConn, HasConstraint):
 
         self._event_row_length = row_length
         self._event_ind = ind
+        self._event_bucket_plan = None
         return row_length, ind
+
+    def _build_event_bucket_plan(self, row_length: torch.Tensor):
+        from btorch.backend.triton import build_event_bucket_plan
+
+        if (
+            self._event_bucket_plan is None
+            or self._event_bucket_plan.pre_segment_start.device != row_length.device
+        ):
+            self._event_bucket_plan = build_event_bucket_plan(row_length)
+        return self._event_bucket_plan
 
     def _event_span_weight(
         self, device: torch.device, dtype: torch.dtype
@@ -361,8 +374,8 @@ class SparseConn(BaseSparseConn, HasConstraint):
         """Apply forward-only Triton event propagation for dense spike flags."""
         from btorch.backend.triton import (
             dense_spike_to_spike_list,
-            post_span_spmm_from_spike_list,
-            pre_span_spmm_from_spike_list,
+            post_span_bucketed_spmm_from_spike_list,
+            pre_span_bucketed_spmm_from_spike_list,
         )
 
         if self.bias is not None:
@@ -381,24 +394,27 @@ class SparseConn(BaseSparseConn, HasConstraint):
 
         row_length, ind = self._build_event_span_layout(spike.device)
         weight = self._event_span_weight(spike.device, spike.dtype)
+        bucket_plan = self._build_event_bucket_plan(row_length)
         spike_list = dense_spike_to_spike_list(spike)
         if mode == "pre_span":
-            out_tensor = pre_span_spmm_from_spike_list(
+            out_tensor = pre_span_bucketed_spmm_from_spike_list(
                 spike_list.count,
                 spike_list.ind,
                 row_length,
                 ind,
                 weight,
+                bucket_plan,
                 size_m=self.out_features,
                 out=out,
             )
         elif mode == "post_span":
-            out_tensor = post_span_spmm_from_spike_list(
+            out_tensor = post_span_bucketed_spmm_from_spike_list(
                 spike_list.count,
                 spike_list.ind,
                 row_length,
                 ind,
                 weight,
+                bucket_plan,
                 size_m=self.out_features,
                 out=out,
             )
@@ -511,9 +527,9 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
             }
         )
         merged = coo_df.merge(constraint_df, how="left", on=["row", "col"])
-        assert (
-            merged["group_id"].notnull().all()
-        ), "Constraint missing for some connections."
+        assert merged["group_id"].notnull().all(), (
+            "Constraint missing for some connections."
+        )
         # Convert group ID from 1-based to 0-based indexing
         return merged["group_id"].values - 1
 
@@ -572,8 +588,15 @@ class SparseEventConn(nn.Module):
         self.register_buffer("post_ind", None)
         self.register_buffer("post_weight", None)
 
+        self.pre_bucket_plan = None
+        self.post_bucket_plan = None
         self.pre_row_stride = 0
         self.post_row_stride = 0
+
+    def _apply(self, fn, recurse=True):
+        self.pre_bucket_plan = None
+        self.post_bucket_plan = None
+        return super()._apply(fn, recurse=recurse)
 
     def set_pre_span_data(
         self,
@@ -604,6 +627,9 @@ class SparseEventConn(nn.Module):
         self.pre_ind = ind.to(device=target_device, dtype=torch.int64)
         self.pre_weight = weight.to(device=target_device, dtype=target_dtype)
         self.pre_row_stride = stride
+        from btorch.backend.triton import build_event_bucket_plan
+
+        self.pre_bucket_plan = build_event_bucket_plan(self.pre_row_length)
 
     def set_post_span_data(
         self,
@@ -643,6 +669,35 @@ class SparseEventConn(nn.Module):
         self.post_ind = ind.to(device=target_device, dtype=torch.int64)
         self.post_weight = weight.to(device=target_device, dtype=target_dtype)
         self.post_row_stride = stride
+        from btorch.backend.triton import build_event_bucket_plan
+
+        self.post_bucket_plan = build_event_bucket_plan(self.post_row_length)
+
+    def _get_pre_bucket_plan(self):
+        from btorch.backend.triton import build_event_bucket_plan
+
+        if self.pre_row_length is None:
+            raise RuntimeError("pre-span buffers are not initialized.")
+        if (
+            self.pre_bucket_plan is None
+            or self.pre_bucket_plan.pre_segment_start.device
+            != self.pre_row_length.device
+        ):
+            self.pre_bucket_plan = build_event_bucket_plan(self.pre_row_length)
+        return self.pre_bucket_plan
+
+    def _get_post_bucket_plan(self):
+        from btorch.backend.triton import build_event_bucket_plan
+
+        if self.post_row_length is None:
+            raise RuntimeError("post-span buffers are not initialized.")
+        if (
+            self.post_bucket_plan is None
+            or self.post_bucket_plan.pre_segment_start.device
+            != self.post_row_length.device
+        ):
+            self.post_bucket_plan = build_event_bucket_plan(self.post_row_length)
+        return self.post_bucket_plan
 
     def forward_events(
         self,
@@ -685,8 +740,8 @@ class SparseEventConn(nn.Module):
     ) -> torch.Tensor:
         """Apply sparse propagation from a compact spike list."""
         from btorch.backend.triton import (
-            post_span_spmm_from_spike_list,
-            pre_span_spmm_from_spike_list,
+            post_span_bucketed_spmm_from_spike_list,
+            pre_span_bucketed_spmm_from_spike_list,
         )
 
         mode = mode or self.event_mode
@@ -697,12 +752,13 @@ class SparseEventConn(nn.Module):
                 or self.pre_weight is None
             ):
                 raise RuntimeError("pre-span buffers are not initialized.")
-            return pre_span_spmm_from_spike_list(
+            return pre_span_bucketed_spmm_from_spike_list(
                 spike_count,
                 spike_ind,
                 self.pre_row_length,
                 self.pre_ind,
                 self.pre_weight,
+                self._get_pre_bucket_plan(),
                 size_m=self.out_features,
                 out=out,
             )
@@ -713,12 +769,13 @@ class SparseEventConn(nn.Module):
                 or self.post_weight is None
             ):
                 raise RuntimeError("post-span buffers are not initialized.")
-            return post_span_spmm_from_spike_list(
+            return post_span_bucketed_spmm_from_spike_list(
                 spike_count,
                 spike_ind,
                 self.post_row_length,
                 self.post_ind,
                 self.post_weight,
+                self._get_post_bucket_plan(),
                 size_m=self.out_features,
                 out=out,
             )
