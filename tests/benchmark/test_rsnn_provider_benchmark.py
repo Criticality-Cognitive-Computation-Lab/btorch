@@ -7,7 +7,11 @@ import torch
 
 
 def _load_benchmark_module():
-    path = Path(__file__).resolve().parents[2] / "benchmark" / "benchmark_persistent_snn.py"
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "benchmark"
+        / "benchmark_persistent_snn.py"
+    )
     spec = importlib.util.spec_from_file_location("benchmark_persistent_snn", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -41,7 +45,12 @@ def test_cpu_benchmark_skips_unavailable_event_and_compile_providers():
     rows = bench.bench_case(
         case,
         device=torch.device("cpu"),
-        providers=("event_pre_span", "event_post_span", "torch_compile_dense", "persistent"),
+        providers=(
+            "event_pre_span",
+            "event_post_span",
+            "torch_compile_dense",
+            "persistent",
+        ),
         persistent_backend="torch_stub",
         warmup=1,
         repeat=1,
@@ -49,8 +58,14 @@ def test_cpu_benchmark_skips_unavailable_event_and_compile_providers():
     )
 
     by_provider = {row["provider"]: row for row in rows}
-    assert by_provider["event_pre_span"]["correctness_status"] == "skipped:requires_cuda"
-    assert by_provider["event_post_span"]["correctness_status"] == "skipped:requires_cuda"
+    assert (
+        by_provider["event_pre_span"]["correctness_status"]
+        == "skipped:requires_cuda"
+    )
+    assert (
+        by_provider["event_post_span"]["correctness_status"]
+        == "skipped:requires_cuda"
+    )
     assert by_provider["persistent"]["correctness_status"] == "stub_only"
     assert by_provider["persistent"]["latency_ms"] >= 0.0
 
@@ -70,6 +85,73 @@ def test_dense_reference_uses_same_csr_weights():
     torch.testing.assert_close(ref.spikes, direct.spikes)
     torch.testing.assert_close(ref.v, direct.v)
     torch.testing.assert_close(ref.psc, direct.psc)
+
+
+def test_benchmark_lif_default_reset_matches_persistent_soft_reset():
+    """Benchmark LIF reset should match first persistent-kernel defaults.
+
+    The first persistent kernel is scoped to the default btorch LIF behavior,
+    where ``hard_reset=False``. A threshold crossing subtracts the reset delta
+    instead of clamping voltage directly to ``v_reset``. With ``v_pre=2`` and
+    threshold ``1``, soft reset leaves the remaining voltage at ``1``.
+    """
+
+    case = bench.BenchCase(
+        n_neuron=1,
+        batch_size=1,
+        t_steps=1,
+        fanout=0,
+        event_rate=0.0,
+        dt=1.0,
+        tau_mem=20.0,
+        v_threshold=1.0,
+        v_reset=0.0,
+        c_m=1.0,
+    )
+
+    spike, v_next = bench.lif_fire_and_update(
+        torch.zeros(1, 1),
+        torch.full((1, 1), 2.0),
+        case,
+    )
+
+    torch.testing.assert_close(spike, torch.ones(1, 1))
+    torch.testing.assert_close(v_next, torch.ones(1, 1))
+
+
+def test_event_provider_passes_static_max_events(monkeypatch):
+    """Event benchmark should avoid per-step GPU max-count synchronization.
+
+    The timed event path receives a CPU-side capacity calibrated outside the
+    timing loop. On CUDA this lets Triton compact dense spikes into a bounded
+    spike list without calling ``count.max().item()`` every timestep.
+    """
+
+    case = _small_case()
+    device = torch.device("cpu")
+    x_seq = bench.make_input_sequence(case, device)
+    matrix = bench.make_recurrent_csr(case, device)
+    dense = bench.csr_to_dense(matrix)
+    seen_max_events: list[int | None] = []
+
+    def fake_event_sparse_mm(matrix, events, *, schedule, max_events=None):
+        del matrix, events, schedule
+        seen_max_events.append(max_events)
+        return torch.zeros(case.batch_size, case.n_neuron)
+
+    monkeypatch.setattr(bench, "event_sparse_mm", fake_event_sparse_mm)
+
+    bench.provider_forward(
+        "event_pre_span",
+        x_seq,
+        matrix,
+        dense,
+        case,
+        event_max_events=7,
+        persistent_backend="torch_stub",
+    )
+
+    assert seen_max_events == [7] * case.t_steps
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -3,6 +3,7 @@ import torch
 
 from btorch.models.linear import SparseLinear
 from btorch.sparse import CSR, BinaryEvents, compact_events, event_sparse_mm
+from btorch.sparse.backends.triton.event import compact_binary_events
 
 
 _cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -29,6 +30,42 @@ def test_compact_binary_events_matches_nonzero():
         compact.indices[1, :1],
         torch.tensor([0], device="cuda"),
     )
+    # The Triton event kernels launch over ``indices.shape[1]``. Keeping this
+    # width equal to the maximum per-batch spike count is the optimization that
+    # makes sparse event execution scale with active spikes instead of all
+    # presynaptic neurons.
+    assert compact.indices.shape == (2, 2)
+
+
+@_cuda
+def test_compact_binary_events_keeps_empty_batches_at_minimum_capacity():
+    events = BinaryEvents(torch.zeros(2, 4, device="cuda"))
+    compact = compact_events(events)
+
+    torch.testing.assert_close(
+        compact.count,
+        torch.tensor([0, 0], device="cuda", dtype=torch.int32),
+    )
+    # Empty spike lists still need one padded column so the representation stays
+    # two-dimensional and downstream kernels can construct a valid launch grid.
+    assert compact.indices.shape == (2, 1)
+
+
+@_cuda
+def test_compact_binary_events_uses_static_max_events_capacity():
+    events = BinaryEvents(
+        torch.tensor(
+            [[0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 0.0]],
+            device="cuda",
+        )
+    )
+    compact = compact_binary_events(events, max_events=3)
+
+    torch.testing.assert_close(
+        compact.count,
+        torch.tensor([2, 1], device="cuda", dtype=torch.int32),
+    )
+    assert compact.indices.shape == (2, 3)
 
 
 @_cuda

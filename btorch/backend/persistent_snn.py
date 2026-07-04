@@ -6,6 +6,41 @@ no-op reference/stub: it validates layout, preserves state, and returns empty
 spike outputs. A future C++/CUDA implementation can register
 ``torch.ops.btorch_cuda.persistent_snn_forward`` without changing benchmark
 or caller code.
+
+The first persistent kernel target is intentionally narrow: recurrent RSNN
+dynamics with a scalar-parameter LIF neuron and an ``ExponentialPSC`` synapse.
+The benchmark and persistent contract share these defaults:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Parameter
+     - Default
+     - First-kernel meaning
+   * - ``dt``
+     - ``1.0``
+     - Euler step size for LIF and exponential PSC decay.
+   * - ``tau_mem``
+     - ``20.0``
+     - LIF membrane time constant.
+   * - ``tau_syn``
+     - ``5.0``
+     - Exponential PSC time constant.
+   * - ``v_threshold``
+     - ``1.0``
+     - Spike threshold; spikes are emitted when ``v >= v_threshold``.
+   * - ``v_reset``
+     - ``0.0``
+     - Reset baseline used by the LIF leak and reset delta.
+   * - ``c_m``
+     - ``1.0``
+     - Membrane capacitance divisor for input current.
+   * - ``hard_reset``
+     - ``False``
+     - Soft reset: subtract ``v_threshold - v_reset`` after a spike.
+   * - ``window_size``
+     - ``128``
+     - Suggested processing window length in time steps.
 """
 
 from __future__ import annotations
@@ -77,7 +112,13 @@ class PersistentSNNOutput:
 
 @dataclass(frozen=True)
 class PersistentSNNParams:
-    """Scalar simulation parameters for the persistent SNN operator."""
+    """Scalar simulation parameters for the persistent SNN operator.
+
+    The first CUDA persistent kernel is scoped to scalar-parameter
+    LIF + ExponentialPSC dynamics. Its default reset mode is the same as
+    :class:`btorch.models.neurons.lif.LIF`: soft reset
+    (``hard_reset=False``).
+    """
 
     dt: float = 1.0
     tau_mem: float = 20.0
@@ -85,6 +126,7 @@ class PersistentSNNParams:
     v_threshold: float = 1.0
     v_reset: float = 0.0
     c_m: float = 1.0
+    hard_reset: bool = False
     window_size: int = 128
 
 
@@ -150,7 +192,9 @@ def _validate_state(
     if tuple(state.v.shape) != expected:
         raise ValueError(f"state.v must have shape {expected}, got {state.v.shape}.")
     if tuple(state.psc.shape) != expected:
-        raise ValueError(f"state.psc must have shape {expected}, got {state.psc.shape}.")
+        raise ValueError(
+            f"state.psc must have shape {expected}, got {state.psc.shape}."
+        )
     if state.refractory is not None and tuple(state.refractory.shape) != expected:
         raise ValueError(
             f"state.refractory must have shape {expected}, "
@@ -175,7 +219,12 @@ def make_empty_state(
     delay_ring = None
     if delay_ring_shape is not None:
         delay_ring = torch.zeros(delay_ring_shape, device=device, dtype=dtype)
-    return PersistentSNNState(v=v, psc=psc, refractory=refractory_t, delay_ring=delay_ring)
+    return PersistentSNNState(
+        v=v,
+        psc=psc,
+        refractory=refractory_t,
+        delay_ring=delay_ring,
+    )
 
 
 def torch_stub_persistent_snn_forward(
@@ -234,6 +283,105 @@ def _has_cuda_op() -> bool:
     )
 
 
+def _ensure_cuda_op() -> None:
+    if _has_cuda_op():
+        return
+    from .persistent import plain_version
+
+    plain_version.load()
+
+
+def _cuda_persistent_snn_forward(
+    events: WindowedSpikeEvents,
+    graph: EventCSRGraph,
+    state: PersistentSNNState,
+    params: PersistentSNNParams,
+    *,
+    return_mode: ReturnMode,
+) -> PersistentSNNOutput:
+    t_steps, batch_size, n_pre = _validate_events(events)
+    n_post = _validate_graph(graph, n_pre)
+    _validate_state(state, batch_size=batch_size, n_post=n_post)
+    if n_pre != n_post:
+        raise ValueError("cuda_persistent v1 requires a recurrent N x N graph.")
+    if params.hard_reset:
+        raise ValueError("cuda_persistent v1 only supports hard_reset=False.")
+    if state.refractory is not None:
+        raise ValueError("cuda_persistent v1 does not support refractory state.")
+    if state.delay_ring is not None:
+        raise ValueError("cuda_persistent v1 does not support delay_ring state.")
+    if events.offsets.dtype != torch.int32 or events.indices.dtype != torch.int32:
+        raise TypeError("cuda_persistent v1 requires int32 event tensors.")
+    if graph.indptr.dtype != torch.int32 or graph.indices.dtype != torch.int32:
+        raise TypeError("cuda_persistent v1 requires int32 graph indices.")
+    if graph.delay is not None and graph.delay.dtype != torch.int32:
+        raise TypeError("cuda_persistent v1 requires int32 graph delay.")
+    if graph.delay is not None and torch.count_nonzero(graph.delay).item() != 0:
+        raise ValueError("cuda_persistent v1 does not support nonzero delay.")
+    if state.v.dtype != torch.float32 or state.psc.dtype != torch.float32:
+        raise TypeError("cuda_persistent v1 requires float32 state tensors.")
+    if graph.weight.dtype != torch.float32:
+        raise TypeError("cuda_persistent v1 requires float32 graph weights.")
+    if events.values is not None and events.values.dtype != torch.float32:
+        raise TypeError("cuda_persistent v1 requires float32 event values.")
+
+    _ensure_cuda_op()
+    event_values = (
+        events.values
+        if events.values is not None
+        else torch.empty((0,), device=events.indices.device, dtype=state.v.dtype)
+    )
+    graph_delay = (
+        graph.delay
+        if graph.delay is not None
+        else torch.empty((0,), device=graph.indices.device, dtype=graph.indices.dtype)
+    )
+    return_events = return_mode in ("events", "both")
+    (
+        dense_spikes,
+        event_offsets,
+        event_indices,
+        v_out,
+        psc_out,
+        _overflow,
+    ) = torch.ops.btorch_cuda.persistent_snn_forward(
+        events.offsets,
+        events.indices,
+        event_values,
+        events.values is not None,
+        graph.indptr,
+        graph.indices,
+        graph.weight,
+        graph_delay,
+        graph.delay is not None,
+        state.v,
+        state.psc,
+        float(params.dt),
+        float(params.tau_mem),
+        float(params.tau_syn),
+        float(params.v_threshold),
+        float(params.v_reset),
+        float(params.c_m),
+        bool(params.hard_reset),
+        return_events,
+    )
+
+    spikes = dense_spikes if return_mode in ("dense", "both") else None
+    spike_events = None
+    if return_events:
+        spike_events = WindowedSpikeEvents(
+            offsets=event_offsets,
+            indices=event_indices,
+            values=None,
+            shape=(t_steps, batch_size, n_post),
+        )
+    return PersistentSNNOutput(
+        spikes=spikes,
+        spike_events=spike_events,
+        state=PersistentSNNState(v=v_out, psc=psc_out),
+    )
+
+
 def persistent_snn_forward(
     events: WindowedSpikeEvents,
     graph: EventCSRGraph,
@@ -265,13 +413,12 @@ def persistent_snn_forward(
 
     use_cuda = backend == "cuda_persistent" or (backend == "auto" and _has_cuda_op())
     if use_cuda:
-        if not _has_cuda_op():
-            raise RuntimeError(
-                "torch.ops.btorch_cuda.persistent_snn_forward is not registered."
-            )
-        raise NotImplementedError(
-            "CUDA op dispatch is reserved for the compiled implementation. "
-            "The Python scaffold and benchmarks are already stable."
+        return _cuda_persistent_snn_forward(
+            events,
+            graph,
+            state,
+            params,
+            return_mode=return_mode,
         )
 
     return torch_stub_persistent_snn_forward(

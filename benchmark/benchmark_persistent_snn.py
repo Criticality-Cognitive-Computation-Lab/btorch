@@ -1,7 +1,8 @@
 """RSNN benchmark for event span, torch.compile, and persistent backends.
 
 The benchmark compares four providers under the same recurrent LIF +
-ExponentialPSC dynamics:
+ExponentialPSC dynamics. The LIF update uses the same default reset mode as
+``btorch.models.neurons.LIF`` and ``PersistentSNNParams``: soft reset.
 
     z_t = LIF(psc_t + x_t)
     psc_{t+1} = exp(-dt / tau_syn) * psc_t + recurrent(z_t)
@@ -27,9 +28,11 @@ from typing import Literal
 
 import matplotlib
 
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -42,7 +45,7 @@ from btorch.backend.persistent_snn import (  # noqa: E402
     make_empty_state,
     persistent_snn_forward,
 )
-from btorch.sparse import BinaryEvents, CSR, event_sparse_mm  # noqa: E402
+from btorch.sparse import CSR, BinaryEvents, event_sparse_mm  # noqa: E402
 
 
 Provider = Literal[
@@ -74,6 +77,8 @@ class BenchCase:
     tau_syn: float = 5.0
     v_threshold: float = 1.0
     v_reset: float = 0.0
+    c_m: float = 1.0
+    hard_reset: bool = False
     input_amplitude: float = 30.0
     weight_scale: float = 0.15
 
@@ -83,7 +88,8 @@ class BenchCase:
 
     @property
     def expected_external_events(self) -> int:
-        return int(round(self.t_steps * self.batch_size * self.n_neuron * self.event_rate))
+        total = self.t_steps * self.batch_size * self.n_neuron
+        return int(round(total * self.event_rate))
 
 
 @dataclass(frozen=True)
@@ -167,14 +173,24 @@ def make_recurrent_csr(case: BenchCase, device: torch.device) -> CSR:
             device=device,
             dtype=torch.float32,
         )
-    return CSR.from_edges(row=row, col=col, data=data, shape=(case.n_neuron, case.n_neuron))
+    return CSR.from_edges(
+        row=row,
+        col=col,
+        data=data,
+        shape=(case.n_neuron, case.n_neuron),
+    )
 
 
 def csr_to_dense(matrix: CSR) -> torch.Tensor:
     """Materialize a CSR matrix as dense ``(N_pre, N_post)`` weights."""
 
     n_pre, n_post = matrix.shape
-    dense = torch.zeros(n_pre, n_post, device=matrix.data.device, dtype=matrix.data.dtype)
+    dense = torch.zeros(
+        n_pre,
+        n_post,
+        device=matrix.data.device,
+        dtype=matrix.data.dtype,
+    )
     indptr = matrix.indptr
     for pre in range(n_pre):
         start = int(indptr[pre].item())
@@ -196,7 +212,10 @@ def csr_to_persistent_graph(matrix: CSR) -> EventCSRGraph:
     )
 
 
-def dense_to_windowed_events(x_seq: torch.Tensor, threshold: float = 0.0) -> WindowedSpikeEvents:
+def dense_to_windowed_events(
+    x_seq: torch.Tensor,
+    threshold: float = 0.0,
+) -> WindowedSpikeEvents:
     """Convert dense ``(T, B, N)`` events to time-batch bucketed events."""
 
     t_steps, batch_size, n_neuron = x_seq.shape
@@ -222,14 +241,17 @@ def lif_fire_and_update(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Single-step deterministic LIF update used by benchmark providers."""
 
-    dv = case.dt * (-(v - case.v_reset) / case.tau_mem + current)
+    dv = case.dt * (-(v - case.v_reset) / case.tau_mem + current / case.c_m)
     v_pre = v + dv
     spikes = (v_pre >= case.v_threshold).to(v.dtype)
-    v_next = torch.where(
-        spikes > 0,
-        torch.full_like(v_pre, case.v_reset),
-        v_pre,
-    )
+    if case.hard_reset:
+        v_next = torch.where(
+            spikes > 0,
+            torch.full_like(v_pre, case.v_reset),
+            v_pre,
+        )
+    else:
+        v_next = v_pre - (case.v_threshold - case.v_reset) * spikes
     return spikes, v_next
 
 
@@ -258,6 +280,7 @@ def event_rsnn_forward(
     case: BenchCase,
     *,
     schedule: Literal["pre_span", "post_span"],
+    max_events: int | None = None,
 ) -> RSNNResult:
     """Event-driven RSNN forward using the main btorch sparse event path."""
 
@@ -268,7 +291,12 @@ def event_rsnn_forward(
     spikes = []
     for t in range(case.t_steps):
         z, v = lif_fire_and_update(v, psc + x_seq[t], case)
-        recurrent = event_sparse_mm(matrix, BinaryEvents(z), schedule=schedule)
+        recurrent = event_sparse_mm(
+            matrix,
+            BinaryEvents(z),
+            schedule=schedule,
+            max_events=max_events,
+        )
         psc = psc * decay + recurrent
         spikes.append(z)
     return RSNNResult(spikes=torch.stack(spikes, dim=0), v=v, psc=psc)
@@ -289,13 +317,20 @@ def persistent_rsnn_forward(
 
     events = dense_to_windowed_events(x_seq)
     graph = csr_to_persistent_graph(matrix)
-    state = make_empty_state(case.batch_size, case.n_neuron, device=x_seq.device)
+    state = make_empty_state(
+        case.batch_size,
+        case.n_neuron,
+        device=x_seq.device,
+        refractory=False,
+    )
     params = PersistentSNNParams(
         dt=case.dt,
         tau_mem=case.tau_mem,
         tau_syn=case.tau_syn,
         v_threshold=case.v_threshold,
         v_reset=case.v_reset,
+        c_m=case.c_m,
+        hard_reset=case.hard_reset,
         window_size=case.t_steps,
     )
     out = persistent_snn_forward(
@@ -317,14 +352,27 @@ def provider_forward(
     weight_dense: torch.Tensor,
     case: BenchCase,
     *,
+    event_max_events: int | None = None,
     persistent_backend: str,
 ):
     """Dispatch one provider forward."""
 
     if provider == "event_pre_span":
-        return event_rsnn_forward(x_seq, matrix, case, schedule="pre_span")
+        return event_rsnn_forward(
+            x_seq,
+            matrix,
+            case,
+            schedule="pre_span",
+            max_events=event_max_events,
+        )
     if provider == "event_post_span":
-        return event_rsnn_forward(x_seq, matrix, case, schedule="post_span")
+        return event_rsnn_forward(
+            x_seq,
+            matrix,
+            case,
+            schedule="post_span",
+            max_events=event_max_events,
+        )
     if provider == "torch_compile_dense":
         compiled = torch.compile(dense_rsnn_forward)
         return compiled(x_seq, weight_dense, case)
@@ -337,12 +385,14 @@ def correctness_status(
     provider: Provider,
     result: RSNNResult | None,
     reference: RSNNResult,
+    *,
+    persistent_backend: str = "torch_stub",
 ) -> tuple[str, float]:
     """Compare a provider result to dense eager reference."""
 
     if result is None:
         return "skipped", float("nan")
-    if provider == "persistent":
+    if provider == "persistent" and persistent_backend != "cuda_persistent":
         return "stub_only", float("nan")
     spike_diff = (result.spikes - reference.spikes).abs().max().item()
     v_diff = (result.v - reference.v).abs().max().item()
@@ -412,6 +462,10 @@ def bench_case(
     matrix = make_recurrent_csr(case, device)
     weight_dense = csr_to_dense(matrix)
     reference = dense_rsnn_forward(x_seq, weight_dense, case)
+    event_max_events = max(
+        1,
+        int(reference.spikes.count_nonzero(dim=2).max().item()),
+    )
     event_count = int(torch.count_nonzero(x_seq).item())
 
     rows: list[dict[str, float | int | str]] = []
@@ -430,6 +484,7 @@ def bench_case(
                 matrix,
                 weight_dense,
                 case,
+                event_max_events=event_max_events,
                 persistent_backend=persistent_backend,
             )
 
@@ -438,7 +493,12 @@ def bench_case(
             if skip_correctness:
                 status, max_diff = "not_checked", float("nan")
             else:
-                status, max_diff = correctness_status(provider, result, reference)
+                status, max_diff = correctness_status(
+                    provider,
+                    result,
+                    reference,
+                    persistent_backend=persistent_backend,
+                )
             latency = time_ms(op, warmup=warmup, repeat=repeat, device=device)
         except Exception as exc:
             row = _empty_row(case, provider, device, f"error:{type(exc).__name__}")
@@ -506,6 +566,7 @@ def sweep_cases(args) -> list[BenchCase]:
             tau_mem=args.tau_mem,
             tau_syn=args.tau_syn,
             v_threshold=args.v_threshold,
+            c_m=args.c_m,
             input_amplitude=args.input_amplitude,
             weight_scale=args.weight_scale,
         )
@@ -665,6 +726,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tau-mem", type=float, default=20.0)
     parser.add_argument("--tau-syn", type=float, default=5.0)
     parser.add_argument("--v-threshold", type=float, default=1.0)
+    parser.add_argument("--c-m", type=float, default=1.0)
     parser.add_argument("--input-amplitude", type=float, default=30.0)
     parser.add_argument("--weight-scale", type=float, default=0.15)
     parser.add_argument("--warmup", type=int, default=10)
