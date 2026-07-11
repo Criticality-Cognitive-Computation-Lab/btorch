@@ -106,35 +106,14 @@ __global__ void persistent_snn_kernel(
         }
         grid.sync();
 
-        // Task3: recurrent prespan fanout -- warp-per-neuron work stealing.
-        //
-        // The original scheme was one-thread-per-neuron: every one of the
-        // ~gridDim*blockDim grid threads did atomicAdd(work_counter, 1) in
-        // this loop -- a contention storm on a single global int, even though
-        // only spike_count neurons have work -- and a single thread then
-        // walked that neuron's entire edge list serially. For sparse activity
-        // that left ~99% of threads idle while they all hammered one atomic.
-        //
-        // Here one *warp* cooperatively processes one spiking neuron: lane 0
-        // claims the next task with a single atomicAdd (warp-aggregated, so
-        // work_counter sees 32x fewer atomics), broadcasts it to the warp,
-        // and all 32 lanes walk the neuron's CSR edge list in parallel. Work
-        // stealing (vs. a static grid-stride split) keeps this balanced for
-        // the production graph's highly skewed fanout (avg ~177, P99 ~1911,
-        // max ~4165 per plan.md): a warp that finishes a low-fanout neuron
-        // immediately grabs the next task instead of idling.
-        //
-        // blockDim.x is a multiple of 32, so every warp is full and the
-        // 0xffffffff mask is valid; `task` is broadcast so the whole warp
-        // takes the same break decision and stays converged into grid.sync().
-        const int lane = global_tid & 31;
-        const int count = *spike_count;
+        // Task3: recurrent prespan fanout -- one-thread-per-neuron work
+        // stealing (original scheme; work distribution intentionally left
+        // unchanged). Each thread claims a spiking neuron from the queue via a
+        // global atomic and walks that neuron's CSR edge list serially,
+        // atomicAdd-ing weights into the post-synaptic psc.
         while (true) {
-            int task = 0;
-            if (lane == 0) {
-                task = atomicAdd(work_counter, 1);
-            }
-            task = __shfl_sync(0xffffffffu, task, 0);
+            const int task = atomicAdd(work_counter, 1);
+            const int count = *spike_count;
             if (task >= count || task >= queue_capacity) {
                 break;
             }
@@ -142,7 +121,7 @@ __global__ void persistent_snn_kernel(
             const int pre = spike_queue_pre[task];
             const int start = graph_indptr[pre];
             const int end = graph_indptr[pre + 1];
-            for (int edge = start + lane; edge < end; edge += 32) {
+            for (int edge = start; edge < end; ++edge) {
                 const int post = graph_indices[edge];
                 if (post >= 0 && post < n_neuron) {
                     atomicAdd(psc + b * n_neuron + post, graph_weight[edge]);
@@ -173,6 +152,180 @@ __global__ void compact_event_indices_kernel(
 }
 
 }  // namespace
+
+// -------------------------------------------------------------------------
+// Non-cooperative "stepped" variant: the SAME event-driven prespan algorithm
+// as persistent_snn_kernel above, but split so each of the 4 per-timestep
+// grid.sync() barriers becomes a separate kernel launch (the launch boundary
+// IS the grid-wide barrier). This is the fair-dispatch counterpart to the
+// persistent kernel: identical per-phase arithmetic, differing only in
+// cooperative-single-launch vs. graph-of-ordinary-launches. Dense output only
+// (no event list / overflow readback), which keeps it CUDA-graph capturable.
+namespace {
+
+__global__ void step_reset_input_kernel(
+    float* __restrict__ input_current,
+    int* __restrict__ spike_count,
+    int* __restrict__ work_counter,
+    int n_cells) {
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    if (gid == 0) {
+        *spike_count = 0;
+        *work_counter = 0;
+    }
+    for (int i = gid; i < n_cells; i += stride) {
+        input_current[i] = 0.0f;
+    }
+}
+
+__global__ void step_scatter_events_kernel(
+    const int* __restrict__ event_offsets,
+    const int* __restrict__ event_indices,
+    const float* __restrict__ event_values,
+    bool has_event_values,
+    float* __restrict__ input_current,
+    int t,
+    int batch_size,
+    int n_neuron) {
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    for (int b = 0; b < batch_size; ++b) {
+        const int bucket = t * batch_size + b;
+        const int start = event_offsets[bucket];
+        const int end = event_offsets[bucket + 1];
+        for (int event = start + gid; event < end; event += stride) {
+            const int pre = event_indices[event];
+            if (pre >= 0 && pre < n_neuron) {
+                const float value = has_event_values ? event_values[event] : 1.0f;
+                atomicAdd(input_current + b * n_neuron + pre, value);
+            }
+        }
+    }
+}
+
+__global__ void step_lif_emit_kernel(
+    float* __restrict__ v,
+    float* __restrict__ psc,
+    float* __restrict__ dense_spikes,
+    const float* __restrict__ input_current,
+    int* __restrict__ spike_queue_batch,
+    int* __restrict__ spike_queue_pre,
+    int* __restrict__ spike_count,
+    int t,
+    int batch_size,
+    int n_neuron,
+    float dt,
+    float tau_mem,
+    float tau_syn,
+    float v_threshold,
+    float v_reset,
+    float c_m) {
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    const int n_cells = batch_size * n_neuron;
+    const int queue_capacity = n_cells;
+    const float decay = expf(-dt / tau_syn);
+    const float reset_delta = v_threshold - v_reset;
+    for (int cell = gid; cell < n_cells; cell += stride) {
+        const int b = cell / n_neuron;
+        const int n = cell - b * n_neuron;
+        const float current = psc[cell] + input_current[cell];
+        const float v_pre =
+            v[cell] + dt * (-(v[cell] - v_reset) / tau_mem + current / c_m);
+        const bool fired = v_pre >= v_threshold;
+        const float spike = fired ? 1.0f : 0.0f;
+        v[cell] = v_pre - reset_delta * spike;
+        dense_spikes[(t * batch_size + b) * n_neuron + n] = spike;
+        psc[cell] *= decay;
+        if (fired) {
+            const int task = atomicAdd(spike_count, 1);
+            if (task < queue_capacity) {
+                spike_queue_batch[task] = b;
+                spike_queue_pre[task] = n;
+            }
+        }
+    }
+}
+
+__global__ void step_fanout_kernel(
+    const int* __restrict__ graph_indptr,
+    const int* __restrict__ graph_indices,
+    const float* __restrict__ graph_weight,
+    float* __restrict__ psc,
+    const int* __restrict__ spike_queue_batch,
+    const int* __restrict__ spike_queue_pre,
+    const int* __restrict__ spike_count,
+    int* __restrict__ work_counter,
+    int batch_size,
+    int n_neuron) {
+    const int n_cells = batch_size * n_neuron;
+    const int queue_capacity = n_cells;
+    while (true) {
+        const int task = atomicAdd(work_counter, 1);
+        const int count = *spike_count;
+        if (task >= count || task >= queue_capacity) {
+            break;
+        }
+        const int b = spike_queue_batch[task];
+        const int pre = spike_queue_pre[task];
+        const int start = graph_indptr[pre];
+        const int end = graph_indptr[pre + 1];
+        for (int edge = start; edge < end; ++edge) {
+            const int post = graph_indices[edge];
+            if (post >= 0 && post < n_neuron) {
+                atomicAdd(psc + b * n_neuron + post, graph_weight[edge]);
+            }
+        }
+    }
+}
+
+}  // namespace
+
+void launch_snn_step(
+    const int* event_offsets,
+    const int* event_indices,
+    const float* event_values,
+    bool has_event_values,
+    const int* graph_indptr,
+    const int* graph_indices,
+    const float* graph_weight,
+    float* v,
+    float* psc,
+    float* dense_spikes,
+    float* input_current,
+    int* spike_queue_batch,
+    int* spike_queue_pre,
+    int* spike_count,
+    int* work_counter,
+    int t,
+    int batch_size,
+    int n_neuron,
+    float dt,
+    float tau_mem,
+    float tau_syn,
+    float v_threshold,
+    float v_reset,
+    float c_m,
+    int grid_dim,
+    int block_dim,
+    cudaStream_t stream) {
+    const int n_cells = batch_size * n_neuron;
+    // One launch per phase; the 4 launch boundaries reproduce the cooperative
+    // kernel's 4 grid.sync() barriers exactly.
+    step_reset_input_kernel<<<grid_dim, block_dim, 0, stream>>>(
+        input_current, spike_count, work_counter, n_cells);
+    step_scatter_events_kernel<<<grid_dim, block_dim, 0, stream>>>(
+        event_offsets, event_indices, event_values, has_event_values,
+        input_current, t, batch_size, n_neuron);
+    step_lif_emit_kernel<<<grid_dim, block_dim, 0, stream>>>(
+        v, psc, dense_spikes, input_current, spike_queue_batch, spike_queue_pre,
+        spike_count, t, batch_size, n_neuron, dt, tau_mem, tau_syn, v_threshold,
+        v_reset, c_m);
+    step_fanout_kernel<<<grid_dim, block_dim, 0, stream>>>(
+        graph_indptr, graph_indices, graph_weight, psc, spike_queue_batch,
+        spike_queue_pre, spike_count, work_counter, batch_size, n_neuron);
+}
 
 void launch_persistent_snn_kernel(
     const int* event_offsets,

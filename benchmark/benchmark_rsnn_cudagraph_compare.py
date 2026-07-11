@@ -13,10 +13,20 @@ dispatched to the GPU*:
     capture of the whole T-step loop (warmup on a side stream, capture once,
     replay with fresh input copied into the static input buffer). Same
     pattern as ``tests/models/test_cudagraph.py``.
-  * ``persistent`` -- the CUDA cooperative-kernel backend from
+  * ``persistent_prespan_cuda`` -- the CUDA cooperative-kernel backend from
     ``btorch.backend.persistent_snn`` (single kernel launch does all T steps
     with in-kernel ``grid.sync()`` barriers instead of separate per-step
     kernel launches).
+  * ``cudagraph_prespan_cuda`` -- the *fair-dispatch* comparison for
+    ``persistent_prespan_cuda``: the **exact same** event-driven CUDA phase code
+    (the ``persistent_snn_forward_stepped`` op, 4 kernels per timestep = the
+    cooperative kernel's 4 ``grid.sync()`` phases) captured in a CUDA graph.
+    ``persistent_prespan_cuda`` vs. this is the only pair holding both algorithm
+    *and implementation* fixed, isolating *dispatch* alone. Note
+    ``cudagraph_prespan`` (Triton) shares the prespan *idea* but a different
+    work distribution (2D event x edge tiling over a padded CSR layout), and
+    ``cudagraph_native_sparse`` is a different (dense scatter) algorithm --
+    neither is a same-code comparison.
   * ``eager_native_sparse`` -- no compile, no graph; the same Python loop run
     directly. Included as a baseline to show what compile/graph buy you.
 
@@ -55,6 +65,7 @@ from benchmark.benchmark_persistent_snn import (  # noqa: E402
 )
 from btorch.backend.persistent_snn import (  # noqa: E402
     PersistentSNNParams,
+    _ensure_cuda_op,
     make_empty_state,
     persistent_snn_forward,
 )
@@ -69,7 +80,8 @@ Provider = Literal[
     "eager_prespan",
     "cudagraph_prespan",
     "cudagraph_prespan_chunked",
-    "persistent",
+    "persistent_prespan_cuda",
+    "cudagraph_prespan_cuda",
 ]
 
 PROVIDERS: tuple[Provider, ...] = (
@@ -80,7 +92,8 @@ PROVIDERS: tuple[Provider, ...] = (
     "eager_prespan",
     "cudagraph_prespan",
     "cudagraph_prespan_chunked",
-    "persistent",
+    "persistent_prespan_cuda",
+    "cudagraph_prespan_cuda",
 )
 
 
@@ -677,6 +690,94 @@ class ChunkedCUDAGraphPreSpanProvider(_ChunkedCUDAGraphProvider):
         return (max_events,)
 
 
+class CUDAGraphPreSpanCudaProvider:
+    """Capture the persistent kernel's *own* event-driven CUDA code, but
+    dispatched as ordinary per-step kernels (the
+    ``persistent_snn_forward_stepped`` op), in a manual CUDA graph.
+
+    This is the fair-dispatch counterpart to the ``persistent_prespan_cuda``
+    provider: the per-phase arithmetic is identical (the stepped op's 4
+    kernels-per-timestep are the same reset/scatter/LIF+emit+decay/fanout phases
+    as the cooperative kernel's 4 ``grid.sync()``-separated phases), so the only
+    thing that differs between ``persistent_prespan_cuda`` and this provider is
+    dispatch -- one cooperative launch with in-kernel barriers vs. a graph of
+    ordinary launches whose boundaries are the barriers. Everything else
+    (native-sparse gather/scatter, Triton pre_span) differs in *algorithm or
+    implementation*; only this pair holds both fixed and isolates dispatch alone.
+
+    The external-input events are fixed for a fixed ``x_seq`` (the benchmark
+    replays the same input), so they are computed once outside the graph and
+    fed in as constants; the op is otherwise capture-safe (fixed grids,
+    device-side counters, no host readback).
+    """
+
+    def __init__(self) -> None:
+        self._graphs: dict[tuple, dict] = {}
+
+    def _call_op(self, events, graph_csr, static_v0, static_psc0, case: BenchCase):
+        return torch.ops.btorch_cuda.persistent_snn_forward_stepped(
+            events.offsets,
+            events.indices,
+            events.values,
+            True,  # has_event_values -- values are the external input currents
+            graph_csr.indptr,
+            graph_csr.indices,
+            graph_csr.weight,
+            static_v0,
+            static_psc0,
+            case.dt,
+            case.tau_mem,
+            case.tau_syn,
+            case.v_threshold,
+            case.v_reset,
+            case.c_m,
+        )
+
+    def _build(self, x_seq: torch.Tensor, matrix: CSR, case: BenchCase) -> dict:
+        _ensure_cuda_op()
+        device = x_seq.device
+        events = dense_to_windowed_events(x_seq)
+        graph_csr = csr_to_persistent_graph(matrix)
+        static_v0, static_psc0 = _zero_state(case, device)
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self._call_op(events, graph_csr, static_v0, static_psc0, case)
+        torch.cuda.current_stream().wait_stream(s)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            spikes, v, psc = self._call_op(
+                events, graph_csr, static_v0, static_psc0, case
+            )
+        return {
+            "graph": graph,
+            "spikes": spikes,
+            "v": v,
+            "psc": psc,
+            # keep capture-referenced tensors alive for the graph's lifetime
+            "events": events,
+            "graph_csr": graph_csr,
+            "static_v0": static_v0,
+            "static_psc0": static_psc0,
+        }
+
+    def __call__(self, x_seq: torch.Tensor, matrix: CSR, case: BenchCase) -> RSNNResult:
+        key = (id(matrix), case.t_steps, case.batch_size, x_seq.shape)
+        state = self._graphs.get(key)
+        if state is None:
+            state = self._build(x_seq, matrix, case)
+            self._graphs[key] = state
+        state["graph"].replay()
+        return RSNNResult(
+            spikes=state["spikes"].clone(),
+            v=state["v"].clone(),
+            psc=state["psc"].clone(),
+        )
+
+
 def run_persistent(x_seq, matrix, case: BenchCase, *, backend: str) -> RSNNResult:
     events = dense_to_windowed_events(x_seq)
     graph = csr_to_persistent_graph(matrix)
@@ -734,6 +835,7 @@ def bench_case(
     prespan_graph_provider: CUDAGraphPreSpanProvider,
     chunked_graph_provider: ChunkedCUDAGraphNativeSparseProvider,
     chunked_prespan_provider: ChunkedCUDAGraphPreSpanProvider,
+    cudagraph_prespan_cuda_provider: CUDAGraphPreSpanCudaProvider,
     chunk_size: int,
     warmup: int,
     repeat: int,
@@ -773,10 +875,12 @@ def bench_case(
                 op = lambda: chunked_prespan_provider.run_full(
                     x_seq, matrix, case, chunk_size=chunk_size, max_events=max_events
                 )
-            elif provider == "persistent":
+            elif provider == "persistent_prespan_cuda":
                 op = lambda: run_persistent(
                     x_seq, matrix, case, backend="cuda_persistent"
                 )
+            elif provider == "cudagraph_prespan_cuda":
+                op = lambda: cudagraph_prespan_cuda_provider(x_seq, matrix, case)
             else:
                 raise ValueError(provider)
 
@@ -868,6 +972,7 @@ def main() -> None:
     prespan_graph_provider = CUDAGraphPreSpanProvider()
     chunked_graph_provider = ChunkedCUDAGraphNativeSparseProvider()
     chunked_prespan_provider = ChunkedCUDAGraphPreSpanProvider()
+    cudagraph_prespan_cuda_provider = CUDAGraphPreSpanCudaProvider()
 
     all_rows: list[dict] = []
     for t_steps in args.t_steps:
@@ -895,6 +1000,7 @@ def main() -> None:
             prespan_graph_provider=prespan_graph_provider,
             chunked_graph_provider=chunked_graph_provider,
             chunked_prespan_provider=chunked_prespan_provider,
+            cudagraph_prespan_cuda_provider=cudagraph_prespan_cuda_provider,
             chunk_size=args.chunk_size,
             warmup=args.warmup,
             repeat=args.repeat,

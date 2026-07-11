@@ -53,6 +53,35 @@ void launch_compact_event_indices_kernel(
     int block_dim,
     cudaStream_t stream);
 
+void launch_snn_step(
+    const int* event_offsets,
+    const int* event_indices,
+    const float* event_values,
+    bool has_event_values,
+    const int* graph_indptr,
+    const int* graph_indices,
+    const float* graph_weight,
+    float* v,
+    float* psc,
+    float* dense_spikes,
+    float* input_current,
+    int* spike_queue_batch,
+    int* spike_queue_pre,
+    int* spike_count,
+    int* work_counter,
+    int t,
+    int batch_size,
+    int n_neuron,
+    float dt,
+    float tau_mem,
+    float tau_syn,
+    float v_threshold,
+    float v_reset,
+    float c_m,
+    int grid_dim,
+    int block_dim,
+    cudaStream_t stream);
+
 int persistent_snn_max_active_blocks_per_sm(int block_dim);
 
 void check_cuda(cudaError_t error, const char* message) {
@@ -311,6 +340,113 @@ persistent_snn_forward_cuda(
     };
 }
 
+// Non-cooperative "stepped" forward: same event-driven prespan algorithm as
+// persistent_snn_forward, but dispatched as ordinary per-phase kernel launches
+// (4 per timestep) instead of one cooperative kernel with in-kernel grid.sync().
+// This is the fair-dispatch comparison point for the persistent kernel. It is
+// CUDA-graph capturable: fixed grid sizes, all counters live on device, and no
+// device->host readback (dense output only; no event list, no overflow check).
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+persistent_snn_forward_stepped_cuda(
+    torch::Tensor event_offsets,
+    torch::Tensor event_indices,
+    torch::Tensor event_values,
+    bool has_event_values,
+    torch::Tensor graph_indptr,
+    torch::Tensor graph_indices,
+    torch::Tensor graph_weight,
+    torch::Tensor v,
+    torch::Tensor psc,
+    double dt,
+    double tau_mem,
+    double tau_syn,
+    double v_threshold,
+    double v_reset,
+    double c_m) {
+    check_cuda_tensor(event_offsets, "event_offsets", torch::kInt32);
+    check_cuda_tensor(event_indices, "event_indices", torch::kInt32);
+    check_cuda_tensor(graph_indptr, "graph_indptr", torch::kInt32);
+    check_cuda_tensor(graph_indices, "graph_indices", torch::kInt32);
+    check_cuda_tensor(graph_weight, "graph_weight", torch::kFloat32);
+    check_cuda_tensor(v, "v", torch::kFloat32);
+    check_cuda_tensor(psc, "psc", torch::kFloat32);
+    check_same_device(event_offsets, v, "event_offsets");
+    check_same_device(event_indices, v, "event_indices");
+    check_same_device(graph_indptr, v, "graph_indptr");
+    check_same_device(graph_indices, v, "graph_indices");
+    check_same_device(graph_weight, v, "graph_weight");
+    check_same_device(psc, v, "psc");
+    if (has_event_values) {
+        check_cuda_tensor(event_values, "event_values", torch::kFloat32);
+        check_same_device(event_values, v, "event_values");
+    }
+
+    c10::cuda::CUDAGuard guard(v.device());
+    TORCH_CHECK(v.dim() == 2, "v must have shape (B, N).");
+    TORCH_CHECK(psc.sizes() == v.sizes(), "psc must match v shape.");
+    const auto batch_size = static_cast<int>(v.size(0));
+    const auto n_neuron = static_cast<int>(v.size(1));
+    TORCH_CHECK(batch_size > 0 && n_neuron > 0, "B and N must be positive.");
+    TORCH_CHECK(
+        graph_indptr.numel() == n_neuron + 1,
+        "graph_indptr must have shape (N + 1,).");
+    TORCH_CHECK(
+        (event_offsets.numel() - 1) % batch_size == 0,
+        "event_offsets bucket count must be divisible by batch size.");
+    const auto t_steps =
+        static_cast<int>((event_offsets.numel() - 1) / batch_size);
+    TORCH_CHECK(t_steps > 0, "T must be positive.");
+
+    const auto options_f = v.options();
+    const auto options_i = event_offsets.options();
+    auto v_out = v.clone();
+    auto psc_out = psc.clone();
+    auto dense_spikes = torch::empty({t_steps, batch_size, n_neuron}, options_f);
+    auto input_current = torch::empty({batch_size, n_neuron}, options_f);
+    auto spike_queue_batch = torch::empty({batch_size * n_neuron}, options_i);
+    auto spike_queue_pre = torch::empty({batch_size * n_neuron}, options_i);
+    auto spike_count = torch::zeros({1}, options_i);
+    auto work_counter = torch::zeros({1}, options_i);
+
+    const int n_cells = batch_size * n_neuron;
+    int grid_dim = (n_cells + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    grid_dim = std::max(1, std::min(grid_dim, 65535));
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+    for (int t = 0; t < t_steps; ++t) {
+        launch_snn_step(
+            event_offsets.data_ptr<int>(),
+            event_indices.data_ptr<int>(),
+            has_event_values ? event_values.data_ptr<float>() : nullptr,
+            has_event_values,
+            graph_indptr.data_ptr<int>(),
+            graph_indices.data_ptr<int>(),
+            graph_weight.data_ptr<float>(),
+            v_out.data_ptr<float>(),
+            psc_out.data_ptr<float>(),
+            dense_spikes.data_ptr<float>(),
+            input_current.data_ptr<float>(),
+            spike_queue_batch.data_ptr<int>(),
+            spike_queue_pre.data_ptr<int>(),
+            spike_count.data_ptr<int>(),
+            work_counter.data_ptr<int>(),
+            t,
+            batch_size,
+            n_neuron,
+            static_cast<float>(dt),
+            static_cast<float>(tau_mem),
+            static_cast<float>(tau_syn),
+            static_cast<float>(v_threshold),
+            static_cast<float>(v_reset),
+            static_cast<float>(c_m),
+            grid_dim,
+            kThreadsPerBlock,
+            stream);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return {dense_spikes, v_out, psc_out};
+}
+
 TORCH_LIBRARY(btorch_cuda, m) {
     m.def(
         "persistent_snn_forward("
@@ -322,8 +458,16 @@ TORCH_LIBRARY(btorch_cuda, m) {
         "float v_threshold, float v_reset, float c_m, bool hard_reset, "
         "bool return_events) -> "
         "(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+    m.def(
+        "persistent_snn_forward_stepped("
+        "Tensor event_offsets, Tensor event_indices, Tensor event_values, "
+        "bool has_event_values, Tensor graph_indptr, Tensor graph_indices, "
+        "Tensor graph_weight, Tensor v, Tensor psc, float dt, float tau_mem, "
+        "float tau_syn, float v_threshold, float v_reset, float c_m) -> "
+        "(Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(btorch_cuda, CUDA, m) {
     m.impl("persistent_snn_forward", &persistent_snn_forward_cuda);
+    m.impl("persistent_snn_forward_stepped", &persistent_snn_forward_stepped_cuda);
 }
