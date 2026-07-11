@@ -77,6 +77,14 @@ __global__ void persistent_snn_kernel(
             const float spike = fired ? 1.0f : 0.0f;
             v[cell] = v_pre - reset_delta * spike;
             dense_spikes[(t * batch_size + b) * n_neuron + n] = spike;
+            // Fold the PSC decay into this loop. Each thread owns psc[cell]
+            // (grid-stride, no cross-thread aliasing), and the reference order
+            // is: current uses the *old* psc; then psc = psc*decay + recurrent.
+            // We already read psc[cell] into `current` above, so decaying it
+            // here -- before the fanout phase atomicAdds the recurrent term --
+            // reproduces that order exactly while removing a separate decay
+            // pass over n_cells and its grid.sync() every timestep.
+            psc[cell] *= decay;
 
             if (fired) {
                 const int task = atomicAdd(spike_count, 1);
@@ -98,14 +106,35 @@ __global__ void persistent_snn_kernel(
         }
         grid.sync();
 
-        for (int cell = global_tid; cell < n_cells; cell += stride) {
-            psc[cell] *= decay;
-        }
-        grid.sync();
-
+        // Task3: recurrent prespan fanout -- warp-per-neuron work stealing.
+        //
+        // The original scheme was one-thread-per-neuron: every one of the
+        // ~gridDim*blockDim grid threads did atomicAdd(work_counter, 1) in
+        // this loop -- a contention storm on a single global int, even though
+        // only spike_count neurons have work -- and a single thread then
+        // walked that neuron's entire edge list serially. For sparse activity
+        // that left ~99% of threads idle while they all hammered one atomic.
+        //
+        // Here one *warp* cooperatively processes one spiking neuron: lane 0
+        // claims the next task with a single atomicAdd (warp-aggregated, so
+        // work_counter sees 32x fewer atomics), broadcasts it to the warp,
+        // and all 32 lanes walk the neuron's CSR edge list in parallel. Work
+        // stealing (vs. a static grid-stride split) keeps this balanced for
+        // the production graph's highly skewed fanout (avg ~177, P99 ~1911,
+        // max ~4165 per plan.md): a warp that finishes a low-fanout neuron
+        // immediately grabs the next task instead of idling.
+        //
+        // blockDim.x is a multiple of 32, so every warp is full and the
+        // 0xffffffff mask is valid; `task` is broadcast so the whole warp
+        // takes the same break decision and stays converged into grid.sync().
+        const int lane = global_tid & 31;
+        const int count = *spike_count;
         while (true) {
-            const int task = atomicAdd(work_counter, 1);
-            const int count = *spike_count;
+            int task = 0;
+            if (lane == 0) {
+                task = atomicAdd(work_counter, 1);
+            }
+            task = __shfl_sync(0xffffffffu, task, 0);
             if (task >= count || task >= queue_capacity) {
                 break;
             }
@@ -113,7 +142,7 @@ __global__ void persistent_snn_kernel(
             const int pre = spike_queue_pre[task];
             const int start = graph_indptr[pre];
             const int end = graph_indptr[pre + 1];
-            for (int edge = start; edge < end; ++edge) {
+            for (int edge = start + lane; edge < end; edge += 32) {
                 const int post = graph_indices[edge];
                 if (post >= 0 && post < n_neuron) {
                     atomicAdd(psc + b * n_neuron + post, graph_weight[edge]);

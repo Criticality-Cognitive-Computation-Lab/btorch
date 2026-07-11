@@ -65,8 +65,10 @@ Provider = Literal[
     "eager_native_sparse",
     "torch_compile_reduce_overhead",
     "cudagraph_native_sparse",
+    "cudagraph_native_sparse_chunked",
     "eager_prespan",
     "cudagraph_prespan",
+    "cudagraph_prespan_chunked",
     "persistent",
 ]
 
@@ -74,8 +76,10 @@ PROVIDERS: tuple[Provider, ...] = (
     "eager_native_sparse",
     "torch_compile_reduce_overhead",
     "cudagraph_native_sparse",
+    "cudagraph_native_sparse_chunked",
     "eager_prespan",
     "cudagraph_prespan",
+    "cudagraph_prespan_chunked",
     "persistent",
 )
 
@@ -481,6 +485,198 @@ class CUDAGraphPreSpanProvider:
         )
 
 
+class _ChunkedCUDAGraphProvider:
+    """Capture a fixed ``chunk_size``-step window once, replay it repeatedly to
+    cover a full ``case.t_steps`` sequence without paying capture cost for the
+    whole sequence up front.
+
+    ``CUDAGraphNativeSparseProvider``/``CUDAGraphPreSpanProvider`` above
+    capture the *entire* T-step loop as one graph, so capture time costs one
+    full eager-speed pass through all T steps -- fine for T=256, not fine if
+    T is 1000+ or only becomes known in pieces. This instead captures a
+    small chunk once. To keep the recurrence correct across replays with no
+    Python-level state threading, the captured region copies its own output
+    state back into its input buffers (``static_v0.copy_(out_v)``), so
+    replay N+1 automatically continues from replay N's final state via fixed
+    CUDA-graph addresses -- the same "in-place hidden state" trick used for
+    graph-capturing RNN cells. Per-chunk spikes are copied into a
+    pre-allocated full-length history buffer *between* replays, which is
+    ordinary eager code (not part of the capture), so it can address any
+    slice of that buffer dynamically -- recording full history does not
+    require the capture itself to span the full history.
+
+    Requires ``chunk_size`` to evenly divide ``case.t_steps``: a short final
+    chunk would still run the graph's fixed ``chunk_size`` steps internally
+    (LIF state decays even on zero-padded input), corrupting both the padded
+    tail of the spike history and the final ``v``/``psc`` state.
+    """
+
+    def __init__(self) -> None:
+        self._graphs: dict[tuple, dict] = {}
+
+    def _forward(
+        self, static_x, matrix, static_v0, static_psc0, case, chunk_size, extra
+    ):
+        raise NotImplementedError
+
+    def _build_extra(self, matrix, case, chunk_size, **build_kwargs) -> dict:
+        raise NotImplementedError
+
+    def _cache_key(self, **build_kwargs) -> tuple:
+        raise NotImplementedError
+
+    def _build(
+        self, matrix: CSR, case: BenchCase, device, chunk_size: int, build_kwargs: dict
+    ) -> dict:
+        static_x = torch.zeros(
+            chunk_size,
+            case.batch_size,
+            case.n_neuron,
+            device=device,
+            dtype=torch.float32,
+        )
+        static_v0, static_psc0 = _zero_state(case, device)
+        extra = self._build_extra(matrix, case, chunk_size, **build_kwargs)
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                _, out_v, out_psc = self._forward(
+                    static_x, matrix, static_v0, static_psc0, case, chunk_size, extra
+                )
+                static_v0.copy_(out_v)
+                static_psc0.copy_(out_psc)
+        torch.cuda.current_stream().wait_stream(s)
+        # Warmup left state non-zero (it's chaining on purpose, same as real
+        # replays will); reset to zero before capture so the graph's own
+        # first invocation -- and every run_full() rollout, which re-zeros
+        # before its first chunk -- starts from a clean initial state.
+        static_v0.zero_()
+        static_psc0.zero_()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_spikes, out_v, out_psc = self._forward(
+                static_x, matrix, static_v0, static_psc0, case, chunk_size, extra
+            )
+            static_v0.copy_(out_v)
+            static_psc0.copy_(out_psc)
+
+        return {
+            "graph": graph,
+            "static_x": static_x,
+            "static_spikes": static_spikes,
+            "static_v0": static_v0,
+            "static_psc0": static_psc0,
+            "extra": extra,  # kept alive -- see CUDAGraphNativeSparseProvider._build
+        }
+
+    def run_full(
+        self,
+        x_seq: torch.Tensor,
+        matrix: CSR,
+        case: BenchCase,
+        *,
+        chunk_size: int,
+        **build_kwargs,
+    ) -> RSNNResult:
+        if case.t_steps % chunk_size != 0:
+            raise ValueError(
+                f"chunk_size={chunk_size} must evenly divide t_steps={case.t_steps}"
+            )
+        device = x_seq.device
+        key = (
+            id(matrix),
+            case.t_steps,
+            case.batch_size,
+            case.n_neuron,
+            chunk_size,
+        ) + self._cache_key(**build_kwargs)
+        state = self._graphs.get(key)
+        if state is None:
+            state = self._build(matrix, case, device, chunk_size, build_kwargs)
+            self._graphs[key] = state
+
+        state["static_v0"].zero_()
+        state["static_psc0"].zero_()
+        history = torch.empty(
+            case.t_steps,
+            case.batch_size,
+            case.n_neuron,
+            device=device,
+            dtype=x_seq.dtype,
+        )
+        for c in range(case.t_steps // chunk_size):
+            start = c * chunk_size
+            end = start + chunk_size
+            state["static_x"].copy_(x_seq[start:end])
+            state["graph"].replay()
+            history[start:end].copy_(state["static_spikes"])
+        return RSNNResult(
+            spikes=history,
+            v=state["static_v0"].clone(),
+            psc=state["static_psc0"].clone(),
+        )
+
+
+class ChunkedCUDAGraphNativeSparseProvider(_ChunkedCUDAGraphProvider):
+    """Chunked capture of the native-sparse recurrent loop."""
+
+    def _forward(
+        self, static_x, matrix, static_v0, static_psc0, case, chunk_size, extra
+    ):
+        return native_sparse_rsnn_forward(
+            static_x,
+            matrix,
+            static_v0,
+            static_psc0,
+            dt=case.dt,
+            tau_mem=case.tau_mem,
+            tau_syn=case.tau_syn,
+            v_threshold=case.v_threshold,
+            v_reset=case.v_reset,
+            c_m=case.c_m,
+            t_steps=chunk_size,
+            row=extra["row"],
+        )
+
+    def _build_extra(self, matrix, case, chunk_size, **build_kwargs) -> dict:
+        return {"row": precompute_csr_row(matrix)}
+
+    def _cache_key(self, **build_kwargs) -> tuple:
+        return ()
+
+
+class ChunkedCUDAGraphPreSpanProvider(_ChunkedCUDAGraphProvider):
+    """Chunked capture of the pre_span (Triton) recurrent loop."""
+
+    def _forward(
+        self, static_x, matrix, static_v0, static_psc0, case, chunk_size, extra
+    ):
+        return prespan_rsnn_forward(
+            static_x,
+            matrix,
+            static_v0,
+            static_psc0,
+            dt=case.dt,
+            tau_mem=case.tau_mem,
+            tau_syn=case.tau_syn,
+            v_threshold=case.v_threshold,
+            v_reset=case.v_reset,
+            c_m=case.c_m,
+            t_steps=chunk_size,
+            max_events=extra["max_events"],
+        )
+
+    def _build_extra(self, matrix, case, chunk_size, *, max_events: int) -> dict:
+        matrix.padded_csr_layout()
+        return {"max_events": max_events}
+
+    def _cache_key(self, *, max_events: int) -> tuple:
+        return (max_events,)
+
+
 def run_persistent(x_seq, matrix, case: BenchCase, *, backend: str) -> RSNNResult:
     events = dense_to_windowed_events(x_seq)
     graph = csr_to_persistent_graph(matrix)
@@ -536,6 +732,9 @@ def bench_case(
     compiled_provider: CompiledNativeSparseProvider,
     graph_provider: CUDAGraphNativeSparseProvider,
     prespan_graph_provider: CUDAGraphPreSpanProvider,
+    chunked_graph_provider: ChunkedCUDAGraphNativeSparseProvider,
+    chunked_prespan_provider: ChunkedCUDAGraphPreSpanProvider,
+    chunk_size: int,
     warmup: int,
     repeat: int,
     check_correctness: bool,
@@ -565,6 +764,14 @@ def bench_case(
             elif provider == "cudagraph_prespan":
                 op = lambda: prespan_graph_provider(
                     x_seq, matrix, case, max_events=max_events
+                )
+            elif provider == "cudagraph_native_sparse_chunked":
+                op = lambda: chunked_graph_provider.run_full(
+                    x_seq, matrix, case, chunk_size=chunk_size
+                )
+            elif provider == "cudagraph_prespan_chunked":
+                op = lambda: chunked_prespan_provider.run_full(
+                    x_seq, matrix, case, chunk_size=chunk_size, max_events=max_events
                 )
             elif provider == "persistent":
                 op = lambda: run_persistent(
@@ -634,6 +841,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=30)
     parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=16,
+        help=(
+            "steps per capture for the *_chunked providers. Must evenly "
+            "divide every --t-steps value."
+        ),
+    )
+    parser.add_argument(
         "--providers", nargs="+", choices=PROVIDERS, default=list(PROVIDERS)
     )
     parser.add_argument("--skip-correctness", action="store_true")
@@ -650,6 +866,8 @@ def main() -> None:
     compiled_provider = CompiledNativeSparseProvider()
     graph_provider = CUDAGraphNativeSparseProvider()
     prespan_graph_provider = CUDAGraphPreSpanProvider()
+    chunked_graph_provider = ChunkedCUDAGraphNativeSparseProvider()
+    chunked_prespan_provider = ChunkedCUDAGraphPreSpanProvider()
 
     all_rows: list[dict] = []
     for t_steps in args.t_steps:
@@ -675,6 +893,9 @@ def main() -> None:
             compiled_provider=compiled_provider,
             graph_provider=graph_provider,
             prespan_graph_provider=prespan_graph_provider,
+            chunked_graph_provider=chunked_graph_provider,
+            chunked_prespan_provider=chunked_prespan_provider,
+            chunk_size=args.chunk_size,
             warmup=args.warmup,
             repeat=args.repeat,
             check_correctness=not args.skip_correctness,
