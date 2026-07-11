@@ -45,6 +45,7 @@ The benchmark and persistent contract share these defaults:
 
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass
 from typing import Literal
 
@@ -151,9 +152,11 @@ def _validate_events(events: WindowedSpikeEvents) -> tuple[int, int, int]:
             "events.offsets must have shape (T * B + 1,), got "
             f"{tuple(offsets.shape)} for shape={events.shape}."
         )
-    if int(offsets[0].item()) != 0:
+    # One D2H sync for both boundary values instead of two separate `.item()` calls.
+    offsets_first, offsets_last = offsets[[0, -1]].tolist()
+    if offsets_first != 0:
         raise ValueError("events.offsets[0] must be zero.")
-    if int(offsets[-1].item()) != indices.numel():
+    if offsets_last != indices.numel():
         raise ValueError("events.offsets[-1] must equal events.indices.numel().")
     if events.values is not None:
         if events.values.shape != indices.shape:
@@ -277,9 +280,8 @@ def torch_stub_persistent_snn_forward(
 
 
 def _has_cuda_op() -> bool:
-    return (
-        hasattr(torch.ops, "btorch_cuda")
-        and hasattr(torch.ops.btorch_cuda, "persistent_snn_forward")
+    return hasattr(torch.ops, "btorch_cuda") and hasattr(
+        torch.ops.btorch_cuda, "persistent_snn_forward"
     )
 
 
@@ -289,6 +291,38 @@ def _ensure_cuda_op() -> None:
     from .persistent import plain_version
 
     plain_version.load()
+
+
+# Delay tensors already confirmed all-zero, keyed by id(). `graph.delay` is part
+# of a graph's fixed structure and is typically reused unchanged across many
+# forward() calls (e.g. sequential windows of one long sequence) -- caching this
+# avoids re-running an O(E) reduction + device->host sync on every single call
+# for a value that never changes.
+#
+# Keyed by id() rather than stored in a `weakref.WeakSet`/`WeakKeyDictionary`:
+# those containers fall back to `==` on hash-bucket lookups, and torch.Tensor's
+# `__eq__` is elementwise (returns a Tensor, not a bool), which raises
+# "Boolean value of Tensor with more than one value is ambiguous" -- even when
+# comparing a tensor against itself, since weakref's own `__eq__` has no
+# identity shortcut. Each entry carries a weakref-with-callback so it's evicted
+# the moment the tensor is actually garbage collected, which also avoids the
+# id()-reuse hazard (a new, unrelated tensor later allocated at the same
+# address would otherwise appear to hit the cache).
+_zero_delay_cache: dict[int, "weakref.ref[torch.Tensor]"] = {}
+
+
+def _delay_confirmed_zero(delay: torch.Tensor) -> bool:
+    ref = _zero_delay_cache.get(id(delay))
+    return ref is not None and ref() is delay
+
+
+def _remember_delay_confirmed_zero(delay: torch.Tensor) -> None:
+    key = id(delay)
+
+    def _evict(_: object, key: int = key) -> None:
+        _zero_delay_cache.pop(key, None)
+
+    _zero_delay_cache[key] = weakref.ref(delay, _evict)
 
 
 def _cuda_persistent_snn_forward(
@@ -316,8 +350,13 @@ def _cuda_persistent_snn_forward(
         raise TypeError("cuda_persistent v1 requires int32 graph indices.")
     if graph.delay is not None and graph.delay.dtype != torch.int32:
         raise TypeError("cuda_persistent v1 requires int32 graph delay.")
-    if graph.delay is not None and torch.count_nonzero(graph.delay).item() != 0:
-        raise ValueError("cuda_persistent v1 does not support nonzero delay.")
+    delay_validated = False
+    if graph.delay is not None:
+        if not _delay_confirmed_zero(graph.delay):
+            if torch.count_nonzero(graph.delay).item() != 0:
+                raise ValueError("cuda_persistent v1 does not support nonzero delay.")
+            _remember_delay_confirmed_zero(graph.delay)
+        delay_validated = True
     if state.v.dtype != torch.float32 or state.psc.dtype != torch.float32:
         raise TypeError("cuda_persistent v1 requires float32 state tensors.")
     if graph.weight.dtype != torch.float32:
@@ -354,6 +393,7 @@ def _cuda_persistent_snn_forward(
         graph.weight,
         graph_delay,
         graph.delay is not None,
+        delay_validated,
         state.v,
         state.psc,
         float(params.dt),

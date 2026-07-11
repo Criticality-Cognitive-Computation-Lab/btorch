@@ -78,7 +78,7 @@ void check_same_device(
         " must be on the same CUDA device as v.");
 }
 
-int cooperative_grid_dim(int block_dim) {
+int cooperative_grid_dim_uncached(int block_dim) {
     int device = -1;
     check_cuda(cudaGetDevice(&device), "cudaGetDevice failed");
 
@@ -91,6 +91,26 @@ int cooperative_grid_dim(int block_dim) {
     const int active_blocks = persistent_snn_max_active_blocks_per_sm(block_dim);
     TORCH_CHECK(active_blocks > 0, "persistent SNN kernel has zero occupancy.");
     return active_blocks * prop.multiProcessorCount;
+}
+
+// `cudaGetDeviceProperties` + `cudaOccupancyMaxActiveBlocksPerMultiprocessor`
+// are synchronous, CPU-blocking driver calls -- and this function was
+// re-running them on *every single* forward() call. Measured cost: ~1.1-1.2ms
+// per call (dwarfing every `.item()` sync in this file combined, which are
+// each ~10-30us). The result only depends on {block_dim, current device,
+// this kernel's fixed resource usage (registers/shared mem)}, none of which
+// change between calls in this process, so it's safe to compute once and
+// cache. (Not safe across a device change mid-process, but this op is always
+// invoked with the tensors' own device via CUDAGuard, and does not support
+// multi-device dispatch within one call.)
+int cooperative_grid_dim(int block_dim) {
+    static int cached = -1;
+    static int cached_block_dim = -1;
+    if (cached < 0 || cached_block_dim != block_dim) {
+        cached = cooperative_grid_dim_uncached(block_dim);
+        cached_block_dim = block_dim;
+    }
+    return cached;
 }
 
 std::tuple<
@@ -110,6 +130,7 @@ persistent_snn_forward_cuda(
     torch::Tensor graph_weight,
     torch::Tensor graph_delay,
     bool has_delay,
+    bool delay_validated,
     torch::Tensor v,
     torch::Tensor psc,
     double dt,
@@ -150,7 +171,13 @@ persistent_snn_forward_cuda(
     }
 
     c10::cuda::CUDAGuard guard(v.device());
-    if (has_delay) {
+    if (has_delay && !delay_validated) {
+        // Only pay for this O(E) reduction + device->host sync when the caller
+        // (the Python `persistent_snn_forward` dispatcher) hasn't already
+        // verified it. The dispatcher caches this per delay-tensor identity,
+        // since the delay array is part of a graph's fixed structure and is
+        // typically reused unchanged across many forward() calls. Direct
+        // callers of this op (bypassing the dispatcher) always re-verify here.
         TORCH_CHECK(
             graph_delay.eq(0).all().item<bool>(),
             "persistent SNN v1 does not support nonzero delay.");
@@ -172,9 +199,11 @@ persistent_snn_forward_cuda(
     TORCH_CHECK(
         event_offsets.numel() >= 2,
         "event_offsets must contain at least one bucket.");
-    TORCH_CHECK(
-        event_offsets[event_offsets.numel() - 1].item<int>() == event_indices.numel(),
-        "event_offsets[-1] must equal event_indices.numel().");
+    // event_offsets[-1] == event_indices.numel() is guaranteed by the Python
+    // `persistent_snn_forward` dispatcher's `_validate_events` (which already
+    // pays this device->host sync once). Not re-checked here to avoid paying
+    // it a second time on every call; direct callers of this op bypass that
+    // guarantee.
     TORCH_CHECK(
         (event_offsets.numel() - 1) % batch_size == 0,
         "event_offsets bucket count must be divisible by batch size.");
@@ -236,27 +265,37 @@ persistent_snn_forward_cuda(
         stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    auto event_offsets_out = torch::empty({t_steps * batch_size + 1}, options_i);
-    event_offsets_out[0].zero_();
-    event_offsets_out.slice(0, 1).copy_(torch::cumsum(event_counts, 0));
-    const int total_spikes =
-        event_offsets_out[event_offsets_out.numel() - 1].item<int>();
-    auto event_indices_out = torch::empty({total_spikes}, options_i);
-    if (return_events && total_spikes > 0) {
-        const int compact_grid = std::min(
-            grid_dim,
-            (t_steps * batch_size + kThreadsPerBlock - 1) / kThreadsPerBlock);
-        launch_compact_event_indices_kernel(
-            event_counts.data_ptr<int>(),
-            event_offsets_out.data_ptr<int>(),
-            event_indices_full.data_ptr<int>(),
-            event_indices_out.data_ptr<int>(),
-            t_steps * batch_size,
-            n_neuron,
-            compact_grid,
-            kThreadsPerBlock,
-            stream);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    torch::Tensor event_offsets_out;
+    torch::Tensor event_indices_out;
+    if (return_events) {
+        event_offsets_out = torch::empty({t_steps * batch_size + 1}, options_i);
+        event_offsets_out[0].zero_();
+        event_offsets_out.slice(0, 1).copy_(torch::cumsum(event_counts, 0));
+        const int total_spikes =
+            event_offsets_out[event_offsets_out.numel() - 1].item<int>();
+        event_indices_out = torch::empty({total_spikes}, options_i);
+        if (total_spikes > 0) {
+            const int compact_grid = std::min(
+                grid_dim,
+                (t_steps * batch_size + kThreadsPerBlock - 1) / kThreadsPerBlock);
+            launch_compact_event_indices_kernel(
+                event_counts.data_ptr<int>(),
+                event_offsets_out.data_ptr<int>(),
+                event_indices_full.data_ptr<int>(),
+                event_indices_out.data_ptr<int>(),
+                t_steps * batch_size,
+                n_neuron,
+                compact_grid,
+                kThreadsPerBlock,
+                stream);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+    } else {
+        // Caller doesn't want per-spike event output (return_mode="dense") --
+        // skip the cumsum + device->host size readback entirely instead of
+        // paying for it unconditionally on every call.
+        event_offsets_out = torch::empty({0}, options_i);
+        event_indices_out = torch::empty({0}, options_i);
     }
 
     if (overflow.item<int>() != 0) {
@@ -277,7 +316,8 @@ TORCH_LIBRARY(btorch_cuda, m) {
         "persistent_snn_forward("
         "Tensor event_offsets, Tensor event_indices, Tensor event_values, "
         "bool has_event_values, Tensor graph_indptr, Tensor graph_indices, "
-        "Tensor graph_weight, Tensor graph_delay, bool has_delay, Tensor v, "
+        "Tensor graph_weight, Tensor graph_delay, bool has_delay, "
+        "bool delay_validated, Tensor v, "
         "Tensor psc, float dt, float tau_mem, float tau_syn, "
         "float v_threshold, float v_reset, float c_m, bool hard_reset, "
         "bool return_events) -> "
