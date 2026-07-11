@@ -99,6 +99,37 @@ Pushed to verify rigorously:
 Corrected the report and the commit message accordingly. (Earlier drafts — and the prior
 report — called this "nondeterminism"; that was wrong.)
 
+## 6. Course correction — revert the rebalance, and the fair comparison
+
+Feedback: don't touch work balance; the warp-per-neuron fan-out (Change B) rebalanced work,
+so it was **reverted** — the fan-out is back to the original one-thread-per-neuron scheme.
+Change A (folded PSC decay) was kept, but with B gone its measured gain is marginal (~1–3%;
+the A-only kernel ≈ the original). So the micro-optimizations don't move the needle much.
+
+The real question resurfaced: is a fair comparison even being made? The old set mixed
+*algorithm* and *dispatch* — and it's worth being precise, because only ONE pair is truly
+same-code:
+- `persistent_prespan_cuda` (cooperative) and `cudagraph_prespan_cuda` (graph): **identical**
+  hand-CUDA phase code (the stepped op is literally the cooperative kernel's 4 grid.sync()
+  phases split into 4 launches). This is the controlled, dispatch-only comparison.
+- `cudagraph_prespan` (Triton): same prespan *idea* but a different work distribution (2D
+  event×edge tiling over a padded CSR layout) — not same code.
+- `cudagraph_native_sparse`: a different algorithm entirely (dense scatter over all edges).
+
+So to isolate dispatch, added `cudagraph_prespan_cuda` via a new
+`persistent_snn_forward_stepped` op. (A cuSPARSE-in-the-kernel idea was dropped — cuSPARSE is
+host-only, can't be called from a cooperative kernel.)
+
+**Result:** same-code, dispatch-only — the cooperative kernel is **~2.8–3.8× slower** than the
+graph of per-step kernels, and `cudagraph_prespan_cuda` is the fastest provider overall. So
+the persistent kernel's slowness is the **cooperative single-launch design** (occupancy-capped
+co-resident grid + grid.sync() cost), not the prespan algorithm. Takeaway: prefer a graph of
+ordinary event-driven kernels; the cooperative kernel buys launch-overhead avoidance that a
+CUDA graph already provides, while giving up occupancy and cheap barriers.
+
+Naming: cooperative = `persistent_prespan_cuda`, graph-of-same-code = `cudagraph_prespan_cuda`
+(prefix = dispatch, suffix = implementation; parallel to the Triton `cudagraph_prespan`).
+
 ## Open item (out of scope, unfixed)
 
 The ~10-spike deterministic divergence from the *dense* reference at T≥128 is a property of
