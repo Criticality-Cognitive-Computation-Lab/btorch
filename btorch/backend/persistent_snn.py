@@ -7,9 +7,9 @@ spike outputs. A future C++/CUDA implementation can register
 ``torch.ops.btorch_cuda.persistent_snn_forward`` without changing benchmark
 or caller code.
 
-The first persistent kernel target is intentionally narrow: recurrent RSNN
-dynamics with a scalar-parameter LIF neuron and an ``ExponentialPSC`` synapse.
-The benchmark and persistent contract share these defaults:
+The persistent kernel target is intentionally narrow: recurrent RSNN dynamics
+with scalar-parameter ``GLIF3`` neurons and ``AlphaPSC`` synapses. The benchmark
+and persistent contract share these defaults:
 
 .. list-table::
    :header-rows: 1
@@ -19,22 +19,28 @@ The benchmark and persistent contract share these defaults:
      - First-kernel meaning
    * - ``dt``
      - ``1.0``
-     - Euler step size for LIF and exponential PSC decay.
-   * - ``tau_mem``
+     - Euler step size for GLIF and AlphaPSC dynamics.
+   * - ``tau``
      - ``20.0``
-     - LIF membrane time constant.
+     - GLIF membrane time constant.
    * - ``tau_syn``
      - ``5.0``
-     - Exponential PSC time constant.
+     - AlphaPSC time constant.
    * - ``v_threshold``
-     - ``1.0``
+     - ``-45.0``
      - Spike threshold; spikes are emitted when ``v >= v_threshold``.
    * - ``v_reset``
-     - ``0.0``
-     - Reset baseline used by the LIF leak and reset delta.
+     - ``-60.0``
+     - Reset baseline used by the GLIF leak and reset delta.
    * - ``c_m``
-     - ``1.0``
+     - ``2.0``
      - Membrane capacitance divisor for input current.
+   * - ``tau_ref``
+     - ``2.0``
+     - Refractory period in time units.
+   * - ``k`` / ``asc_amps``
+     - ``(0.1, 0.2)`` / ``(1.0, -2.0)``
+     - GLIF3 after-spike current decay rates and increments.
    * - ``hard_reset``
      - ``False``
      - Soft reset: subtract ``v_threshold - v_reset`` after a spike.
@@ -97,6 +103,8 @@ class PersistentSNNState:
 
     v: torch.Tensor
     psc: torch.Tensor
+    psc_h: torch.Tensor | None = None
+    asc: torch.Tensor | None = None
     refractory: torch.Tensor | None = None
     delay_ring: torch.Tensor | None = None
 
@@ -110,24 +118,68 @@ class PersistentSNNOutput:
     state: PersistentSNNState
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class PersistentSNNParams:
     """Scalar simulation parameters for the persistent SNN operator.
 
-    The first CUDA persistent kernel is scoped to scalar-parameter
-    LIF + ExponentialPSC dynamics. Its default reset mode is the same as
-    :class:`btorch.models.neurons.lif.LIF`: soft reset
-    (``hard_reset=False``).
+    The CUDA persistent kernel is scoped to scalar-parameter
+    :class:`btorch.models.neurons.glif.GLIF3` +
+    :class:`btorch.models.synapse.AlphaPSC` dynamics. Its default reset mode is
+    the same as ``GLIF3``: soft reset (``hard_reset=False``).
     """
 
     dt: float = 1.0
-    tau_mem: float = 20.0
+    tau: float = 20.0
     tau_syn: float = 5.0
-    v_threshold: float = 1.0
-    v_reset: float = 0.0
-    c_m: float = 1.0
+    v_threshold: float = -45.0
+    v_reset: float = -60.0
+    v_rest: float | None = None
+    c_m: float = 2.0
+    tau_ref: float = 2.0
+    k: tuple[float, ...] = (0.1, 0.2)
+    asc_amps: tuple[float, ...] = (1.0, -2.0)
+    psc_g_max: float = 1.0
     hard_reset: bool = False
     window_size: int = 128
+
+    def __init__(
+        self,
+        dt: float = 1.0,
+        tau: float = 20.0,
+        tau_mem: float | None = None,
+        tau_syn: float = 5.0,
+        v_threshold: float = -45.0,
+        v_reset: float = -60.0,
+        v_rest: float | None = None,
+        c_m: float = 2.0,
+        tau_ref: float = 2.0,
+        k: tuple[float, ...] = (0.1, 0.2),
+        asc_amps: tuple[float, ...] = (1.0, -2.0),
+        psc_g_max: float = 1.0,
+        hard_reset: bool = False,
+        window_size: int = 128,
+    ) -> None:
+        if tau_mem is not None:
+            tau = tau_mem
+        object.__setattr__(self, "dt", dt)
+        object.__setattr__(self, "tau", tau)
+        object.__setattr__(self, "tau_syn", tau_syn)
+        object.__setattr__(self, "v_threshold", v_threshold)
+        object.__setattr__(self, "v_reset", v_reset)
+        object.__setattr__(self, "v_rest", v_rest)
+        object.__setattr__(self, "c_m", c_m)
+        object.__setattr__(self, "tau_ref", tau_ref)
+        object.__setattr__(self, "k", tuple(k))
+        object.__setattr__(self, "asc_amps", tuple(asc_amps))
+        object.__setattr__(self, "psc_g_max", psc_g_max)
+        object.__setattr__(self, "hard_reset", hard_reset)
+        object.__setattr__(self, "window_size", window_size)
+
+    @property
+    def tau_mem(self) -> float:
+        """Backward-compatible alias for the membrane time constant."""
+
+        return self.tau
 
 
 def _check_int_tensor(name: str, tensor: torch.Tensor, ndim: int) -> None:
@@ -195,6 +247,16 @@ def _validate_state(
         raise ValueError(
             f"state.psc must have shape {expected}, got {state.psc.shape}."
         )
+    if state.psc_h is not None and tuple(state.psc_h.shape) != expected:
+        raise ValueError(
+            f"state.psc_h must have shape {expected}, got {state.psc_h.shape}."
+        )
+    if state.asc is not None:
+        if state.asc.ndim != 3 or tuple(state.asc.shape[:2]) != expected:
+            raise ValueError(
+                "state.asc must have shape (B, N, n_asc), got "
+                f"{state.asc.shape}."
+            )
     if state.refractory is not None and tuple(state.refractory.shape) != expected:
         raise ValueError(
             f"state.refractory must have shape {expected}, "
@@ -209,12 +271,16 @@ def make_empty_state(
     device: torch.device | str | None = None,
     dtype: torch.dtype = torch.float32,
     refractory: bool = True,
+    psc_h: bool = True,
+    n_asc: int = 2,
     delay_ring_shape: tuple[int, int, int] | None = None,
 ) -> PersistentSNNState:
     """Create zero-filled persistent SNN state tensors."""
 
     v = torch.zeros((batch_size, n_neuron), device=device, dtype=dtype)
     psc = torch.zeros_like(v)
+    psc_h_t = torch.zeros_like(v) if psc_h else None
+    asc = torch.zeros((batch_size, n_neuron, n_asc), device=device, dtype=dtype)
     refractory_t = torch.zeros_like(v) if refractory else None
     delay_ring = None
     if delay_ring_shape is not None:
@@ -222,6 +288,8 @@ def make_empty_state(
     return PersistentSNNState(
         v=v,
         psc=psc,
+        psc_h=psc_h_t,
+        asc=asc,
         refractory=refractory_t,
         delay_ring=delay_ring,
     )
@@ -306,8 +374,14 @@ def _cuda_persistent_snn_forward(
         raise ValueError("cuda_persistent v1 requires a recurrent N x N graph.")
     if params.hard_reset:
         raise ValueError("cuda_persistent v1 only supports hard_reset=False.")
-    if state.refractory is not None:
-        raise ValueError("cuda_persistent v1 does not support refractory state.")
+    if state.refractory is None:
+        raise ValueError("cuda_persistent v1 requires refractory state.")
+    if state.psc_h is None:
+        raise ValueError("cuda_persistent v1 requires psc_h state.")
+    if state.asc is None:
+        raise ValueError("cuda_persistent v1 requires asc state.")
+    if len(params.k) != 2 or len(params.asc_amps) != 2:
+        raise ValueError("cuda_persistent v1 requires exactly two GLIF3 ASC modes.")
     if state.delay_ring is not None:
         raise ValueError("cuda_persistent v1 does not support delay_ring state.")
     if events.offsets.dtype != torch.int32 or events.indices.dtype != torch.int32:
@@ -320,6 +394,10 @@ def _cuda_persistent_snn_forward(
         raise ValueError("cuda_persistent v1 does not support nonzero delay.")
     if state.v.dtype != torch.float32 or state.psc.dtype != torch.float32:
         raise TypeError("cuda_persistent v1 requires float32 state tensors.")
+    if state.psc_h.dtype != torch.float32 or state.asc.dtype != torch.float32:
+        raise TypeError("cuda_persistent v1 requires float32 extended state tensors.")
+    if state.refractory.dtype != torch.float32:
+        raise TypeError("cuda_persistent v1 requires float32 refractory tensor.")
     if graph.weight.dtype != torch.float32:
         raise TypeError("cuda_persistent v1 requires float32 graph weights.")
     if events.values is not None and events.values.dtype != torch.float32:
@@ -343,6 +421,9 @@ def _cuda_persistent_snn_forward(
         event_indices,
         v_out,
         psc_out,
+        psc_h_out,
+        asc_out,
+        refractory_out,
         _overflow,
     ) = torch.ops.btorch_cuda.persistent_snn_forward(
         events.offsets,
@@ -356,12 +437,22 @@ def _cuda_persistent_snn_forward(
         graph.delay is not None,
         state.v,
         state.psc,
+        state.psc_h,
+        state.asc,
+        state.refractory,
         float(params.dt),
-        float(params.tau_mem),
+        float(params.tau),
         float(params.tau_syn),
         float(params.v_threshold),
         float(params.v_reset),
+        float(params.v_reset if params.v_rest is None else params.v_rest),
         float(params.c_m),
+        float(params.tau_ref),
+        float(params.k[0]),
+        float(params.k[1]),
+        float(params.asc_amps[0]),
+        float(params.asc_amps[1]),
+        float(params.psc_g_max),
         bool(params.hard_reset),
         return_events,
     )
@@ -378,7 +469,13 @@ def _cuda_persistent_snn_forward(
     return PersistentSNNOutput(
         spikes=spikes,
         spike_events=spike_events,
-        state=PersistentSNNState(v=v_out, psc=psc_out),
+        state=PersistentSNNState(
+            v=v_out,
+            psc=psc_out,
+            psc_h=psc_h_out,
+            asc=asc_out,
+            refractory=refractory_out,
+        ),
     )
 
 

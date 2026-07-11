@@ -88,28 +88,84 @@ def _graph(device: torch.device) -> tuple[EventCSRGraph, torch.Tensor]:
     )
 
 
+def _state(
+    batch_size: int,
+    n_neuron: int,
+    device: torch.device,
+    params: PersistentSNNParams | None = None,
+) -> PersistentSNNState:
+    """Create a complete GLIF3 + AlphaPSC persistent state for CUDA tests."""
+
+    params = params or PersistentSNNParams()
+    v = torch.full(
+        (batch_size, n_neuron),
+        params.v_reset,
+        device=device,
+        dtype=torch.float32,
+    )
+    psc = torch.zeros_like(v)
+    return PersistentSNNState(
+        v=v,
+        psc=psc,
+        psc_h=torch.zeros_like(v),
+        asc=torch.zeros(batch_size, n_neuron, 2, device=device),
+        refractory=torch.zeros_like(v),
+    )
+
+
 def _reference(
     x_seq: torch.Tensor,
     weight_dense: torch.Tensor,
     state: PersistentSNNState,
     params: PersistentSNNParams,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Dense reference matching the v1 persistent CUDA contract."""
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Dense reference matching the GLIF3 + AlphaPSC CUDA contract."""
 
     v = state.v.clone()
     psc = state.psc.clone()
-    decay = math.exp(-params.dt / params.tau_syn)
+    assert state.psc_h is not None
+    assert state.asc is not None
+    assert state.refractory is not None
+    psc_h = state.psc_h.clone()
+    asc = state.asc.clone()
+    refractory = state.refractory.clone()
+    syn_decay = math.exp(-params.dt / params.tau_syn)
+    mem_decay = math.exp(-params.dt / params.tau)
+    asc_decay = torch.tensor(
+        [math.exp(-params.dt * params.k[0]), math.exp(-params.dt * params.k[1])],
+        device=x_seq.device,
+        dtype=x_seq.dtype,
+    )
+    asc_amps = torch.tensor(params.asc_amps, device=x_seq.device, dtype=x_seq.dtype)
+    v_rest = params.v_reset if params.v_rest is None else params.v_rest
     spikes = []
     for t in range(x_seq.shape[0]):
-        current = psc + x_seq[t]
-        v_pre = v + params.dt * (
-            -(v - params.v_reset) / params.tau_mem + current / params.c_m
-        )
-        z = (v_pre >= params.v_threshold).to(v.dtype)
+        psc = syn_decay * psc + (1.0 - syn_decay) * psc_h
+        psc_h = syn_decay * psc_h
+        asc_before = asc
+        asc = asc * asc_decay
+        current = psc + x_seq[t] + asc_before.sum(dim=-1)
+        v_inf = v_rest + params.tau * current / params.c_m
+        v_pre = v_inf + (v - v_inf) * mem_decay
+        z = ((v_pre >= params.v_threshold) & (refractory <= 0.0)).to(v.dtype)
         v = v_pre - (params.v_threshold - params.v_reset) * z
-        psc = psc * decay + z @ weight_dense
+        refractory = torch.clamp(refractory - params.dt, min=0.0)
+        refractory = torch.where(
+            z > 0,
+            torch.full_like(refractory, max(params.tau_ref - params.dt, 0.0)),
+            refractory,
+        )
+        asc = asc + asc_amps * z[..., None]
+        psc_h = psc_h + params.psc_g_max * (z @ weight_dense)
         spikes.append(z)
-    return torch.stack(spikes, dim=0), v, psc
+    return torch.stack(spikes, dim=0), v, psc, psc_h, asc, refractory
 
 
 def test_cuda_persistent_matches_dense_reference():
@@ -118,19 +174,16 @@ def test_cuda_persistent_matches_dense_reference():
     device = _require_cuda()
     x_seq = torch.tensor(
         [
-            [[1.2, 0.0, 0.0, 0.0], [0.0, 1.5, 0.0, 0.0]],
-            [[0.0, 0.0, 1.4, 0.0], [0.0, 0.0, 0.0, 1.6]],
-            [[0.6, 0.0, 0.7, 0.0], [0.8, 0.0, 0.0, 0.0]],
+            [[30.0, 0.0, 0.0, 0.0], [0.0, 32.0, 0.0, 0.0]],
+            [[0.0, 0.0, 34.0, 0.0], [0.0, 0.0, 0.0, 36.0]],
+            [[18.0, 0.0, 20.0, 0.0], [22.0, 0.0, 0.0, 0.0]],
         ],
         device=device,
         dtype=torch.float32,
     )
     graph, dense = _graph(device)
-    state = PersistentSNNState(
-        v=torch.zeros(2, 4, device=device),
-        psc=torch.zeros(2, 4, device=device),
-    )
     params = PersistentSNNParams(tau_mem=20.0, tau_syn=5.0, window_size=3)
+    state = _state(2, 4, device, params)
 
     out = _run_cuda_or_skip(
         _dense_to_events(x_seq),
@@ -139,13 +192,29 @@ def test_cuda_persistent_matches_dense_reference():
         params,
         return_mode="both",
     )
-    ref_spikes, ref_v, ref_psc = _reference(x_seq, dense, state, params)
+    ref_spikes, ref_v, ref_psc, ref_psc_h, ref_asc, ref_refractory = _reference(
+        x_seq,
+        dense,
+        state,
+        params,
+    )
 
     assert out.spikes is not None
     assert out.spike_events is not None
+    assert out.state.psc_h is not None
+    assert out.state.asc is not None
+    assert out.state.refractory is not None
     torch.testing.assert_close(out.spikes, ref_spikes, atol=0, rtol=0)
     torch.testing.assert_close(out.state.v, ref_v, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(out.state.psc, ref_psc, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out.state.psc_h, ref_psc_h, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out.state.asc, ref_asc, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(
+        out.state.refractory,
+        ref_refractory,
+        atol=1e-5,
+        rtol=1e-5,
+    )
 
 
 def test_cuda_persistent_event_output_matches_dense_spikes():
@@ -153,15 +222,12 @@ def test_cuda_persistent_event_output_matches_dense_spikes():
 
     device = _require_cuda()
     x_seq = torch.tensor(
-        [[[1.2, 1.3, 0.0, 0.0]], [[0.0, 0.0, 1.4, 1.5]]],
+        [[[30.0, 32.0, 0.0, 0.0]], [[0.0, 0.0, 34.0, 36.0]]],
         device=device,
         dtype=torch.float32,
     )
     graph, _dense = _graph(device)
-    state = PersistentSNNState(
-        v=torch.zeros(1, 4, device=device),
-        psc=torch.zeros(1, 4, device=device),
-    )
+    state = _state(1, 4, device)
     out = _run_cuda_or_skip(
         _dense_to_events(x_seq),
         graph,
@@ -190,6 +256,14 @@ def test_cuda_persistent_soft_reset_preserves_surplus_voltage():
     """Soft reset should subtract threshold delta rather than clamp to reset."""
 
     device = _require_cuda()
+    params = PersistentSNNParams(
+        v_threshold=1.0,
+        v_reset=0.0,
+        v_rest=0.0,
+        c_m=1.0,
+        tau_ref=0.0,
+        window_size=1,
+    )
     x_seq = torch.tensor([[[2.0]]], device=device)
     events = _dense_to_events(x_seq)
     graph = EventCSRGraph(
@@ -199,20 +273,24 @@ def test_cuda_persistent_soft_reset_preserves_surplus_voltage():
         delay=None,
         shape=(1, 1),
     )
-    state = PersistentSNNState(
-        v=torch.zeros(1, 1, device=device),
-        psc=torch.zeros(1, 1, device=device),
-    )
+    state = _state(1, 1, device, params)
     out = _run_cuda_or_skip(
         events,
         graph,
         state,
-        PersistentSNNParams(window_size=1),
+        params,
         return_mode="dense",
     )
+    ref_spikes, ref_v, *_ = _reference(
+        x_seq,
+        torch.zeros(1, 1, device=device),
+        state,
+        params,
+    )
 
-    torch.testing.assert_close(out.spikes, torch.ones_like(out.spikes))
-    torch.testing.assert_close(out.state.v, torch.ones_like(out.state.v))
+    torch.testing.assert_close(out.spikes, ref_spikes)
+    torch.testing.assert_close(out.state.v, ref_v, atol=1e-5, rtol=1e-5)
+    assert torch.all(out.state.v > params.v_reset)
 
 
 def test_cuda_persistent_rejects_unsupported_v1_options():
@@ -227,10 +305,7 @@ def test_cuda_persistent_rejects_unsupported_v1_options():
         delay=torch.tensor([1], device=device, dtype=torch.int32),
         shape=(1, 1),
     )
-    state = PersistentSNNState(
-        v=torch.zeros(1, 1, device=device),
-        psc=torch.zeros(1, 1, device=device),
-    )
+    state = _state(1, 1, device)
 
     with pytest.raises(ValueError, match="hard_reset"):
         persistent_snn_forward(
@@ -246,7 +321,7 @@ def test_cuda_persistent_rejects_unsupported_v1_options():
             PersistentSNNParams(hard_reset=True),
             backend="cuda_persistent",
         )
-    with pytest.raises(ValueError, match="refractory"):
+    with pytest.raises(ValueError, match="psc_h"):
         persistent_snn_forward(
             events,
             EventCSRGraph(
@@ -260,6 +335,24 @@ def test_cuda_persistent_rejects_unsupported_v1_options():
                 v=state.v,
                 psc=state.psc,
                 refractory=torch.zeros_like(state.v),
+            ),
+            backend="cuda_persistent",
+        )
+    with pytest.raises(ValueError, match="asc"):
+        persistent_snn_forward(
+            events,
+            EventCSRGraph(
+                indptr=graph.indptr,
+                indices=graph.indices,
+                weight=graph.weight,
+                delay=None,
+                shape=graph.shape,
+            ),
+            PersistentSNNState(
+                v=state.v,
+                psc=state.psc,
+                psc_h=state.psc_h,
+                refractory=state.refractory,
             ),
             backend="cuda_persistent",
         )
