@@ -12,6 +12,7 @@ def dense_event_to_list_kernel(
     stride_indices_b,
     stride_indices_n,
     n_pre,
+    capacity,
     THRESHOLD: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -29,10 +30,11 @@ def dense_event_to_list_kernel(
     block_count = tl.sum(active_i, axis=0)
     rank = tl.cumsum(active_i, axis=0) - 1
     base = tl.atomic_add(count_ptr + batch, block_count)
+    slot = base + rank
     tl.store(
-        indices_ptr + batch * stride_indices_b + (base + rank) * stride_indices_n,
+        indices_ptr + batch * stride_indices_b + slot * stride_indices_n,
         offsets,
-        mask=active,
+        mask=active & (slot < capacity),
     )
 
 

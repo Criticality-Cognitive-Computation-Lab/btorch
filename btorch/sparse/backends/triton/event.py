@@ -14,7 +14,11 @@ def _require_triton():
     return triton
 
 
-def compact_binary_events(events: BinaryEvents) -> SpikeListEvents:
+def compact_binary_events(
+    events: BinaryEvents,
+    *,
+    max_events: int | None = None,
+) -> SpikeListEvents:
     triton = _require_triton()
     from .event_kernels import dense_event_to_list_kernel
 
@@ -23,8 +27,15 @@ def compact_binary_events(events: BinaryEvents) -> SpikeListEvents:
         raise ValueError("Triton event compaction expects batched 2D values.")
     values = values.contiguous()
     batch_size, n_pre = values.shape
+    if max_events is not None and max_events <= 0:
+        raise ValueError("max_events must be positive.")
+    capacity = n_pre if max_events is None else min(max_events, n_pre)
     count = torch.zeros(batch_size, device=values.device, dtype=torch.int32)
-    indices = torch.empty((batch_size, n_pre), device=values.device, dtype=torch.int64)
+    indices = torch.empty(
+        (batch_size, capacity),
+        device=values.device,
+        dtype=torch.int64,
+    )
     block_size = 256
     grid = (batch_size, triton.cdiv(n_pre, block_size))
     dense_event_to_list_kernel[grid](
@@ -36,10 +47,14 @@ def compact_binary_events(events: BinaryEvents) -> SpikeListEvents:
         indices.stride(0),
         indices.stride(1),
         n_pre,
+        capacity,
         THRESHOLD=events.threshold,
         BLOCK_SIZE=block_size,
         num_warps=8,
     )
+    if max_events is None:
+        capacity = max(int(count.max().item()), 1)
+        indices = indices[:, :capacity].contiguous()
     return SpikeListEvents(count=count, indices=indices, size=n_pre)
 
 
@@ -48,6 +63,7 @@ def event_sparse_mm(
     events: BinaryEvents | SpikeListEvents,
     *,
     schedule: str = "auto",
+    max_events: int | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     triton = _require_triton()
@@ -59,7 +75,10 @@ def event_sparse_mm(
     no_batch = isinstance(events, BinaryEvents) and events.values.ndim == 1
     if isinstance(events, BinaryEvents):
         values = events.values.unsqueeze(0) if no_batch else events.values
-        events = compact_binary_events(BinaryEvents(values, threshold=events.threshold))
+        events = compact_binary_events(
+            BinaryEvents(values, threshold=events.threshold),
+            max_events=max_events,
+        )
     eff_values = matrix.effective_values()
     if not events.indices.is_cuda or not eff_values.is_cuda:
         raise UnsupportedCapabilityError("Triton event execution requires CUDA.")
@@ -71,7 +90,9 @@ def event_sparse_mm(
         )
 
     layout = matrix.padded_csr_layout()
-    batch_size, max_events = events.indices.shape
+    event_count = events.count.contiguous()
+    event_indices = events.indices.contiguous()
+    batch_size, max_events = event_indices.shape
     output_size = getattr(matrix, "operation_shape", matrix.shape)[1]
     if out is None:
         out = torch.zeros(
@@ -115,15 +136,15 @@ def event_sparse_mm(
         raise ValueError(f"Unknown event schedule {schedule!r}.")
 
     kernel[grid](
-        events.count.contiguous(),
-        events.indices.contiguous(),
+        event_count,
+        event_indices,
         layout.row_length.contiguous(),
         layout.row_offset.contiguous(),
         layout.indices.contiguous(),
         eff_values.reshape(-1).contiguous(),
         out,
-        events.indices.stride(0),
-        events.indices.stride(1),
+        event_indices.stride(0),
+        event_indices.stride(1),
         layout.indices.stride(0),
         layout.indices.stride(1),
         out.stride(0),

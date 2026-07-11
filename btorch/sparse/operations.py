@@ -83,6 +83,7 @@ def event_sparse_mm(
     events: EventRepresentation,
     *,
     schedule: str = "auto",
+    max_events: int | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if events.size != matrix.shape[0]:
@@ -102,7 +103,13 @@ def event_sparse_mm(
         try:
             from .backends.triton.event import event_sparse_mm as triton_impl
 
-            return triton_impl(matrix, events, schedule=schedule, out=out)
+            return triton_impl(
+                matrix,
+                events,
+                schedule=schedule,
+                max_events=max_events,
+                out=out,
+            )
         except (BackendUnavailableError, UnsupportedCapabilityError):
             pass
 
