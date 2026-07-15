@@ -5,7 +5,7 @@ import torch
 
 from btorch.models.functional import reset_net_state
 from btorch.models.rnn import make_rnn
-from tests.models.rnn_utils import DTYPE, SimpleRNNCell, last_step_sum
+from tests.models.rnn.rnn_utils import DTYPE, SimpleRNNCell, last_step_sum
 
 
 # Define parameter ranges for exhaustive testing

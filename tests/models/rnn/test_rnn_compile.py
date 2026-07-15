@@ -5,7 +5,7 @@ import torch
 
 from btorch.models.functional import reset_net_state
 from btorch.models.rnn import make_rnn
-from tests.models.rnn_utils import SimpleRNNCell
+from tests.models.rnn.rnn_utils import SimpleRNNCell
 
 
 # Only run on Linux which supports torch.compile
