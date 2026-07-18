@@ -1,10 +1,64 @@
+import pytest
 import torch
 from torch import nn
 
 from btorch.models.base import MemoryModule
 
 
+try:  # scan is a prototype HOP -- absent on older torch, and torch is unpinned.
+    from torch._higher_order_ops.scan import scan
+except ImportError:  # pragma: no cover - depends on the installed torch
+    scan = None
+
+HAS_SCAN = scan is not None
+
+# Shared by tests/ and benchmarks/: feature-detected rather than version-gated,
+# since the HOP's import path is the thing that actually has to exist.
+requires_scan = pytest.mark.skipif(
+    not HAS_SCAN, reason="torch._higher_order_ops.scan unavailable (torch too old)"
+)
+
 DTYPE = torch.float32
+
+
+class ScanRNN(nn.Module):
+    """Run a :class:`SimpleRNNCell`'s recurrence as a single ``scan`` HOP.
+
+    Prototype for replacing the unrolled loop in ``btorch/models/rnn.py``:
+    ``scan`` traces the step once and keeps T a runtime dim, so ``torch.compile``
+    stays O(1) in sequence length instead of unrolling T steps. Wraps an existing
+    cell so weights are shared -> parity can be checked directly against
+    ``make_rnn(cell)`` (btorch's own loop).
+
+    The step math is inlined statelessly (rather than calling ``cell.forward``,
+    which mutates ``cell.h``) because ``scan`` requires a pure, non-mutating
+    combine_fn. Reading the cell's parameters is fine -- dynamo lifts them into
+    the scan HOP's ``additional_inputs``.
+    """
+
+    def __init__(self, cell: "SimpleRNNCell"):
+        super().__init__()
+        self.cell = cell
+
+    def forward(self, x, h0=None):  # x: (T, B, input_size) -> (T, B, hidden_size)
+        if scan is None:  # constructing is fine; only running needs the HOP
+            raise RuntimeError(
+                "ScanRNN needs torch._higher_order_ops.scan, which this torch "
+                "does not have. Gate call sites with rnn_utils.requires_scan."
+            )
+        cell = self.cell
+        if h0 is None:
+            h0 = torch.zeros(
+                x.shape[1], cell.hidden_size, dtype=x.dtype, device=x.device
+            )
+
+        def combine(carry, x_t):
+            h = torch.tanh(x_t @ cell.W_x.t() + carry @ cell.W_h.t() + cell.b)
+            # scan forbids the emitted output aliasing any input/carry -> clone.
+            return h, h.clone()
+
+        _, ys = scan(combine, h0, x)
+        return ys
 
 
 class SimpleRNNCell(MemoryModule):
