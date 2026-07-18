@@ -8,11 +8,33 @@ from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
 from . import base, environ, synapse
+from .cudagraph import CudaGraphRunner
 from .functional import filter_hidden_states, named_hidden_states, set_hidden_states
+
+
+def _cat_chunks(chunks: list[Tensor]) -> Tensor:
+    """Join per-chunk results along time, without a copy in the single-chunk
+    case."""
+    return chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
 
 
 # TODO: handle multiple output
 class RecurrentNNAbstract(base.MemoryModule):
+    """Base class for the time-unrolled recurrent loop.
+
+    CUDA-graph acceleration comes in two flavours, one per use case:
+
+    * Inference: ``cudagraph=True`` captures the loop's device work and replays
+      it (see ``cudagraph.py``). It is the fastest option and composes with
+      ``torch.compile`` and ``cpu_offload``, but is inference-only.
+    * Training: wrap the module in ``torch.compile(model, mode="reduce-overhead")``
+      instead. Its CUDAGraph Trees capture forward and backward separately, so it
+      is correct through ``backward()`` and composes with ``grad_checkpoint`` and
+      ``cpu_offload`` -- call ``torch.compiler.cudagraph_mark_step_begin()`` once
+      per iteration. ``cudagraph=True`` refuses grad-recording calls and points
+      here.
+    """
+
     def __init__(
         self,
         update_state_names: Sequence[str] | None = None,
@@ -23,6 +45,8 @@ class RecurrentNNAbstract(base.MemoryModule):
         grad_checkpoint: bool = False,
         save_grad_history: bool = False,
         grad_state_names: Sequence[str] | None = None,
+        cudagraph: bool = False,
+        cudagraph_warmup: int = 3,
     ):
         super().__init__()
         self.step_mode = step_mode
@@ -34,6 +58,8 @@ class RecurrentNNAbstract(base.MemoryModule):
         self.save_grad_history = save_grad_history
         self.grad_state_names = grad_state_names
         self._grad_history = {}
+        self.cudagraph = cudagraph
+        self._cudagraph_runner = CudaGraphRunner(warmup=cudagraph_warmup)
 
     def _detect_loop_args(self, *args):
         """Heuristic: use first arg's shape to detect loop args"""
@@ -167,55 +193,64 @@ class RecurrentNNAbstract(base.MemoryModule):
 
     @partial(torch.compiler.disable, recursive=False)
     def multi_step_forward(self, *args, loop_args=None, **kwargs):
-        """Unified implementation for chunked unrolling and CPU offloading."""
-        # Reset gradient history
-        if self.save_grad_history:
-            self._grad_history = {}
+        """Run the multi-step loop, optionally as replayed CUDA graphs."""
+        if self.cudagraph:
+            return self._cudagraph_multi_step(*args, loop_args=loop_args, **kwargs)
+        return self._multi_step_forward_impl(*args, loop_args=loop_args, **kwargs)
 
+    def _chunk_plan(self, *args, loop_args=None):
+        """Resolve T, the loop args, and the two block sizes the time loop
+        uses."""
         # Detect loop args and time length T
         if loop_args is None:
             T, loop_args = self._detect_loop_args(*args)
         else:
             T = args[loop_args[0]].shape[0]
 
+        # Unroll size (small chunk)
+        unroll_size = T if self.unroll is False else int(self.unroll)
+
+        # Large chunk size. Follow legacy behavior: if chunk_size is None, treat
+        # unroll_size as the chunk unit when checkpointing is ON (matching the
+        # legacy behavior where unroll was the only block size), else the whole
+        # sequence is one chunk.
+        if self.chunk_size is None:
+            large_chunk_size = unroll_size if self.grad_checkpoint else T
+        else:
+            large_chunk_size = self.chunk_size
+            if self.unroll is not False and large_chunk_size % unroll_size != 0:
+                raise ValueError(
+                    f"chunk_size ({large_chunk_size}) must be a multiple of "
+                    f"unroll ({unroll_size})"
+                )
+
+        num_large_chunks = (T + large_chunk_size - 1) // large_chunk_size
+        return T, loop_args, unroll_size, large_chunk_size, num_large_chunks
+
+    def _split_loop_args(self, args, loop_args, chunk_size):
+        """Split only the loop args along time; torch.split returns zero-copy
+        views."""
+        return {i: torch.split(args[i], chunk_size, dim=0) for i in loop_args}
+
+    # NOTE: `disable(recursive=False)` here is load-bearing, not cosmetic. It keeps
+    # the O(T) python loop eager so only the unroll block is traced+compiled, which
+    # is what makes compile time constant in T. Without it dynamo inlines all T
+    # steps into one graph (T=1000 -> ~335s to compile).
+    @partial(torch.compiler.disable, recursive=False)
+    def _multi_step_forward_impl(self, *args, loop_args=None, **kwargs):
+        """Unified implementation for chunked unrolling and CPU offloading."""
+        # Reset gradient history
+        if self.save_grad_history:
+            self._grad_history = {}
+
+        T, loop_args, unroll_size, large_chunk_size, num_large_chunks = (
+            self._chunk_plan(*args, loop_args=loop_args)
+        )
+
         self._current_T = T
 
         if self.grad_state_names:
             self._init_grad_hist(self.grad_state_names, T)
-
-        # ------------------------------------------------------------------
-        # Determine Chunk Sizes
-        # ------------------------------------------------------------------
-        # Unroll size (small chunk)
-        if self.unroll is False:
-            unroll_size = T  # No inner unrolling
-        else:
-            unroll_size = int(self.unroll)
-
-        # Large chunk size
-        # Follow legacy behavior: if chunk_size is None, check if we need
-        # block-checkpoints.
-        if self.chunk_size is None:
-            # If default (None), we treat unroll_size as the chunk unit if
-            # checkpointing is ON, to match legacy behavior where unroll was the
-            # only block size.
-            # If checkpointing is OFF, large_chunk_size = T is fine (except for
-            # offloading which needs chunks).
-            if self.grad_checkpoint:
-                large_chunk_size = unroll_size
-            else:
-                large_chunk_size = T
-        else:
-            large_chunk_size = self.chunk_size
-            if self.unroll is not False:
-                if large_chunk_size % unroll_size != 0:
-                    raise ValueError(
-                        f"chunk_size ({large_chunk_size}) must be a multiple of "
-                        f"unroll ({unroll_size})"
-                    )
-
-        # Number of large chunks
-        num_large_chunks = (T + large_chunk_size - 1) // large_chunk_size
 
         use_checkpoint = bool(self.grad_checkpoint)
 
@@ -226,11 +261,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         # ------------------------------------------------------------------
         # Outer Loop: Large Chunks (Checkpointing & CPU Offloading)
         # ------------------------------------------------------------------
-        # Split only loop args into large chunks using torch.split
-        # torch.split returns views of the original tensor (zero-copy)
-        split_tensors = {
-            i: torch.split(args[i], large_chunk_size, dim=0) for i in loop_args
-        }
+        split_tensors = self._split_loop_args(args, loop_args, large_chunk_size)
 
         for chunk_id in range(num_large_chunks):
             # Build chunk_args preserving original arg positions
@@ -287,6 +318,79 @@ class RecurrentNNAbstract(base.MemoryModule):
         stacked_states = {k: torch.stack(v, dim=0) for k, v in all_states_lists.items()}
 
         return (stacked_outputs, stacked_states)
+
+    @partial(torch.compiler.disable, recursive=False)
+    def _stacked_chunk_forward(
+        self, *chunk_args, loop_args=(0,), unroll_size=1, **kwargs
+    ):
+        """One large chunk's device work, stacked. This is the captured unit.
+
+        Stacking inside the capture matters: the graph then returns one
+        ``(chunk, ...)`` tensor per output instead of a list of per-step tensors,
+        so copying results out of the replay pool costs one copy per chunk rather
+        than one per timestep -- which would put O(T) eager work back into the
+        loop and undo what capturing bought.
+        """
+        z_chunk, states_chunk = self._process_large_chunk_impl(
+            *chunk_args, loop_args=loop_args, unroll_size=unroll_size, **kwargs
+        )
+        return (
+            torch.stack(z_chunk, dim=0),
+            {k: torch.stack(v, dim=0) for k, v in states_chunk.items()},
+        )
+
+    @partial(torch.compiler.disable, recursive=False)
+    def _cudagraph_multi_step(self, *args, loop_args=None, **kwargs):
+        """Chunked time loop whose per-chunk device work is a replayed CUDA
+        graph.
+
+        The capture boundary sits at the large chunk rather than the whole loop.
+        With the default ``chunk_size=None`` the two coincide (one chunk spans T),
+        so this is still a single replay per call. When the sequence *is* chunked,
+        each chunk replays and every host-side step -- the ``cpu_offload`` moves,
+        the accumulation, the final concat -- stays out here in eager python,
+        where a replay cannot swallow it.
+
+        Chunks of equal length share one capture; a short final remainder keys to
+        its own.
+        """
+        T, loop_args, unroll_size, large_chunk_size, num_large_chunks = (
+            self._chunk_plan(*args, loop_args=loop_args)
+        )
+        self._current_T = T
+
+        split_tensors = self._split_loop_args(args, loop_args, large_chunk_size)
+
+        z_chunks = []
+        state_chunks = {}
+        for chunk_id in range(num_large_chunks):
+            chunk_args = tuple(
+                split_tensors[i][chunk_id] if i in loop_args else args[i]
+                for i in range(len(args))
+            )
+
+            def fn(*inner_args):
+                return self._stacked_chunk_forward(
+                    *inner_args, loop_args=loop_args, unroll_size=unroll_size, **kwargs
+                )
+
+            # Offloading copies out of the pool itself, so skip the runner's clone.
+            z, states = self._cudagraph_runner(
+                self, fn, chunk_args, clone_outputs=not self.cpu_offload
+            )
+
+            if self.cpu_offload:
+                z = z.cpu()
+                states = {k: v.cpu() for k, v in states.items()}
+
+            z_chunks.append(z)
+            for k, v in states.items():
+                state_chunks.setdefault(k, []).append(v)
+
+        return (
+            _cat_chunks(z_chunks),
+            {k: _cat_chunks(v) for k, v in state_chunks.items()},
+        )
 
     def get_grad_history(self) -> dict[str, list]:
         """Retrieve saved gradient history."""

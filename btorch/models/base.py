@@ -615,6 +615,31 @@ def _memory_var(
     return v
 
 
+def _reset_target_sizes(reset_val: ResetValue, batch_size) -> tuple[int, ...]:
+    """Shape a reset would produce -- without building the tensor (no H2D
+    copy)."""
+    if batch_size is None:
+        return tuple(reset_val.sizes)
+    bs = (batch_size,) if isinstance(batch_size, int) else tuple(batch_size)
+    return bs + tuple(reset_val.sizes)
+
+
+def _reset_value_is_zero(value) -> bool:
+    """Whether a reset value is all zeros (scalar or tensor), cheaply and on
+    host."""
+    if value is None or isinstance(value, Callable):
+        return False
+    return not bool(torch.as_tensor(value).any())
+
+
+def _inplace_resize_msg(key, have, want) -> str:
+    return (
+        f"reset(inplace=True) cannot resize memory '{key}' from {tuple(have)} to "
+        f"{tuple(want)}; call reset()/init_state() to (re)allocate, or keep "
+        f"batch_size fixed."
+    )
+
+
 class MemoryModule(StepModule, torch.nn.Module):
     """Base class for all stateful modules with managed memory buffers.
 
@@ -836,7 +861,18 @@ class MemoryModule(StepModule, torch.nn.Module):
         dtype=None,
         device=None,
         skip_mem_name: tuple[str, ...] = (),
+        inplace: bool = False,
     ):
+        """Reset every memory to its registered value.
+
+        Args:
+            inplace: If True, write into the existing buffers instead of rebinding
+                them to freshly-allocated tensors. This keeps each buffer's identity
+                and address stable (required to reset state inside a captured CUDA
+                graph), and the common zero-init case stays on-device (no host copy).
+                Cannot change a buffer's shape -- call ``reset()`` / ``init_state()``
+                to (re)allocate, or keep ``batch_size`` fixed.
+        """
         skip_mem_name_set = set(skip_mem_name)
         for key, reset_val in self._memories_rv.items():
             if key in skip_mem_name_set:
@@ -851,8 +887,21 @@ class MemoryModule(StepModule, torch.nn.Module):
             if batch_size is None:
                 batch_size = self._batch_dim_detect(key)
 
-            v = _memory_var(reset_val, batch_size, **format_args)
-            setattr(self, key, v)
+            if not inplace:
+                setattr(self, key, _memory_var(reset_val, batch_size, **format_args))
+                continue
+
+            if not reset_val.has_batch and _reset_value_is_zero(reset_val.value):
+                # Host-free, capture-safe fast path for zero-init memories.
+                target = _reset_target_sizes(reset_val, batch_size)
+                if tuple(buffer.shape) != target:
+                    raise ValueError(_inplace_resize_msg(key, buffer.shape, target))
+                buffer.zero_()
+            else:
+                v = _memory_var(reset_val, batch_size, **format_args)
+                if buffer.shape != v.shape:
+                    raise ValueError(_inplace_resize_msg(key, buffer.shape, v.shape))
+                buffer.copy_(v)
 
     def __getattr__(self, name: str):
         return torch.nn.Module.__getattr__(self, name)
