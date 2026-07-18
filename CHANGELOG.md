@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **CUDA graph capture for RNNs** (`RecurrentNN(cudagraph=True)`) — collapses the
+  many small per-step launches of the recurrent time loop into a single graph
+  replay, a one-flag speedup for launch-bound inference. Guarded to inference
+  (capture cannot record autograd) and composes with `cpu_offload` and
+  `torch.compile`. Capture lives in `btorch.models.cudagraph` (`CudaGraphRunner`).
+  See [`examples/train_cudagraph.py`](examples/train_cudagraph.py) for inference and
+  a by-hand whole-step training capture, and
+  `benchmarks/rnn/test_compile_strategies.py` for the compile-strategy comparison.
+- **`MemoryModule.reset(inplace=True)`** — resets hidden state into the existing
+  buffers (host-free `zero_()` fast path) so state tensors keep fixed addresses,
+  as CUDA graph capture requires.
+
 ## [0.1.0]
 
 ### Added
