@@ -6,7 +6,7 @@ from typing import Callable
 import torch
 from triton.testing import Benchmark, perf_report
 
-from benchmarks.dense_glif_net.glif_common import _DT, build_model, providers, run_model
+from benchmarks.glif_net.glif_common import _DT, build_model, providers, run_model
 from btorch.models import environ
 from btorch.models.functional import reset_net_state
 from btorch.utils.bench import do_bench

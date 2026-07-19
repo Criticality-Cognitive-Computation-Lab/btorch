@@ -14,7 +14,7 @@ from btorch.models.base import MemoryModule
 from btorch.models.functional import init_net_state, reset_net_state
 from btorch.models.neurons.glif import GLIF3
 from btorch.models.rnn import RecurrentNNAbstract
-from btorch.models.surrogate import ATanApprox
+from btorch.models.surrogate import ATan
 
 
 _DT = 1.0
@@ -360,7 +360,9 @@ def build_neuron(provider: str, N: int, params: dict, require_grad: bool):
             asc_amps=params["asc_amps"],
             tau_ref=0.0,
             hard_reset=_HARD_RESET,
-            surrogate_function=ATanApprox(alpha=_ALPHA, spiking=True),
+            # Exact ATan (1/(1+(alpha·u)²)) — matches what every kernel implements
+            # in its backward, so gradient parity holds off-threshold, not just near it.
+            surrogate_function=ATan(alpha=_ALPHA, spiking=True),
             trainable_param=trainable,
             step_mode="s",
             backend="torch",
@@ -370,15 +372,15 @@ def build_neuron(provider: str, N: int, params: dict, require_grad: bool):
         return neuron
 
     if provider == "triton":
-        from benchmarks.dense_glif_net.glif_triton import glif3_step_triton
+        from benchmarks.glif_net.glif_triton import glif3_step_triton
 
         step_fn = glif3_step_triton
     elif provider == "warp":
-        from benchmarks.dense_glif_net.glif_warp import glif3_step_warp
+        from benchmarks.glif_net.glif_warp import glif3_step_warp
 
         step_fn = glif3_step_warp
     elif provider == "cupy":
-        from benchmarks.dense_glif_net.glif_cupy import glif3_step_cupy
+        from benchmarks.glif_net.glif_cupy import glif3_step_cupy
 
         step_fn = glif3_step_cupy
     else:

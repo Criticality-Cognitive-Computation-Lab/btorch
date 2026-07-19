@@ -57,7 +57,7 @@ import torch
 import warp as wp
 from jaxtyping import Float
 
-from benchmarks.dense_glif_net.glif_common import (
+from benchmarks.glif_net.glif_common import (
     GLIF3StepOps,
     SparseWeight,
     dense_multistep_autograd,
@@ -766,6 +766,9 @@ def _dense_multistep_matmul(
 ):
     """cuBLAS matmul for the recurrent term, Warp neuron kernel for the dynamics:
     one launch pair per timestep."""
+    # The step kernel updates v/Iasc in place across timesteps; clone so the
+    # caller's tensors aren't mutated (the sparse path clones to v_work/I_work).
+    v, Iasc = v.clone(), Iasc.clone()
     T, B = x_seq.shape
     v_seq = torch.empty((T, B), device=v.device, dtype=v.dtype)
     s_seq = torch.empty((T, B), device=v.device, dtype=v.dtype)
@@ -875,6 +878,10 @@ class _WarpSparseSpmv(torch.autograd.Function):
     @staticmethod
     def backward(ctx, glin):
         val_wp, s_wp, lin_wp = ctx.wp_arrays
+        # tape.backward() accumulates; zero the input adjoints first so a repeat
+        # backward (retain_graph / double-backward) can't double-count.
+        val_wp.grad.zero_()
+        s_wp.grad.zero_()
         _seed(lin_wp, glin)
         ctx.tape.backward()
         return (None, None, None,

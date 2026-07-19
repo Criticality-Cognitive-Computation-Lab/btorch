@@ -6,7 +6,7 @@ with the recurrent connection a 5% scale-free sparse SpMV (``scale_free_csr``).
 Rows are the backend, columns the neuron count N; times are ms (forward for
 inference, forward+backward for training). Run with::
 
-    python -m benchmarks.dense_glif_net.bench_glif_sparse
+    python -m benchmarks.glif_net.bench_glif_sparse
 
 Results (T=32, M=2, 5% scale-free, RTX 5090; ms)::
 
@@ -29,7 +29,7 @@ import time
 
 import torch
 
-from benchmarks.dense_glif_net.glif_common import scale_free_csr
+from benchmarks.glif_net.glif_common import scale_free_csr
 
 DEVICE = torch.device("cuda")
 T, M, DT, ALPHA, DENSITY = 32, 2, 1.0, 2.0, 0.05
@@ -37,9 +37,9 @@ NEURON_COUNTS = (8192, 16384, 32768)
 
 
 def _load_backends() -> dict:
-    from benchmarks.dense_glif_net.glif_triton import glif3_step_triton
-    from benchmarks.dense_glif_net.glif_warp import glif3_step_warp
-    from benchmarks.dense_glif_net.glif_cupy import glif3_step_cupy
+    from benchmarks.glif_net.glif_triton import glif3_step_triton
+    from benchmarks.glif_net.glif_warp import glif3_step_warp
+    from benchmarks.glif_net.glif_cupy import glif3_step_cupy
     return {"triton": glif3_step_triton, "warp": glif3_step_warp, "cupy": glif3_step_cupy}
 
 

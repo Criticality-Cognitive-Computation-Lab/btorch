@@ -38,7 +38,7 @@ from functools import lru_cache
 import torch
 from jaxtyping import Float
 
-from benchmarks.dense_glif_net.glif_common import (
+from benchmarks.glif_net.glif_common import (
     SparseWeight,
     GLIF3StepOps,
     dense_multistep_autograd,
@@ -540,10 +540,10 @@ void glif3_sparse_multistep_forward(
     int n_warps = (gridDim.x * blockDim.x) >> 5;
 
     for (int t = 0; t < T; ++t) {
-        const float* s_prev = s_seq + (size_t)(t - 1) * N;
         for (int row = warp; row < N; row += n_warps) {
             float acc = 0.0f;
             if (t > 0) {
+                const float* s_prev = s_seq + (size_t)(t - 1) * N;
                 int start = crow[row], end = crow[row + 1];
                 for (int p = start + lane; p < end; p += 32)
                     acc += val[p] * s_prev[col[p]];

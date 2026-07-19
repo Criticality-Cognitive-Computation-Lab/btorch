@@ -12,7 +12,7 @@ ms, ``None`` on out-of-memory) are written to JSON for ``plot_glif_kernels.py``.
 This is the heavy full benchmark (``bench_glif_sparse.py`` is the quick one); run
 it on a GPU node via ``bench_glif.slurm``::
 
-    python -m benchmarks.dense_glif_net.bench_glif_full --out results.json
+    python -m benchmarks.glif_net.bench_glif_full --out results.json
 
 Results (RTX 5090, M=2, 5% scale-free sparse; ms per pass, ``OOM`` = out of
 memory). ``inference`` is forward only, ``training`` is forward+backward::
@@ -74,7 +74,7 @@ import time
 
 import torch
 
-from benchmarks.dense_glif_net.glif_common import scale_free_csr
+from benchmarks.glif_net.glif_common import scale_free_csr
 
 DEVICE = torch.device("cuda")
 M, DT, ALPHA, DENSITY = 2, 1.0, 2.0, 0.05
@@ -90,9 +90,9 @@ BACKENDS = ["triton", "warp", "cupy"]
 
 
 def _load_backends() -> dict:
-    from benchmarks.dense_glif_net.glif_triton import glif3_step_triton
-    from benchmarks.dense_glif_net.glif_warp import glif3_step_warp
-    from benchmarks.dense_glif_net.glif_cupy import glif3_step_cupy
+    from benchmarks.glif_net.glif_triton import glif3_step_triton
+    from benchmarks.glif_net.glif_warp import glif3_step_warp
+    from benchmarks.glif_net.glif_cupy import glif3_step_cupy
     return {"triton": glif3_step_triton, "warp": glif3_step_warp, "cupy": glif3_step_cupy}
 
 

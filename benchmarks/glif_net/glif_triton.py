@@ -46,7 +46,7 @@ import triton.language as tl
 from jaxtyping import Float
 from triton.language.extra import libdevice
 
-from benchmarks.dense_glif_net.glif_common import (
+from benchmarks.glif_net.glif_common import (
     GLIF3StepOps,
     SparseWeight,
     dense_multistep_autograd,

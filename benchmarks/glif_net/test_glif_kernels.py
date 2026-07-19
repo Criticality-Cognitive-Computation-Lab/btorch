@@ -24,7 +24,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from benchmarks.dense_glif_net.glif_common import GLIFDenseNet, build_neuron
+from benchmarks.glif_net.glif_common import GLIFDenseNet, build_neuron
 from btorch.models import environ
 from btorch.models.functional import init_net_state
 from btorch.models.neurons.glif import GLIF3
@@ -48,11 +48,11 @@ INPUT_KINDS = ("constant", "random")
 def _load_step_fn(name: str):
     pytest.importorskip(name)
     if name == "triton":
-        from benchmarks.dense_glif_net.glif_triton import glif3_step_triton as fn
+        from benchmarks.glif_net.glif_triton import glif3_step_triton as fn
     elif name == "warp":
-        from benchmarks.dense_glif_net.glif_warp import glif3_step_warp as fn
+        from benchmarks.glif_net.glif_warp import glif3_step_warp as fn
     else:
-        from benchmarks.dense_glif_net.glif_cupy import glif3_step_cupy as fn
+        from benchmarks.glif_net.glif_cupy import glif3_step_cupy as fn
     return fn
 
 
@@ -459,7 +459,7 @@ def test_dense_fused_matches_matmul(step_fn, kind):
 # ---------------------------------------------------------------------------
 def _sparse_case(B, M, kind, seed):
     """Sparse CSR weight + its dense equivalent (same values at the nonzeros)."""
-    from benchmarks.dense_glif_net.glif_common import scale_free_csr
+    from benchmarks.glif_net.glif_common import scale_free_csr
     W = scale_free_csr(B, 0.05, DEVICE, seed=seed)
     rows, cols = W.coo_indices[0], W.coo_indices[1]
     dense = torch.zeros(B, B, device=DEVICE, dtype=DTYPE)
@@ -497,7 +497,7 @@ def test_sparse_multistep_matches_dense(step_fn, kind):
 def test_sparse_multistep_grad_matches_dense(step_fn, kind):
     """Sparse training gradients must match the dense-equivalent's — grad w.r.t.
     the sparse values equals the dense weight gradient at the nonzeros."""
-    from benchmarks.dense_glif_net.glif_common import SparseWeight
+    from benchmarks.glif_net.glif_common import SparseWeight
     B, M = 256, 3
     W0, dense0, case, x_seq0, bias0, not_refrac = _sparse_case(B, M, kind, seed=40)
     rows, cols = W0.coo_indices[0], W0.coo_indices[1]

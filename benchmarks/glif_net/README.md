@@ -38,7 +38,7 @@ kernel runs with **no autograd bookkeeping**. Training uses explicit forward and
 backward kernels, except Warp, which uses `wp.Tape` autodiff.
 
 ```python
-from benchmarks.dense_glif_net.glif_triton import glif3_step_triton
+from benchmarks.glif_net.glif_triton import glif3_step_triton
 
 with torch.no_grad():                      # inference: no graph is built
     spike_seq, v_seq, v_out, I_out = glif3_step_triton.dense_multistep_fused(
@@ -172,8 +172,9 @@ where the `N×N` weight (16 GB, ×2 with its gradient) no longer fits.
 
 SpMV streams the CSR arrays `val`+`col` (8 B/nonzero, ~320 MB at `N=2**15`) while
 the gathered spike vector `s` (128 KB) fits L2, so arithmetic intensity is
-`2·nnz / 8·nnz ≈ 0.25 FLOP/B`. Achieved DRAM bandwidth vs the cuSPARSE `csrmv_v3`
-reference (`roofline_sparse.py`; `--ncu` prints the Nsight Compute command):
+`2·nnz / 8·nnz ≈ 0.25 FLOP/B` — deep in the memory-bound regime. Achieved DRAM
+bandwidth (analytical, cross-checked with Nsight Compute) vs the cuSPARSE
+`csrmv_v3` reference, at `N=2**15`, `T=32` (RTX 5090, HBM peak 1792 GB/s):
 
 | backend | DRAM BW | % of HBM peak |
 |---|---:|---:|
@@ -186,24 +187,21 @@ reference (`roofline_sparse.py`; `--ncu` prints the Nsight Compute command):
 
 ```bash
 # correctness (all backends, inference + training)
-pytest benchmarks/dense_glif_net/test_glif_kernels.py
+pytest benchmarks/glif_net/test_glif_kernels.py
 
 # quick tables (neuron + sparse, three N; prints to stdout)
-python -m benchmarks.dense_glif_net.bench_glif_sparse
+python -m benchmarks.glif_net.bench_glif_sparse
 
 # full sweep — {neuron, dense, sparse} x {inference, training} x 3 backends,
 # 8 N points and 8 T points -> JSON. Heavy; run on a GPU node:
-sbatch benchmarks/dense_glif_net/bench_glif.slurm
+sbatch benchmarks/glif_net/bench_glif.slurm
 #   ... or directly:
-python -m benchmarks.dense_glif_net.bench_glif_full \
-    --out benchmarks/dense_glif_net/bench_glif_full_results.json
+python -m benchmarks.glif_net.bench_glif_full \
+    --out benchmarks/glif_net/bench_glif_full_results.json
 
 # Nature-style figures from the sweep JSON (dense and sparse in separate 2x2
 # panels: rows = inference/training, cols = N-sweep/T-sweep; solid = recurrent,
 # dashed = neuron-only baseline). Writes glif_{dense,sparse}_sweep.{png,pdf}:
-python -m benchmarks.dense_glif_net.plot_glif_kernels \
-    --results benchmarks/dense_glif_net/bench_glif_full_results.json
-
-# SpMV roofline vs cuSPARSE (add --ncu to print the Nsight Compute command)
-python -m benchmarks.dense_glif_net.roofline_sparse
+python -m benchmarks.glif_net.plot_glif_kernels \
+    --results benchmarks/glif_net/bench_glif_full_results.json
 ```

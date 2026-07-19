@@ -5,8 +5,8 @@ kind (dense, sparse) in its own figure, a 2x2 panel of runtime vs N and vs T for
 inference and training. Each panel overlays the three backends (colour) for the
 recurrent kind (solid) against the neuron-only multistep baseline (dashed). Run::
 
-    python -m benchmarks.dense_glif_net.bench_glif_full --out results.json
-    python -m benchmarks.dense_glif_net.plot_glif_kernels --results results.json
+    python -m benchmarks.glif_net.bench_glif_full --out results.json
+    python -m benchmarks.glif_net.plot_glif_kernels --results results.json
 """
 
 from __future__ import annotations
