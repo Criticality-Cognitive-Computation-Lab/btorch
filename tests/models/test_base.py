@@ -1,14 +1,17 @@
-"""``MemoryModule.reset(inplace=True)`` -- reset state without reallocating.
+"""In-place state ops that preserve buffer identity -- needed under CUDA graph
+capture, where every state tensor must keep its address across replays.
 
-inplace writes into the existing buffers instead of rebinding them to fresh
-tensors, so buffer identity/address is preserved (needed to reset state inside a
-captured CUDA graph) and zero-init memories stay on-device.
+``MemoryModule.reset(inplace=True)`` and ``set_hidden_states(..., inplace=True)``
+write into the existing buffers instead of rebinding them to fresh tensors;
+``named_hidden_states(..., clone=True)`` snapshots state decoupled from the live
+buffers (e.g. a start state to restore each step).
 """
 
 import pytest
 import torch
 
 from btorch.models.base import MemoryModule
+from btorch.models.functional import named_hidden_states, set_hidden_states
 
 
 class TwoState(MemoryModule):
@@ -46,3 +49,29 @@ def test_reset_inplace_cannot_resize():
     m.reset(batch_size=2)
     with pytest.raises(ValueError, match="cannot resize"):
         m.reset(batch_size=8, inplace=True)  # different batch -> no realloc allowed
+
+
+def test_named_hidden_states_clone_decouples():
+    m = TwoState(4)
+    m.reset(batch_size=2)
+
+    snap = named_hidden_states(m, clone=True)  # decoupled snapshot
+    live = named_hidden_states(m)  # references into the live buffers
+    m.v.add_(5.0)  # mutate the live state
+
+    assert torch.equal(snap["v"], torch.zeros(2, 4))  # snapshot unaffected
+    assert live["v"] is m.v  # no-clone aliases the buffer
+
+
+def test_set_hidden_states_inplace_preserves_buffers():
+    m = TwoState(4)
+    m.reset(batch_size=2)
+    v = m.v
+
+    set_hidden_states(m, {"v": torch.ones(2, 4)}, inplace=True)
+    assert m.v is v  # same object -> address preserved (for CUDA graph replay)
+    assert torch.equal(m.v, torch.ones(2, 4))
+
+    # Contrast: the default rebinds to a fresh tensor.
+    set_hidden_states(m, {"v": torch.full((2, 4), 3.0)})
+    assert m.v is not v and torch.equal(m.v, torch.full((2, 4), 3.0))

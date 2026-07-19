@@ -318,14 +318,18 @@ def run_cudagraph():
     model, opt, lr = build_model()
 
     # Persistent zero state to start every step from -- reset_net_state can't run
-    # inside the captured step (host copy + rebind). The cell reads this at step 0
-    # and rebinds away, so it stays put at a fixed address.
+    # inside the captured step (host copy + rebind). Snapshot it with clone=True so
+    # the start state is a fixed leaf, decoupled from the buffers the cell rebinds
+    # away each step; the cell's own per-step state tensors are allocated from the
+    # graph pool, so they too keep fixed addresses across replays.
     reset_net_state(model, batch_size=BATCH)
-    start_state = {k: v.clone() for k, v in named_hidden_states(model).items()}
+    start_state = named_hidden_states(model, clone=True)
     init_weights = {k: v.clone() for k, v in model.state_dict().items()}
 
     def step_body():
         opt.zero_grad(set_to_none=False)
+        # rebind (not inplace=True): mid-step the state buffer is autograd-tracked,
+        # so a copy_ into it would trip "modified by an inplace operation" in backward.
         set_hidden_states(model, start_state)
         loss_of(*model(X)).backward()  # reads the static X (input) and Y (target)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

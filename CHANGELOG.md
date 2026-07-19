@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
 - **CUDA graph capture for RNNs** (`RecurrentNN(cudagraph=True)`) — collapses the
   many small per-step launches of the recurrent time loop into a single graph
   replay, a one-flag speedup for launch-bound inference. Guarded to inference
@@ -19,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`MemoryModule.reset(inplace=True)`** — resets hidden state into the existing
   buffers (host-free `zero_()` fast path) so state tensors keep fixed addresses,
   as CUDA graph capture requires.
+- **`set_hidden_states(inplace=True)` and `named_hidden_states(clone=True)`** —
+  `inplace` copies state into the existing buffers (fixed addresses, for restoring
+  state in a captured inference graph); `clone` snapshots state decoupled from the
+  live buffers (e.g. a start state to restore each step).
 
 ## [0.1.0]
 

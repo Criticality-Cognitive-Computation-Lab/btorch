@@ -2,6 +2,7 @@ import logging
 from collections.abc import Callable, Sequence
 from typing import Any, Literal
 
+import torch
 from torch import nn
 
 from ..utils.dict_utils import flatten_dict
@@ -96,50 +97,26 @@ def _collect_memory_vars(
     target_attr: Literal["_memories", "_memories_rv"],
     names: Sequence[str] | None = None,
     allow_buffer: bool = False,
+    clone: bool = False,
 ) -> dict[str, Any]:
-    """Return a proper dotted dict flattened up to items of _memories*."""
+    """Return a proper dotted dict flattened up to items of _memories*.
+
+    Single pass over the module tree (hot path): no per-module intermediate
+    dicts, and ``clone`` only touches tensors when actually requested.
+    """
+    # None -> take everything; else keep a module's whole state (its name matched)
+    # or the individually named children (dotted key matched).
+    names_set = _strip_self(set(names)) if names is not None else None
     ret = {}
-    if names is None:
-        for name, mod in mod.named_modules():
-            if allow_buffer or isinstance(mod, base.MemoryModule):
-                mems = getattr(mod, target_attr)
-                mems = (
-                    {k: v for k, v in mems.items()}
-                    if name == ""
-                    else {f"{name}.{k}": v for k, v in mems.items()}
-                )
-                ret.update(mems)
-        return ret
-    else:
-        if len(names) == 0:
-            return {}
-        names_set = set(names)
-        names_set = _strip_self(names_set)
-        for name, mod in mod.named_modules():
-            if allow_buffer or isinstance(mod, base.MemoryModule):
-                mems = getattr(mod, target_attr)
-                mems = (
-                    {k: v for k, v in mems.items()}
-                    if name == ""
-                    else {f"{name}.{k}": v for k, v in mems.items()}
-                )
-                mems_child = {k: v for k, v in mems.items() if k in names}
-                if name in names_set:
-                    ret.update(mems)
-                else:
-                    ret.update(mems_child)
+    for name, m in mod.named_modules():
+        if not (allow_buffer or isinstance(m, base.MemoryModule)):
+            continue
+        prefix = "" if name == "" else f"{name}."
+        for k, v in getattr(m, target_attr).items():
+            key = prefix + k
+            if names_set is None or name in names_set or key in names:
+                ret[key] = v.clone() if clone and torch.is_tensor(v) else v
     return ret
-
-
-def _torch_module_set_whole(mod: nn.Module, hidden_state: dict[str, Any]):
-    for k, v in hidden_state.items():
-        assert k in mod._buffers, f"{k} not in {mod._buffers}"
-        setattr(mod, k, v)
-
-
-def _torch_module_set_attr(mod: nn.Module, key: str, value: Any):
-    assert key in mod._buffers, f"{key} not in {mod._buffers}"
-    setattr(mod, key, value)
 
 
 # ugly, just to unify common code between memories and memories_rv
@@ -150,6 +127,7 @@ def _set_memory_vars(
     target_attr: Literal["_memories", "_memories_rv"],
     hidden_states: dict[str, Any] | None,
     allow_buffer: bool = False,
+    inplace: bool = False,
 ):
     """For convenience, the memories* level doesn't have to be flatten to dot
     dict.
@@ -158,6 +136,12 @@ def _set_memory_vars(
     """
     if hidden_states is None:
         return
+
+    def set_buffer(m: nn.Module, kv: dict[str, Any]):
+        # inplace copies into the existing buffer (keeps its address); else rebinds
+        for k, v in kv.items():
+            assert k in m._buffers, f"{k} not in {m._buffers}"
+            getattr(m, k).copy_(v) if inplace else setattr(m, k, v)
 
     # TODO: ensure no state is set twice. The following case should not happen
     #       {"a.mem": v0, "a.mem.V": v1}
@@ -177,7 +161,7 @@ def _set_memory_vars(
                 # set self's mem vars via either {"": {"v": tensor}}
                 # or {"self": {"v": tensor}}
                 # e.g. m._memories = hidden_state
-                _torch_module_set_whole(m, hidden_state)
+                set_buffer(m, hidden_state)
         else:
             for p in path[:-1]:
                 m = getattr(m, p)
@@ -190,11 +174,11 @@ def _set_memory_vars(
                 if isinstance(m_leaf, base.MemoryModule):
                     set_whole(m_leaf, hidden_state)
                 elif allow_buffer:
-                    _torch_module_set_whole(m_leaf, hidden_state)
+                    set_buffer(m_leaf, hidden_state)
             else:
                 # set a specific mem var via {"m.subm.v": tensor}
                 if allow_buffer:
-                    _torch_module_set_attr(m, path[-1], hidden_state)
+                    set_buffer(m, {path[-1]: hidden_state})
                 else:
                     assert isinstance(m, base.MemoryModule)
                     set_attr(m, path[-1], hidden_state)
@@ -202,7 +186,10 @@ def _set_memory_vars(
 
 # for serialisation as well as rnn to collect states
 def named_hidden_states(
-    mod: nn.Module, names: Sequence[str] | None = None, allow_buffer: bool = False
+    mod: nn.Module,
+    names: Sequence[str] | None = None,
+    allow_buffer: bool = False,
+    clone: bool = False,
 ) -> dict[str, Any]:
     """Collect hidden states (_memories) from a network as a dotted dict.
 
@@ -210,6 +197,9 @@ def named_hidden_states(
         mod: Network module to collect from.
         names: Optional sequence of dotted state names to filter.
         allow_buffer: If True, also collect from non-MemoryModule buffers.
+        clone: If True, clone each tensor so the returned snapshot is decoupled
+            from the live state (e.g. a start state to restore under CUDA graph
+            capture, which must not alias the buffers the step overwrites).
 
     Returns:
         Dotted dictionary mapping ``module.state_name`` to tensor values.
@@ -219,14 +209,19 @@ def named_hidden_states(
         >>> states.keys()
         dict_keys(['neuron.v', 'synapse.psc'])
     """
-    return _collect_memory_vars(mod, "_memories", names, allow_buffer=allow_buffer)
+    return _collect_memory_vars(
+        mod, "_memories", names, allow_buffer=allow_buffer, clone=clone
+    )
 
 
 named_memory_values = filter_hidden_states = named_hidden_states
 
 
 def set_hidden_states(
-    mod: nn.Module, hidden_states: dict[str, Any], allow_buffer: bool = False
+    mod: nn.Module,
+    hidden_states: dict[str, Any],
+    allow_buffer: bool = False,
+    inplace: bool = False,
 ):
     """Set hidden states (_memories) in a network from a dotted dict.
 
@@ -234,19 +229,40 @@ def set_hidden_states(
         mod: Network module to update.
         hidden_states: Dotted dictionary of states.
         allow_buffer: If True, also set on non-MemoryModule buffers.
+        inplace: If True, copy values into the existing state tensors instead of
+            rebinding them, so the buffers keep their identity and memory addresses
+            (e.g. restoring state inside a captured inference graph). Targets must
+            already exist with matching shapes. Use only outside autograd: copying
+            into a buffer that a live graph still needs raises "a variable needed
+            for gradient computation was modified by an inplace operation".
 
     Example:
         >>> functional.set_hidden_states(model, {"neuron.v": v_tensor})
     """
+    if inplace:
 
-    def set_whole(m: base.MemoryModule, v):
-        m._memories = v
+        def set_whole(m: base.MemoryModule, v):
+            for k, val in v.items():
+                m._memories[k].copy_(val)
 
-    def set_attr(m: base.MemoryModule, k, v):
-        m._memories = {k: v}
+        def set_attr(m: base.MemoryModule, k, v):
+            m._memories[k].copy_(v)
+    else:
+
+        def set_whole(m: base.MemoryModule, v):
+            m._memories = v
+
+        def set_attr(m: base.MemoryModule, k, v):
+            m._memories = {k: v}
 
     _set_memory_vars(
-        mod, set_whole, set_attr, "_memories", hidden_states, allow_buffer=allow_buffer
+        mod,
+        set_whole,
+        set_attr,
+        "_memories",
+        hidden_states,
+        allow_buffer=allow_buffer,
+        inplace=inplace,
     )
 
 
