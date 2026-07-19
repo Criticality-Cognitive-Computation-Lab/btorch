@@ -92,10 +92,61 @@ inference; forward+backward for training):
 | Triton | 0.06 | 0.45 | 5.2 | 33 |
 | Warp | 0.26 | 1.3 | 5.4 | 38 |
 | CuPy | 0.06 | 0.46 | 5.5 | 33 |
+| `torch.compile` (reduce-overhead) | — | — | 5.9 | 93 |
 
 Neuron-multistep inference is a single fused kernel (µs-scale); dense training is
 dominated by the per-step autograd graph. Dense inference is close across
 backends and converges to the HBM ceiling as `N` grows (table above).
+
+### vs `torch.compile(mode="reduce-overhead")`
+
+As a general-purpose baseline, the canonical eager btorch recurrent nets —
+`GLIFDenseNet` (`GLIF3` neuron + `nn.Linear`) and `GLIFSparseNet` (a 5%
+scale-free **cuSPARSE** CSR SpMV, `torch.sparse.mm` on a CSR tensor, *not*
+torch's slower native COO) — compiled with `mode="reduce-overhead"` (Inductor +
+CUDA-graph). Overlaid on both sweeps as pink squares. `N=8192`, `T=32` (ms):
+
+| workload | custom kernel | torch.compile | ratio |
+|---|---:|---:|---:|
+| dense inference | 5.2 (triton) | 5.9 | ~1.1× |
+| dense training | 33 (triton) | 93 | ~2.8× |
+| sparse inference | 0.86 (triton) / 0.51 (cupy) | 6.2 | ~7–12× |
+| sparse training | 9.9 (triton) | 727 | ~73× |
+
+- **Inference.** Dense is HBM-bound on re-reading the weight, so Inductor's
+  fused per-step launch matches the kernels once bandwidth saturates. Sparse is
+  ~8–13× slower: the compiled path calls cuSPARSE `csrmv` for the SpMV but does
+  **not** fuse it with the neuron update, and at these sizes the per-step
+  launches (not the SpMV) dominate.
+- **Training is far slower — and it is mostly *not* compute.** See below.
+
+#### Why training is slow (profiler + Nsight Compute)
+
+Two independent overheads, both absent from the fused kernels:
+
+1. **Unfused neuron update = a swarm of launch-bound kernels.** `ncu` on the
+   eager dense-training pass shows the GLIF3 update decomposed into dozens of
+   tiny elementwise kernels per step (`add`/`mul`/`div`/`neg`/`reciprocal`/
+   `expm1`/…), each ~2.5 µs at **<0.1% SM and <2% DRAM utilisation** — pure
+   launch overhead — and autograd roughly doubles the count (one adjoint kernel
+   per forward op). Inductor fuses most of these (so `default`-mode compile
+   beats eager), but the custom kernels fuse the *entire* step — neuron dynamics
+   and the recurrent gemv/SpMV — into **one** kernel per step.
+2. **`reduce-overhead` re-captures the CUDA graph every iteration.** The torch
+   profiler shows only ~133 ms of actual GPU kernel time for a `T=128` dense
+   training iter, yet wall-clock is ~680 ms — a ~5× gap. The stateful net's
+   `reset_net_state` reallocates the neuron state each iteration, which
+   invalidates the captured graph, so reduce-overhead **re-records** it every
+   call instead of replaying (plus ~28% of the GPU time is `Memcpy DtoD` from
+   graph I/O copies). So the training numbers are dominated by graph re-capture,
+   not arithmetic; a loop that reset state in place (letting the graph replay)
+   would recover most of the gap.
+
+Sparse training is pathological (`T=256`: ~25 s) because the cuSPARSE CSR SpMV
+**graph-breaks** under dynamo — reduce-overhead cannot form one graph and
+re-captures fragmented pieces every step (`default`-mode compile, without CUDA
+graphs, is ~6× faster there). The neuron-only m-step is left kernel-only (it
+doesn't trace under reduce-overhead, and is launch-overhead-bound anyway).
 
 ## Sparse recurrent connection (scale-free SpMV)
 

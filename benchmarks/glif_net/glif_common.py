@@ -242,6 +242,33 @@ class GLIFDenseNet(RecurrentNNAbstract):
         return z, {"v": self.neuron.v}
 
 
+class GLIFSparseNet(RecurrentNNAbstract):
+    """Eager sparse-recurrent GLIF3 net for the torch.compile baseline: the
+    recurrent term is a 5% scale-free SpMV done with a **CSR** sparse tensor, so
+    ``torch.sparse.mm`` dispatches to **cuSPARSE** (``csrmv``) rather than
+    torch's slower native COO path. The CSR tensor is rebuilt inside the step
+    from stored ``crow``/``col`` buffers and a ``val`` parameter so autograd
+    stays per-call (a persistent coalesced tensor would be backwarded twice)."""
+
+    def __init__(self, n_neuron: int, neuron: nn.Module, weight, bias, **kwargs):
+        super().__init__(**kwargs)
+        self.neuron = neuron
+        self.n_neuron = int(n_neuron)
+        self.register_buffer("crow", weight.crow)
+        self.register_buffer("col", weight.col)
+        self.val = nn.Parameter(weight.val.detach().clone())
+        self.register_buffer("bias", bias)
+        self.register_memory("spike", 0.0, n_neuron)
+
+    def single_step_forward(self, x):
+        W = torch.sparse_csr_tensor(self.crow, self.col, self.val,
+                                    (self.n_neuron, self.n_neuron))
+        x = x + torch.sparse.mm(W, self.spike.reshape(-1, 1)).reshape(-1) + self.bias
+        z = self.neuron(x)
+        self.spike = z
+        return z, {"v": self.neuron.v}
+
+
 class GLIF3Kernel(MemoryModule):
     def __init__(
         self,

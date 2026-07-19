@@ -3,7 +3,9 @@
 Reads the sweep JSON from ``bench_glif_full.py`` and draws, for each recurrent
 kind (dense, sparse) in its own figure, a 2x2 panel of runtime vs N and vs T for
 inference and training. Each panel overlays the three backends (colour) for the
-recurrent kind (solid) against the neuron-only multistep baseline (dashed). Run::
+recurrent kind (solid) against the neuron-only multistep baseline (dashed), plus
+a ``torch.compile(mode="reduce-overhead")`` baseline (pink squares) on both the
+dense and sparse figures. Run::
 
     python -m benchmarks.glif_net.bench_glif_full --out results.json
     python -m benchmarks.glif_net.plot_glif_kernels --results results.json
@@ -22,6 +24,7 @@ from btorch.utils.file import fig_path
 # Wong colour-blind-safe palette, one hue per backend.
 BACKEND_COLOR = {"triton": "#0072B2", "warp": "#D55E00", "cupy": "#009E73"}
 BACKENDS = ["triton", "warp", "cupy"]
+COMPILE_COLOR = "#CC79A7"        # torch.compile(reduce-overhead) baseline
 
 
 def _style() -> None:
@@ -52,6 +55,10 @@ def _panel(ax, results, kind, mode, axis, xvals, label):
         ax.plot(*_series(xvals, neu), color=color, lw=1.0, ls=(0, (3, 2)),
                 marker="o", mfc="white", mew=0.8, alpha=0.55, zorder=1)
         ax.plot(*_series(xvals, rec), color=color, ls="-", marker="o", zorder=2)
+    compiled = results.get(f"{kind}/{mode}/torch_compile")
+    if compiled is not None:
+        ax.plot(*_series(xvals, compiled[axis]), color=COMPILE_COLOR, ls="-",
+                marker="s", zorder=3)
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
     ax.set_xlabel("N (neurons)" if axis == "N" else "T (steps)")
@@ -73,10 +80,13 @@ def plot_kind(results, meta, kind, out_dir):
         _panel(ax, results, kind, mode, axis, xvals, label)
 
     handles = [Line2D([], [], color=BACKEND_COLOR[b], marker="o", label=b) for b in BACKENDS]
+    if any(f"{kind}/{m}/torch_compile" in results for m in ("inference", "training")):
+        handles.append(Line2D([], [], color=COMPILE_COLOR, marker="s",
+                              label="torch.compile (reduce-overhead)"))
     handles += [Line2D([], [], color="0.35", ls="-", label=f"{kind} recurrent"),
                 Line2D([], [], color="0.35", ls=(0, (3, 2)), label="neuron only")]
-    fig.legend(handles=handles, loc="upper center", ncol=5, frameon=False,
-               bbox_to_anchor=(0.5, 1.04))
+    fig.legend(handles=handles, loc="upper center", ncol=3, frameon=False,
+               bbox_to_anchor=(0.5, 1.06))
     fig.suptitle(f"GLIF3 {kind} recurrent multistep — RTX 5090  "
                  f"(N sweep at T={meta['n_sweep']['T']}, T sweep at N={meta['t_sweep']['N']})",
                  y=-0.02, fontsize=7.5)
