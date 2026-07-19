@@ -5,7 +5,7 @@ import time
 
 import torch
 
-from benchmark.dense_glif_net.glif_common import (
+from benchmarks.dense_glif_net.glif_common import (
     _DT,
     build_model,
     providers,
