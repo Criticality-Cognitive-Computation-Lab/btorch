@@ -6,6 +6,9 @@ reference for three entry points:
 - single step               ``glif3_step_<backend>``
 - neuron multistep          ``.multistep_fused``
 - dense multistep           ``.dense_multistep_fused`` (inference + training)
+- sparse multistep          ``.sparse_multistep_fused`` (scale-free SpMV; the
+                            fused kernel and its gradients are checked against
+                            the dense-equivalent weight)
 
 Spikes, voltages, after-spike currents and gradients must all match the eager
 reference. Inputs come in ``constant`` and ``random`` flavours, and every case
@@ -449,6 +452,86 @@ def test_dense_fused_matches_matmul(step_fn, kind):
     assert_nontrivial_spikes(fused[0])
     for name, a, b in zip(("spike_seq", "v_seq", "v_out", "Iasc"), fused, matmul):
         assert_close(a, b, f"fused_vs_matmul_{name}")
+
+
+# ---------------------------------------------------------------------------
+# Sparse (scale-free recurrent) multistep: inference and training
+# ---------------------------------------------------------------------------
+def _sparse_case(B, M, kind, seed):
+    """Sparse CSR weight + its dense equivalent (same values at the nonzeros)."""
+    from benchmarks.dense_glif_net.glif_common import scale_free_csr
+    W = scale_free_csr(B, 0.05, DEVICE, seed=seed)
+    rows, cols = W.coo_indices[0], W.coo_indices[1]
+    dense = torch.zeros(B, B, device=DEVICE, dtype=DTYPE)
+    dense[rows, cols] = W.val
+    case = make_case(B, M, kind, seed=seed)
+    x_seq = make_input_sequence(16, B, kind, seed=seed + 1)
+    bias = 0.02 * torch.randn(B, generator=torch.Generator(device=DEVICE).manual_seed(seed + 2),
+                              device=DEVICE, dtype=DTYPE)
+    return W, dense, case, x_seq, bias, torch.ones(B, device=DEVICE, dtype=DTYPE)
+
+
+@pytest.mark.parametrize("kind", INPUT_KINDS)
+def test_sparse_multistep_matches_dense(step_fn, kind):
+    """The fused sparse SpMV multistep must match the dense-equivalent weight and
+    spike non-trivially."""
+    B, M = 512, 3
+    W, dense, case, x_seq, bias, not_refrac = _sparse_case(B, M, kind, seed=30)
+    kw = dict(bias=bias, not_refrac=not_refrac, dt=DT, M=M, hard_reset=False, alpha=ALPHA)
+    with torch.no_grad():
+        sparse = step_fn.sparse_multistep_fused(
+            x_seq=x_seq, weight=W, v=case.v.clone(),
+            Iasc=case.Iasc.reshape(-1).clone(),
+            params=kernel_params(case, case.asc_amps.reshape(-1)), **kw)
+        ref = step_fn.dense_multistep_fused(
+            x_seq=x_seq, weight=dense, v=case.v.clone(),
+            Iasc=case.Iasc.reshape(-1).clone(),
+            params=kernel_params(case, case.asc_amps.reshape(-1)),
+            fused_matmul=True, **kw)
+    assert_nontrivial_spikes(sparse[0])
+    for name, a, b in zip(("spike_seq", "v_seq", "v_out", "Iasc"), sparse, ref):
+        assert_close(a, b, f"sparse_vs_dense_{name}")
+
+
+@pytest.mark.parametrize("kind", INPUT_KINDS)
+def test_sparse_multistep_grad_matches_dense(step_fn, kind):
+    """Sparse training gradients must match the dense-equivalent's — grad w.r.t.
+    the sparse values equals the dense weight gradient at the nonzeros."""
+    from benchmarks.dense_glif_net.glif_common import SparseWeight
+    B, M = 256, 3
+    W0, dense0, case, x_seq0, bias0, not_refrac = _sparse_case(B, M, kind, seed=40)
+    rows, cols = W0.coo_indices[0], W0.coo_indices[1]
+
+    def run_sparse():
+        val = leaf(W0.val, True)
+        W = SparseWeight(W0.crow, W0.col, val, W0.coo_indices, W0.N)
+        x, bias = leaf(x_seq0, True), leaf(bias0, True)
+        asc = leaf(case.asc_amps.reshape(-1), True)
+        out = step_fn.sparse_multistep_fused(
+            x_seq=x, weight=W, bias=bias, v=case.v.clone(),
+            Iasc=case.Iasc.reshape(-1).clone(), params=kernel_params(case, asc),
+            not_refrac=not_refrac, dt=DT, M=M, hard_reset=False, alpha=ALPHA)
+        sum(o.sum() for o in out).backward()
+        return val, x, bias
+
+    def run_dense():
+        weight = leaf(dense0, True)
+        x, bias = leaf(x_seq0, True), leaf(bias0, True)
+        asc = leaf(case.asc_amps.reshape(-1), True)
+        out = step_fn.dense_multistep_fused(
+            x_seq=x, weight=weight, bias=bias, v=case.v.clone(),
+            Iasc=case.Iasc.reshape(-1).clone(), params=kernel_params(case, asc),
+            not_refrac=not_refrac, dt=DT, M=M, hard_reset=False, alpha=ALPHA)
+        sum(o.sum() for o in out).backward()
+        return weight, x, bias
+
+    val, xs, bs = run_sparse()
+    wd, xd, bd = run_dense()
+    for name in ("val", "xs", "bs"):
+        assert_nontrivial_grad(locals()[name].grad, name)
+    assert_close(val.grad, wd.grad[rows, cols], "grad_val_vs_dense")
+    assert_close(xs.grad, xd.grad, "grad_x")
+    assert_close(bs.grad, bd.grad, "grad_bias")
 
 
 # ---------------------------------------------------------------------------

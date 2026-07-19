@@ -36,9 +36,12 @@ Organization:
 - single-step ``glif3_step_warp`` (autograd, the training primitive)
 - neuron multistep ``glif3_multistep_fused_warp`` (autograd for training,
   a lean forward-only path for inference)
-- dense multistep ``glif3_dense_multistep_fused_warp`` (inference or training; the
-  recurrent matmul is either fused into the single kernel or delegated to
-  cuBLAS via ``fused_matmul=False``)
+- dense multistep ``glif3_dense_multistep_fused_warp`` (inference or training;
+  the recurrent matmul is delegated to cuBLAS and the neuron dynamics run in a
+  Warp kernel per step)
+- sparse multistep ``glif3_sparse_multistep_fused_warp`` (scale-free recurrent
+  connection; inference is a CSR-vector SpMV via ``wp.tile_sum`` then the neuron
+  kernel, training differentiates the SpMV on the ``wp.Tape`` too)
 
 Conventions (contiguous, fp32 on CUDA):
 - ``v``, ``x``, ``not_refrac``: shape ``(B,)``
@@ -56,20 +59,13 @@ from jaxtyping import Float
 
 from benchmarks.dense_glif_net.glif_common import (
     GLIF3StepOps,
+    SparseWeight,
     dense_multistep_autograd,
-)
-# The recurrent tile_matmul kernel lives in its own Warp module so it compiles
-# lazily (with the right block_dim) instead of during the main module's backward
-# pass. See glif_warp_tiles for why.
-from benchmarks.dense_glif_net.glif_warp_tiles import (
-    TILE_DIM,
-    TILE_THREADS,
-    glif3_recur_matmul_kernel,
+    sparse_multistep_autograd,
 )
 
 
 _WARP_INITIALIZED = False
-_TILES_AVAILABLE: bool | None = None
 
 
 # ----------------------------------------------------------------------------
@@ -325,111 +321,52 @@ def glif3_dense_step_kernel(
     v_out[i] = v_post
 
 
+_TILE_LANES = wp.constant(64)  # threads per row (block) for the tiled SpMV
+
+
 @wp.kernel(enable_backward=False)
-def glif3_dense_multistep_forward_kernel(
-    x_seq: wp.array2d(dtype=wp.float32),  # (T, B)
-    w: wp.array2d(dtype=wp.float32),      # (B, B)
-    b: wp.array(dtype=wp.float32),        # (B,)
-    v: wp.array(dtype=wp.float32),        # (B,)
-    Iasc: wp.array(dtype=wp.float32),     # (B*M,)
-    v_th: wp.array(dtype=wp.float32),
-    v_reset: wp.array(dtype=wp.float32),
-    v_rest: wp.array(dtype=wp.float32),
-    c_m: wp.array(dtype=wp.float32),
-    tau: wp.array(dtype=wp.float32),
-    k: wp.array(dtype=wp.float32),
-    asc_amps: wp.array(dtype=wp.float32),
-    not_refrac: wp.array(dtype=wp.float32),
-    s_seq: wp.array2d(dtype=wp.float32),  # (T, B)
-    v_seq: wp.array2d(dtype=wp.float32),  # (T, B)
-    v_out: wp.array(dtype=wp.float32),    # (B,)
-    I_out: wp.array(dtype=wp.float32),    # (B*M,)
-    T: int,
-    B: int,
-    M: int,
-    dt: float,
-    hard_reset: int,
-    alpha: float,
+def glif3_spmv_tiled_kernel(
+    crow: wp.array(dtype=wp.int32),
+    col: wp.array(dtype=wp.int32),
+    val: wp.array(dtype=wp.float32),
+    s_prev: wp.array(dtype=wp.float32),
+    lin: wp.array(dtype=wp.float32),  # (N,)
 ):
-    # Single-thread fully-fused fallback: one thread walks the whole (t, i)
-    # recurrence so the recurrent matmul stays fused with no cross-block sync.
-    if wp.tid() != 0:
-        return
-    for t in range(T):
-        for i in range(B):
-            base = i * M
-            i_sum = float(0.0)
-            for m in range(M):
-                i_sum += Iasc[base + m]
-
-            lin = float(0.0)
-            for j in range(B):
-                s_prev = float(0.0)
-                if t > 0:
-                    s_prev = s_seq[t - 1, j]
-                lin += w[i, j] * s_prev
-
-            x_in = x_seq[t, i] + b[i] + lin
-            v_prime = neuronal_charge(
-                v[i], x_in, i_sum, v_rest[i], c_m[i], tau[i], dt)
-            spike = neuronal_fire(v_prime, v_th[i], v_reset[i], not_refrac[i], alpha)
-            v_post = neuronal_reset(v_prime, spike, v_th[i], v_reset[i], hard_reset)
-
-            for m in range(M):
-                Iasc[base + m] = neuronal_adaptation(
-                    Iasc[base + m], k[base + m], asc_amps[base + m], spike, dt)
-            v[i] = v_post
-            s_seq[t, i] = spike
-            v_seq[t, i] = v_post
-
-    for i in range(B):
-        v_out[i] = v[i]
-        base = i * M
-        for m in range(M):
-            I_out[base + m] = Iasc[base + m]
+    # CSR-vector with a cooperative reduction. Launched as one block of
+    # _TILE_LANES threads per row (wp.launch, block_dim=_TILE_LANES). Each thread
+    # strides the row's nonzeros for its partial; wp.tile(acc) gathers the block's
+    # per-thread partials into a tile and wp.tile_sum reduces them in a single
+    # shuffle-based cooperative reduction (no atomics).
+    tid = wp.tid()                 # global thread id
+    row = tid // _TILE_LANES
+    lane = tid % _TILE_LANES
+    acc = float(0.0)
+    p = crow[row] + lane
+    end = crow[row + 1]
+    while p < end:
+        acc += val[p] * s_prev[col[p]]
+        p += _TILE_LANES
+    total = wp.tile_sum(wp.tile(acc))
+    wp.tile_store(lin, total, offset=(row,))
 
 
-# ----------------------------------------------------------------------------
-# Fused-tile dense kernels: the recurrent matmul is a block-cooperative
-# wp.tile_matmul (glif3_recur_matmul_kernel, imported from glif_warp_tiles), and
-# the neuron dynamics run one-thread-per-neuron below. They are split into two
-# kernels launched per timestep (the launch boundary is the cross-neuron barrier
-# the recurrent term needs, and a tiled kernel has no per-thread lane for scalar
-# work). Under a single wp.Tape the two-kernel chain differentiates end to end;
-# forward-only launches serve inference.
-# ----------------------------------------------------------------------------
 @wp.kernel
-def glif3_dense_dynamics_kernel(
-    t: int,
-    x_seq: wp.array2d(dtype=wp.float32),    # (T, B)
-    lin: wp.array2d(dtype=wp.float32),      # (B, 1) recurrent input this step
-    bias: wp.array(dtype=wp.float32),       # (B,)
-    v_prev: wp.array(dtype=wp.float32),     # (B,)
-    I_prev: wp.array(dtype=Any),            # (B,) ASC vectors
-    v_th: wp.array(dtype=wp.float32),
-    v_reset: wp.array(dtype=wp.float32),
-    v_rest: wp.array(dtype=wp.float32),
-    c_m: wp.array(dtype=wp.float32),
-    tau: wp.array(dtype=wp.float32),
-    k: wp.array(dtype=Any),
-    asc_amps: wp.array(dtype=Any),
-    not_refrac: wp.array(dtype=wp.float32),
-    dt: float,
-    hard_reset: int,
-    alpha: float,
-    s_out: wp.array2d(dtype=wp.float32),    # (B, 1)
-    v_out: wp.array(dtype=wp.float32),      # (B,)
-    I_out: wp.array(dtype=Any),             # (B,) ASC vectors
+def glif3_spmv_grad_kernel(
+    crow: wp.array(dtype=wp.int32),
+    col: wp.array(dtype=wp.int32),
+    val: wp.array(dtype=wp.float32),
+    s: wp.array(dtype=wp.float32),
+    lin: wp.array(dtype=wp.float32),
 ):
-    n = wp.tid()
-    i_asc = I_prev[n]
-    x_in = x_seq[t, n] + bias[n] + lin[n, 0]
-    v_prime = neuronal_charge(
-        v_prev[n], x_in, asc_sum(i_asc), v_rest[n], c_m[n], tau[n], dt)
-    spike = neuronal_fire(v_prime, v_th[n], v_reset[n], not_refrac[n], alpha)
-    v_out[n] = neuronal_reset(v_prime, spike, v_th[n], v_reset[n], hard_reset)
-    I_out[n] = asc_adapt(i_asc, k[n], asc_amps[n], spike, dt)
-    s_out[n, 0] = spike
+    # Differentiable one-thread-per-row SpMV for training: Warp's tape gets the
+    # adjoints of ``val`` and ``s`` automatically (the read ``s[col[p]]``
+    # back-propagates as an atomic scatter into ``s.grad``), so no hand-written
+    # backward. Used only in the (graph-bound) training path.
+    i = wp.tid()
+    acc = float(0.0)
+    for p in range(crow[i], crow[i + 1]):
+        acc += val[p] * s[col[p]]
+    lin[i] = acc
 
 
 # ----------------------------------------------------------------------------
@@ -480,6 +417,11 @@ def _vec_type(M: int):
 def _wp(tensor: torch.Tensor) -> wp.array:
     """Wrap a contiguous fp32 tensor as a scalar Warp array (no gradient)."""
     return wp.from_torch(tensor, dtype=wp.float32, requires_grad=False)
+
+
+def _wp_int(tensor: torch.Tensor) -> wp.array:
+    """Wrap a contiguous int32 tensor as a Warp array (CSR index arrays)."""
+    return wp.from_torch(tensor, dtype=wp.int32, requires_grad=False)
 
 
 def _wp_grad(tensor: torch.Tensor) -> wp.array:
@@ -817,246 +759,13 @@ def glif3_multistep_fused_warp(
 # ----------------------------------------------------------------------------
 # Dense (neuron + recurrent connection) multistep
 # ----------------------------------------------------------------------------
-def _tiles_available() -> bool:
-    """Whether wp.tile_matmul compiles+runs here (probed once via a tiny launch).
-    Tile ops need Warp built against CUDA 12.6.3+ (MathDx); older toolchains
-    raise at compile time, so we fall back rather than crash."""
-    global _TILES_AVAILABLE
-    if _TILES_AVAILABLE is None:
-        _ensure_warp_init()
-        n = int(TILE_DIM)
-        try:
-            wp.launch_tiled(
-                glif3_recur_matmul_kernel,
-                dim=1,
-                inputs=[
-                    wp.zeros((n, n), dtype=wp.float32, device="cuda"),
-                    wp.zeros((n, 1), dtype=wp.float32, device="cuda"),
-                    n,
-                    wp.zeros((n, 1), dtype=wp.float32, device="cuda"),
-                ],
-                block_dim=TILE_THREADS,
-                device="cuda",
-            )
-            wp.synchronize()
-            _TILES_AVAILABLE = True
-        except Exception:
-            _TILES_AVAILABLE = False
-    return _TILES_AVAILABLE
-
-
-def _tile_eligible(B: int) -> bool:
-    """The fused-tile path needs B to tile evenly and tile ops to be available."""
-    return B % int(TILE_DIM) == 0 and _tiles_available()
-
-
-def _dense_recur_const(params, not_refrac, M):
-    """Constant (non-differentiable) neuron params as Warp arrays for the dense
-    dynamics kernel."""
-    return [
-        _wp(params["v_th"]), _wp(params["v_reset"]), _wp(params["v_rest"]),
-        _wp(params["c_m"]), _wp(params["tau"]),
-        _wp_vec(params["k"], M, requires_grad=False),
-        _wp_vec(params["asc_amps"], M, requires_grad=False), _wp(not_refrac),
-    ]
-
-
-def _dense_multistep_tile_infer(
-    x_seq, weight, bias, v, Iasc, params, not_refrac, dt, M, hard_reset, alpha
-):
-    """Forward-only fused-tile dense multistep: per step, one tile_matmul kernel
-    (W @ s_prev) then one neuron-dynamics kernel. State ping-pongs between two
-    buffers; the per-step launch boundary is the recurrent cross-neuron barrier."""
-    T, B = x_seq.shape
-    dev, dtp = v.device, v.dtype
-    s_seq = torch.empty((T, B), device=dev, dtype=dtp)
-    v_seq = torch.empty((T, B), device=dev, dtype=dtp)
-
-    x_wp, W_wp, bias_wp = _wp(x_seq), _wp(weight), _wp(bias)
-    const = _dense_recur_const(params, not_refrac, M)
-    hr = int(1 if hard_reset else 0)
-
-    s_prev = torch.zeros((B, 1), device=dev, dtype=dtp)
-    lin = torch.empty((B, 1), device=dev, dtype=dtp)
-    v_cur, I_cur = v.clone(), Iasc.reshape(B, M).clone()
-    s_nxt = torch.empty((B, 1), device=dev, dtype=dtp)
-    v_nxt = torch.empty((B,), device=dev, dtype=dtp)
-    I_nxt = torch.empty((B, M), device=dev, dtype=dtp)
-
-    for t in range(T):
-        wp.launch_tiled(
-            glif3_recur_matmul_kernel, dim=B // int(TILE_DIM),
-            inputs=[W_wp, _wp(s_prev), int(B), _wp(lin)],
-            block_dim=TILE_THREADS, device="cuda",
-        )
-        wp.launch(
-            glif3_dense_dynamics_kernel, dim=B,
-            inputs=[
-                int(t), x_wp, _wp(lin), bias_wp,
-                _wp(v_cur), _wp_vec(I_cur, M, requires_grad=False), *const,
-                float(dt), hr, float(alpha),
-                _wp(s_nxt), _wp(v_nxt), _wp_vec(I_nxt, M, requires_grad=False),
-            ],
-            device="cuda",
-        )
-        s_seq[t], v_seq[t] = s_nxt[:, 0], v_nxt
-        s_prev, s_nxt = s_nxt, s_prev
-        v_cur, v_nxt = v_nxt, v_cur
-        I_cur, I_nxt = I_nxt, I_cur
-    return s_seq, v_seq, v_cur, I_cur
-
-
-def _dense_multistep_singlethread(
-    x_seq, weight, bias, v, Iasc, params, not_refrac, dt, M, hard_reset, alpha
-):
-    """Fully-fused fallback for when tiles are unavailable or B does not tile
-    evenly: one thread walks the whole (t, i) recurrence in a single launch."""
-    T, B = x_seq.shape
-    v_seq = torch.empty((T, B), device=v.device, dtype=v.dtype)
-    s_seq = torch.empty((T, B), device=v.device, dtype=v.dtype)
-    v_out = torch.empty_like(v)
-    I_out = torch.empty_like(Iasc)
-    wp.launch(
-        glif3_dense_multistep_forward_kernel, dim=1,
-        inputs=[
-            _wp(x_seq), _wp(weight), _wp(bias), _wp(v), _wp(Iasc),
-            _wp(params["v_th"]), _wp(params["v_reset"]), _wp(params["v_rest"]),
-            _wp(params["c_m"]), _wp(params["tau"]),
-            _wp(params["k"]), _wp(params["asc_amps"]), _wp(not_refrac),
-            _wp(s_seq), _wp(v_seq), _wp(v_out), _wp(I_out),
-            int(T), int(B), int(M), float(dt),
-            int(1 if hard_reset else 0), float(alpha),
-        ],
-        block_dim=1, device="cuda",
-    )
-    return s_seq, v_seq, v_out, I_out
-
-
-class GLIF3DenseMultiStepWarp(torch.autograd.Function):
-    """Fused-tile dense multistep training. Runs the two-kernel (tile_matmul +
-    dynamics) recurrence for T steps under one wp.Tape, with per-step state kept
-    in arrays so the dynamic loop differentiates. Gradients for weight / bias /
-    x_seq / initial state / asc_amps all fall out of tape.backward()."""
-
-    @staticmethod
-    def forward(
-        ctx, x_seq, weight, bias, v, Iasc,
-        v_th, v_reset, v_rest, c_m, tau, k, asc_amps, not_refrac,
-        dt, M, hard_reset, alpha,
-    ):
-        if not x_seq.is_cuda:
-            raise RuntimeError("Dense multistep Warp requires CUDA tensors.")
-        _ensure_warp_init()
-        M = int(M)
-        x_seq, weight, bias = _as_fp32(x_seq), _as_fp32(weight), _as_fp32(bias)
-        v = _as_fp32(v)
-        v_th, v_reset, v_rest = _as_fp32(v_th), _as_fp32(v_reset), _as_fp32(v_rest)
-        c_m, tau, k = _as_fp32(c_m), _as_fp32(tau), _as_fp32(k)
-        asc_amps, not_refrac = _as_fp32(asc_amps), _as_fp32(not_refrac)
-        T, B = x_seq.shape
-        dev, dtp = v.device, v.dtype
-
-        x_wp, W_wp, b_wp = _wp_grad(x_seq), _wp_grad(weight), _wp_grad(bias)
-        asc_wp = _wp_vec(asc_amps, M, requires_grad=True)
-        const = [
-            _wp(v_th), _wp(v_reset), _wp(v_rest), _wp(c_m), _wp(tau),
-            _wp_vec(k, M, requires_grad=False), asc_wp, _wp(not_refrac),
-        ]
-
-        # Per-step state in arrays (array-carried loop => differentiable).
-        s_list = [_wp_grad(torch.zeros((B, 1), device=dev, dtype=dtp))]
-        v_list = [_wp_grad(v)]
-        I_list = [_wp_vec(Iasc, M, requires_grad=True)]
-        lin_list, s_torch, v_torch = [], [], []
-        hr = int(1 if hard_reset else 0)
-
-        tape = wp.Tape()
-        with tape:
-            for t in range(T):
-                lin_wp = _wp_grad(torch.empty((B, 1), device=dev, dtype=dtp))
-                lin_list.append(lin_wp)
-                wp.launch_tiled(
-                    glif3_recur_matmul_kernel, dim=B // int(TILE_DIM),
-                    inputs=[W_wp, s_list[t], int(B), lin_wp],
-                    block_dim=TILE_THREADS, device="cuda",
-                )
-                s_t = torch.empty((B, 1), device=dev, dtype=dtp)
-                v_t = torch.empty((B,), device=dev, dtype=dtp)
-                I_t = torch.empty((B, M), device=dev, dtype=dtp)
-                s_wp, v_wp = _wp_grad(s_t), _wp_grad(v_t)
-                I_wp = _wp_vec(I_t, M, requires_grad=True)
-                wp.launch(
-                    glif3_dense_dynamics_kernel, dim=B,
-                    inputs=[
-                        int(t), x_wp, lin_wp, b_wp, v_list[t], I_list[t], *const,
-                        float(dt), hr, float(alpha), s_wp, v_wp, I_wp,
-                    ],
-                    device="cuda",
-                )
-                s_list.append(s_wp); v_list.append(v_wp); I_list.append(I_wp)
-                s_torch.append(s_t); v_torch.append(v_t)
-
-        ctx.tape = tape
-        ctx.grad_inputs = (x_wp, W_wp, b_wp, v_list[0], I_list[0], asc_wp)
-        ctx.keep = (s_list, v_list, I_list, lin_list, const)  # keep arrays alive
-        ctx.T, ctx.B, ctx.M = T, B, M
-        ctx.Iasc_was_flat = Iasc.ndim == 1
-        ctx.asc_was_flat = asc_amps.ndim == 1
-
-        s_seq = torch.stack([s.view(B) for s in s_torch])
-        v_seq = torch.stack(v_torch)
-        v_out = v_torch[-1]
-        I_out = wp.to_torch(I_list[T]).clone()
-        return s_seq, v_seq, v_out, I_out.reshape(-1) if Iasc.ndim == 1 else I_out
-
-    @staticmethod
-    def backward(ctx, ds_seq, dv_seq, dv_out, dI_out):
-        x_wp, W_wp, b_wp, v0_wp, I0_wp, asc_wp = ctx.grad_inputs
-        s_list, v_list, I_list, _lin, _const = ctx.keep
-        T, B, M = ctx.T, ctx.B, ctx.M
-
-        for t in range(1, T + 1):
-            _seed(s_list[t], ds_seq[t - 1] if ds_seq is not None else None)
-            _seed(v_list[t], dv_seq[t - 1] if dv_seq is not None else None)
-        v_grad = wp.to_torch(v_list[T].grad)
-        if dv_out is not None:
-            v_grad += dv_out.to(dtype=v_grad.dtype)
-        i_grad = wp.to_torch(I_list[T].grad)
-        if dI_out is not None:
-            i_grad += dI_out.reshape(B, M).to(dtype=i_grad.dtype)
-        ctx.tape.backward()
-
-        dx = wp.to_torch(x_wp.grad).clone()
-        dW = wp.to_torch(W_wp.grad).clone()
-        db = wp.to_torch(b_wp.grad).clone()
-        dv0 = wp.to_torch(v0_wp.grad).clone()
-        dI0 = wp.to_torch(I0_wp.grad).clone()
-        dasc = wp.to_torch(asc_wp.grad).clone()
-
-        if ctx.Iasc_was_flat:
-            dI0 = dI0.reshape(-1)
-        if ctx.asc_was_flat:
-            dasc = dasc.reshape(-1)
-        return (dx, dW, db, dv0, dI0, None, None, None, None, None, None, dasc,
-                None, None, None, None, None)
-
-
-def _dense_multistep_tile_autograd(
-    x_seq, weight, bias, v, Iasc, params, not_refrac, dt, M, hard_reset, alpha
-):
-    return GLIF3DenseMultiStepWarp.apply(
-        x_seq, weight, bias, v, Iasc,
-        params["v_th"], params["v_reset"], params["v_rest"],
-        params["c_m"], params["tau"], params["k"], params["asc_amps"], not_refrac,
-        float(dt), int(M), bool(hard_reset), float(alpha),
-    )
 
 
 def _dense_multistep_matmul(
     x_seq, weight, bias, v, Iasc, params, not_refrac, dt, M, hard_reset, alpha
 ):
-    """Non-fused path: cuBLAS matmul for the recurrent term, neuron step kernel
-    for the dynamics. One launch pair per timestep."""
+    """cuBLAS matmul for the recurrent term, Warp neuron kernel for the dynamics:
+    one launch pair per timestep."""
     T, B = x_seq.shape
     v_seq = torch.empty((T, B), device=v.device, dtype=v.dtype)
     s_seq = torch.empty((T, B), device=v.device, dtype=v.dtype)
@@ -1105,14 +814,13 @@ def glif3_dense_multistep_fused_warp(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dense (neuron + recurrent connection) multistep (inference or training).
 
-    With ``fused_matmul=True`` the recurrent matmul is a Warp ``tile_matmul``
-    kernel fused (per step) with the neuron dynamics -- for training the whole
-    T-step recurrence runs under one ``wp.Tape``. With ``fused_matmul=False`` the
-    matmul is delegated to cuBLAS: training composes the single-step Warp
-    autograd primitive per step (``dense_multistep_autograd``); inference runs a
-    per-step cuBLAS matmul plus neuron kernel. When B does not tile evenly or
-    tile ops are unavailable, the fused path degrades gracefully (composition for
-    training, single-thread fused kernel for inference).
+    Warp runs the neuron dynamics; the recurrent matmul is delegated to cuBLAS.
+    Training composes the single-step Warp autograd primitive with a per-step
+    ``torch.mv`` (``dense_multistep_autograd``), so gradients for ``weight`` /
+    ``bias`` / ``x`` / initial state / ``asc_amps`` flow through the tape-based
+    single step. Inference runs a per-step cuBLAS matmul plus one Warp neuron
+    kernel. ``fused_matmul`` is accepted for interface parity but Warp always
+    uses this per-step matmul.
     """
     B = v.numel()
     need_grad = torch.is_grad_enabled() and (
@@ -1120,17 +828,12 @@ def glif3_dense_multistep_fused_warp(
         or v.requires_grad or Iasc.requires_grad or params["asc_amps"].requires_grad
     )
     if need_grad:
-        if fused_matmul and x_seq.is_cuda and _tile_eligible(B):
-            return _dense_multistep_tile_autograd(
-                x_seq, weight, bias, v, Iasc, params, not_refrac,
-                float(dt), int(M), bool(hard_reset), float(alpha),
-            )
         return dense_multistep_autograd(
             _glif3_step_warp, x_seq, weight, bias, v, Iasc, params, not_refrac,
             float(dt), int(M), bool(hard_reset), float(alpha),
         )
     if not x_seq.is_cuda:
-        raise RuntimeError("Fused dense multistep Warp requires CUDA tensors.")
+        raise RuntimeError("Dense multistep Warp requires CUDA tensors.")
     _ensure_warp_init()
     if weight.shape != (B, B):
         raise ValueError("weight must have shape (B, B).")
@@ -1142,45 +845,139 @@ def glif3_dense_multistep_fused_warp(
     fp32 = {key: _as_fp32(params[key]) for key in params}
     not_refrac = _as_fp32(not_refrac)
 
-    if not fused_matmul:
-        path = _dense_multistep_matmul
-    elif _tile_eligible(B):
-        path = _dense_multistep_tile_infer
-    else:
-        path = _dense_multistep_singlethread
-    s_seq, v_seq, v_out, I_out = path(
+    s_seq, v_seq, v_out, I_out = _dense_multistep_matmul(
         x_seq, weight, bias, v, Iasc, fp32, not_refrac,
         float(dt), int(M), bool(hard_reset), float(alpha),
     )
     return s_seq, v_seq, v_out, I_out.view(B, int(M))
 
 
+class _WarpSparseSpmv(torch.autograd.Function):
+    """lin = W @ s via a differentiable Warp kernel on a ``wp.Tape`` — Warp gets
+    the adjoints of the values and ``s`` with no hand-written backward. This is
+    the Warp-backend replacement for the shared torch ``_SparseSpmv``, so Warp
+    sparse training is tape-based end to end (neuron step + SpMV both on tape)."""
+
+    @staticmethod
+    def forward(ctx, crow, col, N, val, s):
+        _ensure_warp_init()
+        lin = torch.empty(N, device=s.device, dtype=s.dtype)
+        val_wp, s_wp, lin_wp = _wp_grad(val), _wp_grad(s), _wp_grad(lin)
+        tape = wp.Tape()
+        with tape:
+            wp.launch(glif3_spmv_grad_kernel, dim=N,
+                      inputs=[_wp_int(crow), _wp_int(col), val_wp, s_wp, lin_wp],
+                      device="cuda")
+        ctx.tape = tape
+        ctx.wp_arrays = (val_wp, s_wp, lin_wp)
+        return wp.to_torch(lin_wp)
+
+    @staticmethod
+    def backward(ctx, glin):
+        val_wp, s_wp, lin_wp = ctx.wp_arrays
+        _seed(lin_wp, glin)
+        ctx.tape.backward()
+        return (None, None, None,
+                wp.to_torch(val_wp.grad).clone(), wp.to_torch(s_wp.grad).clone())
+
+
+def _warp_sparse_spmv(weight, s):
+    return _WarpSparseSpmv.apply(weight.crow, weight.col, weight.N, weight.val, s)
+
+
+def _sparse_multistep_fused(
+    x_seq, weight, bias, v, Iasc, params, not_refrac, dt, M, hard_reset, alpha
+):
+    """Per-step sparse path: a CSR-vector SpMV (a block of ``_TILE_LANES`` threads
+    per row, cooperative ``wp.tile_sum`` reduction -> ``lin``) followed by the
+    neuron step kernel. Two launches per timestep; does not mutate v / Iasc."""
+    T, N = x_seq.shape
+    v_work = v.clone()
+    I_work = Iasc.clone()
+    v_seq = torch.empty((T, N), device=v.device, dtype=v.dtype)
+    s_seq = torch.empty((T, N), device=v.device, dtype=v.dtype)
+    step_v = torch.empty_like(v)
+    step_s = torch.empty_like(v)
+    lin = torch.empty_like(v)
+    s_prev = torch.zeros((N,), device=v.device, dtype=v.dtype)
+
+    crow, col, val = _wp_int(weight.crow), _wp_int(weight.col), _wp(weight.val)
+    hr = int(1 if hard_reset else 0)
+    for t in range(T):
+        wp.launch(
+            glif3_spmv_tiled_kernel, dim=N * int(_TILE_LANES),
+            inputs=[crow, col, val, _wp(s_prev), _wp(lin)],
+            block_dim=int(_TILE_LANES), device="cuda",
+        )
+        x_in = (x_seq[t] + bias + lin).contiguous()
+        wp.launch(
+            glif3_dense_step_kernel, dim=N,
+            inputs=[
+                _wp(x_in), _wp(v_work), _wp(I_work),
+                _wp(params["v_th"]), _wp(params["v_reset"]), _wp(params["v_rest"]),
+                _wp(params["c_m"]), _wp(params["tau"]),
+                _wp(params["k"]), _wp(params["asc_amps"]), _wp(not_refrac),
+                _wp(step_s), _wp(step_v),
+                int(M), float(dt), hr, float(alpha),
+            ],
+            block_dim=256, device="cuda",
+        )
+        s_seq[t] = step_s
+        v_seq[t] = step_v
+        s_prev = step_s.clone()
+
+    return s_seq, v_seq, v_work, I_work
+
+
+def glif3_sparse_multistep_fused_warp(
+    x_seq: Float[torch.Tensor, " T N"],
+    weight: SparseWeight,
+    bias: torch.Tensor,
+    v: Float[torch.Tensor, " N"],
+    Iasc: Float[torch.Tensor, " N M"],
+    params: dict,
+    not_refrac: Float[torch.Tensor, " N"],
+    dt: float,
+    M: int,
+    hard_reset: bool = False,
+    alpha: float = 2.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sparse (neuron + scale-free recurrent connection) multistep.
+
+    Inference runs a load-balanced CSR-vector SpMV (``_SPMV_LANES`` threads per
+    row) then the neuron step kernel, per timestep. Training composes the
+    single-step Warp autograd op with a COO ``torch.sparse`` SpMV each step
+    (``sparse_multistep_autograd``).
+    """
+    N = v.numel()
+    need_grad = torch.is_grad_enabled() and (
+        weight.val.requires_grad or bias.requires_grad or x_seq.requires_grad
+        or v.requires_grad or Iasc.requires_grad or params["asc_amps"].requires_grad
+    )
+    if need_grad:
+        return sparse_multistep_autograd(
+            _glif3_step_warp, x_seq, weight, bias, v, Iasc, params, not_refrac,
+            float(dt), int(M), bool(hard_reset), float(alpha),
+            spmv=_warp_sparse_spmv,  # SpMV gradient via wp.Tape (no manual backward)
+        )
+    if not x_seq.is_cuda:
+        raise RuntimeError("Fused sparse multistep Warp requires CUDA tensors.")
+    _ensure_warp_init()
+    x_seq, bias = _as_fp32(x_seq), _as_fp32(bias)
+    v, Iasc = _as_fp32(v), _as_fp32(Iasc.reshape(-1))
+    fp32 = {key: _as_fp32(params[key]) for key in params}
+    not_refrac = _as_fp32(not_refrac)
+
+    s_seq, v_seq, v_out, I_out = _sparse_multistep_fused(
+        x_seq, weight, bias, v, Iasc, fp32, not_refrac,
+        float(dt), int(M), bool(hard_reset), float(alpha),
+    )
+    return s_seq, v_seq, v_out, I_out.view(N, int(M))
+
+
 glif3_step_warp = GLIF3StepOps(
     step=_glif3_step_warp,
     multistep_fused=glif3_multistep_fused_warp,
     dense_multistep_fused=glif3_dense_multistep_fused_warp,
+    sparse_multistep_fused=glif3_sparse_multistep_fused_warp,
 )
-
-
-class GLIF3Warp(torch.nn.Module):
-    """Thin module wrapper exposing a ``step`` API."""
-
-    def __init__(self, M: int, hard_reset: bool = False, alpha: float = 2.0):
-        super().__init__()
-        self.M = int(M)
-        self.hard_reset = bool(hard_reset)
-        self.alpha = float(alpha)
-
-    def step(
-        self,
-        v: Float[torch.Tensor, " B"],
-        Iasc: Float[torch.Tensor, " B M"],
-        x: Float[torch.Tensor, " B"],
-        params: dict,
-        not_refrac: Float[torch.Tensor, " B"],
-        dt: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return _glif3_step_warp(
-            v=v, Iasc=Iasc, x=x, params=params, not_refrac=not_refrac,
-            dt=float(dt), M=self.M, hard_reset=self.hard_reset, alpha=self.alpha,
-        )

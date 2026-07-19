@@ -20,9 +20,9 @@ Organization:
 - single-step ``glif3_step_triton`` (autograd, the training primitive)
 - neuron multistep ``glif3_multistep_fused_triton`` (autograd for training,
   a lean forward-only path for inference)
-- dense multistep ``glif3_dense_multistep_fused_triton`` (inference or training; the
-  recurrent matmul is either fused into the single kernel or delegated to
-  cuBLAS via ``fused_matmul=False``)
+- dense multistep ``glif3_dense_multistep_fused_triton`` (inference or training;
+  the recurrent matmul is fused into the neuron kernel via a pipelined in-kernel
+  gemv, or delegated to cuBLAS via ``fused_matmul=False``)
 
 Implementation notes:
 - memory is addressed with ``tl.make_block_ptr`` + ``boundary_check`` via the
@@ -48,19 +48,10 @@ from triton.language.extra import libdevice
 
 from benchmarks.dense_glif_net.glif_common import (
     GLIF3StepOps,
+    SparseWeight,
     dense_multistep_autograd,
+    sparse_multistep_autograd,
 )
-
-
-# Autotune warps + pipeline stages (tile shapes are fixed by BLOCK/MPAD from the
-# wrappers), keyed on problem size. The single-program dense kernel is latency
-# bound on one SM, so it wants many warps and load pipelining; small element-wise
-# kernels are left untuned since the autotune dispatch overhead would dominate.
-_WARP_CONFIGS = [
-    triton.Config({}, num_warps=w, num_stages=s)
-    for w in (4, 8, 16, 32)
-    for s in (1, 2, 3)
-]
 
 
 # Use libdevice for exp/expm1: Triton has no native expm1, and its native
@@ -417,6 +408,19 @@ def glif3_neuron_multistep_backward_kernel(
 # Dense multistep kernels (inference)
 # ----------------------------------------------------------------------------
 @triton.jit
+def glif3_neuron_update(x_in, v, iasc, k, asc, v_th, v_reset, v_rest, c_m, tau,
+                        mask, dt, hard_reset: tl.constexpr):
+    """GLIF3 neuron update for a tile: from total input ``x_in`` and previous
+    state ``(v, iasc)`` return ``(spike, v_post, I_post)``. ``iasc`` / ``k`` /
+    ``asc`` are ``(BLOCK, MPAD)`` mode tiles; the rest are ``(BLOCK,)``."""
+    v_prime = neuronal_charge(v, x_in, tl.sum(iasc, axis=1), v_rest, c_m, tau, dt)
+    spike = neuronal_fire(v_prime, v_th, mask)
+    v_post = neuronal_reset(v_prime, spike, v_th, v_reset, hard_reset)
+    I_post = neuronal_adaptation(iasc, k, asc, spike[:, None], dt)
+    return spike, v_post, I_post
+
+
+@triton.jit
 def glif3_dense_step_kernel(
     x_in_ptr,  # (B,) already includes bias + recurrent term
     v_ptr, I_ptr,
@@ -428,8 +432,8 @@ def glif3_dense_step_kernel(
     off = tl.program_id(0) * BLOCK
     mode_valid = tl.arange(0, MPAD) < M
 
-    v = load_vec(v_ptr, B, off, BLOCK)
     x = load_vec(x_in_ptr, B, off, BLOCK)
+    v = load_vec(v_ptr, B, off, BLOCK)
     v_th = load_vec(v_th_ptr, B, off, BLOCK)
     v_reset = load_vec(v_reset_ptr, B, off, BLOCK)
     v_rest = load_vec(v_rest_ptr, B, off, BLOCK)
@@ -440,10 +444,8 @@ def glif3_dense_step_kernel(
     k = tl.where(mode_valid[None, :], load_modes(k_ptr, B, M, off, BLOCK, MPAD), 1.0)
     asc = load_modes(asc_ptr, B, M, off, BLOCK, MPAD)
 
-    v_prime = neuronal_charge(v, x, tl.sum(iasc, axis=1), v_rest, c_m, tau, dt)
-    spike = neuronal_fire(v_prime, v_th, mask)
-    v_post = neuronal_reset(v_prime, spike, v_th, v_reset, hard_reset)
-    I_post = neuronal_adaptation(iasc, k, asc, spike[:, None], dt)
+    spike, v_post, I_post = glif3_neuron_update(
+        x, v, iasc, k, asc, v_th, v_reset, v_rest, c_m, tau, mask, dt, hard_reset)
 
     store_vec(v_ptr, B, off, v_post, BLOCK)
     store_modes(I_ptr, B, M, off, I_post, BLOCK, MPAD)
@@ -451,51 +453,63 @@ def glif3_dense_step_kernel(
     store_vec(v_out_ptr, B, off, v_post, BLOCK)
 
 
-@triton.autotune(configs=_WARP_CONFIGS, key=["B", "T"])
+# Fused single-step dense kernel: the recurrent gemv ``lin = W[rows,:] @ s_prev``
+# is computed in-kernel with a pipelined column loop (``tl.range`` num_stages
+# overlaps the weight-tile streaming with the accumulate) and fused with the
+# neuron update. One launch per timestep; the launch boundary is the cross-step
+# barrier (every block reads the whole previous-step spike vector).
+_DENSE_STEP_CONFIGS = [
+    triton.Config({"BM": bm, "BK": bk, "NUM_STAGES": ns}, num_warps=nw)
+    for bm in (8, 16, 32)
+    for bk in (256, 512)
+    for nw in (4, 8)
+    for ns in (2, 3)
+]
+
+
+@triton.autotune(configs=_DENSE_STEP_CONFIGS, key=["B"],
+                 restore_value=["v_ptr", "I_ptr"])
 @triton.jit
-def glif3_dense_multistep_forward_kernel(
-    x_ptr, w_ptr, b_ptr,  # (T*B,), (B*B,), (B,)
+def glif3_dense_multistep_step_kernel(
+    w_ptr, x_ptr, bias_ptr,  # (B*B,), x_seq[t] (B,), (B,)
     v_ptr, I_ptr,
     v_th_ptr, v_reset_ptr, v_rest_ptr, c_m_ptr, tau_ptr, k_ptr, asc_ptr, mask_ptr,
-    s_seq_ptr, v_seq_ptr, v_out_ptr, I_out_ptr,
-    B, dt, alpha, T,
-    M: tl.constexpr, MPAD: tl.constexpr, hard_reset: tl.constexpr, BLOCK: tl.constexpr,
+    s_prev_ptr, s_out_ptr, v_out_ptr,  # spike[t-1], spike[t], v[t]
+    B, dt, alpha,
+    M: tl.constexpr, MPAD: tl.constexpr, hard_reset: tl.constexpr,
+    BM: tl.constexpr, BK: tl.constexpr, NUM_STAGES: tl.constexpr,
 ):
-    # Single program (grid = 1, BLOCK >= B): the recurrent matmul reads the full
-    # previous-step spike vector, so it stays fused with no cross-block sync.
-    off = 0
+    off = tl.program_id(0) * BM
     mode_valid = tl.arange(0, MPAD) < M
 
-    w_ptrs = tl.make_block_ptr(w_ptr, shape=(B, B), strides=(B, 1), offsets=(0, 0),
-                               block_shape=(BLOCK, BLOCK), order=(1, 0))
-    w = tl.load(w_ptrs, boundary_check=(0, 1), padding_option="zero")
-    bias = load_vec(b_ptr, B, off, BLOCK)
-    v_th = load_vec(v_th_ptr, B, off, BLOCK)
-    v_reset = load_vec(v_reset_ptr, B, off, BLOCK)
-    v_rest = load_vec(v_rest_ptr, B, off, BLOCK)
-    c_m = load_vec(c_m_ptr, B, off, BLOCK)
-    tau = load_vec(tau_ptr, B, off, BLOCK)
-    mask = load_vec(mask_ptr, B, off, BLOCK)
-    k = tl.where(mode_valid[None, :], load_modes(k_ptr, B, M, off, BLOCK, MPAD), 1.0)
-    asc = load_modes(asc_ptr, B, M, off, BLOCK, MPAD)
+    # Recurrent term lin[i] = sum_j W[i, j] * s_prev[j], columns pipelined.
+    lin = tl.zeros([BM], dtype=tl.float32)
+    for k0 in tl.range(0, B, BK, num_stages=NUM_STAGES):
+        w = tl.make_block_ptr(w_ptr, shape=(B, B), strides=(B, 1), offsets=(off, k0),
+                              block_shape=(BM, BK), order=(1, 0))
+        w = tl.load(w, boundary_check=(0, 1), padding_option="zero")
+        s = load_vec(s_prev_ptr, B, k0, BK)
+        lin += tl.sum(w * s[None, :], axis=1)
 
-    v = load_vec(v_ptr, B, off, BLOCK)
-    iasc = load_modes(I_ptr, B, M, off, BLOCK, MPAD)
-    s_prev = tl.zeros([BLOCK], dtype=tl.float32)
+    x_in = load_vec(x_ptr, B, off, BM) + load_vec(bias_ptr, B, off, BM) + lin
+    v = load_vec(v_ptr, B, off, BM)
+    v_th = load_vec(v_th_ptr, B, off, BM)
+    v_reset = load_vec(v_reset_ptr, B, off, BM)
+    v_rest = load_vec(v_rest_ptr, B, off, BM)
+    c_m = load_vec(c_m_ptr, B, off, BM)
+    tau = load_vec(tau_ptr, B, off, BM)
+    mask = load_vec(mask_ptr, B, off, BM)
+    iasc = load_modes(I_ptr, B, M, off, BM, MPAD)
+    k = tl.where(mode_valid[None, :], load_modes(k_ptr, B, M, off, BM, MPAD), 1.0)
+    asc = load_modes(asc_ptr, B, M, off, BM, MPAD)
 
-    for t in tl.range(0, T):
-        lin = tl.sum(w * s_prev[None, :], axis=1)
-        x = load_row(x_ptr, T, B, t, off, BLOCK) + bias + lin
-        v_prime = neuronal_charge(v, x, tl.sum(iasc, axis=1), v_rest, c_m, tau, dt)
-        spike = neuronal_fire(v_prime, v_th, mask)
-        v = neuronal_reset(v_prime, spike, v_th, v_reset, hard_reset)
-        iasc = neuronal_adaptation(iasc, k, asc, spike[:, None], dt)
-        s_prev = spike
-        store_row(s_seq_ptr, T, B, t, off, spike, BLOCK)
-        store_row(v_seq_ptr, T, B, t, off, v, BLOCK)
+    spike, v_post, I_post = glif3_neuron_update(
+        x_in, v, iasc, k, asc, v_th, v_reset, v_rest, c_m, tau, mask, dt, hard_reset)
 
-    store_vec(v_out_ptr, B, off, v, BLOCK)
-    store_modes(I_out_ptr, B, M, off, iasc, BLOCK, MPAD)
+    store_vec(v_ptr, B, off, v_post, BM)
+    store_modes(I_ptr, B, M, off, I_post, BM, MPAD)
+    store_vec(s_out_ptr, B, off, spike, BM)
+    store_vec(v_out_ptr, B, off, v_post, BM)
 
 
 # ----------------------------------------------------------------------------
@@ -806,39 +820,6 @@ def glif3_multistep_fused_triton(
 
 # ----------------------------------------------------------------------------
 # Dense (neuron + recurrent connection) multistep — inference only
-# ----------------------------------------------------------------------------
-# Largest B the single fused program handles: it holds one (B, B) weight tile
-# per program, so beyond this the register/shared pressure makes the per-step
-# cuBLAS matmul path faster (and huge B does not fit one block at all).
-_FUSE_MAX_B = 1024
-
-
-def _dense_multistep_fused(
-    x_seq, weight, bias, v, Iasc, params, not_refrac, dt, M, hard_reset, alpha
-):
-    """Single fused kernel that also computes the recurrent matmul in-kernel.
-
-    Runs as one program (grid = 1) so the recurrent matmul can read the full
-    previous-step spike vector; requires ``B`` to fit one BLOCK.
-    """
-    T, B = x_seq.shape
-    block = triton.next_power_of_2(B)
-    v_seq = torch.empty((T, B), device=v.device, dtype=v.dtype)
-    s_seq = torch.empty((T, B), device=v.device, dtype=v.dtype)
-    v_out = torch.empty_like(v)
-    I_out = torch.empty_like(Iasc)
-
-    glif3_dense_multistep_forward_kernel[(1,)](
-        x_seq.reshape(-1), weight.reshape(-1), bias, v, Iasc,
-        params["v_th"], params["v_reset"], params["v_rest"],
-        params["c_m"], params["tau"], params["k"], params["asc_amps"], not_refrac,
-        s_seq, v_seq, v_out, I_out,
-        B, float(dt), float(alpha), T,
-        M=int(M), MPAD=_mpad(M), hard_reset=bool(hard_reset), BLOCK=int(block),
-    )
-    return s_seq, v_seq, v_out, I_out
-
-
 def _dense_multistep_matmul(
     x_seq, weight, bias, v, Iasc, params, not_refrac, dt, M, hard_reset, alpha, block
 ):
@@ -870,6 +851,34 @@ def _dense_multistep_matmul(
     return s_seq, v_seq, v.clone(), Iasc.clone()
 
 
+def _dense_multistep_fused(
+    x_seq, weight, bias, v, Iasc, params, not_refrac, dt, M, hard_reset, alpha
+):
+    """Fused per-step path: one launch per timestep of the fused kernel that
+    computes the recurrent gemv in-kernel (pipelined) and the neuron update. The
+    launch boundary is the cross-step barrier. Does not mutate v / Iasc."""
+    T, B = x_seq.shape
+    v_work = v.clone()
+    I_work = Iasc.clone()
+    v_seq = torch.empty((T, B), device=v.device, dtype=v.dtype)
+    s_seq = torch.empty((T, B), device=v.device, dtype=v.dtype)
+    zeros = torch.zeros((B,), device=v.device, dtype=v.dtype)
+    grid = lambda meta: (triton.cdiv(B, meta["BM"]),)
+
+    weight_flat = weight.reshape(-1)
+    for t in range(T):
+        s_prev = zeros if t == 0 else s_seq[t - 1]
+        glif3_dense_multistep_step_kernel[grid](
+            weight_flat, x_seq[t], bias, v_work, I_work,
+            params["v_th"], params["v_reset"], params["v_rest"],
+            params["c_m"], params["tau"], params["k"], params["asc_amps"], not_refrac,
+            s_prev, s_seq[t], v_seq[t],
+            B, float(dt), float(alpha),
+            M=int(M), MPAD=_mpad(M), hard_reset=bool(hard_reset),
+        )
+    return s_seq, v_seq, v_work, I_work
+
+
 def glif3_dense_multistep_fused_triton(
     x_seq: Float[torch.Tensor, " T B"],
     weight: torch.Tensor,
@@ -889,10 +898,10 @@ def glif3_dense_multistep_fused_triton(
 
     Routes on gradient need: when gradients are required it runs the autograd
     path (single-step op + torch matmul per step); otherwise a lean forward-only
-    kernel. In the forward-only case ``fused_matmul=True`` computes the recurrent
-    matmul inside the single neuron kernel while ``fused_matmul=False`` delegates
-    it to cuBLAS; the fused path needs the whole layer in one program, so for
-    ``B > _FUSE_MAX_B`` it automatically falls back to the cuBLAS path.
+    kernel. In the forward-only case ``fused_matmul=True`` fuses the recurrent
+    gemv (pipelined in-kernel) with the neuron update, one launch per step; the
+    launch boundary is the cross-step barrier. ``fused_matmul=False`` delegates
+    the matmul to cuBLAS with a neuron kernel per step.
     """
     need_grad = torch.is_grad_enabled() and (
         weight.requires_grad or bias.requires_grad or x_seq.requires_grad
@@ -916,49 +925,141 @@ def glif3_dense_multistep_fused_triton(
     fp32 = {key: _as_fp32(params[key]) for key in params}
     not_refrac = _as_fp32(not_refrac)
 
-    if fused_matmul and B <= _FUSE_MAX_B:
-        s_seq, v_seq, v_out, I_out = _dense_multistep_fused(
-            x_seq, weight, bias, v, Iasc, fp32, not_refrac,
+    path = _dense_multistep_fused if fused_matmul else _dense_multistep_matmul
+    args = (x_seq, weight, bias, v, Iasc, fp32, not_refrac,
+            float(dt), int(M), bool(hard_reset), float(alpha))
+    if fused_matmul:
+        s_seq, v_seq, v_out, I_out = path(*args)
+    else:
+        s_seq, v_seq, v_out, I_out = path(*args, int(block))
+    return s_seq, v_seq, v_out, I_out.view(B, int(M))
+
+
+# ----------------------------------------------------------------------------
+# Sparse (scale-free recurrent) multistep — fused CSR-vector SpMV + neuron update.
+# One program (a single warp) per neuron row is the classic CSR-vector schedule:
+# the warp reduces lin_i = sum_p val[p] * s_prev[col[p]] over the row's nonzeros
+# (gathered), which tolerates the scale-free load imbalance since the scheduler
+# overlaps short and long rows. One launch per step; the launch boundary is the
+# cross-step barrier.
+# ----------------------------------------------------------------------------
+@triton.jit
+def glif3_sparse_step_kernel(
+    crow_ptr, col_ptr, val_ptr,  # CSR
+    x_ptr, bias_ptr, v_ptr, I_ptr,
+    v_th_ptr, v_reset_ptr, v_rest_ptr, c_m_ptr, tau_ptr, k_ptr, asc_ptr, mask_ptr,
+    s_prev_ptr, s_out_ptr, v_out_ptr,
+    N, dt, alpha,
+    M: tl.constexpr, hard_reset: tl.constexpr, BK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    start = tl.load(crow_ptr + row)
+    end = tl.load(crow_ptr + row + 1)
+
+    # CSR-vector reduction of this row's nonzeros against the previous spikes.
+    acc = tl.zeros((BK,), dtype=tl.float32)
+    for p in range(start, end, BK):
+        offs = p + tl.arange(0, BK)
+        m = offs < end
+        cols = tl.load(col_ptr + offs, mask=m, other=0)
+        vals = tl.load(val_ptr + offs, mask=m, other=0.0)
+        sv = tl.load(s_prev_ptr + cols, mask=m, other=0.0)
+        acc += vals * sv
+    lin = tl.sum(acc)
+
+    # GLIF3 update for this single neuron row.
+    i_sum = 0.0
+    for mm in range(M):
+        i_sum += tl.load(I_ptr + row * M + mm)
+    x_in = tl.load(x_ptr + row) + tl.load(bias_ptr + row) + lin
+    v_prime = neuronal_charge(
+        tl.load(v_ptr + row), x_in, i_sum, tl.load(v_rest_ptr + row),
+        tl.load(c_m_ptr + row), tl.load(tau_ptr + row), dt)
+    spike = neuronal_fire(v_prime, tl.load(v_th_ptr + row), tl.load(mask_ptr + row))
+    v_post = neuronal_reset(v_prime, spike, tl.load(v_th_ptr + row),
+                            tl.load(v_reset_ptr + row), hard_reset)
+    for mm in range(M):
+        i_asc = tl.load(I_ptr + row * M + mm)
+        tl.store(I_ptr + row * M + mm, exp_euler(
+            i_asc, -tl.load(k_ptr + row * M + mm) * i_asc,
+            -tl.load(k_ptr + row * M + mm), dt) + tl.load(asc_ptr + row * M + mm) * spike)
+    tl.store(v_ptr + row, v_post)
+    tl.store(s_out_ptr + row, spike)
+    tl.store(v_out_ptr + row, v_post)
+
+
+def _sparse_multistep_fused(
+    x_seq, weight, bias, v, Iasc, params, not_refrac, dt, M, hard_reset, alpha
+):
+    """Fused per-step sparse path: one launch per timestep of the CSR-vector SpMV
+    kernel fused with the neuron update. Does not mutate v / Iasc."""
+    T, N = x_seq.shape
+    v_work = v.clone()
+    I_work = Iasc.clone()
+    v_seq = torch.empty((T, N), device=v.device, dtype=v.dtype)
+    s_seq = torch.empty((T, N), device=v.device, dtype=v.dtype)
+    zeros = torch.zeros((N,), device=v.device, dtype=v.dtype)
+
+    for t in range(T):
+        s_prev = zeros if t == 0 else s_seq[t - 1]
+        glif3_sparse_step_kernel[(N,)](
+            weight.crow, weight.col, weight.val,
+            x_seq[t], bias, v_work, I_work,
+            params["v_th"], params["v_reset"], params["v_rest"],
+            params["c_m"], params["tau"], params["k"], params["asc_amps"], not_refrac,
+            s_prev, s_seq[t], v_seq[t],
+            N, float(dt), float(alpha),
+            M=int(M), hard_reset=bool(hard_reset), BK=128, num_warps=1,
+        )
+    return s_seq, v_seq, v_work, I_work
+
+
+def glif3_sparse_multistep_fused_triton(
+    x_seq: Float[torch.Tensor, " T N"],
+    weight: SparseWeight,
+    bias: torch.Tensor,
+    v: Float[torch.Tensor, " N"],
+    Iasc: Float[torch.Tensor, " N M"],
+    params: dict,
+    not_refrac: Float[torch.Tensor, " N"],
+    dt: float,
+    M: int,
+    hard_reset: bool = False,
+    alpha: float = 2.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sparse (neuron + scale-free recurrent connection) multistep.
+
+    Inference fuses a CSR-vector SpMV with the neuron update, one launch per step.
+    Training composes the single-step op with a COO ``torch.sparse`` SpMV each
+    step (``sparse_multistep_autograd``).
+    """
+    need_grad = torch.is_grad_enabled() and (
+        weight.val.requires_grad or bias.requires_grad or x_seq.requires_grad
+        or v.requires_grad or Iasc.requires_grad or params["asc_amps"].requires_grad
+    )
+    if need_grad:
+        return sparse_multistep_autograd(
+            _glif3_step_triton, x_seq, weight, bias, v, Iasc, params, not_refrac,
             float(dt), int(M), bool(hard_reset), float(alpha),
         )
-    else:
-        s_seq, v_seq, v_out, I_out = _dense_multistep_matmul(
-            x_seq, weight, bias, v, Iasc, fp32, not_refrac,
-            float(dt), int(M), bool(hard_reset), float(alpha), int(block),
-        )
-    return s_seq, v_seq, v_out, I_out.view(B, int(M))
+    if not x_seq.is_cuda:
+        raise RuntimeError("Fused sparse multistep Triton requires CUDA tensors.")
+    N = v.numel()
+    x_seq, bias = _as_fp32(x_seq), _as_fp32(bias)
+    v, Iasc = _as_fp32(v), _as_fp32(Iasc.reshape(-1))
+    fp32 = {key: _as_fp32(params[key]) for key in params}
+    not_refrac = _as_fp32(not_refrac)
+
+    s_seq, v_seq, v_out, I_out = _sparse_multistep_fused(
+        x_seq, weight, bias, v, Iasc, fp32, not_refrac,
+        float(dt), int(M), bool(hard_reset), float(alpha),
+    )
+    return s_seq, v_seq, v_out, I_out.view(N, int(M))
 
 
 glif3_step_triton = GLIF3StepOps(
     step=_glif3_step_triton,
     multistep_fused=glif3_multistep_fused_triton,
     dense_multistep_fused=glif3_dense_multistep_fused_triton,
+    sparse_multistep_fused=glif3_sparse_multistep_fused_triton,
 )
-
-
-class GLIF3Triton(torch.nn.Module):
-    """Thin module wrapper exposing a ``step`` API."""
-
-    def __init__(
-        self, M: int, hard_reset: bool = False, alpha: float = 2.0, block: int = 256
-    ):
-        super().__init__()
-        self.M = int(M)
-        self.hard_reset = bool(hard_reset)
-        self.alpha = float(alpha)
-        self.block = int(block)
-
-    def step(
-        self,
-        v: Float[torch.Tensor, " B"],
-        Iasc: Float[torch.Tensor, " B M"],
-        x: Float[torch.Tensor, " B"],
-        params: dict,
-        not_refrac: Float[torch.Tensor, " B"],
-        dt: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return _glif3_step_triton(
-            v=v, Iasc=Iasc, x=x, params=params, not_refrac=not_refrac,
-            dt=float(dt), M=self.M, hard_reset=self.hard_reset,
-            alpha=self.alpha, block=self.block,
-        )

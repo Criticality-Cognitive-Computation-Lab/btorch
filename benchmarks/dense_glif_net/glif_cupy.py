@@ -20,9 +20,10 @@ Organization:
 - single-step ``glif3_step_cupy`` (autograd, the training primitive)
 - neuron multistep ``glif3_multistep_fused_cupy`` (autograd for training,
   a lean forward-only path for inference)
-- dense multistep ``glif3_dense_multistep_fused_cupy`` (inference or training; the
-  recurrent matmul is either fused into the single kernel or delegated to
-  cuBLAS via ``fused_matmul=False``)
+- dense multistep ``glif3_dense_multistep_fused_cupy`` (inference or training;
+  the fused path runs the whole time loop in one cooperative launch with an
+  in-kernel coalesced recurrent matmul, or delegates the matmul to cuBLAS via
+  ``fused_matmul=False``)
 
 Conventions (flattened, contiguous, fp32 on CUDA):
 - ``v``, ``x``, ``not_refrac``: shape ``(N,)``
@@ -38,8 +39,10 @@ import torch
 from jaxtyping import Float
 
 from benchmarks.dense_glif_net.glif_common import (
+    SparseWeight,
     GLIF3StepOps,
     dense_multistep_autograd,
+    sparse_multistep_autograd,
 )
 
 
@@ -49,9 +52,6 @@ except ImportError:  # pragma: no cover - optional dependency
     cp = None
 
 
-
-# Threads cooperating on the recurrent matmul tile in the fused dense kernel.
-_FUSED_TILE_K = 128
 
 # ----------------------------------------------------------------------------
 # CUDA-C device helpers shared by every kernel below. Each mirrors one step of
@@ -367,18 +367,23 @@ void glif3_neuron_multistep_backward(
 """
 
 _DENSE_MULTISTEP_FORWARD_SRC = (
-    "#define TILE_K " + str(_FUSED_TILE_K) + "\n"
+    "#include <cooperative_groups.h>\n"
+    "namespace cg = cooperative_groups;\n"
     + _DEVICE_HELPERS + r"""
 // Fully fused dense (neuron + recurrent connection) multistep, inference only.
-// The recurrent term lin_i = sum_j w[i,j] * s_prev[j] is computed inside the
-// kernel with a shared-memory tiled matmul over the previous step's spikes.
+// One cooperative launch runs the whole time loop. A persistent grid strides
+// over neuron rows; each block reduces lin_i = sum_j w[i,j] * s_prev[j] with a
+// coalesced block-per-row reduction (consecutive threads read consecutive
+// columns), applies the GLIF3 update on lane 0, then cg::this_grid().sync()
+// makes every block see all spikes of step t-1 before step t. The launcher sizes
+// the grid to the kernel's occupancy so all blocks are co-resident.
 extern "C" __global__
 void glif3_dense_multistep_forward(
     const float* x_seq,  // (T*N,)
     const float* w,      // (N*N,)
     const float* b,      // (N,)
-    float* v,            // (N,)
-    float* Iasc,         // (N*M,)
+    float* v,            // (N,) working state, updated in place
+    float* Iasc,         // (N*M,) working state, updated in place
     const float* v_th,
     const float* v_reset,
     const float* v_rest,
@@ -389,8 +394,6 @@ void glif3_dense_multistep_forward(
     const float* mask,
     float* s_seq,        // (T*N,)
     float* v_seq,        // (T*N,)
-    float* v_out,        // (N,)
-    float* I_out,        // (N*M,)
     int T,
     int N,
     int M,
@@ -398,57 +401,50 @@ void glif3_dense_multistep_forward(
     int hard_reset,
     float alpha
 ) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    bool active = i < N;
-    int base = i * M;
-    int w_base = i * N;
-
-    float v_i = active ? v[i] : 0.0f;
-
-    extern __shared__ float s_prev_tile[];
+    cg::grid_group grid = cg::this_grid();
+    int n_blocks = gridDim.x, tid = threadIdx.x, bdim = blockDim.x;
+    int lane = tid & 31, warp = tid >> 5;
+    __shared__ float warp_sums[32];
 
     for (int t = 0; t < T; ++t) {
-        // Tiled recurrent matmul over the previous step's spikes.
-        float lin = 0.0f;
-        for (int k0 = 0; k0 < N; k0 += TILE_K) {
-            int col = k0 + threadIdx.x;
-            if (threadIdx.x < TILE_K) {
-                float s_prev = (t > 0 && col < N) ? s_seq[(t - 1) * N + col] : 0.0f;
-                s_prev_tile[threadIdx.x] = s_prev;
+        for (int row = blockIdx.x; row < N; row += n_blocks) {
+            const float* w_row = w + (size_t)row * N;
+            float lin = 0.0f;
+            if (t > 0) {
+                const float* s_prev = s_seq + (size_t)(t - 1) * N;
+                for (int j = tid; j < N; j += bdim) lin += w_row[j] * s_prev[j];
             }
+            // Warp reduce, then reduce the per-warp partials through shared memory.
+            for (int off = 16; off > 0; off >>= 1)
+                lin += __shfl_down_sync(0xffffffff, lin, off);
+            if (lane == 0) warp_sums[warp] = lin;
             __syncthreads();
-            int tile = min(TILE_K, N - k0);
-            if (active) {
-                for (int j = 0; j < tile; ++j)
-                    lin += w[w_base + k0 + j] * s_prev_tile[j];
+            if (warp == 0) {
+                lin = (tid < (bdim + 31) / 32) ? warp_sums[lane] : 0.0f;
+                for (int off = 16; off > 0; off >>= 1)
+                    lin += __shfl_down_sync(0xffffffff, lin, off);
+                if (lane == 0) {
+                    int base = row * M;
+                    float i_sum = 0.0f;
+                    for (int m = 0; m < M; ++m) i_sum += Iasc[base + m];
+                    float x_in = x_seq[t * N + row] + b[row] + lin;
+                    float v_prime = neuronal_charge(
+                        v[row], x_in, i_sum, v_rest[row], c_m[row], tau[row], dt);
+                    float spike = neuronal_fire(v_prime, v_th[row], mask[row]);
+                    float v_post = neuronal_reset(
+                        v_prime, spike, v_th[row], v_reset[row], hard_reset);
+                    for (int m = 0; m < M; ++m)
+                        Iasc[base + m] = neuronal_adaptation(
+                            Iasc[base + m], k[base + m], asc[base + m], spike, dt);
+                    v[row] = v_post;
+                    s_seq[t * N + row] = spike;
+                    v_seq[t * N + row] = v_post;
+                }
             }
             __syncthreads();
         }
-        if (!active) continue;
-
-        float i_sum = 0.0f;
-        for (int m = 0; m < M; ++m) i_sum += Iasc[base + m];
-
-        float x_in = x_seq[t * N + i] + b[i] + lin;
-        float v_prime = neuronal_charge(
-            v_i, x_in, i_sum, v_rest[i], c_m[i], tau[i], dt);
-        float spike = neuronal_fire(v_prime, v_th[i], mask[i]);
-        float v_post = neuronal_reset(
-            v_prime, spike, v_th[i], v_reset[i], hard_reset);
-
-        for (int m = 0; m < M; ++m) {
-            Iasc[base + m] = neuronal_adaptation(
-                Iasc[base + m], k[base + m], asc[base + m], spike, dt);
-        }
-        v_i = v_post;
-        s_seq[t * N + i] = spike;
-        v_seq[t * N + i] = v_post;
+        grid.sync();
     }
-
-    if (!active) return;
-    v[i] = v_i;
-    v_out[i] = v_i;
-    for (int m = 0; m < M; ++m) I_out[base + m] = Iasc[base + m];
 }
 """
 )
@@ -500,6 +496,84 @@ void glif3_dense_step(
 }
 """
 
+_SPARSE_MULTISTEP_FORWARD_SRC = (
+    "#include <cooperative_groups.h>\n"
+    "namespace cg = cooperative_groups;\n"
+    + _DEVICE_HELPERS + r"""
+// Fully fused sparse (neuron + recurrent connection) multistep, inference only.
+// One cooperative launch runs the whole time loop. The recurrent term is a CSR
+// SpMV with the classic CSR-vector schedule: one warp per neuron row (grid-stride
+// over rows) reduces lin_i = sum_p val[p] * s_prev[col[p]] with a shuffle reduce
+// -- good under scale-free load imbalance because idle warps stride on to the
+// next row. Lane 0 then runs the GLIF3 update; cg::this_grid().sync() makes every
+// warp see all spikes of step t-1 before step t.
+extern "C" __global__
+void glif3_sparse_multistep_forward(
+    const int* crow,     // (N+1,) row pointers
+    const int* col,      // (nnz,) columns
+    const float* val,    // (nnz,) weights
+    const float* x_seq,  // (T*N,)
+    const float* b,      // (N,)
+    float* v,            // (N,) working state
+    float* Iasc,         // (N*M,) working state
+    const float* v_th,
+    const float* v_reset,
+    const float* v_rest,
+    const float* c_m,
+    const float* tau,
+    const float* k,
+    const float* asc,
+    const float* mask,
+    float* s_seq,        // (T*N,)
+    float* v_seq,        // (T*N,)
+    int T,
+    int N,
+    int M,
+    float dt,
+    int hard_reset,
+    float alpha
+) {
+    cg::grid_group grid = cg::this_grid();
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int n_warps = (gridDim.x * blockDim.x) >> 5;
+
+    for (int t = 0; t < T; ++t) {
+        const float* s_prev = s_seq + (size_t)(t - 1) * N;
+        for (int row = warp; row < N; row += n_warps) {
+            float acc = 0.0f;
+            if (t > 0) {
+                int start = crow[row], end = crow[row + 1];
+                for (int p = start + lane; p < end; p += 32)
+                    acc += val[p] * s_prev[col[p]];
+            }
+            for (int o = 16; o > 0; o >>= 1)
+                acc += __shfl_down_sync(0xffffffff, acc, o);
+            if (lane == 0) {
+                int base = row * M;
+                float i_sum = 0.0f;
+                for (int m = 0; m < M; ++m) i_sum += Iasc[base + m];
+                float x_in = x_seq[t * N + row] + b[row] + acc;
+                float v_prime = neuronal_charge(
+                    v[row], x_in, i_sum, v_rest[row], c_m[row], tau[row], dt);
+                float spike = neuronal_fire(v_prime, v_th[row], mask[row]);
+                float v_post = neuronal_reset(
+                    v_prime, spike, v_th[row], v_reset[row], hard_reset);
+                for (int m = 0; m < M; ++m)
+                    Iasc[base + m] = neuronal_adaptation(
+                        Iasc[base + m], k[base + m], asc[base + m], spike, dt);
+                v[row] = v_post;
+                s_seq[t * N + row] = spike;
+                v_seq[t * N + row] = v_post;
+            }
+        }
+        grid.sync();
+    }
+}
+"""
+)
+
 
 # ----------------------------------------------------------------------------
 # Python-side helpers
@@ -547,6 +621,9 @@ def _ptr(tensor: torch.Tensor) -> int:
 
 
 def _current_stream() -> "cp.cuda.Stream":
+    # ExternalStream(ptr) wraps torch's raw CUDA stream so RawKernel launches run
+    # on the same stream. (Stream.from_external wants a stream-protocol object,
+    # not a raw pointer, so it is not a drop-in replacement here.)
     _require_cupy()
     return cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream)
 
@@ -565,9 +642,14 @@ def _compile_kernels(device: int):
                 _NEURON_MULTISTEP_BACKWARD_SRC, "glif3_neuron_multistep_backward"
             ),
             "dense_forward": cp.RawKernel(
-                _DENSE_MULTISTEP_FORWARD_SRC, "glif3_dense_multistep_forward"
+                _DENSE_MULTISTEP_FORWARD_SRC, "glif3_dense_multistep_forward",
+                enable_cooperative_groups=True,
             ),
             "dense_step": cp.RawKernel(_DENSE_STEP_SRC, "glif3_dense_step"),
+            "sparse_forward": cp.RawKernel(
+                _SPARSE_MULTISTEP_FORWARD_SRC, "glif3_sparse_multistep_forward",
+                enable_cooperative_groups=True,
+            ),
         }
 
 
@@ -885,30 +967,39 @@ def glif3_multistep_fused_cupy(
 def _dense_multistep_fused(
     x_seq, weight, bias, v, Iasc, params, not_refrac, dt, M, hard_reset, alpha, block
 ):
-    """Single fused kernel that also computes the recurrent matmul in-kernel."""
-    if block < _FUSED_TILE_K:
-        raise ValueError("block must be >= TILE_K for the fused dense CuPy kernel.")
+    """Fused dense multistep: one cooperative launch runs the whole time loop with
+    a coalesced block-per-row recurrent matmul and cg::this_grid().sync() between
+    steps. Does not mutate v / Iasc (works on clones)."""
     T, N = x_seq.shape
+    v_work = v.clone()
+    Iasc_work = Iasc.clone()
     v_seq = torch.empty((T, N), device=v.device, dtype=v.dtype)
     s_seq = torch.empty((T, N), device=v.device, dtype=v.dtype)
-    v_out = torch.empty_like(v)
-    I_out = torch.empty_like(Iasc)
+
+    kernel = _kernels()["dense_forward"]
+    # Fill every SM with as many blocks as co-reside: the cooperative launch
+    # behind cg::this_grid().sync() needs all blocks resident at once, and this
+    # coalesced block-per-row kernel needs the warps to hide memory latency.
+    n_sm = cp.cuda.Device().attributes["MultiProcessorCount"]
+    blocks_per_sm = cp.cuda.driver.occupancyMaxActiveBlocksPerMultiprocessor(
+        kernel.kernel.ptr, block, 0
+    )
+    grid = max(1, blocks_per_sm) * n_sm
 
     with _current_stream():
-        _kernels()["dense_forward"](
-            _grid(N, block), (block,),
+        kernel(
+            (grid,), (block,),
             (
                 _ptr(x_seq.reshape(-1)), _ptr(weight.reshape(-1)), _ptr(bias),
-                _ptr(v), _ptr(Iasc),
+                _ptr(v_work), _ptr(Iasc_work),
                 _ptr(params["v_th"]), _ptr(params["v_reset"]), _ptr(params["v_rest"]),
                 _ptr(params["c_m"]), _ptr(params["tau"]),
                 _ptr(params["k"]), _ptr(params["asc_amps"]), _ptr(not_refrac),
-                _ptr(s_seq), _ptr(v_seq), _ptr(v_out), _ptr(I_out),
+                _ptr(s_seq), _ptr(v_seq),
                 cp.int32(T), *_scalars(N, int(M), dt, hard_reset, alpha),
             ),
-            shared_mem=int(_FUSED_TILE_K * 4),
         )
-    return s_seq, v_seq, v_out, I_out
+    return s_seq, v_seq, v_work, Iasc_work
 
 
 def _dense_multistep_matmul(
@@ -967,9 +1058,12 @@ def glif3_dense_multistep_fused_cupy(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dense (neuron + recurrent connection) multistep (inference or training).
 
-    With ``fused_matmul=True`` the recurrent matmul is computed inside the single
-    neuron kernel; with ``fused_matmul=False`` it is delegated to cuBLAS and the
-    neuron dynamics run in a per-step kernel.
+    Routes on gradient need: training composes the single-step CuPy autograd
+    primitive with a per-step ``torch.mv`` (``dense_multistep_autograd``).
+    Inference with ``fused_matmul=True`` runs the whole time loop in one
+    cooperative launch (in-kernel coalesced recurrent matmul + neuron update,
+    ``cg::this_grid().sync()`` between steps); ``fused_matmul=False`` delegates
+    the matmul to cuBLAS with a neuron kernel per step.
     """
     _require_cupy()
     need_grad = torch.is_grad_enabled() and (
@@ -1002,36 +1096,89 @@ def glif3_dense_multistep_fused_cupy(
     return s_seq, v_seq, v_out, I_out.view(N, int(M))
 
 
+def _sparse_multistep_fused(
+    x_seq, weight, bias, v, Iasc, params, not_refrac, dt, M, hard_reset, alpha
+):
+    """Fused sparse multistep: one cooperative launch runs the whole time loop
+    with an in-kernel CSR-vector SpMV and cg::this_grid().sync() between steps.
+    Does not mutate v / Iasc (works on clones)."""
+    T, N = x_seq.shape
+    v_work = v.clone()
+    Iasc_work = Iasc.clone()
+    v_seq = torch.empty((T, N), device=v.device, dtype=v.dtype)
+    s_seq = torch.empty((T, N), device=v.device, dtype=v.dtype)
+
+    kernel = _kernels()["sparse_forward"]
+    block = 256
+    n_sm = cp.cuda.Device().attributes["MultiProcessorCount"]
+    blocks_per_sm = cp.cuda.driver.occupancyMaxActiveBlocksPerMultiprocessor(
+        kernel.kernel.ptr, block, 0
+    )
+    grid = max(1, blocks_per_sm) * n_sm
+
+    with _current_stream():
+        kernel(
+            (grid,), (block,),
+            (
+                _ptr(weight.crow), _ptr(weight.col), _ptr(weight.val),
+                _ptr(x_seq.reshape(-1)), _ptr(bias), _ptr(v_work), _ptr(Iasc_work),
+                _ptr(params["v_th"]), _ptr(params["v_reset"]), _ptr(params["v_rest"]),
+                _ptr(params["c_m"]), _ptr(params["tau"]),
+                _ptr(params["k"]), _ptr(params["asc_amps"]), _ptr(not_refrac),
+                _ptr(s_seq), _ptr(v_seq),
+                cp.int32(T), *_scalars(N, int(M), dt, hard_reset, alpha),
+            ),
+        )
+    return s_seq, v_seq, v_work, Iasc_work
+
+
+def glif3_sparse_multistep_fused_cupy(
+    x_seq: Float[torch.Tensor, " T N"],
+    weight: SparseWeight,
+    bias: torch.Tensor,
+    v: Float[torch.Tensor, " N"],
+    Iasc: Float[torch.Tensor, " N M"],
+    params: dict,
+    not_refrac: Float[torch.Tensor, " N"],
+    dt: float,
+    M: int,
+    hard_reset: bool = False,
+    alpha: float = 2.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sparse (neuron + scale-free recurrent connection) multistep.
+
+    Inference runs the whole time loop in one cooperative launch (in-kernel
+    CSR-vector SpMV + neuron update, ``cg::this_grid().sync()`` between steps);
+    training composes the single-step CuPy autograd op with a COO ``torch.sparse``
+    SpMV each step (``sparse_multistep_autograd``)."""
+    _require_cupy()
+    need_grad = torch.is_grad_enabled() and (
+        weight.val.requires_grad or bias.requires_grad or x_seq.requires_grad
+        or v.requires_grad or Iasc.requires_grad or params["asc_amps"].requires_grad
+    )
+    if need_grad:
+        return sparse_multistep_autograd(
+            _glif3_step_cupy, x_seq, weight, bias, v, Iasc, params, not_refrac,
+            float(dt), int(M), bool(hard_reset), float(alpha),
+        )
+    if not x_seq.is_cuda:
+        raise RuntimeError("Fused sparse multistep CuPy requires CUDA tensors.")
+    N = v.numel()
+    x_seq, bias = _as_fp32(x_seq), _as_fp32(bias)
+    v, Iasc = _as_fp32(v), _as_fp32(Iasc.reshape(-1))
+    fp32 = {key: _as_fp32(params[key]) for key in params}
+    not_refrac = _as_fp32(not_refrac)
+
+    s_seq, v_seq, v_out, I_out = _sparse_multistep_fused(
+        x_seq, weight, bias, v, Iasc, fp32, not_refrac,
+        float(dt), int(M), bool(hard_reset), float(alpha),
+    )
+    return s_seq, v_seq, v_out, I_out.view(N, int(M))
+
+
 glif3_step_cupy = GLIF3StepOps(
     step=_glif3_step_cupy,
     multistep_fused=glif3_multistep_fused_cupy,
     dense_multistep_fused=glif3_dense_multistep_fused_cupy,
+    sparse_multistep_fused=glif3_sparse_multistep_fused_cupy,
 )
-
-
-class GLIF3CuPy(torch.nn.Module):
-    """Thin module wrapper exposing a ``step`` API."""
-
-    def __init__(
-        self, M: int, hard_reset: bool = False, alpha: float = 2.0, block: int = 256
-    ):
-        super().__init__()
-        self.M = int(M)
-        self.hard_reset = bool(hard_reset)
-        self.alpha = float(alpha)
-        self.block = int(block)
-
-    def step(
-        self,
-        v: Float[torch.Tensor, " N"],
-        Iasc: Float[torch.Tensor, " N M"],
-        x: Float[torch.Tensor, " N"],
-        params: dict,
-        not_refrac: Float[torch.Tensor, " N"],
-        dt: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return _glif3_step_cupy(
-            v=v, Iasc=Iasc, x=x, params=params, not_refrac=not_refrac,
-            dt=float(dt), M=self.M, hard_reset=self.hard_reset,
-            alpha=self.alpha, block=self.block,
-        )

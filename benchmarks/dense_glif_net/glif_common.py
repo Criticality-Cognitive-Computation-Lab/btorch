@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+from collections import namedtuple
 from dataclasses import dataclass
 from typing import Callable
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -26,16 +28,117 @@ class GLIF3StepOps:
     """A backend's GLIF3 kernel entry points behind one object.
 
     Call it for the single (training) step; use ``.multistep_fused`` /
-    ``.dense_multistep_fused`` for the fused multistep paths. This replaces
-    attaching those two functions as attributes onto the step function.
+    ``.dense_multistep_fused`` / ``.sparse_multistep_fused`` for the fused
+    multistep paths.
     """
 
     step: Callable
     multistep_fused: Callable
     dense_multistep_fused: Callable
+    sparse_multistep_fused: Callable = None
 
     def __call__(self, *args, **kwargs):
         return self.step(*args, **kwargs)
+
+
+# A sparse recurrent weight, preprocessed once. ``crow``/``col``/``val`` are the
+# CSR arrays the fused SpMV kernels read; ``coo_indices`` = stack([row, col]) is
+# kept so the training path can wrap fresh ``val`` in a COO tensor with
+# ``is_coalesced=True`` (no runtime coalesce). All tensors are contiguous int32/
+# fp32 on device; edges are sorted + deduplicated.
+SparseWeight = namedtuple("SparseWeight", ["crow", "col", "val", "coo_indices", "N"])
+
+
+def scale_free_csr(N: int, density: float, device, seed: int = 0,
+                   gamma: float = 2.5) -> SparseWeight:
+    """Scale-free recurrent connectivity. In-degrees (nonzeros per row) follow a
+    power law and columns are drawn by preferential attachment, so a few hub
+    neurons dominate — the heavy load imbalance a good SpMV must handle. Coalesced
+    once here (the one-time preprocess); nothing is re-sorted at runtime."""
+    rng = np.random.default_rng(seed)
+    nnz_target = int(density * N * N)
+    deg = rng.pareto(gamma - 1.0, size=N) + 1.0
+    deg = np.clip(np.round(deg / deg.sum() * nnz_target).astype(np.int64), 1, N)
+    pop = rng.pareto(gamma - 1.0, size=N) + 1.0
+    col = rng.choice(N, size=int(deg.sum()), p=pop / pop.sum())
+    row = np.repeat(np.arange(N), deg)
+    val = rng.standard_normal(len(col)) / np.sqrt(deg.mean())
+
+    idx = torch.stack([torch.from_numpy(row), torch.from_numpy(col)])
+    coo = torch.sparse_coo_tensor(idx, torch.from_numpy(val).float(), (N, N)).coalesce()
+    rows, cols = coo.indices()
+    crow = torch.zeros(N + 1, dtype=torch.int32)
+    crow[1:] = torch.bincount(rows, minlength=N).cumsum(0)
+    return SparseWeight(
+        crow.to(device), cols.int().contiguous().to(device),
+        coo.values().to(device), coo.indices().to(device), N)
+
+
+class _SparseSpmv(torch.autograd.Function):
+    """lin = W @ s for a COO weight, with gradients to the values and to ``s``.
+
+    Both forward and backward are O(nnz) scatter/gathers, so nothing dense is
+    ever materialized. This is why we do NOT use ``torch.sparse.mm`` for training:
+    its backward w.r.t. the sparse values builds a dense (N, N) gradient, which
+    OOMs at N=2**15 (~27 GB) even though the final gradient is only nnz-sized.
+    """
+
+    @staticmethod
+    def forward(ctx, rows, cols, N, val, s):
+        lin = torch.zeros(N, device=s.device, dtype=s.dtype)
+        lin.index_add_(0, rows, val * s[cols])
+        ctx.save_for_backward(rows, cols, val, s)
+        ctx.N = N
+        return lin
+
+    @staticmethod
+    def backward(ctx, glin):
+        rows, cols, val, s = ctx.saved_tensors
+        grad_val = glin[rows] * s[cols]           # nnz-sized, no dense (N, N)
+        grad_s = torch.zeros(ctx.N, device=s.device, dtype=s.dtype)
+        grad_s.index_add_(0, cols, val * glin[rows])
+        return None, None, None, grad_val, grad_s
+
+
+def sparse_spmv(weight: SparseWeight, s: torch.Tensor) -> torch.Tensor:
+    """lin = W @ s with gradients to the weight values and to ``s``."""
+    return _SparseSpmv.apply(
+        weight.coo_indices[0].long(), weight.coo_indices[1].long(),
+        weight.N, weight.val, s)
+
+
+def sparse_multistep_autograd(
+    step: Callable,
+    x_seq: torch.Tensor,
+    weight: SparseWeight,
+    bias: torch.Tensor,
+    v: torch.Tensor,
+    Iasc: torch.Tensor,
+    params: dict,
+    not_refrac: torch.Tensor,
+    dt: float,
+    M: int,
+    hard_reset: bool,
+    alpha: float,
+    spmv: Callable = sparse_spmv,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Autograd sparse-recurrent multistep for training: single-step op composed
+    with a differentiable sparse SpMV each step. Shared by every backend; ``spmv``
+    lets a backend inject its own (e.g. Warp's tape-based SpMV) in place of the
+    default nnz-sized torch op."""
+    T, B = x_seq.shape
+    s_prev = torch.zeros(B, device=x_seq.device, dtype=x_seq.dtype)
+    v_cur, I_cur = v, Iasc.reshape(-1)
+    spikes, voltages = [], []
+    for t in range(T):
+        x_in = x_seq[t] + bias + spmv(weight, s_prev)
+        v_cur, I_cur, s_prev = step(
+            v=v_cur, Iasc=I_cur, x=x_in, params=params, not_refrac=not_refrac,
+            dt=dt, M=M, hard_reset=hard_reset, alpha=alpha,
+        )
+        spikes.append(s_prev)
+        voltages.append(v_cur)
+    return torch.stack(spikes), torch.stack(voltages), v_cur, I_cur.view(B, M)
 
 
 def dense_multistep_autograd(
