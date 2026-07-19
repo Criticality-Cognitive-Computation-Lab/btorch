@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+from dataclasses import dataclass
 from typing import Callable
 
 import torch
@@ -18,6 +19,59 @@ _DT = 1.0
 _ALPHA = 2.0
 _M = 2
 _HARD_RESET = False
+
+
+@dataclass(frozen=True)
+class GLIF3StepOps:
+    """A backend's GLIF3 kernel entry points behind one object.
+
+    Call it for the single (training) step; use ``.multistep_fused`` /
+    ``.dense_multistep_fused`` for the fused multistep paths. This replaces
+    attaching those two functions as attributes onto the step function.
+    """
+
+    step: Callable
+    multistep_fused: Callable
+    dense_multistep_fused: Callable
+
+    def __call__(self, *args, **kwargs):
+        return self.step(*args, **kwargs)
+
+
+def dense_multistep_autograd(
+    step: Callable,
+    x_seq: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    v: torch.Tensor,
+    Iasc: torch.Tensor,
+    params: dict,
+    not_refrac: torch.Tensor,
+    dt: float,
+    M: int,
+    hard_reset: bool,
+    alpha: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Autograd dense (neuron + recurrent connection) multistep for training.
+
+    Composes the single-step autograd op with a torch matmul each step, so torch
+    builds the graph and the gradients for ``weight`` / ``bias`` / ``x_seq`` /
+    initial state / ``asc_amps`` all fall out of the single-step backward. Shared
+    by every backend since it only depends on the backend's single-step op.
+    """
+    T, B = x_seq.shape
+    s_prev = torch.zeros(B, device=x_seq.device, dtype=x_seq.dtype)
+    v_cur, I_cur = v, Iasc.reshape(-1)
+    spikes, voltages = [], []
+    for t in range(T):
+        x_in = x_seq[t] + bias + torch.mv(weight, s_prev)
+        v_cur, I_cur, s_prev = step(
+            v=v_cur, Iasc=I_cur, x=x_in, params=params, not_refrac=not_refrac,
+            dt=dt, M=M, hard_reset=hard_reset, alpha=alpha,
+        )
+        spikes.append(s_prev)
+        voltages.append(v_cur)
+    return torch.stack(spikes), torch.stack(voltages), v_cur, I_cur.view(B, M)
 
 
 def has_module(name: str) -> bool:
@@ -45,11 +99,11 @@ class GLIFDenseNet(RecurrentNNAbstract):
         self.register_memory("spike", 0.0, n_neuron)
 
     def multi_step_forward(self, x_seq: torch.Tensor):
-        if (
-            hasattr(self.neuron, "step_fn")
-            and hasattr(self.neuron.step_fn, "dense_multistep_fused")
-            and not torch.is_grad_enabled()
+        if hasattr(self.neuron, "step_fn") and hasattr(
+            self.neuron.step_fn, "dense_multistep_fused"
         ):
+            # dense_multistep_fused routes internally: a lean fused/cuBLAS forward
+            # under no_grad, an autograd path when gradients are required.
             step_fn = self.neuron.step_fn
             spike_seq, v_seq, v_out, I_out = step_fn.dense_multistep_fused(
                 x_seq=x_seq,
@@ -213,15 +267,15 @@ def build_neuron(provider: str, N: int, params: dict, require_grad: bool):
         return neuron
 
     if provider == "triton":
-        from benchmark.dense_glif_net.glif_triton import glif3_step_triton
+        from benchmarks.dense_glif_net.glif_triton import glif3_step_triton
 
         step_fn = glif3_step_triton
     elif provider == "warp":
-        from benchmark.dense_glif_net.glif_warp import glif3_step_warp
+        from benchmarks.dense_glif_net.glif_warp import glif3_step_warp
 
         step_fn = glif3_step_warp
     elif provider == "cupy":
-        from benchmark.dense_glif_net.glif_cupy import glif3_step_cupy
+        from benchmarks.dense_glif_net.glif_cupy import glif3_step_cupy
 
         step_fn = glif3_step_cupy
     else:
