@@ -4,7 +4,7 @@ from collections.abc import Callable
 import torch
 from triton.testing import Benchmark, perf_report
 
-from benchmark.dense_glif_net.glif_common import _DT, make_inputs, providers
+from benchmarks.dense_glif_net.glif_common import _DT, make_inputs, providers
 from btorch.models import environ
 from btorch.models.functional import init_net_state, reset_net_state
 from btorch.models.neurons.glif import GLIF3
@@ -106,11 +106,11 @@ def _run_multistep_kernel(
     hard_reset: bool,
 ) -> torch.Tensor:
     if provider == "triton":
-        from benchmark.dense_glif_net.glif_triton import glif3_step_triton as step_fn
+        from benchmarks.dense_glif_net.glif_triton import glif3_step_triton as step_fn
     elif provider == "warp":
-        from benchmark.dense_glif_net.glif_warp import glif3_step_warp as step_fn
+        from benchmarks.dense_glif_net.glif_warp import glif3_step_warp as step_fn
     elif provider == "cupy":
-        from benchmark.dense_glif_net.glif_cupy import glif3_step_cupy as step_fn
+        from benchmarks.dense_glif_net.glif_cupy import glif3_step_cupy as step_fn
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
