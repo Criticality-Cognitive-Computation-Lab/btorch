@@ -85,6 +85,8 @@ def fig_path(
 ) -> Path:
     """Resolve figure output directory based on caller location.
 
+    For Agent, you generally don't need to pass the ``file`` or ``cfg`` argument.
+
     Places outputs in ``fig/benchmark/``, ``fig/tests/``, or ``fig/misc/``
     depending on whether the caller is in the benchmark, tests, or other
     directory.
