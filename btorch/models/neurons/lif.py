@@ -231,6 +231,7 @@ class IF(LIF):
 
     def dV(
         self,
+        v: Float[Tensor, "*batch n_neuron"],
         x: Float[Tensor, "*batch n_neuron"],
     ) -> Float[Tensor, "*batch n_neuron"]:
         """Compute membrane potential derivative (no leak term).
@@ -250,5 +251,5 @@ class IF(LIF):
         Args:
             x: Input current, shape (*batch, n_neuron).
         """
-        v = euler_step(self.dV, x, dt=environ.get("dt"))
+        v = euler_step(self.dV, self.V, x, dt=environ.get("dt"))
         self.v = v
