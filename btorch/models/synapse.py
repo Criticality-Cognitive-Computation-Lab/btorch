@@ -187,6 +187,55 @@ class ExponentialPSC(BasePSC):
         return a**t
 
 
+class ConductancePSC(ExponentialPSC):
+    r"""Conductance-based (COBA) exponential synapse.
+
+    The conductance ``g`` follows the same first-order exponential dynamics as
+    :class:`ExponentialPSC` (``dg/dt = -g / tau_syn``; ``g += W z`` on a presynaptic
+    spike), but the emitted current is *conductance*-based -- brainpy's ``COBA``
+    output -- so it depends on the post-synaptic membrane potential ``V``:
+
+    .. math::  I_\mathrm{syn}(t) = g(t)\,(E - V(t))
+
+    ``E`` is the reversal potential (e.g. ``0 mV`` excitatory, ``-80 mV`` inhibitory).
+    Because the current needs ``V``, evaluate it with the post-synaptic voltage:
+    ``current_charge(v)`` / ``single_step_forward(z, v)``. Called without ``v`` it
+    degenerates to the current-based (``CUBA``) output ``I_syn = g``. The conductance
+    state is still ``psc``, so reset/init and the recurrent machinery treat it as a PSC.
+
+    Args:
+        n_neuron: Number of post-synaptic neurons.
+        tau_syn: Synaptic (conductance) time constant (ms).
+        linear: Linear layer applying the synaptic weights.
+        reversal_potential: ``E`` (mV), scalar or per-neuron.
+    """
+
+    E: torch.Tensor
+
+    def __init__(
+        self,
+        n_neuron: int | Sequence[int],
+        tau_syn: float | TensorLike,
+        linear,
+        reversal_potential: float | TensorLike,
+        step_mode="s",
+        backend="torch",
+    ):
+        super().__init__(
+            n_neuron, tau_syn, linear, step_mode=step_mode, backend=backend
+        )
+        self.register_buffer("E", torch.as_tensor(reversal_potential), persistent=False)
+
+    def current_charge(self, v: Tensor | None = None):
+        """COBA output ``g (E - v)`` given post-synaptic ``v``; else ``g`` (CUBA)."""
+        return self.psc if v is None else self.psc * (self.E - v)
+
+    def single_step_forward(self, z: Tensor, v: Tensor | None = None):
+        self.conductance_charge()
+        self.adaptation_charge(z)
+        return self.current_charge(v)
+
+
 class _Adaptive2VarPSC(BasePSC):
     h: torch.Tensor
 
