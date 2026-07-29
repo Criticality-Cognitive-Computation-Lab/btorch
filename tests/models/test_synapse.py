@@ -10,6 +10,7 @@ from btorch.models.history import SpikeHistory
 from btorch.models.synapse import (
     AlphaPSC,
     AlphaPSCBilleh,
+    ConductancePSC,
     DelayedPSC,
     DualExponentialPSC,
     ExponentialPSC,
@@ -35,6 +36,39 @@ def _expected_exponential_psc(
         expected.append(psc.clone())
 
     return torch.stack(expected, dim=0)
+
+
+def test_conductance_psc_coba_output():
+    """ConductancePSC (COBA) emits g * (E - V); degenerates to CUBA (g) without v."""
+    from btorch.models.linear import DenseConn
+
+    n, dt, tau = 3, 1.0, 5.0
+    with environ.context(dt=dt):
+        lin = DenseConn(n, n, bias=None)
+        with torch.no_grad():
+            lin.weight.copy_(torch.eye(n))  # identity weights: g += z
+        syn = ConductancePSC(n, tau_syn=tau, linear=lin, reversal_potential=0.0)  # exc
+        syn.init_state(batch_size=1)
+
+        z = torch.zeros(1, n)
+        z[0, 0] = 1.0
+        v = torch.full((1, n), -55.0)
+
+        current = syn.single_step_forward(z, v)  # g = 1 -> I = 1 * (0 - (-55))
+        assert abs(float(syn.psc[0, 0]) - 1.0) < 1e-5
+        assert abs(float(current[0, 0]) - 55.0) < 1e-4
+
+        decay = float(torch.exp(torch.tensor(-dt / tau)))
+        current2 = syn.single_step_forward(torch.zeros(1, n), v)  # decay, no input
+        assert abs(float(syn.psc[0, 0]) - decay) < 1e-5
+        assert abs(float(current2[0, 0]) - decay * 55.0) < 1e-4
+        assert abs(float(syn.current_charge()[0, 0]) - decay) < 1e-5  # CUBA (no v)
+
+    with environ.context(dt=dt):
+        syn_i = ConductancePSC(n, tau_syn=tau, linear=lin, reversal_potential=-80.0)
+        syn_i.init_state(batch_size=1)
+        current_i = syn_i.single_step_forward(z, v)  # I = 1 * (-80 - (-55)) = -25
+        assert abs(float(current_i[0, 0]) - (-25.0)) < 1e-4
 
 
 def test_exponential_psc_latency_matches_manual():
