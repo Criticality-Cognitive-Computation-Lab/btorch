@@ -21,7 +21,7 @@ dependencies:
   - xarray
   - h5py
   - hdf5plugin
-  - pandas>=3.0.3 # assume CoW
+  - pandas>=3.0.5 # assume CoW
   - numba
   - seaborn
   # dev
