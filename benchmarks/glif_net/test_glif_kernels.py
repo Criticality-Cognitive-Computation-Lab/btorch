@@ -38,7 +38,7 @@ ALPHA = 2.0
 RTOL = 1e-4
 ATOL = 1e-4
 
-BACKENDS = ("triton", "warp", "cupy")
+BACKENDS = ("triton", "warp", "cupy", "tilelang")
 INPUT_KINDS = ("constant", "random")
 
 
@@ -51,8 +51,10 @@ def _load_step_fn(name: str):
         from benchmarks.glif_net.glif_triton import glif3_step_triton as fn
     elif name == "warp":
         from benchmarks.glif_net.glif_warp import glif3_step_warp as fn
-    else:
+    elif name == "cupy":
         from benchmarks.glif_net.glif_cupy import glif3_step_cupy as fn
+    else:
+        from benchmarks.glif_net.glif_tilelang import glif3_step_tilelang as fn
     return fn
 
 

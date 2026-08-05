@@ -410,6 +410,10 @@ def build_neuron(provider: str, N: int, params: dict, require_grad: bool):
         from benchmarks.glif_net.glif_cupy import glif3_step_cupy
 
         step_fn = glif3_step_cupy
+    elif provider == "tilelang":
+        from benchmarks.glif_net.glif_tilelang import glif3_step_tilelang
+
+        step_fn = glif3_step_tilelang
     else:
         raise ValueError(f"Unknown provider: {provider}")
 

@@ -22,8 +22,9 @@ from matplotlib.lines import Line2D
 from btorch.utils.file import fig_path
 
 # Wong colour-blind-safe palette, one hue per backend.
-BACKEND_COLOR = {"triton": "#0072B2", "warp": "#D55E00", "cupy": "#009E73"}
-BACKENDS = ["triton", "warp", "cupy"]
+BACKEND_COLOR = {"triton": "#0072B2", "warp": "#D55E00", "cupy": "#009E73",
+                 "tilelang": "#E69F00"}
+BACKENDS = ["triton", "warp", "cupy", "tilelang"]
 COMPILE_COLOR = "#CC79A7"        # torch.compile(reduce-overhead) baseline
 
 

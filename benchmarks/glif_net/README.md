@@ -1,10 +1,14 @@
 # GLIF3 recurrent SNN kernels
 
 Reference kernels for a GLIF3 spiking network with a recurrent connection,
-across three GPU backends — **Triton**, **Warp**, and **CuPy** — plus eager
-PyTorch. Each backend covers the single step, the neuron-only multistep, and
-the recurrent multistep (dense all-to-all **and** 5 % scale-free sparse), for
-both **inference** and **training**.
+across four GPU backends — **Triton**, **Warp**, **CuPy**, and **TileLang** —
+plus eager PyTorch. Each backend covers the single step, the neuron-only
+multistep, and the recurrent multistep (dense all-to-all **and** 5 % scale-free
+sparse), for both **inference** and **training**. TileLang additionally provides
+a **persistent** fused sparse kernel that runs the whole recurrence in one
+cooperative launch (`T.sync_grid()` barrier per step), keeping neuron state
+resident and fusing the CSR-vector SpMV with the neuron update in a single
+launch — which stock Triton/Warp/CuPy cannot express (see below).
 
 The GLIF3 update per step (exponential-Euler membrane, heaviside spike with an
 ATan surrogate gradient, `M` after-spike currents):
@@ -92,7 +96,15 @@ inference; forward+backward for training):
 | Triton | 0.06 | 0.45 | 5.2 | 33 |
 | Warp | 0.26 | 1.3 | 5.4 | 38 |
 | CuPy | 0.06 | 0.46 | 5.5 | 33 |
+| TileLang | **0.04** | 4.2 | **4.8** | 33 |
 | `torch.compile` (reduce-overhead) | — | — | 5.9 | 93 |
+
+TileLang is the **fastest** backend for neuron and dense *inference* (its
+scalar one-thread-per-neuron update fuses the whole GLIF3 step in registers) and
+ties on dense training. Its neuron *training* is slower (4.2 ms) only because it
+composes `T` single-step autograd calls — many tiny launches — instead of a
+fused BPTT kernel; dense/sparse training hide that behind the recurrent
+matmul/SpMV backward, so there it is competitive-to-fastest.
 
 Neuron-multistep inference is a single fused kernel (µs-scale); dense training is
 dominated by the per-step autograd graph. Dense inference is close across
@@ -188,6 +200,7 @@ N-sweep/T-sweep columns; recurrent solid, neuron-only baseline dashed).
 | Triton | 0.06 | 0.06 | 0.06 | 0.06 |
 | Warp | 0.26 | 0.27 | 0.26 | 0.27 |
 | CuPy | 0.06 | 0.06 | 0.06 | 0.06 |
+| TileLang | 0.04 | 0.04 | 0.04 | 0.04 |
 
 *Neuron multistep — training*
 | backend | N=8192 | N=16384 | N=32768 | N=65536 |
@@ -195,6 +208,7 @@ N-sweep/T-sweep columns; recurrent solid, neuron-only baseline dashed).
 | Triton | 0.45 | 0.45 | 0.45 | 0.45 |
 | Warp | 1.32 | 1.28 | 1.29 | 1.34 |
 | CuPy | 0.46 | 0.47 | 0.47 | 0.48 |
+| TileLang | 4.2 | 4.3 | 4.2 | 4.2 |
 
 *Sparse recurrent multistep — inference*
 | backend | N=8192 | N=16384 | N=32768 | N=65536 |
@@ -202,6 +216,7 @@ N-sweep/T-sweep columns; recurrent solid, neuron-only baseline dashed).
 | Triton (CSR-vector) | 0.86 | 1.58 | 8.77 | 34.4 |
 | Warp (CSR-vector) | 6.49 | 6.47 | 9.18 | 36.0 |
 | CuPy (CSR-vector) | 0.51 | 1.23 | 8.23 | 35.1 |
+| TileLang (CSR-vector, persistent) | 1.1 | 4.0 | 23.8 | 83.1 |
 
 *Sparse recurrent multistep — training*
 | backend | N=8192 | N=16384 | N=32768 | N=65536 |
@@ -209,6 +224,7 @@ N-sweep/T-sweep columns; recurrent solid, neuron-only baseline dashed).
 | Triton | 9.9 | 31.0 | 121 | 470 |
 | Warp | 44.8 | 109 | 261 | 709 |
 | CuPy | 10.3 | 30.9 | 121 | 470 |
+| TileLang | 8.9 | 31.5 | 122 | 473 |
 
 The neuron-only multistep is a single fused kernel whose runtime is flat in `N`
 (µs-scale, memory-bandwidth-trivial); the sparse recurrent term is what grows
@@ -218,6 +234,38 @@ sparse inference until then, so its curve is flat-then-rising rather than
 monotone. At the same `N`, dense recurrent (table above) costs ~10× the sparse
 SpMV for inference — it re-reads the full `N×N` weight — and OOMs at `N=65536`
 where the `N×N` weight (16 GB, ×2 with its gradient) no longer fits.
+
+### TileLang persistent fused sparse kernel
+
+The stock backends realize the sparse recurrent inference as **T separate kernel
+launches** — each launch is the cross-step barrier, and the neuron state
+(`v`, `Iasc`) round-trips global memory across every boundary. TileLang expresses
+what they cannot: **one cooperative launch for the whole recurrence**
+(`_sparse_persistent` in `glif_tilelang.py`). The grid stays resident; each
+timestep does a CSR-vector SpMV (same warp-per-row schedule as the siblings —
+`rows` rows/block × `lanes` lanes, reduced with `T.reduce_sum`), fuses the GLIF3
+update, double-buffers the spike vector in a grid-global scratch, and a single
+`T.sync_grid()` separates steps. No relaunch, and only the spike vector (not the
+full neuron state) crosses the barrier.
+
+It is **correct** (matches the eager reference and the sibling kernels). The
+**raw CSR-vector SpMV is competitive** — a single full-grid SpMV is ~24 µs,
+matching cuSPARSE (~22 µs). The catch is structural: a cooperative launch
+requires every block co-resident for `T.sync_grid()`, and this register-heavy
+fused kernel fits only **~1 block/SM** (`_persistent_grid` derives the count from
+the hardware threads-per-SM limit, but cooperative residency caps it there —
+launching more throws `CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_MANY_BLOCKS`). So the
+~170-block persistent grid is **parallelism-starved at large N** (where the
+siblings' full-grid per-launch SpMVs use thousands of blocks), and the per-step
+`sync_grid` lets the slowest scale-free **hub** row gate the whole grid. Net:
+TileLang sparse inference **wins at small N** (`N=512`: **0.09 ms** vs Triton
+1.01, CuPy 0.14) and **loses at large N** (`N=65536`: 83 ms vs Triton/CuPy ~34).
+Closing the large-N gap means giving up the single-launch persistence for a
+per-step full-grid fused kernel — a deliberate trade, kept persistent here to
+demonstrate the fused-recurrence capability. Sparse **training** (composing the
+TileLang single-step through the shared autograd path) is **fastest** at `N=8192`
+(8.9 ms vs Triton 10.1, CuPy 13.4), tying at larger N where the shared SpMV
+backward dominates.
 
 ### Roofline
 
