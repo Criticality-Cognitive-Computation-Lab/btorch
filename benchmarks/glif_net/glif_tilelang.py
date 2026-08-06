@@ -35,19 +35,20 @@ a busy GPU or a 2-warmup/10-iter loop badly mis-reports these µs-scale kernels)
   kernel (a runtime ``T.serial`` loop, not unrolled); training is a single
   **fused BPTT** kernel that walks T in reverse carrying the adjoints in
   registers — one launch instead of T composed single-step backwards.
-- the persistent sparse kernel's raw CSR-vector SpMV matches cuSPARSE, but the
-  fused kernel is **cooperative-launch occupancy-bound**. TileLang's sanctioned
-  persistent pattern is one block per SM (``driver.get_num_sms()``, as in every
-  persistent example and ``T.PersistentTileScheduler``'s default) — a cooperative
-  launch needs all CTAs co-resident and TileLang has no occupancy API to size >1
-  block/SM safely. So throughput comes from a *bigger* block: one 1024-thread CTA
-  per SM, 32 rows × one warp each (``_SP_ROWS``/``_SP_LANES``). That caps thread
-  occupancy at 1024/1536 ≈ 67% (one 1024-thread block can't share an SM with
-  another), whereas CuPy's lighter kernel reaches full occupancy via its own
-  ``occupancyMaxActiveBlocks`` grid — the ~2× residual gap at large N. (Empirically
-  multiple small cooperative blocks/SM were slower here: more blocks to
-  ``sync_grid`` and less work amortized per block.) The per-step ``T.sync_grid``
-  barrier also lets the slowest scale-free hub row gate the grid each step.
+- the persistent sparse kernel's raw CSR-vector SpMV matches cuSPARSE; the fused
+  kernel is competitive at small N and ~2x behind CuPy at large N. The grid is
+  sized the sanctioned way (one block/SM, ``driver.get_num_sms()``, as in every
+  persistent example / ``T.PersistentTileScheduler`` default). TileLang has no
+  occupancy API and doesn't surface a CUfunction handle, so it can't size the
+  cooperative grid via ``occupancyMaxActiveBlocksPerMultiprocessor(func)*numSMs``
+  the way CuPy does; parallelism comes from a bigger block (one 1024-thread CTA/SM,
+  32 rows x one warp, ``_SP_ROWS``/``_SP_LANES``). The residual gap is **not**
+  occupancy — ncu shows this kernel at 67% achieved occupancy vs CuPy's lower
+  ~17%, both latency-bound (near-zero DRAM on the scale-free gather). It is kernel
+  efficiency: CuPy's hand-written ``__shfl_down_sync`` reduce + tight gather vs
+  TileLang's ``T.reduce_sum`` (shared-mem staged) + generated gather, across the
+  per-step ``T.sync_grid`` barriers. The raw SpMV matching cuSPARSE localizes the
+  loss to that fused-reduction/barrier overhead; exact mechanism not isolated.
 The dense path still uses cuBLAS ``addmv`` + a neuron kernel per step (not an
 in-kernel gemv); its training composes the single-step op through the shared
 autograd helper, hidden behind the matmul backward.

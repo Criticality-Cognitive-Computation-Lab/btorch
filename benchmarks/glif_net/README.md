@@ -250,24 +250,30 @@ full neuron state) crosses the barrier.
 
 It is **correct** (matches the eager reference and the sibling kernels). The
 **raw CSR-vector SpMV is competitive** — a single full-grid SpMV is ~24 µs,
-matching cuSPARSE (~22 µs). The grid is sized the TileLang-sanctioned way —
-`driver.get_num_sms()`, one block per SM, exactly as every persistent example
-and `T.PersistentTileScheduler` default (TileLang has **no** occupancy API and
-does no grid clamping, so an over-provisioned cooperative grid just throws
-`CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_MANY_BLOCKS`). In this model you add
-parallelism with a **bigger block**, not more blocks: one 1024-thread CTA per SM
-running 32 rows × one warp (`_SP_ROWS`/`_SP_LANES` = 32/32). That still caps
-thread occupancy at 1024/1536 ≈ 67% — a single 1024-thread block can't share an
-SM with another — whereas CuPy's lighter kernel reaches full occupancy via its
-own `occupancyMaxActiveBlocks` grid. (Multiple small cooperative blocks/SM were
-tried and are *slower* here: more blocks to `sync_grid`, less work amortized per
-block.) Net: TileLang sparse inference **wins at small N** (`N=512`: **0.09 ms**
-vs Triton 0.87, CuPy 0.14), ties around `N=8192` (1.0 vs 0.85/0.48), and is
-~2× behind at large N (`N=65536`: 63 ms vs Triton/CuPy ~34) — the residual is
-the occupancy cap, not the SpMV. Sparse **training** (composing the TileLang
-single-step through the shared autograd path) is the **fastest** backend at
-`N=8192` (8.1 ms vs Triton 10.0, CuPy 10.5), tying at larger N where the shared
-SpMV backward dominates.
+matching cuSPARSE (~22 µs). The cooperative grid is sized the TileLang-sanctioned
+way: `driver.get_num_sms()`, one block per SM, exactly as every persistent
+example and `T.PersistentTileScheduler`'s default. TileLang exposes **no**
+occupancy API and no CUfunction handle, so it can't do what CuPy does — CuPy
+sizes its cooperative grid with `occupancyMaxActiveBlocksPerMultiprocessor(...)
+* numSMs` on the raw CUfunction (that product is exactly the cooperative-launch
+limit). In TileLang's one-block-per-SM model you add parallelism with a *bigger*
+block: one 1024-thread CTA per SM, 32 rows × one warp (`_SP_ROWS`/`_SP_LANES`).
+
+The remaining ~2× vs CuPy at large N is **not occupancy** — Nsight Compute shows
+TileLang running at 67% achieved warp occupancy vs CuPy's *lower* ~17%, with both
+near-zero DRAM (the scale-free gather is latency-bound, not bandwidth-bound). So
+the gap is **kernel efficiency in the fused persistent path**, not parallelism:
+CuPy's hand-written kernel uses a tight `__shfl_down_sync` register shuffle-reduce
+and gather loop, where TileLang's generated code uses `T.reduce_sum` (staged
+through shared memory) plus the compiler's scalar-gather codegen, repeated across
+the 32 `sync_grid` steps. The raw SpMV matching cuSPARSE localizes the loss to
+that fused-reduction/barrier overhead; the exact mechanism is not fully isolated.
+Net: TileLang sparse inference **wins at small N** (`N=512`: **0.09 ms** vs
+Triton 0.87, CuPy 0.14), ties around `N=8192` (1.0 vs 0.85/0.48), and is ~2×
+behind at large N (`N=65536`: 63 ms vs Triton/CuPy ~34). Sparse **training**
+(composing the TileLang single-step through the shared autograd path) is the
+**fastest** backend at `N=8192` (8.1 ms vs Triton 10.0, CuPy 10.5), tying at
+larger N where the shared SpMV backward dominates.
 
 ### Roofline
 
