@@ -9,8 +9,9 @@ Measures every ``{backend} x {kind} x {mode}`` combination:
             ``torch.compile`` (mode ``reduce-overhead``) baseline on the
             canonical eager btorch net (``*/compile`` rows, dense + sparse)
 
-Two sweeps (8 points each): N at fixed T, and T at a medium N. Results (median
-ms, ``None`` on out-of-memory) are written to JSON for ``plot_glif_kernels.py``.
+Two sweeps (8 points each): N at fixed T, and T at a medium N. Results (min over
+several timed windows to reject shared-GPU contention; ``None`` on out-of-memory)
+are written to JSON for ``plot_glif_kernels.py``.
 This is the heavy full benchmark (``bench_glif_sparse.py`` is the quick one); run
 it on a GPU node via ``bench_glif.slurm``::
 
@@ -25,35 +26,35 @@ re-capture makes it impractically slow to time)::
     inference | N sweep (T=32)
            kind/backend      512    1024    2048    4096    8192   16384   32768   65536
           neuron/triton     0.06    0.06    0.06    0.06    0.06    0.06    0.06    0.06
-            neuron/warp     0.25    0.25    0.25    0.25    0.25    0.25    0.25    0.25
+            neuron/warp     0.29    0.29    0.29    0.29    0.29    0.26    0.25    0.25
             neuron/cupy     0.06    0.06    0.06    0.06    0.06    0.06    0.06    0.06
         neuron/tilelang     0.04    0.04    0.04    0.04    0.04    0.04    0.04    0.04
-           dense/triton     1.57    1.55    1.62    1.56    5.21   20.41   80.94     OOM
-             dense/warp     5.43    5.46    5.45    5.46    5.49   20.02   80.60     OOM
-             dense/cupy     0.15    0.21    0.35    0.75    5.51   20.88   80.91     OOM
-         dense/tilelang     1.65    1.65    1.66    1.67    4.76   19.87   80.42     OOM
+           dense/triton     1.56    1.38    1.37    1.37    5.23   20.56   80.93     OOM
+             dense/warp     5.35    5.36    5.35    5.37    5.37   20.03   80.58     OOM
+             dense/cupy     0.15    0.21    0.35    0.75    5.52   20.89   80.91     OOM
+         dense/tilelang     1.67    1.69    1.67    1.68    4.80   19.96   80.60     OOM
           dense/compile     1.89    1.65    1.89    1.77    5.86   20.94   81.54     OOM
-          sparse/triton     1.01    1.00    1.00    1.00    1.00    1.61    8.86   34.03
-            sparse/warp     6.67    6.66    6.68    6.67    6.67    6.67    9.08   35.66
-            sparse/cupy     0.14    0.15    0.25    0.32    0.49    1.26    8.32   34.11
-        sparse/tilelang     0.09    0.13    0.21    0.46    1.14    3.97   23.81   83.10
+          sparse/triton     0.87    0.86    0.86    0.86    0.85    1.54    8.86   33.94
+            sparse/warp     6.52    6.51    6.49    6.50    6.50    6.50    9.00   35.64
+            sparse/cupy     0.14    0.15    0.25    0.34    0.48    1.18    8.28   33.91
+        sparse/tilelang     0.09    0.13    0.24    0.47    1.01    2.86   17.81   62.68
          sparse/compile     6.24    6.27    6.23    6.36    6.24    6.23    9.57     OOM
 
     training | N sweep (T=32)
            kind/backend      512    1024    2048    4096    8192   16384   32768   65536
-          neuron/triton     0.42    0.45    0.44    0.45    0.45    0.43    0.46    0.44
-            neuron/warp     1.28    1.29    1.29    1.30    1.38    1.31    1.32    1.32
-            neuron/cupy     0.44    0.44    0.45    0.45    0.45    0.45    0.46    0.45
-        neuron/tilelang     0.38    0.37    0.36    0.39    0.38    0.38    0.38    0.39
-           dense/triton     8.17    7.76    7.88    8.32   32.68   128.0   495.8     OOM
-             dense/warp    33.86   35.31   34.20   34.69   37.50   129.1   496.8     OOM
-             dense/cupy     7.47    7.63    7.54    8.43   32.69   128.0   495.8     OOM
-         dense/tilelang     6.62    6.71    6.50    8.43   32.65   127.9   495.7     OOM
+          neuron/triton     0.42    0.42    0.41    0.42    0.45    0.46    0.43    0.46
+            neuron/warp     1.27    1.31    1.22    1.26    1.23    1.24    1.24    1.25
+            neuron/cupy     0.43    0.43    0.43    0.44    0.44    0.44    0.44    0.44
+        neuron/tilelang     0.35    0.35    0.35    0.37    0.36    0.36    0.36    0.37
+           dense/triton     7.71    7.78    7.71    8.25   32.65   127.9   495.7     OOM
+             dense/warp    33.06   34.46   34.55   34.51   36.99   129.0   497.0     OOM
+             dense/cupy     7.51    7.62    7.51    8.28   32.67   127.9   495.7     OOM
+         dense/tilelang     6.51    6.67    6.62    8.20   32.63   128.0   495.8     OOM
           dense/compile    59.54   59.50   63.41   65.54   92.61   195.1   608.1     OOM
-          sparse/triton     9.93   10.10   10.19   10.28   10.11   31.54   122.2   473.2
-            sparse/warp    43.32   43.45   45.22   44.98   66.69   107.5   265.6   732.2
-            sparse/cupy    11.39   12.46   12.20   12.99   13.37   31.54   122.2   473.5
-        sparse/tilelang     8.84    8.79    9.14    8.86    8.88   31.55   122.2   472.9
+          sparse/triton     9.97   11.90   11.83   11.86   10.02   31.59   121.5   473.0
+            sparse/warp    46.94   47.54   48.04   48.09   48.85   107.9   266.3   731.7
+            sparse/cupy     9.63   10.25   10.66   10.62   10.46   31.62   121.6   473.1
+        sparse/tilelang     8.14    8.18    8.16    8.15    8.11   31.60   121.6   474.3
          sparse/compile    741.3   687.0   608.9   618.0   726.7  1253.0  3075.0     OOM
 
     inference | T sweep (N=8192)
@@ -62,32 +63,32 @@ re-capture makes it impractically slow to time)::
             neuron/warp     0.25    0.25    0.25    0.25    0.25    0.25    0.25    0.25
             neuron/cupy     0.06    0.06    0.06    0.06    0.06    0.08    0.16    0.31
         neuron/tilelang     0.04    0.04    0.04    0.04    0.04    0.04    0.05    0.09
-           dense/triton     0.66    1.31    2.61    5.21   10.42   20.78   41.54   83.07
-             dense/warp     0.76    1.43    2.78    5.49   10.91   21.65   43.27   87.04
-             dense/cupy     0.55    1.26    2.68    5.51   11.18   22.47   45.04   90.38
-         dense/tilelang     0.60    1.19    2.38    4.76    9.58   19.40   40.08   84.38
+           dense/triton     0.66    1.31    2.62    5.23   10.44   20.88   41.68   83.29
+             dense/warp     0.74    1.41    2.73    5.34   10.63   21.16   42.18   87.05
+             dense/cupy     0.55    1.26    2.68    5.51   11.16   22.48   45.06   90.34
+         dense/tilelang     0.60    1.19    2.37    4.77    9.56   19.38   40.15   84.29
           dense/compile     1.71    2.43    3.73    5.84   11.59   20.55   41.39   84.99
-          sparse/triton     0.15    0.26    0.46    0.87    1.69    3.30    6.62   13.07
-            sparse/warp     0.91    1.74    3.38    6.68   13.23   26.32   52.97   105.8
-            sparse/cupy     0.07    0.12    0.24    0.49    1.00    2.00    3.98    7.81
-        sparse/tilelang     0.15    0.29    0.57    1.15    2.28    4.59    9.19   18.33
+          sparse/triton     0.15    0.26    0.46    0.86    1.67    3.26    6.50   12.95
+            sparse/warp     0.89    1.69    3.28    6.47   12.89   25.72   51.06   102.1
+            sparse/cupy     0.07    0.12    0.23    0.48    0.97    1.97    3.93    7.77
+        sparse/tilelang     0.13    0.25    0.52    1.02    2.08    4.10    8.12   15.78
          sparse/compile     2.00    2.61    3.82    6.37   11.16   20.76   39.92   78.22
 
     training | T sweep (N=8192)
            kind/backend        4       8      16      32      64     128     256     512
-          neuron/triton     0.42    0.43    0.45    0.44    0.44    0.44    0.44    1.00
-            neuron/warp     1.30    1.29    1.29    1.30    1.30    1.30    1.32    1.47
-            neuron/cupy     0.45    0.44    0.45    0.46    0.45    0.46    0.49    1.12
-        neuron/tilelang     0.38    0.36    0.40    0.39    0.40    0.42    0.74    1.68
-           dense/triton     3.55    7.72   16.02   32.67   66.05   133.1   268.2   540.4
-             dense/warp     4.51    8.95   18.67   37.20   73.35   151.9   360.7   769.8
-             dense/cupy     3.55    7.75   16.03   32.70   66.08   133.1   268.3   540.7
-         dense/tilelang     3.54    7.70   16.02   32.66   65.97   133.0   268.0   539.9
+          neuron/triton     0.44    0.42    0.43    0.43    0.43    0.43    0.43    0.95
+            neuron/warp     1.22    1.22    1.23    1.24    1.33    1.24    1.25    1.46
+            neuron/cupy     0.43    0.43    0.44    0.46    0.46    0.47    0.49    1.13
+        neuron/tilelang     0.35    0.35    0.36    0.37    0.36    0.45    0.45    0.56
+           dense/triton     3.54    7.72   15.99   32.67   66.02   132.9   268.3   545.5
+             dense/warp     4.47    9.03   19.50   38.17   73.60   151.1   342.1   752.2
+             dense/cupy     3.54    7.69   15.99   32.68   66.04   132.9   268.4   545.6
+         dense/tilelang     3.52    7.68   15.99   32.63   66.01   132.7   267.9   543.8
           dense/compile      OOM     OOM   44.24   92.93   225.7   631.4  2009.3  7111.2
-          sparse/triton     1.52    2.69    5.01    9.38   20.58   40.24   74.51   142.1
-            sparse/warp     5.80   11.15   44.10   44.48   85.21   164.5   343.9   716.1
-            sparse/cupy     1.70    2.99    5.52   10.83   23.08   43.71   81.30   156.7
-        sparse/tilelang     1.34    2.39    4.39    8.23   17.16   33.67   64.89   148.5
+          sparse/triton     1.52    2.69    4.97    9.33   20.15   38.98   73.67   149.2
+            sparse/warp     5.78   11.09   23.08   44.68   87.67   169.8   345.2   734.8
+            sparse/cupy     1.58    2.80    5.13    9.65   22.33   43.05   76.07   146.5
+        sparse/tilelang     1.33    2.36    4.34    8.16   16.53   33.77   63.83   128.8
          sparse/compile    58.85   121.7   281.6   726.1  2168.3  7113.2     OOM     OOM
 """
 
@@ -163,13 +164,15 @@ def _call(step, kind, x, bias, params, v, Iasc, nr, weight):
         x_seq=x, weight=weight, bias=bias, v=v.clone(), Iasc=Iasc.clone(), **common)
 
 
-def _time_ms(fn, grad, iters):
-    """Median-ish wall time per call. Warms up generously and auto-calibrates the
-    rep count so the fixed per-measurement overhead (host dispatch + the single
-    trailing ``cuda.synchronize``) is amortized. With only a couple of warmups
-    and ~10 reps, sub-0.1 ms kernels — TileLang's especially, whose per-call
-    dispatch transient is larger than Triton's — read several× too slow; batching
-    reps to a ~50 ms window fixes it for every backend."""
+def _time_ms(fn, grad, iters, windows=5):
+    """Min-of-N wall time per call. Warms up generously and auto-calibrates the
+    rep count so the fixed per-measurement overhead (host dispatch + the trailing
+    ``cuda.synchronize``) is amortized — with only a couple of warmups and ~10
+    reps, sub-0.1 ms kernels (TileLang's especially, whose per-call dispatch
+    transient is larger than Triton's) read several× too slow; batching reps to a
+    ~50 ms window fixes it. Then time ``windows`` separate batches and take the
+    **minimum**: on a shared GPU, transient contention from another process only
+    ever inflates a window, so the min rejects those bursts (best-of-N)."""
     ctx = torch.enable_grad() if grad else torch.no_grad()
     with ctx:
         for _ in range(25):
@@ -182,12 +185,15 @@ def _time_ms(fn, grad, iters):
         torch.cuda.synchronize()
         per_call = (time.time() - t0) / 20
         reps = min(1000, max(iters, int(0.05 / max(per_call, 1e-6))))
-        torch.cuda.synchronize()
-        t0 = time.time()
-        for _ in range(reps):
-            fn()
-        torch.cuda.synchronize()
-    return (time.time() - t0) / reps * 1000.0
+        best = float("inf")
+        for _ in range(windows):
+            torch.cuda.synchronize()
+            t0 = time.time()
+            for _ in range(reps):
+                fn()
+            torch.cuda.synchronize()
+            best = min(best, (time.time() - t0) / reps)
+    return best * 1000.0
 
 
 def measure(step, kind, mode, N, T):

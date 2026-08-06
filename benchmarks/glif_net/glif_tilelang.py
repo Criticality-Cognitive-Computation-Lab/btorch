@@ -36,15 +36,18 @@ a busy GPU or a 2-warmup/10-iter loop badly mis-reports these µs-scale kernels)
   **fused BPTT** kernel that walks T in reverse carrying the adjoints in
   registers — one launch instead of T composed single-step backwards.
 - the persistent sparse kernel's raw CSR-vector SpMV matches cuSPARSE, but the
-  kernel is **cooperative-launch occupancy-bound**: the grid must be co-resident
-  for ``T.sync_grid()``, and this register-heavy kernel fits only ~1 block/SM
-  (``_persistent_grid`` derives the count from ``max_threads_per_multi_processor``
-  but cooperative residency caps it lower). So at large N the ~170-block grid is
-  parallelism-starved vs the siblings' full-grid per-launch SpMVs, and the
-  per-step ``T.sync_grid`` barrier lets the slowest scale-free hub row gate the
-  whole grid — it wins at small N (few tiles, relaunch overhead dominates) and
-  loses at large N. A per-step (non-cooperative, full-grid) fused kernel would
-  close the large-N gap at the cost of the single-launch persistence.
+  fused kernel is **cooperative-launch occupancy-bound**. TileLang's sanctioned
+  persistent pattern is one block per SM (``driver.get_num_sms()``, as in every
+  persistent example and ``T.PersistentTileScheduler``'s default) — a cooperative
+  launch needs all CTAs co-resident and TileLang has no occupancy API to size >1
+  block/SM safely. So throughput comes from a *bigger* block: one 1024-thread CTA
+  per SM, 32 rows × one warp each (``_SP_ROWS``/``_SP_LANES``). That caps thread
+  occupancy at 1024/1536 ≈ 67% (one 1024-thread block can't share an SM with
+  another), whereas CuPy's lighter kernel reaches full occupancy via its own
+  ``occupancyMaxActiveBlocks`` grid — the ~2× residual gap at large N. (Empirically
+  multiple small cooperative blocks/SM were slower here: more blocks to
+  ``sync_grid`` and less work amortized per block.) The per-step ``T.sync_grid``
+  barrier also lets the slowest scale-free hub row gate the grid each step.
 The dense path still uses cuBLAS ``addmv`` + a neuron kernel per step (not an
 in-kernel gemv); its training composes the single-step op through the shared
 autograd helper, hidden behind the matmul backward.
@@ -514,29 +517,25 @@ def glif3_dense_multistep_fused_tilelang(x_seq, weight, bias, v, Iasc, params,
 # Sparse recurrent multistep — TileLang CSR SpMV fused with the neuron update.
 # ----------------------------------------------------------------------------
 
-_SP_ROWS, _SP_LANES = 16, 64        # CSR-vector tile: rows/block x lanes/row
-# Upper bound on resident blocks per SM, mirroring the register-pressure cap
-# DeepSeek's TileKernels applies in ``_choose_num_persistent_blocks``. Exact
-# occupancy needs the compiled cubin's per-thread register count, so both they
-# and we bound the threads-based estimate instead of computing it.
-MAX_BLOCKS_PER_SM = 16
+# CSR-vector tile: one warp per row (lanes=32, cheap single-warp shuffle reduce,
+# same as CuPy/Triton), packed to the 1024-thread block max (rows=32) so one CTA
+# processes 32 rows — the way to get parallelism in TileLang's one-block-per-SM
+# cooperative model is a bigger block, not more blocks (see _persistent_grid).
+_SP_ROWS, _SP_LANES = 32, 32
 
 
 @functools.lru_cache(maxsize=None)
-def _persistent_grid(block_threads: int) -> int:
-    """CTAs to launch for the cooperative persistent kernel: SMs x resident
-    blocks/SM. TileLang exposes the persistent primitive but no occupancy helper
-    (``T.Persistent`` takes the wave size as given), so — like DeepSeek's
-    TileKernels — derive blocks/SM from the hardware threads-per-SM limit, capped
-    at ``MAX_BLOCKS_PER_SM``. One block per SM (the GEMM default, where a tile
-    already fills the SM) leaves most of the grid idle for our small-block SpMV.
-    These kernels index global memory directly and use no shared memory, so smem
-    never binds occupancy."""
-    props = torch.cuda.get_device_properties(0)
-    threads_per_sm = getattr(props, "max_threads_per_multi_processor", 0)
-    per_sm = max(1, min(threads_per_sm // block_threads if block_threads else 1,
-                        MAX_BLOCKS_PER_SM))
-    return props.multi_processor_count * per_sm
+def _persistent_grid() -> int:
+    """CTAs for the cooperative persistent kernel = one block per SM, the pattern
+    every TileLang persistent example uses (``driver.get_num_sms()`` in
+    ``example_gemm_persistent`` / ``example_mla_decode_persistent``, and the
+    default of ``T.PersistentTileScheduler``). A cooperative launch needs all CTAs
+    co-resident; TileLang has no occupancy API and does no grid clamping, so it
+    would pass an over-provisioned grid straight to ``cudaLaunchCooperativeKernel``
+    and hit ``CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_MANY_BLOCKS``. num_SMs blocks is
+    always ≤ the cooperative max; throughput comes from a bigger block."""
+    from tilelang.carver.arch import driver
+    return driver.get_num_sms()
 
 
 @functools.lru_cache(maxsize=None)
@@ -582,7 +581,7 @@ def _sparse_persistent(T_steps: int, B: int, M: int, nnz: int, hard_reset: bool,
                             for m in range(M):
                                 Ibuf[row * M + m] = I0[row * M + m]
             T.sync_grid()
-            for t in range(T_steps):
+            for t in T.serial(0, T_steps):   # runtime loop, not unrolled
                 cur = t % 2
                 nxt = (t + 1) % 2
                 for tile in T.Persistent([T.ceildiv(B, rows)], blocks, pid):
@@ -644,7 +643,7 @@ def glif3_sparse_multistep_fused_tilelang(x_seq, weight, bias, v, Iasc, params,
             not_refrac, dt, M, hard_reset, alpha)
     Tn, B = x_seq.shape
     kern = _sparse_persistent(Tn, B, M, int(weight.col.numel()), hard_reset,
-                              _persistent_grid(_SP_ROWS * _SP_LANES))
+                              _persistent_grid())
     fp = {key: _as_fp32(params[key]) for key in params}
     with torch.no_grad():
         s_seq, v_seq, v_out, I_out = kern(
