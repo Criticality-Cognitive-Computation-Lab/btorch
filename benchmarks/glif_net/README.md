@@ -259,21 +259,27 @@ sizes its cooperative grid with `occupancyMaxActiveBlocksPerMultiprocessor(...)
 limit). In TileLang's one-block-per-SM model you add parallelism with a *bigger*
 block: one 1024-thread CTA per SM, 32 rows × one warp (`_SP_ROWS`/`_SP_LANES`).
 
-The remaining ~2× vs CuPy at large N is **not isolated**, and two natural
-hypotheses were tested and *ruled out*:
-- **Not occupancy.** Nsight Compute shows TileLang at 67% achieved warp occupancy
-  vs CuPy's *lower* ~17%, both near-zero DRAM (the scale-free gather is
-  latency-bound). TileLang is more occupied yet slower.
-- **Not the reduction.** TileLang lowers `T.reduce_sum(dim=1)` to a
-  `tl::AllReduce` with a block-wide `NamedBarrier`, not a warp shuffle. Rewriting
-  it with `T.warp_reduce_sum` (the `__shfl_down_sync` idiom CuPy uses) is
-  bit-exact and runs at **the same time** (0.99 ms) — so the reduce isn't the
-  cost.
-The raw full-grid SpMV matches cuSPARSE, so the loss is somewhere in the fused
-*persistent* structure (per-step `sync_grid`, the persistent grid-stride, the
-neuron update running on lane 0 while the row's other 31 lanes idle, or generated
-scalar-gather code) — not yet pinned down. The primitives to match CuPy exist;
-the straightforward levers don't close the gap.
+The remaining ~2× vs CuPy at large N was **isolated by ablation**: zeroing each
+component and re-timing (`N=8192`, full = 0.99 ms) attributes **0.91 ms (92%) to
+the CSR gather loop itself**, 0.02 ms to the per-step `sync_grid`, and 0.04 ms to
+the neuron update + persistent bookkeeping (at `N=32768` the gather is 99%). So
+the gap is the gather `acc += val[p] * s[col[p]]`, and every other suspect is
+minor. Three hypotheses about *why the gather is slower than CuPy's* were tested
+and ruled out:
+- **Not occupancy** — ncu: TileLang 67% achieved warp occupancy vs CuPy's *lower*
+  ~17%, both near-zero DRAM (the random gather is latency-bound). More occupied,
+  yet slower.
+- **Not the reduction** — `T.reduce_sum(dim=1)` lowers to a `tl::AllReduce` with a
+  block `NamedBarrier`, but rewriting it as `T.warp_reduce_sum` (CuPy's exact
+  `__shfl_down_sync` idiom) is bit-exact and the *same* time (0.99 ms).
+- **Not loop scheduling** — unrolling the gather (`T.unroll(unroll_factor=2/4/8)`,
+  to give nvcc a window to overlap the independent loads) does **not** help
+  (0.99 → 1.00 ms); the `col[p]`→`s[col[p]]` load chain isn't reorderable enough.
+What remains is the **generated scalar-gather code quality** — TileLang's per-step
+gather (~28 µs) vs CuPy's hand-written pointer gather (~15 µs, faster than even
+cuSPARSE's 22 µs by keeping the CSR arrays + spike vector hot in L2 across steps).
+Matching it would need tighter gather codegen than the accessible TileLang knobs
+produce; it is a real codegen gap, not a missing primitive or a config mistake.
 Net: TileLang sparse inference **wins at small N** (`N=512`: **0.09 ms** vs
 Triton 0.87, CuPy 0.14), ties around `N=8192` (1.0 vs 0.85/0.48), and is ~2×
 behind at large N (`N=65536`: 63 ms vs Triton/CuPy ~34). Sparse **training**
