@@ -42,13 +42,14 @@ a busy GPU or a 2-warmup/10-iter loop badly mis-reports these µs-scale kernels)
   occupancy API and doesn't surface a CUfunction handle, so it can't size the
   cooperative grid via ``occupancyMaxActiveBlocksPerMultiprocessor(func)*numSMs``
   the way CuPy does; parallelism comes from a bigger block (one 1024-thread CTA/SM,
-  32 rows x one warp, ``_SP_ROWS``/``_SP_LANES``). The residual gap is **not**
-  occupancy — ncu shows this kernel at 67% achieved occupancy vs CuPy's lower
-  ~17%, both latency-bound (near-zero DRAM on the scale-free gather). It is kernel
-  efficiency: CuPy's hand-written ``__shfl_down_sync`` reduce + tight gather vs
-  TileLang's ``T.reduce_sum`` (shared-mem staged) + generated gather, across the
-  per-step ``T.sync_grid`` barriers. The raw SpMV matching cuSPARSE localizes the
-  loss to that fused-reduction/barrier overhead; exact mechanism not isolated.
+  32 rows x one warp, ``_SP_ROWS``/``_SP_LANES``). The residual gap is **not
+  isolated**, and two hypotheses were tested + ruled out: not occupancy (ncu: 67%
+  here vs CuPy's lower ~17%, both latency-bound), and not the reduction (rewriting
+  ``T.reduce_sum`` as ``T.warp_reduce_sum`` — the ``__shfl_down_sync`` idiom CuPy
+  uses — is bit-exact and the *same* time). The raw SpMV matches cuSPARSE, so the
+  loss is in the fused persistent structure (per-step ``sync_grid``, grid-stride,
+  the lane-0 neuron update, or gather codegen) — the primitives to match CuPy
+  exist, but the straightforward levers don't close it.
 The dense path still uses cuBLAS ``addmv`` + a neuron kernel per step (not an
 in-kernel gemv); its training composes the single-step op through the shared
 autograd helper, hidden behind the matmul backward.

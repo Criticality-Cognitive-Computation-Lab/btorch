@@ -259,15 +259,21 @@ sizes its cooperative grid with `occupancyMaxActiveBlocksPerMultiprocessor(...)
 limit). In TileLang's one-block-per-SM model you add parallelism with a *bigger*
 block: one 1024-thread CTA per SM, 32 rows × one warp (`_SP_ROWS`/`_SP_LANES`).
 
-The remaining ~2× vs CuPy at large N is **not occupancy** — Nsight Compute shows
-TileLang running at 67% achieved warp occupancy vs CuPy's *lower* ~17%, with both
-near-zero DRAM (the scale-free gather is latency-bound, not bandwidth-bound). So
-the gap is **kernel efficiency in the fused persistent path**, not parallelism:
-CuPy's hand-written kernel uses a tight `__shfl_down_sync` register shuffle-reduce
-and gather loop, where TileLang's generated code uses `T.reduce_sum` (staged
-through shared memory) plus the compiler's scalar-gather codegen, repeated across
-the 32 `sync_grid` steps. The raw SpMV matching cuSPARSE localizes the loss to
-that fused-reduction/barrier overhead; the exact mechanism is not fully isolated.
+The remaining ~2× vs CuPy at large N is **not isolated**, and two natural
+hypotheses were tested and *ruled out*:
+- **Not occupancy.** Nsight Compute shows TileLang at 67% achieved warp occupancy
+  vs CuPy's *lower* ~17%, both near-zero DRAM (the scale-free gather is
+  latency-bound). TileLang is more occupied yet slower.
+- **Not the reduction.** TileLang lowers `T.reduce_sum(dim=1)` to a
+  `tl::AllReduce` with a block-wide `NamedBarrier`, not a warp shuffle. Rewriting
+  it with `T.warp_reduce_sum` (the `__shfl_down_sync` idiom CuPy uses) is
+  bit-exact and runs at **the same time** (0.99 ms) — so the reduce isn't the
+  cost.
+The raw full-grid SpMV matches cuSPARSE, so the loss is somewhere in the fused
+*persistent* structure (per-step `sync_grid`, the persistent grid-stride, the
+neuron update running on lane 0 while the row's other 31 lanes idle, or generated
+scalar-gather code) — not yet pinned down. The primitives to match CuPy exist;
+the straightforward levers don't close the gap.
 Net: TileLang sparse inference **wins at small N** (`N=512`: **0.09 ms** vs
 Triton 0.87, CuPy 0.14), ties around `N=8192` (1.0 vs 0.85/0.48), and is ~2×
 behind at large N (`N=65536`: 63 ms vs Triton/CuPy ~34). Sparse **training**
