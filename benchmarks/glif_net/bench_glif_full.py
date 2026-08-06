@@ -44,7 +44,7 @@ re-capture makes it impractically slow to time)::
           neuron/triton     0.42    0.45    0.44    0.45    0.45    0.43    0.46    0.44
             neuron/warp     1.28    1.29    1.29    1.30    1.38    1.31    1.32    1.32
             neuron/cupy     0.44    0.44    0.45    0.45    0.45    0.45    0.46    0.45
-        neuron/tilelang     4.16    4.15    4.26    4.23    4.20    4.26    4.23    4.23
+        neuron/tilelang     0.38    0.37    0.36    0.39    0.38    0.38    0.38    0.39
            dense/triton     8.17    7.76    7.88    8.32   32.68   128.0   495.8     OOM
              dense/warp    33.86   35.31   34.20   34.69   37.50   129.1   496.8     OOM
              dense/cupy     7.47    7.63    7.54    8.43   32.69   128.0   495.8     OOM
@@ -78,7 +78,7 @@ re-capture makes it impractically slow to time)::
           neuron/triton     0.42    0.43    0.45    0.44    0.44    0.44    0.44    1.00
             neuron/warp     1.30    1.29    1.29    1.30    1.30    1.30    1.32    1.47
             neuron/cupy     0.45    0.44    0.45    0.46    0.45    0.46    0.49    1.12
-        neuron/tilelang     0.78    1.29    2.31    4.24    8.45   17.18   32.68   63.77
+        neuron/tilelang     0.38    0.36    0.40    0.39    0.40    0.42    0.74    1.68
            dense/triton     3.55    7.72   16.02   32.67   66.05   133.1   268.2   540.4
              dense/warp     4.51    8.95   18.67   37.20   73.35   151.9   360.7   769.8
              dense/cupy     3.55    7.75   16.03   32.70   66.08   133.1   268.3   540.7

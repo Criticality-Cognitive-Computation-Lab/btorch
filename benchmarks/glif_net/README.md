@@ -96,15 +96,15 @@ inference; forward+backward for training):
 | Triton | 0.06 | 0.45 | 5.2 | 33 |
 | Warp | 0.26 | 1.3 | 5.4 | 38 |
 | CuPy | 0.06 | 0.46 | 5.5 | 33 |
-| TileLang | **0.04** | 4.2 | **4.8** | 33 |
+| TileLang | **0.04** | **0.38** | **4.8** | 33 |
 | `torch.compile` (reduce-overhead) | — | — | 5.9 | 93 |
 
-TileLang is the **fastest** backend for neuron and dense *inference* (its
-scalar one-thread-per-neuron update fuses the whole GLIF3 step in registers) and
-ties on dense training. Its neuron *training* is slower (4.2 ms) only because it
-composes `T` single-step autograd calls — many tiny launches — instead of a
-fused BPTT kernel; dense/sparse training hide that behind the recurrent
-matmul/SpMV backward, so there it is competitive-to-fastest.
+TileLang is the **fastest** backend for neuron inference, neuron training, and
+dense inference, and ties on dense training. Its scalar one-thread-per-neuron
+kernels fuse the whole GLIF3 step in registers, and the neuron multistep runs
+the T-step loop *inside* one kernel (a runtime `T.serial` loop, not unrolled) —
+for training a single **fused BPTT** kernel walks the T steps in reverse carrying
+the reverse-time adjoints in registers, one launch instead of T.
 
 Neuron-multistep inference is a single fused kernel (µs-scale); dense training is
 dominated by the per-step autograd graph. Dense inference is close across
@@ -208,7 +208,7 @@ N-sweep/T-sweep columns; recurrent solid, neuron-only baseline dashed).
 | Triton | 0.45 | 0.45 | 0.45 | 0.45 |
 | Warp | 1.32 | 1.28 | 1.29 | 1.34 |
 | CuPy | 0.46 | 0.47 | 0.47 | 0.48 |
-| TileLang | 4.2 | 4.3 | 4.2 | 4.2 |
+| TileLang | 0.38 | 0.38 | 0.38 | 0.39 |
 
 *Sparse recurrent multistep — inference*
 | backend | N=8192 | N=16384 | N=32768 | N=65536 |

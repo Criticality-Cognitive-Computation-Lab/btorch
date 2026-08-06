@@ -30,8 +30,11 @@ are ``(B,)``; ``Iasc`` / ``k`` / ``asc_amps`` are ``(B*M,)`` with base ``i*M``.
 
 Performance (measured on an *unloaded* GPU with adequate warmup — see the README;
 a busy GPU or a 2-warmup/10-iter loop badly mis-reports these µs-scale kernels):
-- neuron and dense inference are the **fastest** of all backends (the scalar
-  one-thread-per-neuron update fuses the whole GLIF3 step into registers);
+- neuron inference, neuron training, and dense inference are the **fastest** of
+  all backends, and dense training ties. The neuron multistep loops T inside one
+  kernel (a runtime ``T.serial`` loop, not unrolled); training is a single
+  **fused BPTT** kernel that walks T in reverse carrying the adjoints in
+  registers — one launch instead of T composed single-step backwards.
 - the persistent sparse kernel's raw CSR-vector SpMV matches cuSPARSE, but the
   kernel is **cooperative-launch occupancy-bound**: the grid must be co-resident
   for ``T.sync_grid()``, and this register-heavy kernel fits only ~1 block/SM
@@ -42,8 +45,9 @@ a busy GPU or a 2-warmup/10-iter loop badly mis-reports these µs-scale kernels)
   whole grid — it wins at small N (few tiles, relaunch overhead dominates) and
   loses at large N. A per-step (non-cooperative, full-grid) fused kernel would
   close the large-N gap at the cost of the single-launch persistence.
-The neuron/dense paths use a Python-unrolled T loop (a given ``T`` recompiles),
-and dense uses cuBLAS ``addmv`` + a neuron kernel per step, not an in-kernel gemv.
+The dense path still uses cuBLAS ``addmv`` + a neuron kernel per step (not an
+in-kernel gemv); its training composes the single-step op through the shared
+autograd helper, hidden behind the matmul backward.
 """
 
 import functools
@@ -240,7 +244,7 @@ def _neuron_multistep(T_steps: int, B: int, M: int, hard_reset: bool, block: int
                     vcur[0] = v0[idx]
                     for m in range(M):
                         Icur[m] = I0[idx * M + m]
-                    for t in range(T_steps):
+                    for t in T.serial(0, T_steps):   # runtime loop, not unrolled
                         isum = T.alloc_local((1,), "float32")
                         isum[0] = T.float32(0)
                         for m in range(M):
@@ -267,24 +271,192 @@ def _neuron_multistep(T_steps: int, B: int, M: int, hard_reset: bool, block: int
     return tilelang.compile(main, out_idx=[12, 13, 14, 15])
 
 
+@functools.lru_cache(maxsize=None)
+def _neuron_multistep_train_fwd(T_steps: int, B: int, M: int, hard_reset: bool,
+                                block: int = _BLOCK):
+    """Training forward: like the inference multistep but also saves the pre-step
+    ``I_seq`` the backward needs. Runtime ``T.serial`` loop — not unrolled."""
+    N = B * M
+    HR = 1 if hard_reset else 0
+
+    @T.prim_func
+    def main(
+        x_seq: T.Tensor((T_steps, B), "float32"),
+        v0: T.Tensor((B,), "float32"), I0: T.Tensor((N,), "float32"),
+        v_th: T.Tensor((B,), "float32"), v_reset: T.Tensor((B,), "float32"),
+        v_rest: T.Tensor((B,), "float32"), c_m: T.Tensor((B,), "float32"),
+        tau: T.Tensor((B,), "float32"), k: T.Tensor((N,), "float32"),
+        asc_amps: T.Tensor((N,), "float32"), nr: T.Tensor((B,), "float32"),
+        dt: T.float32,
+        s_seq: T.Tensor((T_steps, B), "float32"),
+        v_seq: T.Tensor((T_steps, B), "float32"),
+        I_seq: T.Tensor((T_steps, N), "float32"),
+        v_out: T.Tensor((B,), "float32"), I_out: T.Tensor((N,), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(B, block), threads=block) as bx:
+            for i in T.Parallel(block):
+                idx = bx * block + i
+                if idx < B:
+                    vcur = T.alloc_local((1,), "float32"); vcur[0] = v0[idx]
+                    Icur = T.alloc_local((M,), "float32")
+                    for m in range(M):
+                        Icur[m] = I0[idx * M + m]
+                    for t in T.serial(0, T_steps):
+                        for m in range(M):
+                            I_seq[t, idx * M + m] = Icur[m]   # pre-step I_asc
+                        isum = T.alloc_local((1,), "float32"); isum[0] = T.float32(0)
+                        for m in range(M):
+                            isum[0] += Icur[m]
+                        v_inf = v_rest[idx] + tau[idx] * (x_seq[t, idx] + isum[0]) / c_m[idx]
+                        vp = v_inf + (vcur[0] - v_inf) * T.exp(-dt / tau[idx])
+                        sp = T.alloc_local((1,), "float32"); sp[0] = T.float32(0)
+                        if vp >= v_th[idx]:
+                            sp[0] = nr[idx]
+                        if HR == 1:
+                            vcur[0] = vp - (vp - v_reset[idx]) * sp[0]
+                        else:
+                            vcur[0] = vp - (v_th[idx] - v_reset[idx]) * sp[0]
+                        for m in range(M):
+                            j = idx * M + m
+                            Icur[m] = Icur[m] * T.exp(-k[j] * dt) + asc_amps[j] * sp[0]
+                        s_seq[t, idx] = sp[0]; v_seq[t, idx] = vcur[0]
+                    v_out[idx] = vcur[0]
+                    for m in range(M):
+                        I_out[idx * M + m] = Icur[m]
+
+    return tilelang.compile(main, out_idx=[12, 13, 14, 15, 16])
+
+
+@functools.lru_cache(maxsize=None)
+def _neuron_multistep_train_bwd(T_steps: int, B: int, M: int, hard_reset: bool,
+                                block: int = _BLOCK):
+    """Fused BPTT backward: ONE kernel walks the T steps in reverse (runtime
+    ``T.serial``, not unrolled), carrying the reverse-time adjoints (dv_post, dI,
+    dasc) in registers — the same math as the single-step backward composed T
+    times, but a single launch instead of T."""
+    N = B * M
+    HR = 1 if hard_reset else 0
+
+    @T.prim_func
+    def main(
+        x_seq: T.Tensor((T_steps, B), "float32"), v0: T.Tensor((B,), "float32"),
+        v_seq: T.Tensor((T_steps, B), "float32"), s_seq: T.Tensor((T_steps, B), "float32"),
+        I_seq: T.Tensor((T_steps, N), "float32"),
+        v_th: T.Tensor((B,), "float32"), v_reset: T.Tensor((B,), "float32"),
+        v_rest: T.Tensor((B,), "float32"), c_m: T.Tensor((B,), "float32"),
+        tau: T.Tensor((B,), "float32"), k: T.Tensor((N,), "float32"),
+        asc_amps: T.Tensor((N,), "float32"), nr: T.Tensor((B,), "float32"),
+        ds_seq: T.Tensor((T_steps, B), "float32"), dv_seq: T.Tensor((T_steps, B), "float32"),
+        dv_out: T.Tensor((B,), "float32"), dI_out: T.Tensor((N,), "float32"),
+        dt: T.float32, alpha: T.float32,
+        dv0: T.Tensor((B,), "float32"), dI0: T.Tensor((N,), "float32"),
+        dx: T.Tensor((T_steps, B), "float32"), dasc: T.Tensor((N,), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(B, block), threads=block) as bx:
+            for i in T.Parallel(block):
+                idx = bx * block + i
+                if idx < B:
+                    decay = T.exp(-dt / tau[idx])
+                    dv_post = T.alloc_local((1,), "float32"); dv_post[0] = dv_out[idx]
+                    dI = T.alloc_local((M,), "float32")
+                    dA = T.alloc_local((M,), "float32")
+                    for m in range(M):
+                        dI[m] = dI_out[idx * M + m]; dA[m] = T.float32(0)
+                    for ti in T.serial(0, T_steps):
+                        t = T_steps - 1 - ti
+                        dv_post[0] += dv_seq[t, idx]
+                        sp = s_seq[t, idx]
+                        vpre = T.alloc_local((1,), "float32")
+                        if t == 0:
+                            vpre[0] = v0[idx]
+                        else:
+                            vpre[0] = v_seq[t - 1, idx]
+                        isum = T.alloc_local((1,), "float32"); isum[0] = T.float32(0)
+                        for m in range(M):
+                            isum[0] += I_seq[t, idx * M + m]
+                        v_inf = v_rest[idx] + tau[idx] * (x_seq[t, idx] + isum[0]) / c_m[idx]
+                        vprime = v_inf + (vpre[0] - v_inf) * decay
+                        denom = v_th[idx] - v_reset[idx]
+                        u = (vprime - v_th[idx]) / denom
+                        ds_dvp = nr[idx] / (1.0 + (alpha * u) * (alpha * u)) / denom
+                        dvp = T.alloc_local((1,), "float32")
+                        dsv = T.alloc_local((1,), "float32")
+                        if HR == 1:
+                            dvp[0] = dv_post[0] * (1.0 - sp)
+                            dsv[0] = dv_post[0] * (-(vprime - v_reset[idx]))
+                        else:
+                            dvp[0] = dv_post[0]
+                            dsv[0] = dv_post[0] * (-(v_th[idx] - v_reset[idx]))
+                        dIs = T.alloc_local((1,), "float32"); dIs[0] = T.float32(0)
+                        for m in range(M):
+                            dIs[0] += dI[m] * asc_amps[idx * M + m]
+                        ds_total = ds_seq[t, idx] + dsv[0] + dIs[0]
+                        dvp[0] = dvp[0] + ds_total * ds_dvp
+                        dv_inf = dvp[0] * (1.0 - decay)
+                        dI_common = dv_inf * (tau[idx] / c_m[idx])
+                        dx[t, idx] = dI_common
+                        for m in range(M):
+                            j = idx * M + m
+                            dA[m] += dI[m] * sp
+                            dI[m] = dI[m] * T.exp(-k[j] * dt) + dI_common
+                        dv_post[0] = dvp[0] * decay
+                    dv0[idx] = dv_post[0]
+                    for m in range(M):
+                        dI0[idx * M + m] = dI[m]; dasc[idx * M + m] = dA[m]
+
+    return tilelang.compile(main, out_idx=[19, 20, 21, 22])
+
+
+class _GLIF3NeuronMultiStepTileLang(torch.autograd.Function):
+    """Neuron-only multistep with a single fused BPTT backward kernel."""
+
+    @staticmethod
+    def forward(ctx, x_seq, v0, I0, v_th, v_reset, v_rest, c_m, tau, k, asc_amps,
+                nr, dt, M, hard_reset, alpha):
+        Tn, B = x_seq.shape
+        args = [_as_fp32(t) for t in (x_seq, v0, I0, v_th, v_reset, v_rest, c_m,
+                                      tau, k, asc_amps, nr)]
+        s_seq, v_seq, I_seq, v_out, I_out = _neuron_multistep_train_fwd(
+            Tn, B, M, hard_reset)(*args, float(dt))
+        ctx.save_for_backward(args[0], args[1], v_seq, s_seq, I_seq, *args[3:11])
+        ctx.dt, ctx.M, ctx.hard_reset, ctx.alpha = float(dt), M, hard_reset, float(alpha)
+        return s_seq, v_seq, v_out, I_out
+
+    @staticmethod
+    def backward(ctx, ds_seq, dv_seq, dv_out, dI_out):
+        (x_seq, v0, v_seq, s_seq, I_seq, v_th, v_reset, v_rest, c_m, tau, k,
+         asc_amps, nr) = ctx.saved_tensors
+        Tn, B = x_seq.shape
+        N = B * ctx.M
+        z = torch.zeros
+        ds_seq = _as_fp32(ds_seq) if ds_seq is not None else z(Tn, B, device=x_seq.device)
+        dv_seq = _as_fp32(dv_seq) if dv_seq is not None else z(Tn, B, device=x_seq.device)
+        dv_out = _as_fp32(dv_out) if dv_out is not None else z(B, device=x_seq.device)
+        dI_out = _as_fp32(dI_out) if dI_out is not None else z(N, device=x_seq.device)
+        dv0, dI0, dx, dasc = _neuron_multistep_train_bwd(Tn, B, ctx.M, ctx.hard_reset)(
+            x_seq, v0, v_seq, s_seq, I_seq, v_th, v_reset, v_rest, c_m, tau, k,
+            asc_amps, nr, ds_seq, dv_seq, dv_out, dI_out, ctx.dt, ctx.alpha)
+        return (dx, dv0, dI0, None, None, None, None, None, None, dasc,
+                None, None, None, None, None)
+
+
 def _neuron_multistep_autograd(x_seq, v, Iasc, params, not_refrac, dt, M,
                                hard_reset, alpha):
-    """Neuron-only multistep training: compose the single-step autograd op."""
+    """Neuron-only multistep training: a single fused forward + fused BPTT
+    backward (both loop over T internally, not Python-unrolled)."""
     Tn, B = x_seq.shape
-    v_cur, I_cur = v, Iasc.reshape(-1)
-    spikes, voltages = [], []
-    for t in range(Tn):
-        v_cur, I_cur, s = _glif3_step_tilelang(
-            v_cur, I_cur, x_seq[t], params, not_refrac, dt, M, hard_reset, alpha)
-        spikes.append(s)
-        voltages.append(v_cur)
-    return torch.stack(spikes), torch.stack(voltages), v_cur, I_cur.view(B, M)
+    s_seq, v_seq, v_out, I_out = _GLIF3NeuronMultiStepTileLang.apply(
+        x_seq, v, Iasc.reshape(-1), params["v_th"], params["v_reset"],
+        params["v_rest"], params["c_m"], params["tau"], params["k"],
+        params["asc_amps"], not_refrac, float(dt), int(M), bool(hard_reset),
+        float(alpha))
+    return s_seq, v_seq, v_out, I_out.view(B, M)
 
 
 def glif3_multistep_fused_tilelang(x_seq, v, Iasc, params, not_refrac, dt, M,
                                    hard_reset=False, alpha=2.0):
-    """Neuron-only multistep: lean persistent forward for inference, composed
-    autograd for training."""
+    """Neuron-only multistep: lean forward-only kernel for inference, a fused
+    forward + single fused BPTT kernel for training."""
     need_grad = torch.is_grad_enabled() and (
         x_seq.requires_grad or v.requires_grad or Iasc.requires_grad
         or params["asc_amps"].requires_grad)
