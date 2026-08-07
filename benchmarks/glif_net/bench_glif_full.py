@@ -37,7 +37,7 @@ re-capture makes it impractically slow to time)::
           sparse/triton     0.87    0.86    0.86    0.86    0.85    1.54    8.86   33.94
             sparse/warp     6.52    6.51    6.49    6.50    6.50    6.50    9.00   35.64
             sparse/cupy     0.14    0.15    0.25    0.34    0.48    1.18    8.28   33.91
-        sparse/tilelang     0.09    0.13    0.24    0.47    1.01    2.86   17.81   62.68
+        sparse/tilelang     0.07    0.17    0.26    0.50    0.55    1.32   10.06   38.58
          sparse/compile     6.24    6.27    6.23    6.36    6.24    6.23    9.57     OOM
 
     training | N sweep (T=32)
@@ -71,7 +71,7 @@ re-capture makes it impractically slow to time)::
           sparse/triton     0.15    0.26    0.46    0.86    1.67    3.26    6.50   12.95
             sparse/warp     0.89    1.69    3.28    6.47   12.89   25.72   51.06   102.1
             sparse/cupy     0.07    0.12    0.23    0.48    0.97    1.97    3.93    7.77
-        sparse/tilelang     0.13    0.25    0.52    1.02    2.08    4.10    8.12   15.78
+        sparse/tilelang     0.14    0.27    0.53    1.05    2.06    4.28    8.31    8.73
          sparse/compile     2.00    2.61    3.82    6.37   11.16   20.76   39.92   78.22
 
     training | T sweep (N=8192)

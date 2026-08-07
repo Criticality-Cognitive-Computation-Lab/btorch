@@ -42,14 +42,15 @@ a busy GPU or a 2-warmup/10-iter loop badly mis-reports these µs-scale kernels)
   occupancy API and doesn't surface a CUfunction handle, so it can't size the
   cooperative grid via ``occupancyMaxActiveBlocksPerMultiprocessor(func)*numSMs``
   the way CuPy does; parallelism comes from a bigger block (one 1024-thread CTA/SM,
-  32 rows x one warp, ``_SP_ROWS``/``_SP_LANES``). Ablation pins the ~2x gap on the
-  **CSR gather loop** (92% of runtime at N=8192, 99% at N=32768; sync_grid ~2%,
-  neuron update ~4%). Ruled out as the cause: occupancy (ncu 67% here vs CuPy's
-  lower ~17%, both latency-bound), the reduction (``T.warp_reduce_sum`` shuffle =
-  same time as ``T.reduce_sum``), and loop unrolling the gather (no help). What
-  remains is generated scalar-gather code quality — TileLang's per-step gather
-  ~28us vs CuPy's hand-written pointer gather ~15us. A real codegen gap, not a
-  missing primitive or config mistake.
+  32 rows x one warp, ``_SP_ROWS``/``_SP_LANES``). Ablation pinned the gap on the
+  **CSR gather loop** (92-99% of runtime; sync_grid/neuron <5%). Root cause is
+  tile-ai/tilelang #2458: TileLang wraps every scalar indexed load in a redundant
+  per-load bounds/thread guard that dominates the random gather. The kernel strips
+  it with ``TL_DISABLE_SAFE_MEMORY_ACCESS`` (indices in-bounds by construction) for
+  ~1.6-1.7x on the gather. After the fix TileLang is fastest at small N and within
+  ~1.15-1.2x of CuPy elsewhere; the small residual is CuPy's hand-written pointer
+  gather being a touch tighter than the generated one. (Ruled out as causes:
+  occupancy, the reduction (warp_reduce_sum==reduce_sum), gather unrolling.)
 The dense path still uses cuBLAS ``addmv`` + a neuron kernel per step (not an
 in-kernel gemv); its training composes the single-step op through the shared
 autograd helper, hidden behind the matmul backward.
@@ -631,7 +632,16 @@ def _sparse_persistent(T_steps: int, B: int, M: int, nnz: int, hard_reset: bool,
 
     return tilelang.compile(
         main, out_idx=[16, 17, 18, 19],
-        pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+        pass_configs={
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+            # Strip the per-load bounds/thread guard TileLang wraps every scalar
+            # indexed load in (tile-ai/tilelang #2122/#2458) — it dominates the
+            # random CSR gather (val[p] / col[p] / sbuf[col[p]]). Every index here
+            # is in-bounds by construction (p in [crow[row], crow[row+1]),
+            # col[p] in [0, B), all row-guarded), so removing the guard is safe
+            # and ~1.6-1.7x faster on the gather.
+            tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+        })
 
 
 def glif3_sparse_multistep_fused_tilelang(x_seq, weight, bias, v, Iasc, params,

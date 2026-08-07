@@ -216,7 +216,7 @@ N-sweep/T-sweep columns; recurrent solid, neuron-only baseline dashed).
 | Triton (CSR-vector) | 0.86 | 1.58 | 8.77 | 34.4 |
 | Warp (CSR-vector) | 6.49 | 6.47 | 9.18 | 36.0 |
 | CuPy (CSR-vector) | 0.51 | 1.23 | 8.23 | 35.1 |
-| TileLang (CSR-vector, persistent) | 1.0 | 2.9 | 17.8 | 62.7 |
+| TileLang (CSR-vector, persistent) | 0.55 | 1.3 | 10.1 | 38.6 |
 
 *Sparse recurrent multistep — training*
 | backend | N=8192 | N=16384 | N=32768 | N=65536 |
@@ -259,33 +259,32 @@ sizes its cooperative grid with `occupancyMaxActiveBlocksPerMultiprocessor(...)
 limit). In TileLang's one-block-per-SM model you add parallelism with a *bigger*
 block: one 1024-thread CTA per SM, 32 rows × one warp (`_SP_ROWS`/`_SP_LANES`).
 
-The remaining ~2× vs CuPy at large N was **isolated by ablation**: zeroing each
-component and re-timing (`N=8192`, full = 0.99 ms) attributes **0.91 ms (92%) to
-the CSR gather loop itself**, 0.02 ms to the per-step `sync_grid`, and 0.04 ms to
-the neuron update + persistent bookkeeping (at `N=32768` the gather is 99%). So
-the gap is the gather `acc += val[p] * s[col[p]]`, and every other suspect is
-minor. Three hypotheses about *why the gather is slower than CuPy's* were tested
-and ruled out:
-- **Not occupancy** — ncu: TileLang 67% achieved warp occupancy vs CuPy's *lower*
-  ~17%, both near-zero DRAM (the random gather is latency-bound). More occupied,
-  yet slower.
-- **Not the reduction** — `T.reduce_sum(dim=1)` lowers to a `tl::AllReduce` with a
-  block `NamedBarrier`, but rewriting it as `T.warp_reduce_sum` (CuPy's exact
-  `__shfl_down_sync` idiom) is bit-exact and the *same* time (0.99 ms).
-- **Not loop scheduling** — unrolling the gather (`T.unroll(unroll_factor=2/4/8)`,
-  to give nvcc a window to overlap the independent loads) does **not** help
-  (0.99 → 1.00 ms); the `col[p]`→`s[col[p]]` load chain isn't reorderable enough.
-What remains is the **generated scalar-gather code quality** — TileLang's per-step
-gather (~28 µs) vs CuPy's hand-written pointer gather (~15 µs, faster than even
-cuSPARSE's 22 µs by keeping the CSR arrays + spike vector hot in L2 across steps).
-Matching it would need tighter gather codegen than the accessible TileLang knobs
-produce; it is a real codegen gap, not a missing primitive or a config mistake.
-Net: TileLang sparse inference **wins at small N** (`N=512`: **0.09 ms** vs
-Triton 0.87, CuPy 0.14), ties around `N=8192` (1.0 vs 0.85/0.48), and is ~2×
-behind at large N (`N=65536`: 63 ms vs Triton/CuPy ~34). Sparse **training**
-(composing the TileLang single-step through the shared autograd path) is the
-**fastest** backend at `N=8192` (8.1 ms vs Triton 10.0, CuPy 10.5), tying at
-larger N where the shared SpMV backward dominates.
+**What was slow, and the fix.** Component ablation (zero each part, re-time)
+attributed **92–99% of runtime to the CSR gather loop** `acc += val[p]*s[col[p]]`
+— not the reduction, `sync_grid`, or the neuron update (all <5%). Three
+hypotheses for *why the gather trailed CuPy* were tested and **ruled out**:
+occupancy (ncu: TileLang 67% achieved vs CuPy's *lower* ~17%, both latency-bound
+at near-zero DRAM — more occupied yet slower), the reduction (`T.warp_reduce_sum`
+shuffle == `T.reduce_sum`, bit-exact same time), and gather unrolling
+(`T.unroll(unroll_factor=2/4/8)` — no help). The actual cause, found in
+[tile-ai/tilelang #2458](https://github.com/tile-ai/tilelang/issues/2458)
+(a maintainer-confirmed ~3.9× dynamic-gather slowdown) with fixes
+[#2122](https://github.com/tile-ai/tilelang/pull/2122)/[#2120](https://github.com/tile-ai/tilelang/pull/2120):
+TileLang wraps **every scalar indexed load in a redundant per-load bounds/thread
+guard**, and that guard dominates a random-gather hot loop. Every index here is
+in-bounds by construction (`p ∈ [crow[row], crow[row+1])`, `col[p] ∈ [0,B)`, all
+row-guarded), so the kernel compiles with
+`pass_configs={TL_DISABLE_SAFE_MEMORY_ACCESS: True}` to strip the guard —
+**1.6–1.7× faster** on the gather, correctness unchanged (all tests pass).
+
+Net after the fix: TileLang sparse inference is **fastest at small N** (`N=512`:
+0.07 ms vs Triton 0.87, CuPy 0.14), **beats Triton and is within ~1.15× of CuPy**
+at `N=8192` (0.55 vs 0.85 / 0.48), and stays within ~1.15–1.2× at larger N
+(`N=32768`: 10.1 vs 8.9/8.3; `N=65536`: 39 vs 34/34) — the residual is CuPy's
+hand-written pointer gather still being a touch tighter than TileLang's generated
+one. Sparse **training** (composing the TileLang single-step through the shared
+autograd path) is the **fastest** backend at `N=8192` (8.1 ms vs Triton 10.0,
+CuPy 10.5), tying at larger N where the shared SpMV backward dominates.
 
 ### Roofline
 
