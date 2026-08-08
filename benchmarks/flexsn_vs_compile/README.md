@@ -77,3 +77,99 @@ T=16 it fuses both into one kernel (190 us). So T=8 (229 us total) > T=16
 (190 us) despite fewer steps. It's inductor's fusion heuristic flipping between
 "split" and "fused" as the unrolled graph grows (and it fragments into many
 kernels again past ~T=32, hence the T=32+ cliff).
+
+---
+
+# PDL vs CUDA-graphs vs persistent kernel (sparse RSNN multistep)
+
+`bench_pdl.py` is a separate study on the **same launch-overhead question**, but
+for a workload that is a *hard* sequential recurrence: a GLIF3 recurrent spiking
+network (RSNN) with a **5% scale-free recurrent connection** `W`, stepped for
+`T=64`. Step `t` needs every spike of `t-1` (`x_in = x[t] + bias + W @ s[t-1]`),
+so the launch boundary *is* the cross-step barrier — one CSR-vector SpMV + GLIF3
+update kernel per timestep. It asks: what actually removes that per-step launch
+cost, and when does it matter?
+
+Four strategies, each in **Triton**, **CuPy**, and **TileLang** (`bench_pdl.py`):
+
+- `plain` — `T` ordinary per-step launches (baseline).
+- `pdl` — **Programmatic Dependent Launch** (sm_90+): step `t+1` starts in the
+  drain shadow of `t`, `griddepcontrol.wait` gating only the spike dependency.
+  Triton `launch_pdl=True` + `gdc_wait`/`gdc_launch_dependents`; TileLang
+  `pdl_sync`/`pdl_trigger`; CuPy inline-PTX `griddepcontrol` + `cuLaunchKernelEx`
+  with `PROGRAMMATIC_STREAM_SERIALIZATION` (via `cuda-python`), including an
+  **L2-prefetch prologue** that streams this row's `val`/`col` before the wait.
+- `cudagraph` — the `T` plain launches captured once and replayed.
+- `persistent` — one cooperative launch runs the whole `T`-loop with `grid.sync`
+  between steps (CuPy `cg::this_grid().sync`, TileLang `T.sync_grid`; reused from
+  `glif_net`). No relaunch, but the grid is capped at SM co-residency. *Triton /
+  Warp cannot express this* — only the cooperative backends have a `persistent`
+  cell, which is itself the point.
+
+## What the data shows (RTX 5090, T=64, speedup vs each DSL's `plain`)
+
+| N | DSL | plain (ms) | PDL | cudagraph | persistent |
+|------:|----------|----:|-----:|-----:|-----:|
+| 512 | triton | 1.435 | 0.99x | **11.1x** | — |
+| 512 | cupy | 0.621 | 0.62x | 3.70x | 2.25x |
+| 512 | tilelang | 1.274 | 1.01x | 9.71x | **8.77x** |
+| 2048 | triton | 1.449 | 1.02x | 4.62x | — |
+| 2048 | cupy | 0.621 | 0.62x | 2.91x | 1.31x |
+| 2048 | tilelang | 1.279 | 1.01x | 5.07x | 4.89x |
+| 8192 | triton | 1.431 | 1.01x | 1.56x | — |
+| 8192 | cupy | 0.639 | 0.63x | 1.01x | 0.64x |
+| 8192 | tilelang | 1.281 | 1.02x | 1.60x | 1.21x |
+| 24576 | triton | 9.557 | 1.01x | 1.00x | — |
+| 24576 | cupy | 8.352 | 0.98x | 1.01x | 0.89x |
+| 24576 | tilelang | 9.198 | 1.01x | 1.01x | 0.80x |
+
+**The whole story is a launch-bound → bandwidth-bound crossover at ~N=8192.**
+
+- **CUDA graphs** are the only broadly-winning trick, and only while launches
+  dominate: **9–11x at N=512**, decaying monotonically to **~1.0x at N=24576**.
+  Removing `T` host launches (~5 µs each) is worth a lot when a step is ~20 µs
+  and nothing when it is ~150 µs.
+- **Persistent** is strong at small N (**8.8x**, TileLang, N=512) but **inverts
+  at scale — 0.80–0.89x at N=24576.** The cooperative launch pins the grid to
+  one block/SM, so at large N it under-subscribes the memory system that the
+  full-grid per-step launches saturate. It trades relaunch cost for occupancy,
+  and past the crossover that is a losing trade.
+- **PDL is ~1.0x for the whole sweep** (Triton/TileLang 0.98–1.02x). At small N
+  the step is *launch*-bound, and PDL hides launch *latency* but not the launch
+  *cost* graphs remove — so graphs win and PDL doesn't. At large N the step is
+  *bandwidth*-bound: the previous kernel already saturates HBM, so there is no
+  spare bandwidth for the next grid to prefetch into (the L2-prefetch prologue
+  has nothing to overlap). PDL only helps kernels bounded by inter-launch
+  *latency* with spare memory/compute to overlap — this sparse SpMV is bounded by
+  neither at the same time.
+- **CuPy PDL is 0.62x** — not a PDL effect but the launch *mechanism*: the
+  `cuda-python` `cuLaunchKernelEx` host path is heavier than CuPy's native
+  `RawKernel.__call__`, and at small N that extra host cost per launch dominates.
+  The same kernel via the native launcher (`plain`) is 1.6x faster.
+
+**Bottom line for the N=24576 sparse RSNN:** it is memory-bandwidth-bound, so
+none of PDL / graphs / persistent helps (0.80–1.01x); the per-step launch is
+already optimal and the win, if any, must come from the *kernel* (bandwidth), not
+the *launch*. The launch-side tricks pay off only in the launch-bound regime
+(N ≲ 4096), where CUDA graphs are the robust choice and a persistent fused kernel
+is competitive on the cooperative backends.
+
+## Numerical note
+
+Backends match the torch (cuSPARSE) reference **exactly through T=16** at
+N=24576; at T=64 the per-step Triton and the CuPy-persistent schedules differ by
+~2000/24576 spikes (`n_mismatch`). This is float **summation-order** sensitivity,
+not a bug: the ~1200-term hub-row dot products reduce in a different order than
+cuSPARSE, flipping borderline threshold crossings that then compound over the
+64-step recurrence (CuPy per-step even goes 0→2→0 mismatches as T grows). The
+harness reports the spike-mismatch *count*, not max-error, for exactly this
+reason.
+
+## Usage
+
+```bash
+# sweep launch-bound -> GPU-bound (default N = 512 2048 8192 24576), T=64
+python -m benchmarks.flexsn_vs_compile.bench_pdl --N 512 2048 8192 24576 --T 64
+# or a single size; heavy — prefer SLURM (dedicated GPU = clean timing)
+sbatch benchmarks/flexsn_vs_compile/pdl.sbatch
+```
