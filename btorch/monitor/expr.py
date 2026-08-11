@@ -100,6 +100,12 @@ class Expr:
         self._no_compose()
         return Elementwise("pow", (self,), {"exponent": exponent})
 
+    def __getitem__(self, index) -> Expr:
+        # per-step (single-step) index into each step's [B, N] value, stacked over
+        # time. To index the TIME axis (multistep), use map_seq(lambda V: V[k]).
+        self._no_compose()
+        return Elementwise("getitem", (self,), {"index": index})
+
     # -- reductions over time (streamable via carry) ----------------------
     def mean(self) -> Expr:
         self._no_compose()

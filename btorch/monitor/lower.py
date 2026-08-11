@@ -40,6 +40,8 @@ def _apply_ew(op: str, args: list, params: dict):
         return torch.clamp(args[0], min=params.get("min"), max=params.get("max"))
     if op == "pow":
         return torch.pow(args[0], params["exponent"])
+    if op == "getitem":
+        return args[0][params["index"]]
     raise ValueError(f"unknown elementwise op {op!r}")
 
 
