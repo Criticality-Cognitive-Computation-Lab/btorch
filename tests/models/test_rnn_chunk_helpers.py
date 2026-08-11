@@ -142,10 +142,12 @@ def test_chunk_step_helpers_match_a_manual_loop():
 
     from btorch.models import environ
 
+    # Both helpers return ``(z, states, record_state)``; the third element is the
+    # recording-engine state, which is irrelevant here (no monitors configured).
     with environ.context(dt=1.0):
-        z_ref, _ = cell._run_unroll_block(x, loop_args=(0,))
+        z_ref, _, _ = cell._run_unroll_block(x, loop_args=(0,))
         functional.set_hidden_states(cell, start)
-        z_chunked, _ = cell._run_chunk_steps(x, loop_args=(0,), unroll_size=3)
+        z_chunked, _, _ = cell._run_chunk_steps(x, loop_args=(0,), unroll_size=3)
     torch.testing.assert_close(torch.stack(z_chunked), torch.stack(z_ref))
 
 

@@ -3,6 +3,7 @@ from matplotlib import pyplot as plt
 
 from btorch.models.functional import reset_net_state
 from btorch.models.rnn import make_rnn
+from btorch.monitor import grad
 from btorch.utils.file import save_fig
 from tests.models.rnn.rnn_utils import SimpleRNNCell, last_step_sum
 
@@ -13,9 +14,9 @@ def test_rnn_gradient_flow():
     T, batch_size, input_size, hidden_size = 50, 2, 4, 8
 
     # Enable grad history saving
-    rnn = make_rnn(
-        SimpleRNNCell, unroll=4, save_grad_history=True, grad_state_names=["h"]
-    )(input_size=input_size, hidden_size=hidden_size)
+    rnn = make_rnn(SimpleRNNCell, unroll=4, update_state_names={"h_grad": grad("h")})(
+        input_size=input_size, hidden_size=hidden_size
+    )
 
     x = torch.randn(T, batch_size, input_size, requires_grad=True)
 
@@ -27,8 +28,7 @@ def test_rnn_gradient_flow():
     loss = last_step_sum(out)
     loss.backward()
 
-    grad_history = rnn.get_grad_history()
-    h_grads = grad_history.get("h", [])
+    h_grads = rnn.get_records()["h_grad"]
 
     assert len(h_grads) == T
 
@@ -74,7 +74,7 @@ def test_rnn_flow_checkpointing_comparison():
         rnn = make_rnn(
             SimpleRNNCell,
             unroll=4,
-            save_grad_history=True,
+            update_state_names={"h_grad": grad("h")},
             grad_checkpoint=cfg["grad_checkpoint"],
         )(input_size=3, hidden_size=4)
         rnns.append(rnn)
@@ -94,8 +94,9 @@ def test_rnn_flow_checkpointing_comparison():
         out, _ = rnn(x_copy)
         out.sum().backward()
 
-        grad_norms = [g.norm().item() for g in rnn.get_grad_history()["h"]]
-        grad_histories[cfg["name"]] = rnn.get_grad_history()["h"]
+        h_grads = rnn.get_records()["h_grad"]
+        grad_norms = [g.norm().item() for g in h_grads]
+        grad_histories[cfg["name"]] = h_grads
         ax.plot(grad_norms, label=cfg["name"], marker="x")
 
     ax.set_title("Gradient Flow Comparison: Checkpointing vs Eager")
