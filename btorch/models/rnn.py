@@ -1,4 +1,4 @@
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping
 from functools import partial
 from typing import overload
 
@@ -7,6 +7,7 @@ import torch.nn as nn
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
+from ..monitor import EagerFrame, Expr, Recorder, RecordSpec, Resolver
 from . import base, environ, synapse
 from .cudagraph import CudaGraphRunner
 from .functional import filter_hidden_states, named_hidden_states, set_hidden_states
@@ -16,6 +17,30 @@ def _cat_chunks(chunks: list[Tensor]) -> Tensor:
     """Join per-chunk results along time, without a copy in the single-chunk
     case."""
     return chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+
+
+def _split_state_specs(spec):
+    """Split ``update_state_names`` into legacy names + recorder specs.
+
+    Plain dotted strings (and ``None`` = all memories) flow through the classic
+    ``stacked_states`` path unchanged; :class:`~btorch.monitor.Expr` /
+    ``grad(...)`` / ``{name: expr}`` specs route to the recording engine and are
+    read via :meth:`get_records`.
+
+    Returns ``(legacy_names, record_specs)`` where ``legacy_names`` is
+    ``None`` (all memories), else a list of dotted strings; and ``record_specs``
+    is a list of engine specs.
+    """
+    if spec is None:
+        return None, []
+    if isinstance(spec, (str, Expr)):
+        spec = [spec]
+    if isinstance(spec, Mapping):
+        return [], [spec]
+    legacy_names, record_specs = [], []
+    for entry in spec:
+        (legacy_names if isinstance(entry, str) else record_specs).append(entry)
+    return legacy_names, record_specs
 
 
 # TODO: handle multiple output
@@ -33,33 +58,59 @@ class RecurrentNNAbstract(base.MemoryModule):
       ``cpu_offload`` -- call ``torch.compiler.cudagraph_mark_step_begin()`` once
       per iteration. ``cudagraph=True`` refuses grad-recording calls and points
       here.
+
+    ``update_state_names`` is the single recording spec: plain dotted strings
+    populate ``stacked_states``; ``Expr`` / ``grad(...)`` / ``{name: expr}`` specs
+    (see :mod:`btorch.monitor`) are read via :meth:`get_records`.  Value/reduction
+    monitors compose with ``cudagraph=True`` (their fold is captured inside the
+    chunk graph), single-chunk only; ``grad(...)`` monitors are refused there.
     """
 
     def __init__(
         self,
-        update_state_names: Sequence[str] | None = None,
+        update_state_names: RecordSpec | None = None,
         step_mode="m",
         unroll: int | bool = 8,
         chunk_size: int | None = None,
         cpu_offload: bool = False,
         grad_checkpoint: bool = False,
-        save_grad_history: bool = False,
-        grad_state_names: Sequence[str] | None = None,
         cudagraph: bool = False,
         cudagraph_warmup: int = 3,
     ):
         super().__init__()
+        # `update_state_names` is the single recording spec. Dotted strings (and
+        # None = all memories) use the classic stacked_states path; Expr /
+        # grad(...) / {name: expr} specs use the recording engine (get_records()).
+        legacy_names, record_specs = _split_state_specs(update_state_names)
         self.step_mode = step_mode
-        self.update_state_names = update_state_names
+        self.update_state_names = legacy_names
         self.unroll = unroll
         self.chunk_size = chunk_size
         self.cpu_offload = cpu_offload
         self.grad_checkpoint = grad_checkpoint
-        self.save_grad_history = save_grad_history
-        self.grad_state_names = grad_state_names
-        self._grad_history = {}
         self.cudagraph = cudagraph
         self._cudagraph_runner = CudaGraphRunner(warmup=cudagraph_warmup)
+
+        # --- lazy recording engine (see btorch.monitor) ------------------
+        self._record_specs = record_specs or None
+        self._recorder = None  # built lazily at first multi_step_forward
+        self._records: dict = {}
+        self._records_active = False  # set once the recorder is built (skip if empty)
+        self._record_has_grad = False
+        self._record_grad_keys: list = []
+        self._record_grad_refs: list = []
+        self._state_resolver = None  # set when the recorder is built
+        # Whether the recorder may read plain (non-MemoryModule) buffers.
+        self._state_allow_buffer = False
+
+    def _state_module(self) -> nn.Module:
+        """The module the recorder resolves dotted state names against.
+
+        A method rather than a stored attribute so we never register a module as
+        its own submodule (which breaks named_modules / pickling).  Subclasses
+        that hold the stateful cell elsewhere override this (see ``make_rnn``).
+        """
+        return self
 
     def _detect_loop_args(self, *args):
         """Heuristic: use first arg's shape to detect loop args"""
@@ -78,43 +129,35 @@ class RecurrentNNAbstract(base.MemoryModule):
         *args, **kwargs
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]: ...
 
-    def _init_grad_hist(self, state_names: Sequence[str], T: int):
-        self._grad_history = {name: [None] * T for name in state_names}
-
-    def _should_save_grad(self, state_name: str) -> bool:
-        """Check if gradient should be saved for this state."""
-        if not self.save_grad_history:
-            return False
-        if self.grad_state_names is None:
-            return True
-        return state_name in self.grad_state_names
-
-    def _register_grad_hook(self, tensor: Tensor, state_name: str, timestep: int):
-        """Register a hook to capture gradients during backward pass."""
-
-        def grad_hook(grad):
-            if grad is not None:
-                self._grad_history[state_name][timestep] = grad.detach().clone()
-            return grad
-
-        if tensor.requires_grad:
-            tensor.register_hook(grad_hook)
-
     def _process_small_chunk(
-        self, *args, loop_args=(0,), unroll_steps: int = 1, **kwargs
+        self, *args, loop_args=(0,), unroll_steps: int = 1, record_carry=None, **kwargs
     ):
         """Inner loop for processing a small chunk.
 
-        Returns:
-            - z_seq: list[Tensor]
-            - states_seq: dict[str, list[Tensor]]
+        Returns ``(z_seq, states_seq, record_state)`` where ``record_state`` is
+        ``(carry, record_buffers, grad_snapshots)``:
+
+        - ``carry``: the streaming reduction/window carry, threaded and returned
+          (functional -- grad_checkpoint recompute discards its copy; the whole
+          fold is tensor ops so cudagraph can capture it).
+        - ``record_buffers``: per-step tensors of each materialise/raw stack-point
+          node (``{node_id: [tensor, ...]}``).
+        - ``grad_snapshots``: per-step source tensors for grad monitors.
+
+        The monitor source read happens here -- inside the traced small chunk,
+        right after ``single_step_forward`` -- so the just-rebound buffers hold
+        this step's tensors (byte-identical, grad-connected, cudagraph-safe).
         """
-        # Determine actual number of steps for this small chunk (might be remainder)
-        # However, args are already sliced to the correct size by caller.
         T = args[loop_args[0]].shape[0]
         z_seq = []
         states_seq = {}
+        carry = record_carry
+        record_buffers: dict[int, list] = {}
+        grad_snapshots: list = []
 
+        fold_records = self._records_active
+        capture_grad = self._record_has_grad
+        grad_refs = self._record_grad_refs
         loop_positions = tuple(loop_args)
         static_args = list(args)
         for t in range(T):
@@ -124,17 +167,25 @@ class RecurrentNNAbstract(base.MemoryModule):
             z_seq.append(z)
             for k, v in states.items():
                 states_seq.setdefault(k, []).append(v)
+            if fold_records:
+                snapshot = self._state_resolver.snapshot()
+                carry, stack = self._recorder.step_kernel(carry, EagerFrame(snapshot))
+                for node_id, value in stack.items():
+                    record_buffers.setdefault(node_id, []).append(value)
+                if capture_grad:
+                    grad_snapshots.append([snapshot[ref] for ref in grad_refs])
 
-        return z_seq, states_seq
+        return z_seq, states_seq, (carry, record_buffers, grad_snapshots)
 
     @partial(torch.compiler.disable, recursive=False)
     def _process_large_chunk_impl(
-        self, *chunk_args, loop_args=(0,), unroll_size=1, **kwargs
+        self, *chunk_args, loop_args=(0,), unroll_size=1, record_carry=None, **kwargs
     ):
         """Process a large chunk by splitting it into small unroll blocks.
 
         This function is NOT checkpointed itself, but is the body of the
-        checkpoint.
+        checkpoint.  It threads ``record_carry`` across blocks and returns the
+        accumulated ``(carry, record_buffers, grad_snapshots)``.
         """
         # Split loop args into unroll-sized chunks using torch.split
         # torch.split returns views of the original tensor (zero-copy)
@@ -144,6 +195,9 @@ class RecurrentNNAbstract(base.MemoryModule):
 
         chunk_z = []
         chunk_states = {}
+        carry = record_carry
+        record_buffers: dict[int, list] = {}
+        grad_snapshots: list = []
 
         # Iterate over the split chunks (all loop args have same number of chunks)
         num_blocks = len(split_tensors[loop_args[0]])
@@ -156,40 +210,50 @@ class RecurrentNNAbstract(base.MemoryModule):
             )
 
             # Process small chunk
-            z_sub, states_sub = self._process_small_chunk(
-                *sub_args,
-                loop_args=loop_args,
-                unroll_steps=sub_args[loop_args[0]].shape[0],
-                **kwargs,
+            z_sub, states_sub, (carry, buffers_sub, grads_sub) = (
+                self._process_small_chunk(
+                    *sub_args,
+                    loop_args=loop_args,
+                    unroll_steps=sub_args[loop_args[0]].shape[0],
+                    record_carry=carry,
+                    **kwargs,
+                )
             )
 
             chunk_z.extend(z_sub)
             for k, v in states_sub.items():
                 chunk_states.setdefault(k, []).extend(v)
+            for node_id, values in buffers_sub.items():
+                record_buffers.setdefault(node_id, []).extend(values)
+            grad_snapshots.extend(grads_sub)
 
-        return chunk_z, chunk_states
+        return chunk_z, chunk_states, (carry, record_buffers, grad_snapshots)
 
     def _checkpointed_large_chunk(
         self,
         *chunk_args,
         loop_args=(0,),
         unroll_size=1,
+        record_carry=None,
         **kwargs,
     ):
         memories = named_hidden_states(self)
         env = environ.all()
 
-        def _pure(env, memories, *inner_args):
+        def _pure(env, memories, record_carry, *inner_args):
             set_hidden_states(self, memories)
             with environ.context(**env):
                 return self._process_large_chunk_impl(
                     *inner_args,
                     loop_args=loop_args,
                     unroll_size=unroll_size,
+                    record_carry=record_carry,
                     **kwargs,
                 )
 
-        return checkpoint(_pure, env, memories, *chunk_args, use_reentrant=False)
+        return checkpoint(
+            _pure, env, memories, record_carry, *chunk_args, use_reentrant=False
+        )
 
     @partial(torch.compiler.disable, recursive=False)
     def multi_step_forward(self, *args, loop_args=None, **kwargs):
@@ -239,9 +303,7 @@ class RecurrentNNAbstract(base.MemoryModule):
     @partial(torch.compiler.disable, recursive=False)
     def _multi_step_forward_impl(self, *args, loop_args=None, **kwargs):
         """Unified implementation for chunked unrolling and CPU offloading."""
-        # Reset gradient history
-        if self.save_grad_history:
-            self._grad_history = {}
+        self._ensure_recorder()
 
         T, loop_args, unroll_size, large_chunk_size, num_large_chunks = (
             self._chunk_plan(*args, loop_args=loop_args)
@@ -249,14 +311,15 @@ class RecurrentNNAbstract(base.MemoryModule):
 
         self._current_T = T
 
-        if self.grad_state_names:
-            self._init_grad_hist(self.grad_state_names, T)
-
         use_checkpoint = bool(self.grad_checkpoint)
 
         # Accumulators
         all_z_list = []
         all_states_lists = {}
+        # Streaming record carry, threaded across chunks (see _process_small_chunk).
+        record_carry = self._init_record_carry() if self._records_active else None
+        record_buffers: dict[int, list] = {}
+        grad_snapshots: list = []
 
         # ------------------------------------------------------------------
         # Outer Loop: Large Chunks (Checkpointing & CPU Offloading)
@@ -272,20 +335,20 @@ class RecurrentNNAbstract(base.MemoryModule):
             )
 
             # Process Large Chunk
-            if use_checkpoint:
-                z_chunk, states_chunk = self._checkpointed_large_chunk(
+            chunk_fn = (
+                self._checkpointed_large_chunk
+                if use_checkpoint
+                else self._process_large_chunk_impl
+            )
+            z_chunk, states_chunk, (record_carry, buffers_chunk, grads_chunk) = (
+                chunk_fn(
                     *chunk_args,
                     loop_args=loop_args,
                     unroll_size=unroll_size,
+                    record_carry=record_carry,
                     **kwargs,
                 )
-            else:
-                z_chunk, states_chunk = self._process_large_chunk_impl(
-                    *chunk_args,
-                    loop_args=loop_args,
-                    unroll_size=unroll_size,
-                    **kwargs,
-                )
+            )
 
             # Offload to CPU if requested
             if self.cpu_offload:
@@ -298,24 +361,17 @@ class RecurrentNNAbstract(base.MemoryModule):
             all_z_list.extend(z_chunk)
             for k, lst in states_chunk.items():
                 all_states_lists.setdefault(k, []).extend(lst)
+            for node_id, values in buffers_chunk.items():
+                record_buffers.setdefault(node_id, []).extend(values)
+            grad_snapshots.extend(grads_chunk)
 
-        # ------------------------------------------------------------------
-        # Post-process: Register gradient hooks and stack
-        # ------------------------------------------------------------------
-        # Register hooks BEFORE stacking, on the original tensors in the lists
-        # This ensures hooks are on tensors that participate in the backward pass
-        if self.save_grad_history:
-            for state_name, tensors in all_states_lists.items():
-                if not self._should_save_grad(state_name):
-                    continue
-                if state_name not in self._grad_history:
-                    self._grad_history[state_name] = [None] * T
-                for t, tensor in enumerate(tensors):
-                    self._register_grad_hook(tensor, state_name, t)
-
-        # Stack after registering hooks
+        # Stack the legacy update_state_names channel.
         stacked_outputs = torch.stack(all_z_list, dim=0)
         stacked_states = {k: torch.stack(v, dim=0) for k, v in all_states_lists.items()}
+
+        # Recording engine: finalise the streamed carry + materialise buffers.
+        if self._records_active:
+            self._finalize_records(record_carry, record_buffers, grad_snapshots, T)
 
         return (stacked_outputs, stacked_states)
 
@@ -330,14 +386,31 @@ class RecurrentNNAbstract(base.MemoryModule):
         so copying results out of the replay pool costs one copy per chunk rather
         than one per timestep -- which would put O(T) eager work back into the
         loop and undo what capturing bought.
+
+        Records are folded and finalised *inside* the capture too (the fold is
+        pure tensor ops on a tensor carry), so the record outputs are graph
+        outputs that replay like the states.  This is only used for a single chunk
+        spanning T (``_cudagraph_multi_step`` enforces that when records are on),
+        so ``finalize`` sees the whole sequence.
         """
-        z_chunk, states_chunk = self._process_large_chunk_impl(
-            *chunk_args, loop_args=loop_args, unroll_size=unroll_size, **kwargs
+        carry = self._init_record_carry() if self._records_active else None
+        z_chunk, states_chunk, (carry, record_buffers, _grads) = (
+            self._process_large_chunk_impl(
+                *chunk_args,
+                loop_args=loop_args,
+                unroll_size=unroll_size,
+                record_carry=carry,
+                **kwargs,
+            )
         )
-        return (
-            torch.stack(z_chunk, dim=0),
-            {k: torch.stack(v, dim=0) for k, v in states_chunk.items()},
+        stacked_z = torch.stack(z_chunk, dim=0)
+        stacked_states = {k: torch.stack(v, dim=0) for k, v in states_chunk.items()}
+        records = (
+            self._recorder.finalize(carry, record_buffers)
+            if self._records_active
+            else {}
         )
+        return stacked_z, stacked_states, records
 
     @partial(torch.compiler.disable, recursive=False)
     def _cudagraph_multi_step(self, *args, loop_args=None, **kwargs):
@@ -353,11 +426,29 @@ class RecurrentNNAbstract(base.MemoryModule):
 
         Chunks of equal length share one capture; a short final remainder keys to
         its own.
+
+        value/reduction monitors are folded inside the captured chunk
+        (see ``_stacked_chunk_forward``) and stored in ``self._records``; this
+        requires a single chunk, and ``grad(...)`` monitors are refused (below).
         """
         T, loop_args, unroll_size, large_chunk_size, num_large_chunks = (
             self._chunk_plan(*args, loop_args=loop_args)
         )
         self._current_T = T
+
+        self._ensure_recorder()
+        if self._records_active:
+            if self._record_has_grad:
+                raise RuntimeError(
+                    "cudagraph=True is incompatible with grad(...) monitors: their "
+                    "hooks only fire in the backward pass, which replay never runs."
+                )
+            if num_large_chunks > 1:
+                raise RuntimeError(
+                    "cudagraph=True with recording requires a single chunk (the "
+                    "default chunk_size=None spans T); chunked capture cannot "
+                    "finalise streaming reductions across separate replays."
+                )
 
         split_tensors = self._split_loop_args(args, loop_args, large_chunk_size)
 
@@ -375,7 +466,7 @@ class RecurrentNNAbstract(base.MemoryModule):
                 )
 
             # Offloading copies out of the pool itself, so skip the runner's clone.
-            z, states = self._cudagraph_runner(
+            z, states, records = self._cudagraph_runner(
                 self, fn, chunk_args, clone_outputs=not self.cpu_offload
             )
 
@@ -387,18 +478,87 @@ class RecurrentNNAbstract(base.MemoryModule):
             for k, v in states.items():
                 state_chunks.setdefault(k, []).append(v)
 
+        # Single chunk when records are on, so these records span all of T.
+        if self._records_active:
+            if self.cpu_offload:
+                records = {
+                    k: (v.cpu() if torch.is_tensor(v) else v)
+                    for k, v in records.items()
+                }
+            self._records = records
+
         return (
             _cat_chunks(z_chunks),
             {k: _cat_chunks(v) for k, v in state_chunks.items()},
         )
 
-    def get_grad_history(self) -> dict[str, list]:
-        """Retrieve saved gradient history."""
-        return self._grad_history
+    # ------------------------------------------------------------------
+    # Recording engine (btorch.monitor): drives update_state_names' Expr /
+    # grad(...) specs; plain dotted-string names use the stacked_states path.
+    # ------------------------------------------------------------------
+    def _ensure_recorder(self):
+        if self._record_specs is None or self._recorder is not None:
+            return
+        resolver = Resolver(self._state_module(), allow_buffer=self._state_allow_buffer)
+        self._recorder = Recorder(self._record_specs, resolver=resolver)
+        self._state_resolver = resolver
+        self._records_active = not self._recorder.is_empty
+        self._record_has_grad = self._recorder.has_grad_specs
+        # refs / keys of grad monitors, in a stable order for per-step capture
+        grad_specs = self._recorder.grad_specs
+        self._record_grad_keys = [key for key, _ref, _name in grad_specs]
+        self._record_grad_refs = [ref for _key, ref, _name in grad_specs]
 
-    def clear_grad_history(self):
-        """Clear all saved gradient history."""
-        self._grad_history = {}
+    def _init_record_carry(self) -> dict:
+        """Allocate the streaming carry (shapes via FakeTensor, no real alloc).
+
+        Uses the current state buffers as shape/dtype/device examples, so it must
+        run after ``init_state``/``reset`` (state exists by the first forward).
+        """
+        example = EagerFrame(self._state_resolver.snapshot())
+        return self._recorder.init_carry(example)
+
+    def _finalize_records(
+        self, carry: dict, record_buffers: dict, grad_snapshots: list, T: int
+    ) -> None:
+        """Turn the streamed carry + materialise buffers into the records dict.
+
+        ``grad_snapshots[t]`` holds the per-step source tensors (one per grad
+        monitor, in ``_record_grad_refs`` order) for backward-time hooks.
+        """
+        self._records = self._recorder.finalize(carry, record_buffers)
+        for i, key in enumerate(self._record_grad_keys):
+            history: list = [None] * T
+            self._records[key] = history
+            for t in range(T):
+                self._register_record_grad_hook(grad_snapshots[t][i], key, t)
+        if self.cpu_offload:
+            self._records = {
+                k: (v.cpu() if torch.is_tensor(v) else v)
+                for k, v in self._records.items()
+            }
+
+    def _register_record_grad_hook(self, tensor: Tensor, key: str, t: int):
+        def grad_hook(grad):
+            if grad is not None:
+                self._records[key][t] = grad.detach().clone()
+            return grad
+
+        if torch.is_tensor(tensor) and tensor.requires_grad:
+            tensor.register_hook(grad_hook)
+
+    def get_records(self) -> dict[str, Tensor | list]:
+        """Recorded monitor outputs (Expr / grad(...) specs of
+        update_state_names).
+
+        Reduction / derived / raw records are tensors; ``grad(...)`` monitors are
+        ``list[Tensor | None]`` of length T, populated after ``backward()``.
+        """
+        return self._records
+
+    def clear_records(self) -> None:
+        """Drop the recorded outputs from the last forward."""
+        self._records = {}
 
 
 # ----------------------------------------------------------------------
@@ -439,6 +599,11 @@ def make_rnn(
                     self.rnn_cell = neuron_cls(*args, **kwargs)
                 else:
                     self.rnn_cell = neuron_cls
+                self._state_allow_buffer = allow_buffer
+
+            def _state_module(self):
+                # matches filter_hidden_states(self.rnn_cell, ...) in the step
+                return self.rnn_cell
 
             def single_step_forward(self, *args, **kwargs):
                 out = self.rnn_cell(*args, **kwargs)
@@ -478,7 +643,7 @@ class RecurrentNN(RecurrentNNAbstract):
         syn_inp_module: nn.Module | None = None,
         neuron_inp_module: nn.Module | None = None,
         *,
-        update_state_names: Sequence[str] | None = None,
+        update_state_names: RecordSpec | None = None,
         unroll: int | bool = 8,
         chunk_size: int | None = None,
         cpu_offload: bool = False,
@@ -501,6 +666,7 @@ class RecurrentNN(RecurrentNNAbstract):
         self.neuron_inp_module = neuron_inp_module
         self.syn_inp_module = syn_inp_module
         self.allow_buffer = allow_buffer
+        self._state_allow_buffer = allow_buffer  # recorder resolves against self
 
     def single_step_forward(self, x: Tensor, x_syn: Tensor | None = None):
         if self.neuron_inp_module is not None:
@@ -544,8 +710,9 @@ class ApicalRecurrentNN(RecurrentNN):
             currents to the apical compartment.
         syn_inp_module: Optional module applied to ``x_syn``.
         neuron_inp_module: Optional module applied to ``x``.
-        update_state_names: Dotted state names to expose in the returned
-            state dictionary.
+        update_state_names: Recording spec (see RecurrentNNAbstract): dotted
+            strings -> stacked_states; Expr / grad(...) / {name: expr} ->
+            get_records().
         unroll: Inner unroll block size.
         chunk_size: Outer chunk size for gradient checkpointing / offloading.
         cpu_offload: Move chunk outputs to CPU during forward.
@@ -563,7 +730,7 @@ class ApicalRecurrentNN(RecurrentNN):
         syn_inp_module: nn.Module | None = None,
         neuron_inp_module: nn.Module | None = None,
         *,
-        update_state_names: Sequence[str] | None = None,
+        update_state_names: RecordSpec | None = None,
         unroll: int | bool = 8,
         chunk_size: int | None = None,
         cpu_offload: bool = False,
@@ -661,7 +828,7 @@ class SomaApicalRecurrentNN(ApicalRecurrentNN):
         synapse_apical: Synapse model for the apical compartment.
         syn_inp_module: Optional module applied to ``x_syn``.
         neuron_inp_module: Optional module applied to ``x``.
-        update_state_names: Dotted state names to expose.
+        update_state_names: Recording spec; see RecurrentNNAbstract.
         **kwargs: Passed to :class:`ApicalRecurrentNN`.
     """
 
@@ -673,7 +840,7 @@ class SomaApicalRecurrentNN(ApicalRecurrentNN):
         syn_inp_module: nn.Module | None = None,
         neuron_inp_module: nn.Module | None = None,
         *,
-        update_state_names: Sequence[str] | None = None,
+        update_state_names: RecordSpec | None = None,
         **kwargs,
     ):
         super().__init__(

@@ -159,10 +159,9 @@ def test_cudagraph_is_inference_only(x_needs_grad):
     "kwargs, x_device, match",
     [
         (dict(grad_checkpoint=True), "cuda", "incompatible with grad_checkpoint"),
-        (dict(save_grad_history=True), "cuda", "incompatible with save_grad_history"),
         (dict(), "cpu", "CUDA device"),
     ],
-    ids=["grad_checkpoint", "save_grad_history", "cpu-input"],
+    ids=["grad_checkpoint", "cpu-input"],
 )
 def test_cudagraph_rejects_unsupported(kwargs, x_device, match):
     graphed = _build(cudagraph=True, **kwargs)
