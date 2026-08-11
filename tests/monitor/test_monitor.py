@@ -200,6 +200,34 @@ def test_per_step_expression_over_two_columns(sequence):
     )
 
 
+def test_col_plus_scalar_is_per_step(sequence):
+    v_seq, psc_seq = sequence
+    recorder = record_over(StatefulNet(), {"shifted": col("neuron.v") + 1})
+    records = run_steps(recorder, v_seq, psc_seq)
+    torch.testing.assert_close(records["shifted"], torch.stack(v_seq, 0) + 1)
+
+
+def test_getitem_indexes_each_step_then_stacks(sequence):
+    # col[...] is a PER-STEP index into each step's [B, N] value; to index the TIME
+    # axis use map_seq(lambda V: V[k]).
+    v_seq, psc_seq = sequence
+    stacked = torch.stack(v_seq, 0)  # [T, B, F]
+    recorder = record_over(
+        StatefulNet(),
+        {
+            "feat1": col("neuron.v")[:, 1],  # per-step feature index -> [T, B]
+            "feat1_mean": col("neuron.v")[:, 1].mean(),  # index, then reduce over time
+            "at_step2": map_seq(
+                lambda V: V[2], col("neuron.v")
+            ),  # multistep: value at t=2
+        },
+    )
+    records = run_steps(recorder, v_seq, psc_seq)
+    torch.testing.assert_close(records["feat1"], stacked[:, :, 1])
+    torch.testing.assert_close(records["feat1_mean"], stacked[:, :, 1].mean(0))
+    torch.testing.assert_close(records["at_step2"], stacked[2])
+
+
 def test_diff_is_first_difference_with_warmup_masked(sequence):
     v_seq, psc_seq = sequence
     stacked = torch.stack(v_seq, 0)
