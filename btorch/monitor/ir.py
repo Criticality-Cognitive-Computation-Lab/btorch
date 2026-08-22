@@ -190,7 +190,7 @@ def _emit(g: Graph, e: E.Expr, resolver: Resolver) -> int:
                 "nested reduction (reducing an already-reduced value) is not "
                 "supported in v1."
             )
-        return g._add("reduce", (cid,), {"kind": e.kind}, AGG)
+        return g._add("reduce", (cid,), {"kind": e.kind, **e.params}, AGG)
 
     if isinstance(e, E.CustomReduce):
         cid = _emit(g, e.child, resolver)
