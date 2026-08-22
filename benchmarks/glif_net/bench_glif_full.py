@@ -308,7 +308,28 @@ def compile_ms(kind, mode, N, T):
 
     Both are chunk-unrolled so compile cost stays flat in T. Median ms, or None
     on OOM / trace failure. Neuron-only stays kernel-only (its m-step doesn't
-    trace under reduce-overhead, and it is launch-overhead-bound anyway)."""
+    trace under reduce-overhead, and it is launch-overhead-bound anyway).
+
+    **Training is slower than eager here (verified, root cause identified, not
+    a benchmark artifact)** -- ``reset_net_state(model)`` below uses its default
+    ``inplace=False``, which rebinds every stateful buffer (``neuron.v``,
+    ``neuron.Iasc``, ``spike``) to a **freshly allocated tensor** each call.
+    CUDA graphs require static input addresses, so `reduce-overhead`'s
+    CUDAGraph Trees **fully re-record the graph on every single call**
+    (confirmed via ``TORCH_LOGS=cudagraphs``: "static input data pointer
+    changed" on ~every call) instead of replaying a cached graph -- the
+    re-recording cost dominates and is what you're paying for, not real
+    compute. Switching to ``inplace=True`` (``base.py``'s own docstring: "required
+    to reset state inside a captured CUDA graph") stops the pointer churn but
+    then hits a *different* CUDA-graph-safety error, because
+    ``GLIFDenseNet.multi_step_forward``'s unroll-chunk loop reads/writes the
+    same persistent buffers across separately-captured graph replays without
+    cloning between them -- this model's chunked-unroll + persistent-buffer
+    design isn't actually compatible with ``reduce-overhead``'s replay model.
+    Plain ``torch.compile(mode=None)`` (Inductor fusion, no CUDA graphs) on the
+    same non-inplace reset is 4-11x *faster* than eager, so Inductor fusion
+    itself is a clear win; it is specifically the CUDA-graph capture mechanism,
+    defeated every call, that is pathological for this recurrent-state model."""
     from benchmarks.glif_net.glif_common import (
         make_inputs, build_neuron, GLIFDenseNet, GLIFSparseNet)
     from btorch.models import environ

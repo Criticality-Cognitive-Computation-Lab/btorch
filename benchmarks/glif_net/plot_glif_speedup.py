@@ -57,7 +57,6 @@ def _panel(ax, results, kind, mode, axis, xvals, label):
         ax.plot(*_series(xvals, sp), color=COMPILE_COLOR, ls="-", marker="s", zorder=3)
     ax.axhline(1.0, color="0.5", ls=(0, (3, 2)), lw=0.8, zorder=0)
     ax.set_xscale("log", base=2)
-    ax.set_yscale("log")
     ax.set_xlabel("N (neurons)" if axis == "N" else "T (steps)")
     ax.set_ylabel("speedup vs eager (x)")
     ax.grid(True, which="major", ls=":", lw=0.4, alpha=0.5)
