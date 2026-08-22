@@ -10,6 +10,8 @@ state buffer (``neuron.v`` and ``synapse.psc``).  The tests read as usage exampl
 (top) followed by engine-internal guarantees and rejected specs (bottom).
 """
 
+import platform
+
 import pytest
 import torch
 import torch.nn as nn
@@ -23,6 +25,7 @@ from btorch.monitor import (
     grad,
     lit,
     map_seq,
+    map_step,
     validate_reducer,
 )
 from btorch.monitor.ir import AGG, STEP, build
@@ -301,10 +304,29 @@ def test_map_seq_result_can_be_post_processed(sequence):
 
 def test_grad_monitor_registers_a_grad_spec():
     # grad(...) is recorded via backward hooks by the consumer; the engine just
-    # exposes it as a grad spec.
+    # exposes it as a grad spec.  Crucially it does NOT emit a source/stack
+    # node: no [T, ...] value trace is materialised unless col("v")/"v" is
+    # also requested.
     recorder = record_over(StatefulNet(), {"v_grad": grad("neuron.v")})
     assert recorder.has_grad_specs
     assert recorder.grad_specs[0][0] == "v_grad"
+    assert not recorder.is_empty  # the grad spec alone still counts as work
+    assert recorder.raw_columns == set()
+    assert list(recorder.stack_nids) == []  # nothing to materialise
+
+
+def test_col_and_grad_share_one_resolution(sequence):
+    # ["v", {"v_grad": grad("v")}] resolves both specs to ONE TargetRef
+    # (Resolver is idempotent per name): one per-step read feeds both outputs,
+    # so asking for values+grads costs no duplicate reads or columns.
+    net = StatefulNet()
+    recorder = record_over(net, [{"v": col("neuron.v"), "v_grad": grad("neuron.v")}])
+    assert recorder.resolver.n_refs == 1
+    assert recorder.raw_columns == {"v"}
+    assert len(recorder.graph.grad_specs) == 1
+    v_seq, psc_seq = sequence
+    records = run_steps(recorder, v_seq, psc_seq)
+    torch.testing.assert_close(records["v"], torch.stack(v_seq, 0))
 
 
 def test_custom_reducer_fold(sequence):
@@ -330,7 +352,9 @@ def test_custom_reducer_sees_validity_flag(sequence):
     torch.testing.assert_close(records["m"], (stacked[1:] - stacked[:-1]).mean(0))
 
 
+@pytest.mark.skipif(platform.system() != "Linux", reason="torch.compile: Linux only")
 def test_validate_reducer_accepts_a_pure_reducer():
+    # validate_reducer traces the reducer with torch.compile(fullgraph=True)
     validate_reducer(_EMA(0.1), torch.randn(BATCH, FEATURES))
     validate_reducer(_WeightedMean(), torch.randn(BATCH, FEATURES))
 
@@ -368,6 +392,60 @@ def test_validate_reducer_rejects_self_mutation():
 
     with pytest.raises(RuntimeError, match="its own state"):
         validate_reducer(_BadSelf(), torch.randn(BATCH, FEATURES))
+
+
+def test_validate_reducer_ignores_opaque_object_state():
+    # An attribute of an unknown type cannot be compared by value soundly
+    # (repr may embed volatile state, e.g. ids or counters); the snapshot skips
+    # it instead of risking a false "mutated" error.  Regression guard: this
+    # used to raise because repr() changed between calls.
+
+    class _Opaque:
+        """An object whose repr is unstable across calls."""
+
+        def __init__(self):
+            self.ticks = 0
+
+        def __repr__(self):  # deliberately volatile
+            self.ticks += 1
+            return f"<Opaque call#{self.ticks}>"
+
+    class _Volatile(Reducer):
+        def __init__(self):
+            self.opaque = _Opaque()  # repr changes even when untouched
+
+        def init(self, example):
+            return torch.zeros_like(example)
+
+        def update(self, carry, value, valid):
+            return carry + value
+
+        def finalize(self, carry):
+            return carry
+
+    validate_reducer(_Volatile(), torch.randn(BATCH, FEATURES))
+
+
+def test_validate_reducer_rejects_container_state_mutation():
+    # Tracked containers (deep-copied at snapshot) are still checked: appending
+    # per-step data to a list on self must be rejected like a scalar counter.
+
+    class _BadList(Reducer):
+        def __init__(self):
+            self.seen = []  # mutable container -> still caught
+
+        def init(self, example):
+            return torch.zeros_like(example)
+
+        def update(self, carry, value, valid):
+            self.seen.append(value)
+            return carry + value
+
+        def finalize(self, carry):
+            return carry
+
+    with pytest.raises(RuntimeError, match="its own state"):
+        validate_reducer(_BadList(), torch.randn(BATCH, FEATURES))
 
 
 def test_validate_reducer_rejects_value_mutation():
@@ -468,6 +546,7 @@ def test_carry_threading_across_chunks_matches_single_pass(sequence):
         torch.testing.assert_close(single_pass[key], chunked[key], msg=key)
 
 
+@pytest.mark.skipif(platform.system() != "Linux", reason="torch.compile: Linux only")
 def test_step_kernel_compiles_fullgraph_without_graph_breaks(sequence):
     # the per-step fold + torch.stack over a fixed unroll compiles to one graph.
     v_seq, psc_seq = sequence
@@ -532,6 +611,20 @@ def test_broadcast_back_is_rejected():
 def test_grad_leaf_cannot_be_composed():
     with pytest.raises(TypeError, match="grad"):
         grad("neuron.v").mean()
+
+
+def test_grad_leaf_cannot_be_a_binary_operand():
+    # the guard must check BOTH sides: a grad on the right used to slip past
+    # the DSL and only fail later at IR build, far from the offending line
+    with pytest.raises(TypeError, match="grad"):
+        col("neuron.v") * grad("neuron.v")
+    with pytest.raises(TypeError, match="grad"):
+        2.0 / col("neuron.v") + grad("neuron.v")
+
+
+def test_grad_leaf_cannot_be_a_map_target():
+    with pytest.raises(TypeError, match="grad"):
+        map_step(lambda a, b: a + b, col("neuron.v"), grad("neuron.v"))
 
 
 def test_processed_monitor_requires_an_explicit_name():
