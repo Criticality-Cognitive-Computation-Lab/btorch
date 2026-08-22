@@ -28,7 +28,9 @@ TargetRef = NewType("TargetRef", int)
 class StepFrame(Protocol):
     """Per-step view: maps a resolved ref to its current tensor value."""
 
-    def __getitem__(self, ref: TargetRef) -> Tensor: ...
+    def __getitem__(self, ref: TargetRef) -> Tensor:
+        """Return this step's value for ``ref``."""
+        raise NotImplementedError
 
 
 def _walk(root: nn.Module, dotted: str) -> tuple[nn.Module, str]:
@@ -74,11 +76,15 @@ class Resolver:
     One resolver per :class:`~btorch.monitor.engine.Recorder`.  ``resolve`` is
     idempotent per name, so shared targets across monitors collapse to one ref
     (and one per-step read).
+
+    Resolution is purely structural -- any dotted attribute path is accepted;
+    whether a target is a *legal* state (e.g. memory-only unless
+    ``allow_buffer``) is consumer policy, enforced where that notion exists
+    (see ``RecurrentNNAbstract._reject_non_memory_targets``).
     """
 
-    def __init__(self, root: nn.Module, *, allow_buffer: bool = False):
+    def __init__(self, root: nn.Module):
         self.root = root
-        self.allow_buffer = allow_buffer
         self._accessors: list[tuple[nn.Module, str]] = []
         self._by_name: dict[str, TargetRef] = {}
 
@@ -114,6 +120,14 @@ class Resolver:
     @property
     def n_refs(self) -> int:
         return len(self._accessors)
+
+    def resolved(self) -> list[tuple[nn.Module, str]]:
+        """``(owner_module, leaf_attr)`` pairs in ref order.
+
+        Lets a consumer audit what was bound (e.g. enforce that every target is
+        a memory of a ``MemoryModule``) without poking at private state.
+        """
+        return list(self._accessors)
 
     def snapshot(self) -> list[Tensor]:
         """The current buffer tensors in ref order (no copy)."""
