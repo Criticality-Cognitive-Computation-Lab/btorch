@@ -121,6 +121,12 @@ class Recorder:
         return {nid: [] for nid in self.program.stack_nids}
 
     def finalize(self, carry, buffers) -> dict:
+        """Reduce the final carry (+ stacked raw buffers) to records.
+
+        Raw source columns keep their autograd connection; every derived
+        or reduced record is detached (reductions stream through an O(1)
+        carry that is not part of the forward graph).
+        """
         return self.program.finalize(carry, buffers)
 
     def run(self, frames: Sequence[StepFrame]) -> dict:

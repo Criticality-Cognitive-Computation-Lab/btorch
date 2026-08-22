@@ -111,6 +111,14 @@ class Expr:
         self._no_compose()
         return Elementwise("pow", (self,), {"exponent": exponent})
 
+    def __pow__(self, exponent) -> Expr:
+        if isinstance(exponent, Expr):
+            raise TypeError(
+                "col ** col is not supported; use .pow(scalar), map_step for "
+                "tensor exponents."
+            )
+        return self.pow(exponent)
+
     def __getitem__(self, index) -> Expr:
         # per-step (single-step) index into each step's [B, N] value, stacked over
         # time. To index the TIME axis (multistep), use map_seq(lambda V: V[k]).
@@ -143,23 +151,44 @@ class Expr:
         return Reduce("max", self)
 
     def count(self) -> Expr:
+        """Number of valid steps (warmup-masked steps excluded), as a float
+        tensor."""
         self._no_compose()
         return Reduce("count", self)
 
-    def std(self) -> Expr:
-        self._no_compose()
-        return Reduce("std", self)
+    def std(self, correction: int = 1) -> Expr:
+        """Standard deviation over time (per batch/feature element).
 
-    def var(self) -> Expr:
+        Matches :meth:`torch.Tensor.std`'s default: ``correction=1`` (the
+        unbiased sample estimate, denominator ``count - correction``).  Pass
+        ``correction=0`` for the population statistic.  Streaming (Welford).
+        """
         self._no_compose()
-        return Reduce("var", self)
+        return Reduce("std", self, {"correction": correction})
+
+    def var(self, correction: int = 1) -> Expr:
+        """Variance over time; same ``correction`` convention as
+        :meth:`std`."""
+        self._no_compose()
+        return Reduce("var", self, {"correction": correction})
 
     # -- windowed (streamable via ring carry) -----------------------------
     def diff(self, n: int = 1) -> Expr:
+        """The lag-``n`` first difference ``x_t - x_{t-n}`` (NOT the
+        nth-order difference of :func:`torch.diff`, which shrinks T).
+
+        The sequence keeps length T: warmup steps output zeros and are
+        validity-masked out of downstream reductions/counters.
+        """
         self._no_compose()
         return Window("diff", n, self)
 
     def shift(self, n: int = 1) -> Expr:
+        """The value from ``n`` steps earlier, zero-filled during warmup.
+
+        Unlike :func:`torch.roll` there is no wraparound; unlike Polars there
+        are no nulls (zeros + a validity flag instead).
+        """
         self._no_compose()
         return Window("shift", n, self)
 
@@ -239,6 +268,7 @@ class Window(Expr):
 class Reduce(Expr):
     kind: str  # mean|sum|last|first|min|max|count|std|var
     child: Expr
+    params: dict = field(default_factory=dict)  # e.g. {"correction": int}
 
 
 @dataclass(frozen=True, eq=False)
