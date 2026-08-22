@@ -82,20 +82,26 @@ class CompiledProgram:
     # cached carry layout (built once via meta tensors); see init_carry
     _carry_slots: list[_CarrySlot] | None = None
     _creduce: dict | None = None  # nid -> _CustomReduce
+    _carry_sig: list | None = None  # example signature the layout was built for
 
     # ------------------------------------------------------------------ carry
     def init_carry(self, example_frame: StepFrame) -> dict:
         """A fresh zero carry.
 
         The carry layout (shapes/dtypes/devices) is inferred **once**
-        via meta tensors (no allocation) and cached; subsequent calls
-        just allocate the tensors, so the hot path never re-runs the
-        inference.
+        via meta tensors (no allocation) and cached against the
+        example's signature; subsequent calls just allocate the tensors,
+        so the hot path never re-runs the inference.  A changed
+        signature (e.g. the consumer reset its state with a new batch
+        size) re-infers the layout rather than handing back a stale-
+        shaped carry.
         """
         from torch.utils._pytree import tree_flatten
 
-        if self._carry_slots is None:
+        sig = [(tuple(t.shape), t.dtype, t.device) for t in example_frame.values()]
+        if self._carry_slots is None or self._carry_sig != sig:
             self._carry_slots, self._creduce = self._infer_carry_slots(example_frame)
+            self._carry_sig = sig
         carry = {
             s.key: (
                 torch.zeros(s.shape, dtype=s.dtype, device=s.device)

@@ -546,6 +546,30 @@ def test_carry_threading_across_chunks_matches_single_pass(sequence):
         torch.testing.assert_close(single_pass[key], chunked[key], msg=key)
 
 
+def test_init_carry_reinfers_when_state_shapes_change():
+    # The carry layout is cached from the first example; a consumer that resets
+    # its state with a new batch size must get a fresh-shaped carry, not a
+    # stale one (a stale shape can silently broadcast in reductions).
+    recorder = record_over(StatefulNet(), {"m": col("neuron.v").mean()})
+    net = recorder.resolver.root
+
+    def sum_shape(carry):
+        # the mean's accumulator slot -- its only [B, F]-shaped carry entry
+        return next(v.shape for v in carry.values() if v.dim() == 2)
+
+    net.neuron.v = torch.randn(2, FEATURES)
+    carry_b2 = recorder.init_carry(recorder.resolver.frame())
+    assert sum_shape(carry_b2) == (2, FEATURES)
+
+    net.neuron.v = torch.randn(5, FEATURES)
+    carry_b5 = recorder.init_carry(recorder.resolver.frame())
+    assert sum_shape(carry_b5) == (5, FEATURES)
+
+    # same shapes again -> hot path reuses the cached layout
+    net.neuron.v = torch.randn(2, FEATURES)
+    assert sum_shape(recorder.init_carry(recorder.resolver.frame())) == (2, FEATURES)
+
+
 @pytest.mark.skipif(platform.system() != "Linux", reason="torch.compile: Linux only")
 def test_step_kernel_compiles_fullgraph_without_graph_breaks(sequence):
     # the per-step fold + torch.stack over a fixed unroll compiles to one graph.

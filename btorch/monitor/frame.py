@@ -32,6 +32,10 @@ class StepFrame(Protocol):
         """Return this step's value for ``ref``."""
         raise NotImplementedError
 
+    def values(self) -> list[Tensor]:
+        """All values in ref order (for shape/dtype/device introspection)."""
+        raise NotImplementedError
+
 
 def _walk(root: nn.Module, dotted: str) -> tuple[nn.Module, str]:
     """Resolve a dotted name to ``(owning_module, leaf_attr)``.
@@ -155,3 +159,7 @@ class EagerFrame:
 
     def __getitem__(self, ref: TargetRef) -> Tensor:
         return self._values[ref]
+
+    def values(self) -> list[Tensor]:
+        """All values in ref order."""
+        return list(self._values)
