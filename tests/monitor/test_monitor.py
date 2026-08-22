@@ -461,6 +461,41 @@ def test_validate_reducer_rejects_in_place_carry_mutation():
         validate_reducer(_BadInPlace(), torch.randn(BATCH, FEATURES))
 
 
+class _BadInPlace(Reducer):
+    """Folds value into the carry in place -- pure-looking eager, corrupt
+    later."""
+
+    def init(self, example):
+        return torch.zeros_like(example)
+
+    def update(self, carry, value, valid):
+        carry += value
+        return carry
+
+    def finalize(self, carry):
+        return carry
+
+
+def test_fold_is_purity_checked_at_build_time():
+    # building a recorder runs the cheap invariant checks automatically: an
+    # in-place reducer is rejected where the mistake is made, not silently
+    # under checkpoint/cudagraph later.
+    with pytest.raises(RuntimeError, match="in place"):
+        record_over(StatefulNet(), {"m": col("neuron.v").fold(_BadInPlace())})
+
+
+def test_auto_validate_false_opts_out_of_build_time_checks(sequence):
+    class _Unchecked(_BadInPlace):
+        auto_validate = False  # exotic reducers may legitimately opt out
+
+    v_seq, psc_seq = sequence
+    recorder = record_over(StatefulNet(), {"m": col("neuron.v").fold(_Unchecked())})
+    records = run_steps(recorder, v_seq, psc_seq)
+    # eager results look right (the corruption is mode-specific) -- opting out
+    # is on your head; validate_reducer remains as the explicit deep check.
+    torch.testing.assert_close(records["m"], torch.stack(v_seq, 0).sum(0))
+
+
 def test_validate_reducer_rejects_self_mutation():
     class _BadSelf(Reducer):
         def __init__(self):
@@ -565,14 +600,16 @@ class _StructureChanging(Reducer):
 
 
 def test_reducer_with_changing_carry_structure_is_rejected_twice(sequence):
-    # the validator catches it statically (before any recording)...
+    # layer 1: the build-time purity check rejects it statically...
     with pytest.raises(RuntimeError, match="structure"):
-        validate_reducer(_StructureChanging(), torch.randn(BATCH, FEATURES))
-    # ...and the runtime fold re-checks it per step (defence in depth for
-    # engines driven without validate_reducer).
-    recorder = record_over(
-        StatefulNet(), {"g": col("neuron.v").fold(_StructureChanging())}
-    )
+        record_over(StatefulNet(), {"g": col("neuron.v").fold(_StructureChanging())})
+
+    # ...layer 2 (defence in depth for opt-out reducers): the runtime fold
+    # re-checks the carry pytree per step.
+    class _Unchecked(_StructureChanging):
+        auto_validate = False
+
+    recorder = record_over(StatefulNet(), {"g": col("neuron.v").fold(_Unchecked())})
     with pytest.raises(ValueError, match="constant"):
         run_steps(recorder, *sequence)
 
