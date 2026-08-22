@@ -227,6 +227,78 @@ def measure(step, kind, mode, N, T):
         torch.cuda.empty_cache()
 
 
+def eager_ms(kind, mode, N, T):
+    """Pure eager-PyTorch baseline (no ``torch.compile``, no fused kernel): the
+    same canonical btorch net as ``compile_ms``, run as a plain per-step Python
+    loop -- ``RecurrentNNAbstract.multi_step_forward`` is O(T) eager underneath
+    regardless of ``unroll`` (``unroll`` only chunks what gets *traced*), so
+    this is exactly what ``compile_ms`` measures minus the ``torch.compile``
+    wrap. ``neuron`` has no recurrent connection: build the bare GLIF3 module
+    and loop ``neuron(x[t])`` directly. Median ms, or None on OOM."""
+    from benchmarks.glif_net.glif_common import (
+        make_inputs, build_neuron, GLIFDenseNet, GLIFSparseNet)
+    from btorch.models import environ
+    from btorch.models.functional import init_net_state, reset_net_state
+    grad = mode == "training"
+    model = None
+    try:
+        weight, bias, x_seq, params = make_inputs(T, N, DEVICE, require_grad=grad)
+        neuron = build_neuron("torch_eager", N, params, grad)
+        if kind == "neuron":
+            model = neuron
+            init_net_state(model, device=DEVICE, dtype=torch.float32)
+            leaves = [x_seq, params["asc_amps"]] if grad else []
+
+            def fn():
+                reset_net_state(model)
+                with environ.context(dt=DT):
+                    if grad:
+                        spikes = [model(x_seq[t]) for t in range(T)]
+                        torch.stack(spikes).sum().backward()
+                    else:
+                        with torch.no_grad():
+                            for t in range(T):
+                                model(x_seq[t])
+        else:
+            if kind == "dense":
+                model = GLIFDenseNet(N, neuron, unroll=8)
+                init_net_state(model, device=DEVICE, dtype=torch.float32)
+                model.linear.weight.data.copy_(weight)
+                model.linear.bias.data.copy_(bias)
+                leaves = [x_seq, model.linear.weight, model.linear.bias]
+            else:
+                W = scale_free_csr(N, DENSITY, DEVICE, seed=0)
+                model = GLIFSparseNet(N, neuron, W, bias, unroll=8)
+                init_net_state(model, device=DEVICE, dtype=torch.float32)
+                leaves = [x_seq, model.val]
+            if grad:
+                leaves.append(params["asc_amps"])
+
+            def fn():
+                reset_net_state(model)
+                with environ.context(dt=DT):
+                    if grad:
+                        spike_seq, _ = model(x_seq)
+                        spike_seq.sum().backward()
+                    else:
+                        with torch.no_grad():
+                            model(x_seq)
+
+        def run():
+            for leaf in leaves:
+                leaf.grad = None
+            fn()
+
+        return _time_ms(run, grad, iters=5 if grad else 10)
+    except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
+        if "memory" not in str(exc).lower():
+            raise
+        return None
+    finally:
+        del model
+        torch.cuda.empty_cache()
+
+
 def compile_ms(kind, mode, N, T):
     """``torch.compile(mode="reduce-overhead")`` on the canonical eager btorch
     recurrent net, as a general-purpose baseline for the fused kernels:
@@ -286,12 +358,15 @@ def compile_ms(kind, mode, N, T):
         torch._dynamo.reset()
 
 
+def _meta() -> dict:
+    return {"M": M, "dt": DT, "density": DENSITY,
+            "n_sweep": {"N": N_SWEEP, "T": N_SWEEP_T},
+            "t_sweep": {"T": T_SWEEP, "N": T_SWEEP_N}}
+
+
 def run() -> dict:
     backends = _load_backends()
-    out = {"meta": {"M": M, "dt": DT, "density": DENSITY,
-                    "n_sweep": {"N": N_SWEEP, "T": N_SWEEP_T},
-                    "t_sweep": {"T": T_SWEEP, "N": T_SWEEP_N}},
-           "results": {}}
+    out = {"meta": _meta(), "results": {}}
     for kind in KINDS:
         for mode in MODES:
             for backend, step in backends.items():
@@ -301,6 +376,8 @@ def run() -> dict:
                 out["results"][key] = {"N": n_row, "T": t_row}
                 print(f"{key:28} N-sweep {n_row}", flush=True)
                 print(f"{key:28} T-sweep {t_row}", flush=True)
+    # Pure eager-PyTorch baseline (no compile, no fused kernel), all three kinds.
+    out["results"].update(run_eager())
     # torch.compile(reduce-overhead) baseline, dense + sparse recurrent.
     for kind in ("dense", "sparse"):
         for mode in MODES:
@@ -313,10 +390,41 @@ def run() -> dict:
     return out
 
 
+def run_eager() -> dict:
+    """Just the ``{kind}/{mode}/eager`` rows (all three kinds), for filling in
+    the eager baseline into an existing results JSON without re-running the
+    (already measured) kernel/warp/compile rows."""
+    results = {}
+    for kind in KINDS:
+        for mode in MODES:
+            key = f"{kind}/{mode}/eager"
+            n_row = [eager_ms(kind, mode, N, N_SWEEP_T) for N in N_SWEEP]
+            t_row = [eager_ms(kind, mode, T_SWEEP_N, T) for T in T_SWEEP]
+            results[key] = {"N": n_row, "T": t_row}
+            print(f"{key:28} N-sweep {n_row}", flush=True)
+            print(f"{key:28} T-sweep {t_row}", flush=True)
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="bench_glif_full_results.json")
+    ap.add_argument("--only", choices=["eager"], default=None,
+                    help="run only this subset and merge into --out if it exists, "
+                         "instead of re-running the full grid")
     args = ap.parse_args()
+    if args.only == "eager":
+        import os
+        if os.path.exists(args.out):
+            with open(args.out) as f:
+                results = json.load(f)
+        else:
+            results = {"meta": _meta(), "results": {}}
+        results["results"].update(run_eager())
+        with open(args.out, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"wrote {args.out}")
+        return
     results = run()
     with open(args.out, "w") as f:
         json.dump(results, f, indent=2)

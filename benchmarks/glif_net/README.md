@@ -322,4 +322,16 @@ python -m benchmarks.glif_net.bench_glif_full \
 # dashed = neuron-only baseline). Writes glif_{dense,sparse}_sweep.{png,pdf}:
 python -m benchmarks.glif_net.plot_glif_kernels \
     --results benchmarks/glif_net/bench_glif_full_results.json
+
+# add only the eager-PyTorch baseline rows ({neuron,dense,sparse} x
+# {inference,training}) into an existing results JSON, without re-running the
+# (already measured) kernel/warp/compile rows:
+python -m benchmarks.glif_net.bench_glif_full --only eager \
+    --out benchmarks/glif_net/bench_glif_full_results.json
+
+# speedup-vs-eager figures (same 2x2 layout, one figure per kind — neuron,
+# dense, sparse — y-axis is eager_ms / backend_ms, log scale, 1x = eager).
+# Writes glif_{neuron,dense,sparse}_speedup.{png,pdf}:
+python -m benchmarks.glif_net.plot_glif_speedup \
+    --results benchmarks/glif_net/bench_glif_full_results.json
 ```
