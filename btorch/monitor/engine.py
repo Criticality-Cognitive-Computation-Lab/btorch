@@ -74,6 +74,29 @@ def _alias(e, name: str):
     return e.alias(name)
 
 
+def split_channel_specs(spec: RecordSpec | None) -> tuple[list[str] | None, list]:
+    """Split a recording spec into ``(legacy_names, record_specs)``.
+
+    The single authority on the spec grammar (consumers like the RNN loop call
+    this instead of re-implementing dispatch): plain dotted strings -- and
+    ``None``, meaning "all memories" -- flow through the consumer's legacy
+    stacked-states channel; :class:`~btorch.monitor.expr.Expr` specs (incl.
+    ``grad(...)``) route to the recorder.  Strings and Exprs mix freely in one
+    list.  A top-level ``{name: expr}`` mapping renames AND switches channel:
+    every value normalises to an Expr, so ``legacy_names`` is ``[]`` and the
+    legacy channel is off for that network.
+    """
+    if spec is None:
+        return None, []
+    specs = _normalize_specs(spec)
+    if isinstance(spec, (str, Expr)):  # single spec: already normalised to one
+        return ([], specs) if isinstance(spec, Expr) else ([spec], [])
+    return (
+        [s for s in specs if isinstance(s, str)],
+        [s for s in specs if not isinstance(s, str)],
+    )
+
+
 class Recorder:
     """Compile record specs once against a :class:`Resolver`, then drive them.
 
@@ -132,13 +155,6 @@ class Recorder:
             node = self.graph.node(nid)
             if node.op == "source":
                 names.update(node.names)
-        return names
-
-    @property
-    def materialized_columns(self) -> set[str]:
-        names: set[str] = set()
-        for nid in self.program.stack_nids:
-            names.update(self.graph.node(nid).names)
         return names
 
     @property

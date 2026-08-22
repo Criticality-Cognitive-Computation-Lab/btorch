@@ -64,7 +64,6 @@ class _CustomReduce:
 
     nid: int
     reducer: object  # btorch.monitor.reducer.Reducer
-    child: int
     shape: tuple[int, ...]  # child value shape (input to reducer.init)
     dtype: torch.dtype
     device: object
@@ -77,8 +76,6 @@ class CompiledProgram:
     graph: Graph
     step_nids: tuple[int, ...]  # nodes evaluated/folded per step (topo order)
     stack_nids: tuple[int, ...]  # nodes whose per-step output is buffered
-    reduce_nids: tuple[int, ...]
-    creduce_nids: tuple[int, ...] = ()  # custom fold(reducer) nodes
     # cached carry layout (built once via meta tensors); see init_carry
     _carry_slots: list[_CarrySlot] | None = None
     _creduce: dict | None = None  # nid -> _CustomReduce
@@ -156,14 +153,12 @@ class CompiledProgram:
             elif node.op == "reduce":
                 mval[nid] = mval[node.inputs[0]]
             elif node.op == "creduce":
-                child = node.inputs[0]
-                fv = mval[child]
+                fv = mval[node.inputs[0]]
                 reducer = node.params["reducer"]
                 leaves, treespec = tree_flatten(reducer.init(fv))
                 creduce[nid] = _CustomReduce(
                     nid,
                     reducer,
-                    child,
                     tuple(fv.shape),
                     fv.dtype,
                     ref_dev,
@@ -183,7 +178,9 @@ class CompiledProgram:
             slots.append(_CarrySlot(key, (), dtype or ref_dt, ref_dev, 0.0))
 
         slots.append(_CarrySlot("__step__", (), torch.long, ref_dev, 0.0))
-        for nid in self.reduce_nids:
+        for nid in self.step_nids:
+            if g.node(nid).op != "reduce":
+                continue  # window rings are handled below
             kind = g.node(nid).params["kind"]
             cid = g.node(nid).inputs[0]
             # min/max accumulate +-inf, so their slots must be float even for
@@ -444,18 +441,11 @@ def lower(graph: Graph) -> CompiledProgram:
     """Partition the graph into the per-step region and roles."""
     step_nids = []
     stack_nids = []
-    reduce_nids = []
-    creduce_nids = []
     for nid, node in enumerate(graph.nodes):
         if node.op == "mapseq":
             continue
-        if node.op == "reduce":
-            step_nids.append(nid)
-            reduce_nids.append(nid)
-            continue
-        if node.op == "creduce":
-            step_nids.append(nid)
-            creduce_nids.append(nid)
+        if node.op in ("reduce", "creduce"):
+            step_nids.append(nid)  # folded per step; slots built in _infer_carry_slots
             continue
         if node.op == "elementwise" and node.level == AGG:
             continue  # agg-arithmetic runs in finalize
@@ -467,6 +457,4 @@ def lower(graph: Graph) -> CompiledProgram:
         graph=graph,
         step_nids=tuple(step_nids),
         stack_nids=tuple(stack_nids),
-        reduce_nids=tuple(reduce_nids),
-        creduce_nids=tuple(creduce_nids),
     )
