@@ -394,6 +394,7 @@ def test_validate_reducer_rejects_self_mutation():
         validate_reducer(_BadSelf(), torch.randn(BATCH, FEATURES))
 
 
+@pytest.mark.skipif(platform.system() != "Linux", reason="torch.compile: Linux only")
 def test_validate_reducer_ignores_opaque_object_state():
     # An attribute of an unknown type cannot be compared by value soundly
     # (repr may embed volatile state, e.g. ids or counters); the snapshot skips
