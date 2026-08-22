@@ -28,7 +28,10 @@ from .lower import CompiledProgram, lower
 
 #: What ``update_state_names=`` accepts: a single spec (a dotted ``str`` or an
 #: :class:`~btorch.monitor.expr.Expr`), a sequence of them (entries may also be a
-#: ``{name: expr}`` mapping), or a top-level ``{name: expr}`` mapping.
+#: ``{name: expr}`` mapping renaming a processed monitor), or a top-level
+#: ``{name: expr}`` mapping.  A top-level mapping routes every value (including
+#: plain strings) through the recorder -- it renames AND switches channel:
+#: the legacy ``stacked_states`` output is disabled entirely for that network.
 RecordSpec = str | Expr | Mapping | Sequence
 
 
@@ -69,6 +72,21 @@ def _alias(e, name: str):
 
 
 class Recorder:
+    """Compile record specs once against a :class:`Resolver`, then drive them.
+
+    Args:
+        specs: Record specs (see :data:`RecordSpec` for the accepted grammar);
+            plain strings are treated as ``col(name)``.
+        resolver: Resolves dotted names / bare tensors to refs under the
+            consumer's state module.
+
+    Drive with ``init_carry`` / ``step_kernel`` (one frame per timestep) /
+    ``finalize`` -- threading the carry and appending stack outputs to buffers
+    across chunk boundaries is the DRIVER's job, as in
+    :meth:`RecurrentNNAbstract._multi_step_forward_impl` -- or one-shot via
+    :meth:`run(frames)`, which returns ``{name: Tensor}``.
+    """
+
     def __init__(self, specs, *, resolver: Resolver):
         self.resolver = resolver
         self.graph = build(_normalize_specs(specs), resolver)

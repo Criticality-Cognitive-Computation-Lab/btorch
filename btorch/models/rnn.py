@@ -36,6 +36,11 @@ def _split_state_specs(
     ``grad(...)`` / ``{name: expr}`` specs route to the recording engine and are
     read via :meth:`get_records`.
 
+    A top-level ``{name: expr}`` mapping is ALL-recorder: every value routes to
+    the engine (plain-string values become ``col(...)``), so the legacy
+    ``stacked_states`` channel is switched off entirely.  Use a mixed *list* to
+    feed both channels at once.
+
     Returns ``(legacy_names, record_specs)`` where ``legacy_names`` is
     ``None`` (all memories), else a list of dotted strings; and ``record_specs``
     is a list of engine specs.
@@ -69,10 +74,13 @@ class RecurrentNNAbstract(base.MemoryModule):
       here.
 
     ``update_state_names`` is the single recording spec: plain dotted strings
-    populate ``stacked_states``; ``Expr`` / ``grad(...)`` / ``{name: expr}`` specs
-    (see :mod:`btorch.monitor`) are read via :meth:`get_records`.  Value/reduction
-    monitors compose with ``cudagraph=True`` (their fold is captured inside the
-    chunk graph), single-chunk only; ``grad(...)`` monitors are refused there.
+    populate ``stacked_states``; ``Expr`` / ``grad(...)`` specs (see
+    :mod:`btorch.monitor`) are read via :meth:`get_records`.  Strings and
+    Exprs mix freely in one list.  A top-level ``{name: expr}`` mapping routes
+    EVERYTHING through the recorder and disables ``stacked_states`` for that
+    network (see :func:`_split_state_specs`).  Value/reduction monitors compose
+    with ``cudagraph=True`` (their fold is captured inside the chunk graph),
+    single-chunk only; ``grad(...)`` monitors are refused there.
     """
 
     def __init__(
@@ -569,20 +577,25 @@ class RecurrentNNAbstract(base.MemoryModule):
         """
         self._records = self._recorder.finalize(carry, record_buffers)
         for i, key in enumerate(self._record_grad_keys):
+            # the hook closes over THIS list (not self._records) so that
+            # clear_records() between forward and backward cannot make a
+            # pending hook write into a replaced dict
             history: list = [None] * T
             self._records[key] = history
             for t in range(T):
-                self._register_record_grad_hook(grad_snapshots[t][i], key, t)
+                self._register_record_grad_hook(grad_snapshots[t][i], key, t, history)
         if self.cpu_offload:
             self._records = {
                 k: (v.cpu() if torch.is_tensor(v) else v)
                 for k, v in self._records.items()
             }
 
-    def _register_record_grad_hook(self, tensor: Tensor, key: str, t: int):
+    def _register_record_grad_hook(
+        self, tensor: Tensor, key: str, t: int, history: list
+    ):
         def grad_hook(grad):
             if grad is not None:
-                self._records[key][t] = grad.detach().clone()
+                history[t] = grad.detach().clone()
             return grad
 
         if torch.is_tensor(tensor) and tensor.requires_grad:
@@ -592,13 +605,21 @@ class RecurrentNNAbstract(base.MemoryModule):
         """Recorded monitor outputs (Expr / grad(...) specs of
         update_state_names).
 
-        Reduction / derived / raw records are tensors; ``grad(...)`` monitors are
-        ``list[Tensor | None]`` of length T, populated after ``backward()``.
+        Reduction / derived / raw records are tensors; ``grad(...)`` monitors
+        are ``list[Tensor | None]`` of length T, populated after
+        ``backward()``.  Raw columns keep their autograd connection (trainable
+        like ``stacked_states``); every derived/reduced record is detached.
+        The dict is rebuilt on each forward -- hold onto it across steps at
+        your own peril -- and its tensors move to CPU under ``cpu_offload``.
         """
         return self._records
 
     def clear_records(self) -> None:
-        """Drop the recorded outputs from the last forward."""
+        """Drop the recorded outputs from the last forward.
+
+        Safe to call while grad monitors still owe a backward: their pending
+        hooks write into an orphaned list instead of raising.
+        """
         self._records = {}
 
 
@@ -628,7 +649,13 @@ def make_rnn(
     | RecurrentNNAbstract
     | Callable[[type[base.MemoryModule]], type[RecurrentNNAbstract]]
 ):
-    """RNN wrapper."""
+    """RNN wrapper.
+
+    Wraps a (``MemoryModule``) cell class or instance in the time-unrolled
+    loop; all recording kwargs (``update_state_names``, ``allow_buffer``) and
+    execution-mode kwargs pass through to :class:`RecurrentNNAbstract` -- see
+    its docstring for the recording spec grammar.
+    """
 
     def _build_rnn_class(
         neuron_cls: type[base.MemoryModule] | base.MemoryModule,

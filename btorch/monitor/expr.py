@@ -120,8 +120,13 @@ class Expr:
         return self.pow(exponent)
 
     def __getitem__(self, index) -> Expr:
-        # per-step (single-step) index into each step's [B, N] value, stacked over
-        # time. To index the TIME axis (multistep), use map_seq(lambda V: V[k]).
+        """Per-step (single-step) index into each step's ``[B, N]`` value,
+        stacked over time.
+
+        This indexes FEATURES/BATCH, never the time axis: ``col("v")[:, 0]``
+        gives feature 0 at every step.  To pick a timestep, use
+        ``map_seq(lambda V: V[k])``.
+        """
         self._no_compose()
         return Elementwise("getitem", (self,), {"index": index})
 
@@ -244,7 +249,12 @@ class Lit(Expr):
 
 @dataclass(frozen=True, eq=False)
 class Grad(Expr):
-    """Per-step gradient of a target (eager-only, via ``register_hook``)."""
+    """Per-step gradient of a target.
+
+    Captured backward-time via ``register_hook`` by the consumer: it composes
+    with ``torch.compile`` (the loop region is compiler-disabled) but is
+    refused under ``cudagraph=True`` -- replay never runs backward.
+    """
 
     target: str | Tensor
     is_grad: bool = True
@@ -309,7 +319,11 @@ def lit(value) -> Expr:
 
 
 def grad(target: str | Tensor) -> Expr:
-    """Record per-step gradients of a target (eager-only, backward-time)."""
+    """Record per-step gradients of a target (backward-time, via hooks).
+
+    Works under ``torch.compile``; refused under ``cudagraph=True``.  Only
+    ``.alias()`` may wrap it -- reduce the recorded trace in post.
+    """
     return Grad(target)
 
 
