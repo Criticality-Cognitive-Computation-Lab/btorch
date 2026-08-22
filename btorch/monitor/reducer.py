@@ -23,6 +23,7 @@ trusting it in a compiled / captured loop.
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Protocol
 
 import torch
@@ -80,18 +81,43 @@ class RecordEngine(Protocol):
     extra hooks the ``Recorder.run`` convenience driver uses.
     """
 
-    def init_carry(self, example_frame: StepFrame) -> Any: ...
-    def step_kernel(self, carry: Any, frame: StepFrame) -> tuple[Any, dict]: ...
-    def finalize(self, carry: Any, buffers: dict) -> dict[str, Tensor]: ...
-    def new_buffers(self) -> dict: ...
+    def init_carry(self, example_frame: StepFrame) -> Any:
+        """Allocate and return the initial carry, shaped from an example
+        frame."""
+        raise NotImplementedError
+
+    def step_kernel(self, carry: Any, frame: StepFrame) -> tuple[Any, dict]:
+        """Fold one step's ``frame`` into ``carry``; return ``(carry,
+        stack)``."""
+        raise NotImplementedError
+
+    def finalize(self, carry: Any, buffers: dict) -> dict[str, Tensor]:
+        """Reduce the final carry (+ stacked raw buffers) to records."""
+        raise NotImplementedError
+
+    def new_buffers(self) -> dict:
+        """Fresh per-run containers for stacked raw (per-step) values."""
+        raise NotImplementedError
+
     @property
-    def stack_nids(self): ...
+    def stack_nids(self):
+        """Ids of per-step values to materialise (stacked over time)."""
+        raise NotImplementedError
+
     @property
-    def grad_specs(self) -> list[tuple[str, TargetRef, str]]: ...
+    def grad_specs(self) -> list[tuple[str, TargetRef, str]]:
+        """``(name, ref, mode)`` triples recorded via backward hooks."""
+        raise NotImplementedError
+
     @property
-    def has_grad_specs(self) -> bool: ...
+    def has_grad_specs(self) -> bool:
+        """Whether any gradient monitors are registered."""
+        raise NotImplementedError
+
     @property
-    def is_empty(self) -> bool: ...
+    def is_empty(self) -> bool:
+        """Whether no recording specs are registered at all."""
+        raise NotImplementedError
 
 
 def validate_reducer(reducer: Reducer, example: Tensor, *, steps: int = 4) -> None:
@@ -115,8 +141,9 @@ def validate_reducer(reducer: Reducer, example: Tensor, *, steps: int = 4) -> No
             f"with a non-tensor leaf: {carry0!r}"
         )
 
-    # Snapshot everything update might illegally mutate: the carry, the input value,
-    # and the reducer's own state (all attributes, not just tensors).
+    # Snapshot everything update might illegally mutate: the carry, the input
+    # value, and the reducer's own state (value-comparable attributes; see
+    # _attr_snapshot).
     probe = torch.ones_like(example)  # non-zero, so in-place folds are observable
     carry_before = [x.clone() for x in leaves]
     probe_before = probe.clone()
@@ -172,12 +199,23 @@ def validate_reducer(reducer: Reducer, example: Tensor, *, steps: int = 4) -> No
 
 
 def _attr_snapshot(reducer) -> dict:
-    """Snapshot a reducer's attributes for a before/after mutation
-    comparison."""
-    return {
-        k: (v.detach().clone() if isinstance(v, Tensor) else repr(v))
-        for k, v in vars(reducer).items()
-    }
+    """Snapshot a reducer's attributes for a before/after mutation check.
+
+    Only attributes with a sound *value* comparison are tracked: tensors are
+    cloned, immutable scalars copied by value, standard containers deep-copied.
+    Arbitrary objects are skipped -- their equality semantics are unknowable
+    (``repr`` can embed volatile state such as ids or counters), so comparing
+    them risks flagging semantically-unchanged state as mutated.
+    """
+    snap: dict = {}
+    for k, v in vars(reducer).items():
+        if isinstance(v, Tensor):
+            snap[k] = v.detach().clone()
+        elif isinstance(v, int | float | bool | bytes | str | complex | type(None)):
+            snap[k] = v
+        elif isinstance(v, list | tuple | set | frozenset | dict):
+            snap[k] = copy.deepcopy(v)
+    return snap
 
 
 def _attr_changed(before, after) -> bool:
