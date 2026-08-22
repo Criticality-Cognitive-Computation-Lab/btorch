@@ -122,18 +122,15 @@ def sequence():
 # ===========================================================================
 def test_bare_string_records_the_raw_trace(sequence):
     v_seq, psc_seq = sequence
-    recorder = record_over(StatefulNet(), ["neuron.v"])
+    recorder = record_over(
+        StatefulNet(), ["neuron.v", col("synapse.psc").alias("membrane")]
+    )
     records = run_steps(recorder, v_seq, psc_seq)
-    # a bare dotted string stacks the buffer over time -> [T, B, F]
+    # a bare dotted string stacks the buffer over time -> [T, B, F];
+    # .alias() renames the output key without changing what is recorded
     torch.testing.assert_close(records["neuron.v"], torch.stack(v_seq, 0))
-    assert recorder.raw_columns == {"neuron.v"}
-
-
-def test_alias_renames_the_output_key(sequence):
-    v_seq, psc_seq = sequence
-    recorder = record_over(StatefulNet(), [col("neuron.v").alias("membrane")])
-    records = run_steps(recorder, v_seq, psc_seq)
-    assert set(records) == {"membrane"}
+    torch.testing.assert_close(records["membrane"], torch.stack(psc_seq, 0))
+    assert recorder.raw_columns == {"neuron.v", "membrane"}
 
 
 def test_bare_tensor_reference_resolves_like_a_dotted_name(sequence):
@@ -145,19 +142,13 @@ def test_bare_tensor_reference_resolves_like_a_dotted_name(sequence):
     torch.testing.assert_close(records["v"], torch.stack(v_seq, 0))
 
 
-def test_mean_reduces_over_time(sequence):
-    v_seq, psc_seq = sequence
-    recorder = record_over(StatefulNet(), {"v_mean": col("neuron.v").mean()})
-    records = run_steps(recorder, v_seq, psc_seq)
-    torch.testing.assert_close(records["v_mean"], torch.stack(v_seq, 0).mean(0))
-
-
 def test_scalar_reductions_over_time(sequence):
     v_seq, psc_seq = sequence
     stacked = torch.stack(v_seq, 0)
     recorder = record_over(
         StatefulNet(),
         {
+            "mean": col("neuron.v").mean(),
             "sum": col("neuron.v").sum(),
             "last": col("neuron.v").last(),
             "first": col("neuron.v").first(),
@@ -167,6 +158,7 @@ def test_scalar_reductions_over_time(sequence):
         },
     )
     records = run_steps(recorder, v_seq, psc_seq)
+    torch.testing.assert_close(records["mean"], stacked.mean(0))
     torch.testing.assert_close(records["sum"], stacked.sum(0))
     torch.testing.assert_close(records["last"], v_seq[-1])
     torch.testing.assert_close(records["first"], v_seq[0])
@@ -175,7 +167,9 @@ def test_scalar_reductions_over_time(sequence):
     torch.testing.assert_close(records["count"], torch.tensor(float(T)))
 
 
-def test_std_and_var_match_population_statistics(sequence):
+def test_std_var_default_matches_torch_correction_convention(sequence):
+    # .std()/.var() default to correction=1 like torch's .std(dim=0)/.var(dim=0);
+    # correction=0 gives the population statistic.
     v_seq, psc_seq = sequence
     stacked = torch.stack(v_seq, 0)
     recorder = record_over(
@@ -183,31 +177,85 @@ def test_std_and_var_match_population_statistics(sequence):
         {
             "std": col("neuron.v").std(),
             "var": col("neuron.v").var(),
+            "std_pop": col("neuron.v").std(correction=0),
+            "var_pop": col("neuron.v").var(correction=0),
         },
     )
     records = run_steps(recorder, v_seq, psc_seq)
-    # streaming Welford; population (unbiased=False) by convention
-    torch.testing.assert_close(records["var"], stacked.var(0, unbiased=False))
-    torch.testing.assert_close(records["std"], stacked.std(0, unbiased=False))
+    torch.testing.assert_close(records["std"], stacked.std(0))
+    torch.testing.assert_close(records["var"], stacked.var(0))
+    torch.testing.assert_close(records["std_pop"], stacked.std(0, correction=0))
+    torch.testing.assert_close(records["var_pop"], stacked.var(0, correction=0))
 
 
-def test_per_step_expression_over_two_columns(sequence):
+def test_per_step_expressions_over_columns_and_scalars(sequence):
     v_seq, psc_seq = sequence
-    # elementwise over two state buffers, evaluated per timestep, stacked over time
+    # elementwise over two state buffers and against scalars: evaluated per
+    # timestep, stacked over time
     recorder = record_over(
-        StatefulNet(), {"drive": col("neuron.v") - col("synapse.psc")}
+        StatefulNet(),
+        {
+            "drive": col("neuron.v") - col("synapse.psc"),
+            "shifted": col("neuron.v") + 1,
+        },
     )
     records = run_steps(recorder, v_seq, psc_seq)
     torch.testing.assert_close(
         records["drive"], torch.stack(v_seq, 0) - torch.stack(psc_seq, 0)
     )
-
-
-def test_col_plus_scalar_is_per_step(sequence):
-    v_seq, psc_seq = sequence
-    recorder = record_over(StatefulNet(), {"shifted": col("neuron.v") + 1})
-    records = run_steps(recorder, v_seq, psc_seq)
     torch.testing.assert_close(records["shifted"], torch.stack(v_seq, 0) + 1)
+
+
+def test_elementwise_math_matches_torch(sequence):
+    # the unary/binary math surface against the same ops on the stacked trace
+    v_seq, psc_seq = sequence
+    stacked = torch.stack(v_seq, 0)
+    recorder = record_over(
+        StatefulNet(),
+        {
+            "absed": abs(col("neuron.v")),
+            "relued": col("neuron.v").relu(),
+            "clamped": col("neuron.v").clamp(-0.5, 0.5),
+            "squared": col("neuron.v") ** 2,
+            "halved": col("neuron.v") / 2,
+        },
+    )
+    records = run_steps(recorder, v_seq, psc_seq)
+    torch.testing.assert_close(records["absed"], stacked.abs())
+    torch.testing.assert_close(records["relued"], stacked.relu())
+    torch.testing.assert_close(records["clamped"], stacked.clamp(-0.5, 0.5))
+    torch.testing.assert_close(records["squared"], stacked.pow(2))
+    torch.testing.assert_close(records["halved"], stacked / 2)
+
+
+def test_tensor_literal_broadcasts_like_a_torch_operand(sequence):
+    # a tensor literal joins the graph as a constant and broadcasts per step
+    v_seq, psc_seq = sequence
+    bias = torch.tensor([10.0, 20.0, 30.0])
+    recorder = record_over(StatefulNet(), {"biased": col("neuron.v") + lit(bias)})
+    records = run_steps(recorder, v_seq, psc_seq)
+    torch.testing.assert_close(records["biased"], torch.stack(v_seq, 0) + bias)
+
+
+def test_min_max_work_on_integer_spike_buffers():
+    # spike counts are integer buffers; min/max accumulate +-inf so they
+    # promote their accumulator to float instead of crashing (regression).
+    net = StatefulNet()
+    torch.manual_seed(0)
+    spk_seq = [torch.randint(0, 4, (BATCH, FEATURES)) for _ in range(T)]
+    recorder = Recorder(
+        {"lo": col("synapse.psc").min(), "hi": col("synapse.psc").max()},
+        resolver=Resolver(net),
+    )
+    frames = []
+    for spk in spk_seq:
+        net.synapse.psc = spk
+        frames.append(recorder.resolver.frame())
+    records = recorder.run(frames)
+    stacked = torch.stack([s.float() for s in spk_seq], 0)
+    assert records["lo"].dtype.is_floating_point
+    torch.testing.assert_close(records["lo"], stacked.min(0).values)
+    torch.testing.assert_close(records["hi"], stacked.max(0).values)
 
 
 def test_getitem_indexes_each_step_then_stacks(sequence):
@@ -274,58 +322,96 @@ def test_second_difference_excludes_both_warmup_steps(sequence):
     torch.testing.assert_close(records["d2_mean"], second.mean(0))
 
 
+def test_shift_lags_with_zero_fill_not_wraparound(sequence):
+    # shift(n) is the value from n steps earlier; warmup is zero-filled
+    # (torch.roll would wrap around, torch.diff-style ops would shrink T).
+    v_seq, psc_seq = sequence
+    stacked = torch.stack(v_seq, 0)
+    recorder = record_over(
+        StatefulNet(),
+        {
+            "lag1": col("neuron.v").shift(),
+            "lag3_mean": col("neuron.v").shift(3).mean(),  # denom = T-3, not T
+        },
+    )
+    records = run_steps(recorder, v_seq, psc_seq)
+    expected = torch.zeros_like(stacked)
+    expected[1:] = stacked[:-1]
+    torch.testing.assert_close(records["lag1"], expected)
+    # the mean only divides by valid rows (T-3), i.e. the values x_0..x_{T-4}
+    torch.testing.assert_close(records["lag3_mean"], stacked[: T - 3].mean(0))
+
+
+def test_first_last_under_a_windowed_input_skip_warmup(sequence):
+    # first/last are validity-gated: on a diff() input they take the first/last
+    # VALID difference, not the zero-filled warmup rows.
+    v_seq, psc_seq = sequence
+    stacked = torch.stack(v_seq, 0)
+    diffs = stacked[1:] - stacked[:-1]
+    recorder = record_over(
+        StatefulNet(),
+        {
+            "first_diff": col("neuron.v").diff().first(),
+            "last_diff": col("neuron.v").diff().last(),
+        },
+    )
+    records = run_steps(recorder, v_seq, psc_seq)
+    torch.testing.assert_close(records["first_diff"], diffs[0])
+    torch.testing.assert_close(records["last_diff"], diffs[-1])
+
+
+def test_map_step_applies_fn_per_step_across_columns(sequence):
+    v_seq, psc_seq = sequence
+    # map_step is the streamable custom boundary: fn sees each step's [B, N]
+    # slices (map_seq sees the whole [T, B, N] stack instead).
+    recorder = record_over(
+        StatefulNet(),
+        {"gain": map_step(lambda a, b: a + b, col("neuron.v"), col("synapse.psc"))},
+    )
+    records = run_steps(recorder, v_seq, psc_seq)
+    torch.testing.assert_close(
+        records["gain"], torch.stack(v_seq, 0) + torch.stack(psc_seq, 0)
+    )
+
+
 def test_map_seq_runs_a_custom_fn_on_the_whole_sequence(sequence):
     v_seq, psc_seq = sequence
     # map_seq materialises [T, B, F] and applies fn once (needed for non-streaming
-    # ops like median)
-    median_over_time = map_seq(lambda V: V.median(0).values, col("neuron.v"))
-    recorder = record_over(StatefulNet(), {"median": median_over_time})
-    records = run_steps(recorder, v_seq, psc_seq)
-    expected = torch.stack(v_seq, 0).median(0).values
-    torch.testing.assert_close(records["median"], expected)
-
-
-def test_pipe_is_a_polars_style_alias_of_map_seq(sequence):
-    v_seq, psc_seq = sequence
-    piped = col("neuron.v").pipe(lambda V: V.sum(0))
-    records = run_steps(record_over(StatefulNet(), {"s": piped}), v_seq, psc_seq)
-    torch.testing.assert_close(records["s"], torch.stack(v_seq, 0).sum(0))
-
-
-def test_map_seq_result_can_be_post_processed(sequence):
-    # edge case: a map_seq nested under further arithmetic (not the root).
-    v_seq, psc_seq = sequence
+    # ops like median); it can be nested under further arithmetic (not just a root)
     recorder = record_over(
-        StatefulNet(), {"twice_sum": map_seq(lambda V: V.sum(0), col("neuron.v")) * 2}
+        StatefulNet(),
+        {
+            "median": map_seq(lambda V: V.median(0).values, col("neuron.v")),
+            "twice_sum": map_seq(lambda V: V.sum(0), col("neuron.v")) * 2,
+        },
     )
     records = run_steps(recorder, v_seq, psc_seq)
-    torch.testing.assert_close(records["twice_sum"], torch.stack(v_seq, 0).sum(0) * 2)
+    stacked = torch.stack(v_seq, 0)
+    torch.testing.assert_close(records["median"], stacked.median(0).values)
+    torch.testing.assert_close(records["twice_sum"], stacked.sum(0) * 2)
 
 
-def test_grad_monitor_registers_a_grad_spec():
-    # grad(...) is recorded via backward hooks by the consumer; the engine just
-    # exposes it as a grad spec.  Crucially it does NOT emit a source/stack
-    # node: no [T, ...] value trace is materialised unless col("v")/"v" is
-    # also requested.
-    recorder = record_over(StatefulNet(), {"v_grad": grad("neuron.v")})
-    assert recorder.has_grad_specs
-    assert recorder.grad_specs[0][0] == "v_grad"
-    assert not recorder.is_empty  # the grad spec alone still counts as work
-    assert recorder.raw_columns == set()
-    assert list(recorder.stack_nids) == []  # nothing to materialise
-
-
-def test_col_and_grad_share_one_resolution(sequence):
-    # ["v", {"v_grad": grad("v")}] resolves both specs to ONE TargetRef
-    # (Resolver is idempotent per name): one per-step read feeds both outputs,
-    # so asking for values+grads costs no duplicate reads or columns.
+def test_grad_specs_materialise_nothing_but_share_resolution(sequence):
+    # grad(...) is recorded via backward hooks by the consumer; the engine only
+    # exposes it as a grad spec.  A grad-only spec emits NO source/stack node:
+    # no [T, ...] value trace is materialised unless col("v")/"v" is also
+    # requested.  When both are requested they resolve to ONE TargetRef
+    # (Resolver is idempotent per name), so values+grads cost a single
+    # per-step read.
     net = StatefulNet()
-    recorder = record_over(net, [{"v": col("neuron.v"), "v_grad": grad("neuron.v")}])
-    assert recorder.resolver.n_refs == 1
-    assert recorder.raw_columns == {"v"}
-    assert len(recorder.graph.grad_specs) == 1
+    grad_only = record_over(StatefulNet(), {"v_grad": grad("neuron.v")})
+    assert grad_only.has_grad_specs
+    assert grad_only.grad_specs[0][0] == "v_grad"
+    assert not grad_only.is_empty  # the grad spec alone still counts as work
+    assert grad_only.raw_columns == set()
+    assert list(grad_only.stack_nids) == []  # nothing to materialise
+
+    both = record_over(net, [{"v": col("neuron.v"), "v_grad": grad("neuron.v")}])
+    assert both.resolver.n_refs == 1
+    assert both.raw_columns == {"v"}
+    assert len(both.graph.grad_specs) == 1
     v_seq, psc_seq = sequence
-    records = run_steps(recorder, v_seq, psc_seq)
+    records = run_steps(both, v_seq, psc_seq)
     torch.testing.assert_close(records["v"], torch.stack(v_seq, 0))
 
 
@@ -478,44 +564,37 @@ class _StructureChanging(Reducer):
         return carry[0] if isinstance(carry, tuple) else carry
 
 
-def test_validate_reducer_rejects_changing_carry_structure():
+def test_reducer_with_changing_carry_structure_is_rejected_twice(sequence):
+    # the validator catches it statically (before any recording)...
     with pytest.raises(RuntimeError, match="structure"):
         validate_reducer(_StructureChanging(), torch.randn(BATCH, FEATURES))
-
-
-def test_engine_rejects_changing_carry_structure(sequence):
-    v_seq, psc_seq = sequence
+    # ...and the runtime fold re-checks it per step (defence in depth for
+    # engines driven without validate_reducer).
     recorder = record_over(
         StatefulNet(), {"g": col("neuron.v").fold(_StructureChanging())}
     )
     with pytest.raises(ValueError, match="constant"):
-        run_steps(recorder, v_seq, psc_seq)
+        run_steps(recorder, *sequence)
 
 
 # ===========================================================================
 # Engine-internal guarantees (memory, sharing, chunking, compile)
 # ===========================================================================
-def test_streaming_reduction_allocates_no_time_axis_buffer():
-    # the memory-honesty guarantee: a pure reduction folds into an O(1) carry and
-    # never materialises a [T, ...] buffer.
+def test_graph_shape_streams_shares_and_levels():
+    # one test telling the whole IR story: a reduction folds into an O(1)
+    # carry (no [T, ...] buffer), shared subexpressions intern to a single
+    # node (CSE), bare columns are STEP-level stack points while reductions
+    # are AGG.
     recorder = record_over(StatefulNet(), {"v_mean": col("neuron.v").mean()})
     assert recorder.stack_nids == ()
     assert recorder.raw_columns == set()
 
-
-def test_shared_subexpression_is_computed_once():
-    # CSE: col("neuron.v") used by two reductions interns to a single Source node.
     graph = build(
         [col("neuron.v").mean().alias("a"), col("neuron.v").sum().alias("b")],
         Resolver(StatefulNet()),
     )
-    sources = [node for node in graph.nodes if node.op == "source"]
-    assert len(sources) == 1
+    assert len([n for n in graph.nodes if n.op == "source"]) == 1
 
-
-def test_temporal_levels_and_stack_points():
-    # a bare column is a per-step (STEP) value materialised as a stack point; a
-    # reduction is a time-invariant (AGG) value.
     graph = build(
         [col("neuron.v"), col("neuron.v").mean().alias("m")], Resolver(StatefulNet())
     )

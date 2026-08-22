@@ -55,66 +55,6 @@ def test_rnn_gradient_flow():
     assert grad_norms[0] > 0  # Should still have some gradient at the beginning
 
 
-def test_rnn_flow_checkpointing_comparison():
-    """Compare gradient flow with and without checkpointing."""
-    torch.manual_seed(42)
-    T = 20
-
-    # Create shared input and RNNs with synced weights
-    x = torch.randn(T, 2, 3, requires_grad=True)
-
-    configs = [
-        {"name": "No CP", "grad_checkpoint": False},
-        {"name": "With CP", "grad_checkpoint": True},
-    ]
-
-    # Create all RNNs first
-    rnns = []
-    for cfg in configs:
-        rnn = make_rnn(
-            SimpleRNNCell,
-            unroll=4,
-            update_state_names={"h_grad": grad("h")},
-            grad_checkpoint=cfg["grad_checkpoint"],
-        )(input_size=3, hidden_size=4)
-        rnns.append(rnn)
-
-    # Sync weights from first RNN to all others
-    for i in range(1, len(rnns)):
-        rnns[i].rnn_cell.W_x.data.copy_(rnns[0].rnn_cell.W_x.data)
-        rnns[i].rnn_cell.W_h.data.copy_(rnns[0].rnn_cell.W_h.data)
-        rnns[i].rnn_cell.b.data.copy_(rnns[0].rnn_cell.b.data)
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-
-    grad_histories = {}
-    for cfg, rnn in zip(configs, rnns):
-        x_copy = x.detach().clone().requires_grad_(True)
-        reset_net_state(rnn, batch_size=2)
-        out, _ = rnn(x_copy)
-        out.sum().backward()
-
-        h_grads = rnn.get_records()["h_grad"]
-        grad_norms = [g.norm().item() for g in h_grads]
-        grad_histories[cfg["name"]] = h_grads
-        ax.plot(grad_norms, label=cfg["name"], marker="x")
-
-    ax.set_title("Gradient Flow Comparison: Checkpointing vs Eager")
-    ax.set_xlabel("Time step")
-    ax.set_ylabel("||grad h_t||")
-    ax.legend()
-    ax.grid(True)
-
-    save_fig(fig, name="rnn_flow_checkpoint_comparison")
-    plt.close(fig)
-
-    # Assert that gradient histories match between checkpointed and non-checkpointed
-    # They SHOULD match because checkpoint is mathematically equivalent
-    for t in range(T):
-        g_no_cp = grad_histories["No CP"][t]
-        g_with_cp = grad_histories["With CP"][t]
-        assert torch.allclose(g_no_cp, g_with_cp, atol=1e-5), (
-            f"Gradient mismatch at t={t}: "
-            f"||no_cp||={g_no_cp.norm().item():.4f}, "
-            f"||with_cp||={g_with_cp.norm().item():.4f}"
-        )
+# NOTE: checkpointed-vs-eager gradient parity is pinned by
+# tests/models/rnn/test_rnn_ops.py::test_rnn_exhaustive_ops[grad_checkpoint=True,
+# record_grad=True]; a plotting-only duplicate lived here and was removed.

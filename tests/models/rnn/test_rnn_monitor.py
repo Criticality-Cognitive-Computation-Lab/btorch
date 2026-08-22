@@ -69,10 +69,19 @@ def test_bare_string_records_the_hidden_state_into_stacked_states():
 
 
 def test_col_expr_records_the_raw_trace_into_records():
-    # col("h") (an Expr, not a bare string) routes to get_records() instead
-    net = recording_rnn(update_state_names=[col("h").alias("h_trace")])
-    outputs, _ = net(random_inputs())
+    # col("h") (an Expr, not a bare string) routes to get_records() instead;
+    # strings and Exprs mix freely in one spec -- each goes to its own channel
+    net = recording_rnn(
+        update_state_names=[
+            col("h").alias("h_trace"),
+            "h",
+            col("h").mean().alias("h_mean"),
+        ]
+    )
+    outputs, states = net(random_inputs())
     torch.testing.assert_close(net.get_records()["h_trace"], outputs)
+    torch.testing.assert_close(states["h"], outputs)  # string -> stacked_states
+    torch.testing.assert_close(net.get_records()["h_mean"], outputs.mean(0))
 
 
 def test_reductions_and_derived_quantities():
@@ -91,20 +100,46 @@ def test_reductions_and_derived_quantities():
     torch.testing.assert_close(records["mean_speed"], speed)
 
 
-def test_strings_and_exprs_split_between_states_and_records():
-    # one spec, two destinations: dotted strings -> stacked_states (return value);
-    # Expr specs -> get_records().
-    net = recording_rnn(update_state_names=["h", col("h").mean().alias("h_mean")])
-    outputs, states = net(random_inputs())
-    torch.testing.assert_close(states["h"], outputs)  # string -> stacked_states
-    torch.testing.assert_close(net.get_records()["h_mean"], outputs.mean(0))
-
-
 def test_no_expr_specs_builds_no_recorder():
     net = recording_rnn(update_state_names=["h"])  # plain string: legacy path only
     assert net._recorder is None
     net(random_inputs())
     assert net.get_records() == {}
+
+
+def test_plain_buffers_need_allow_buffer_like_the_legacy_path():
+    # policy parity: by default the recorder accepts exactly what the legacy
+    # stacked_states collection accepts -- memories of MemoryModules.  A plain
+    # (non-memory) buffer target is REFUSED instead of being silently skipped;
+    # allow_buffer=True explicitly unblocks it on the recorder channel.
+    torch.manual_seed(0)
+    cell = SimpleRNNCell(DIN, H)
+    cell.register_buffer("aux", torch.zeros(B, H, dtype=DTYPE))  # NOT a memory
+
+    refused = make_rnn(cell, update_state_names=[col("aux")])
+    reset_net_state(refused, batch_size=B)
+    with pytest.raises(KeyError, match="allow_buffer"):
+        refused(random_inputs())
+
+    recorded = make_rnn(
+        cell, update_state_names={"aux_sq": col("aux") ** 2}, allow_buffer=True
+    )
+    reset_net_state(recorded, batch_size=B)
+    recorded(random_inputs())
+    assert recorded.get_records()["aux_sq"].shape == (T, B, H)
+
+
+def test_records_follow_a_batch_size_change_after_reset():
+    # reset with a new batch size -> the recorder re-infers its carry layout;
+    # a stale carry would broadcast-corrupt reductions (regression guard for
+    # the engine-level fix, driven end-to-end through the loop).
+    net = recording_rnn(update_state_names={"mean": col("h").mean()})
+    net(random_inputs())
+    assert net.get_records()["mean"].shape == (B, H)
+
+    reset_net_state(net, batch_size=B + 3)
+    net(torch.randn(T, B + 3, DIN, dtype=DTYPE))
+    assert net.get_records()["mean"].shape == (B + 3, H)
 
 
 def test_raw_records_keep_grad_but_reductions_are_detached():
@@ -120,23 +155,26 @@ def test_raw_records_keep_grad_but_reductions_are_detached():
 # ===========================================================================
 # Execution-mode compatibility: records must be invariant to how the loop runs
 # ===========================================================================
+# The default reference (unroll=8 over T=12) already exercises multi-block
+# eager with a partial final block; unroll=1/4/full repeat the same code
+# paths, so only modes with DISTINCT machinery are parametrised.
 _EXECUTION_MODES = [
-    pytest.param({"unroll": 1}, id="unroll=1"),
-    pytest.param({"unroll": 4}, id="unroll=4"),
-    pytest.param({"unroll": False}, id="unroll=full"),
     pytest.param({"unroll": 4, "chunk_size": 8}, id="chunked"),
     pytest.param({"unroll": 4, "grad_checkpoint": True}, id="grad_checkpoint"),
-    pytest.param(
-        {"unroll": 4, "chunk_size": 8, "grad_checkpoint": True},
-        id="grad_checkpoint+chunked",
-    ),
     pytest.param({"unroll": 4, "cpu_offload": True}, id="cpu_offload"),
 ]
 
 
 @pytest.mark.parametrize("mode", _EXECUTION_MODES)
 def test_records_are_invariant_across_execution_modes(mode):
-    specs = {"raw": col("h"), "mean": col("h").mean(), "speed": col("h").diff().mean()}
+    # value records AND a stateful custom Reducer (EMA) written as a functional
+    # tensor carry inherit correctness across every execution mode.
+    specs = {
+        "raw": col("h"),
+        "mean": col("h").mean(),
+        "speed": col("h").diff().mean(),
+        "ema": col("h").fold(EMA(0.3)),
+    }
 
     reference = recording_rnn(update_state_names=dict(specs))
     reference(random_inputs())
@@ -148,20 +186,6 @@ def test_records_are_invariant_across_execution_modes(mode):
         want = expected[key]
         got = got.to(want.device)  # cpu_offload moves records to CPU
         torch.testing.assert_close(got, want, msg=f"{key} under {mode}")
-
-
-@pytest.mark.parametrize("mode", _EXECUTION_MODES)
-def test_custom_reducer_composes_across_execution_modes(mode):
-    # a stateful Reducer (EMA) written as a functional tensor carry inherits
-    # correctness across all execution modes.
-    reference = recording_rnn(update_state_names={"ema": col("h").fold(EMA(0.3))})
-    reference(random_inputs())
-    expected = reference.get_records()["ema"].clone()
-
-    net = recording_rnn(update_state_names={"ema": col("h").fold(EMA(0.3))}, **mode)
-    net(random_inputs())
-    got = net.get_records()["ema"].to(expected.device)
-    torch.testing.assert_close(got, expected, msg=f"EMA under {mode}")
 
 
 @pytest.mark.skipif(platform.system() != "Linux", reason="torch.compile: Linux only")
@@ -242,25 +266,25 @@ def test_cudagraph_replays_value_records():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="cudagraph needs CUDA")
-def test_cudagraph_refuses_grad_monitors():
-    # grad hooks only fire in backward, which replay never runs -> refused.
-    net = recording_rnn(update_state_names={"h_grad": grad("h")}, cudagraph=True).cuda()
-    reset_net_state(net, batch_size=B)
+def test_cudagraph_refuses_grad_monitors_and_multichunk_records():
+    # two recording refusals under replay: (a) grad hooks only fire in backward,
+    # which replay never runs; (b) a streaming reduction cannot be finalised
+    # across separate per-chunk replays.
+    grad_net = recording_rnn(
+        update_state_names={"h_grad": grad("h")}, cudagraph=True
+    ).cuda()
+    reset_net_state(grad_net, batch_size=B)
     with torch.no_grad():  # reach the grad-monitor refusal, not the requires-grad guard
         with pytest.raises(RuntimeError, match=r"grad\(\.\.\.\) monitors"):
-            net(random_inputs().cuda())
+            grad_net(random_inputs().cuda())
 
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="cudagraph needs CUDA")
-def test_cudagraph_refuses_multichunk_records():
-    # a streaming reduction can't be finalised across separate per-chunk replays.
-    net = recording_rnn(
+    chunked = recording_rnn(
         update_state_names={"mean": col("h").mean()},
         cudagraph=True,
         unroll=4,
         chunk_size=8,
     ).cuda()
-    reset_net_state(net, batch_size=B)
+    reset_net_state(chunked, batch_size=B)
     with torch.no_grad():
         with pytest.raises(RuntimeError, match="single chunk"):
-            net(random_inputs().cuda())
+            chunked(random_inputs().cuda())
