@@ -8,7 +8,14 @@ import torch.nn as nn
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
-from ..monitor import EagerFrame, Expr, Recorder, RecordSpec, Resolver
+from ..monitor import (
+    EagerFrame,
+    Expr,
+    Recorder,
+    RecordSpec,
+    Resolver,
+    TargetRef,
+)
 from . import base, environ, synapse
 from .base import StepMode
 from .cudagraph import CudaGraphRunner
@@ -53,7 +60,9 @@ def _chunk_to_cpu(z, states: dict):
     return to_cpu(z), {k: to_cpu(v) for k, v in states.items()}
 
 
-def _split_state_specs(spec):
+def _split_state_specs(
+    spec: RecordSpec | None,
+) -> tuple[list[str] | None, list]:
     """Split ``update_state_names`` into legacy names + recorder specs.
 
     Plain dotted strings (and ``None`` = all memories) flow through the classic
@@ -130,14 +139,12 @@ class RecurrentNNAbstract(base.MemoryModule):
         # --- lazy recording engine (see btorch.monitor) ------------------
         self._record_specs = record_specs or None
         self._recorder = None  # built lazily at first multi_step_forward
-        self._records: dict = {}
+        self._records: dict[str, Tensor | list] = {}
         self._records_active = False  # set once the recorder is built (skip if empty)
         self._record_has_grad = False
-        self._record_grad_keys: list = []
-        self._record_grad_refs: list = []
+        self._record_grad_keys: list[str] = []
+        self._record_grad_refs: list[TargetRef] = []
         self._state_resolver = None  # set when the recorder is built
-        # Whether the recorder may read plain (non-MemoryModule) buffers.
-        self._state_allow_buffer = False
 
     def _state_module(self) -> nn.Module:
         """The module the recorder resolves dotted state names against.
@@ -147,6 +154,18 @@ class RecurrentNNAbstract(base.MemoryModule):
         that hold the stateful cell elsewhere override this (see ``make_rnn``).
         """
         return self
+
+    def _state_allow_buffer(self) -> bool:
+        """Whether the recorder may resolve non-memory state on
+        :meth:`_state_module`.
+
+        Single source of truth for the recorder's resolution policy: it always
+        mirrors the ``allow_buffer`` flag of the legacy ``stacked_states``
+        collection (see :func:`btorch.models.functional.filter_hidden_states`),
+        so the two recording paths cannot disagree.  Subclasses that take an
+        ``allow_buffer`` argument override this alongside :meth:`_state_module`.
+        """
+        return False
 
     def _detect_loop_args(self, *args: Any) -> tuple[int, tuple[int, ...]]:
         """Infer ``(T, loop_args)`` from the first positional argument.
@@ -530,8 +549,12 @@ class RecurrentNNAbstract(base.MemoryModule):
     def _ensure_recorder(self):
         if self._record_specs is None or self._recorder is not None:
             return
-        resolver = Resolver(self._state_module(), allow_buffer=self._state_allow_buffer)
+        resolver = Resolver(self._state_module())
         self._recorder = Recorder(self._record_specs, resolver=resolver)
+        if not self._state_allow_buffer():
+            # mirror filter_hidden_states' legacy policy so both recording
+            # paths accept exactly the same targets
+            self._reject_non_memory_targets(resolver)
         self._state_resolver = resolver
         self._records_active = not self._recorder.is_empty
         self._record_has_grad = self._recorder.has_grad_specs
@@ -540,7 +563,25 @@ class RecurrentNNAbstract(base.MemoryModule):
         self._record_grad_keys = [key for key, _ref, _name in grad_specs]
         self._record_grad_refs = [ref for _key, ref, _name in grad_specs]
 
-    def _init_record_carry(self) -> dict:
+    @staticmethod
+    def _reject_non_memory_targets(resolver: Resolver) -> None:
+        """Reject recorder targets outside a MemoryModule's memories.
+
+        With ``allow_buffer=False`` the legacy ``stacked_states`` path collects
+        only ``MemoryModule`` memories; silently accepting plain buffers here
+        would let the two paths disagree on what gets recorded.
+        """
+        for module, attr in resolver.resolved():
+            memories = getattr(module, "_memories_rv", None)
+            if isinstance(memories, dict) and attr in memories:
+                continue
+            raise KeyError(
+                f"monitor target {attr!r} on {type(module).__name__} is not a "
+                "registered memory of a MemoryModule. Pass allow_buffer=True "
+                "to record plain buffers."
+            )
+
+    def _init_record_carry(self) -> dict[str, Tensor | tuple[Tensor, ...]]:
         """Allocate the streaming carry (shapes via FakeTensor, no real alloc).
 
         Uses the current state buffers as shape/dtype/device examples, so it must
@@ -630,18 +671,25 @@ def make_rnn(
                     self.rnn_cell = neuron_cls(*args, **kwargs)
                 else:
                     self.rnn_cell = neuron_cls
-                self._state_allow_buffer = allow_buffer
+                # single source of truth for both recording paths (legacy
+                # stacked_states collection + the btorch.monitor recorder)
+                self.allow_buffer = allow_buffer
 
             def _state_module(self):
                 # matches filter_hidden_states(self.rnn_cell, ...) in the step
                 return self.rnn_cell
+
+            def _state_allow_buffer(self) -> bool:
+                return self.allow_buffer
 
             def single_step_forward(
                 self, *args: Any, **kwargs: Any
             ) -> tuple[Any, dict[str, Tensor]]:
                 out = self.rnn_cell(*args, **kwargs)
                 states = filter_hidden_states(
-                    self.rnn_cell, self.update_state_names, allow_buffer=allow_buffer
+                    self.rnn_cell,
+                    self.update_state_names,
+                    allow_buffer=self.allow_buffer,
                 )
                 return out, states
 
@@ -697,8 +745,12 @@ class RecurrentNN(RecurrentNNAbstract):
 
         self.neuron_inp_module = neuron_inp_module
         self.syn_inp_module = syn_inp_module
+        # single source of truth for both recording paths (legacy
+        # stacked_states collection + the btorch.monitor recorder)
         self.allow_buffer = allow_buffer
-        self._state_allow_buffer = allow_buffer  # recorder resolves against self
+
+    def _state_allow_buffer(self) -> bool:
+        return self.allow_buffer
 
     def single_step_forward(
         self, x: Tensor, x_syn: Tensor | None = None
