@@ -44,38 +44,49 @@ class Expr:
         if self.is_grad:
             raise TypeError(_GRAD_MSG)
 
+    def _operand(self, o) -> Expr:
+        """Coerce a binary operand to an :class:`Expr`, rejecting grad leaves.
+
+        Callers check ``self`` via :meth:`_no_compose`; the *other* operand is
+        checked here, else ``col("v") + grad("h")`` would silently compose a
+        grad leaf into arithmetic.
+        """
+        e = _lit(o)
+        e._no_compose()
+        return e
+
     # -- arithmetic (elementwise, streamable) -----------------------------
     def __add__(self, o) -> Expr:
         self._no_compose()
-        return Elementwise("add", (self, _lit(o)))
+        return Elementwise("add", (self, self._operand(o)))
 
     def __radd__(self, o) -> Expr:
         self._no_compose()
-        return Elementwise("add", (_lit(o), self))
+        return Elementwise("add", (self._operand(o), self))
 
     def __sub__(self, o) -> Expr:
         self._no_compose()
-        return Elementwise("sub", (self, _lit(o)))
+        return Elementwise("sub", (self, self._operand(o)))
 
     def __rsub__(self, o) -> Expr:
         self._no_compose()
-        return Elementwise("sub", (_lit(o), self))
+        return Elementwise("sub", (self._operand(o), self))
 
     def __mul__(self, o) -> Expr:
         self._no_compose()
-        return Elementwise("mul", (self, _lit(o)))
+        return Elementwise("mul", (self, self._operand(o)))
 
     def __rmul__(self, o) -> Expr:
         self._no_compose()
-        return Elementwise("mul", (_lit(o), self))
+        return Elementwise("mul", (self._operand(o), self))
 
     def __truediv__(self, o) -> Expr:
         self._no_compose()
-        return Elementwise("div", (self, _lit(o)))
+        return Elementwise("div", (self, self._operand(o)))
 
     def __rtruediv__(self, o) -> Expr:
         self._no_compose()
-        return Elementwise("div", (_lit(o), self))
+        return Elementwise("div", (self._operand(o), self))
 
     def __neg__(self) -> Expr:
         self._no_compose()
@@ -272,16 +283,21 @@ def grad(target: str | Tensor) -> Expr:
     return Grad(target)
 
 
+def _checked_cols(cols) -> tuple[Expr, ...]:
+    """Validate multi-target args: at least one, and no grad leaves."""
+    if not cols:
+        raise ValueError("requires at least one column expression")
+    for c in cols:
+        c._no_compose()
+    return tuple(cols)
+
+
 def map_step(fn: Callable[..., Tensor], *cols: Expr) -> Expr:
     """``fn(a_t, b_t, ...)`` per step on ``[B, N]`` slices; streamable."""
-    if not cols:
-        raise ValueError("map_step requires at least one column expression")
-    return MapStep(fn, tuple(cols))
+    return MapStep(fn, _checked_cols(cols))
 
 
 def map_seq(fn: Callable[..., Tensor], *cols: Expr) -> Expr:
     """``fn(A, B, ...)`` once on stacked ``[T, B, N]`` columns;
     materialises."""
-    if not cols:
-        raise ValueError("map_seq requires at least one column expression")
-    return MapSeq(fn, tuple(cols))
+    return MapSeq(fn, _checked_cols(cols))
