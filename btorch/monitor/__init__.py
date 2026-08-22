@@ -6,7 +6,7 @@ engine infers streaming (O(1) carry) vs materialise (stack ``[T, ...]``) and
 lowers to one per-step kernel.  See :class:`Recorder`.
 """
 
-from .engine import Recorder, RecordSpec
+from .engine import Recorder, RecordSpec, split_channel_specs
 from .expr import Expr, col, grad, lit, map_seq, map_step
 from .frame import EagerFrame, Resolver, StepFrame, TargetRef
 from .reducer import RecordEngine, Reducer, validate_reducer
@@ -15,6 +15,7 @@ from .reducer import RecordEngine, Reducer, validate_reducer
 __all__ = [
     "Recorder",
     "RecordSpec",
+    "split_channel_specs",
     "RecordEngine",
     "Reducer",
     "validate_reducer",

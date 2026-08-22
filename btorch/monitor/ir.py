@@ -62,17 +62,13 @@ class Graph:
 
 
 def _param_key(params: dict):
+    # functions/objects hash by identity; tensors/lists/dicts fall back to id()
     items = []
     for k, v in sorted(params.items()):
-        if callable(v):
-            items.append((k, id(v)))
-        elif hasattr(v, "__hash__") and not isinstance(v, (list, dict)):
-            try:
-                hash(v)
-                items.append((k, v))
-            except TypeError:
-                items.append((k, id(v)))
-        else:
+        try:
+            hash(v)
+            items.append((k, v))
+        except TypeError:
             items.append((k, id(v)))
     return tuple(items)
 
