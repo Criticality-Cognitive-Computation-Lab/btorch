@@ -8,8 +8,9 @@ Two levels, from safest to most powerful:
   so a reducer composes with ``torch.compile`` / ``cudagraph`` / ``cpu_offload`` /
   ``grad_checkpoint`` **automatically** -- there is nothing mode-specific to get
   right, as long as the three methods are pure tensor ops (no in-place mutation of
-  the carry, no ``.item()``, no Python-scalar carry).  This is the recommended way
-  to add custom recording.
+  the carry, no ``.item()``, no Python-scalar carry).  (At the RNN level,
+  ``cudagraph=True`` recording additionally requires a single chunk.)  This is
+  the recommended way to add custom recording.
 
 * :class:`RecordEngine` -- the full driver contract (``init_carry`` / ``step_kernel``
   / ``finalize`` / ...).  A wholesale replacement for the DSL engine, driven by the
@@ -127,6 +128,11 @@ def validate_reducer(reducer: Reducer, example: Tensor, *, steps: int = 4) -> No
     the carry / the ``value`` / the reducer instance, a carry structure that changes
     between ``init`` and ``update``, or code that is not ``fullgraph``-traceable
     (``.item()``, numpy, data-dependent Python branching).
+
+    Coverage notes: ``finalize`` must return a ``Tensor``.  Attributes of an
+    unknown (non-tensor/scalar/container) type are SKIPPED by the self-mutation
+    check -- value-comparing arbitrary objects is unsound -- so keep mutable
+    state in tensors or standard containers.
 
     Note: this resets the process-wide Dynamo compile cache
     (``torch._dynamo.reset()``) to measure traceability in isolation.
