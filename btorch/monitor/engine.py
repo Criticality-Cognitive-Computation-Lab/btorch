@@ -19,11 +19,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
+import torch
+
 from . import expr as E
 from .expr import Expr
 from .frame import Resolver, StepFrame
 from .ir import build
 from .lower import CompiledProgram, lower
+from .reducer import _check_reducer_purity
 
 
 #: What ``update_state_names=`` accepts: a single spec (a dotted ``str`` or an
@@ -85,12 +88,30 @@ class Recorder:
     across chunk boundaries is the DRIVER's job, as in
     :meth:`RecurrentNNAbstract._multi_step_forward_impl` -- or one-shot via
     :meth:`run(frames)`, which returns ``{name: Tensor}``.
+
+    Every ``fold(reducer)`` is purity-checked here at build time (cheap, no
+    tracing); a reducer subclass can opt out with ``auto_validate = False``.
     """
 
     def __init__(self, specs, *, resolver: Resolver):
         self.resolver = resolver
         self.graph = build(_normalize_specs(specs), resolver)
         self.program: CompiledProgram = lower(self.graph)
+        self._check_reducers()
+
+    def _check_reducers(self):
+        """Run the cheap invariant checks on each fold(reducer), once.
+
+        Catches impure reducers at construction -- where the mistake is made --
+        instead of silently corrupting results under checkpoint/cudagraph later.
+        Shape-agnostic by design: a scalar example suffices.
+        """
+        example = torch.zeros(())
+        for node in self.graph.nodes:
+            if node.op == "creduce" and getattr(
+                node.params["reducer"], "auto_validate", True
+            ):
+                _check_reducer_purity(node.params["reducer"], example)
 
     # -- introspection ----------------------------------------------------
     @property

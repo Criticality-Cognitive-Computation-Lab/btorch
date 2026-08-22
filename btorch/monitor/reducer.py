@@ -41,7 +41,16 @@ class Reducer:
     after ``.diff()``).  Use it to keep counts/denominators correct: multiply it into
     additive accumulators (``total += value * valid``; ``count += valid``) or mask on
     it (``torch.where(valid > 0, value, ...)``).
+
+    Subclasses are checked automatically when the recorder is built
+    (:func:`_check_reducer_purity`; cheap, no tracing).  Set the class attribute
+    ``auto_validate = False`` to opt out -- e.g. for exotic reducers whose update
+    intentionally mutates a scratch buffer.  :func:`validate_reducer` stays
+    available as the deep check (it additionally traces with ``torch.compile``).
     """
+
+    #: Whether building a Recorder runs the cheap purity checks (default on).
+    auto_validate: bool = True
 
     def init(self, example: Tensor) -> Any:
         """Return the initial carry, given an example step value (for
@@ -121,21 +130,14 @@ class RecordEngine(Protocol):
         raise NotImplementedError
 
 
-def validate_reducer(reducer: Reducer, example: Tensor, *, steps: int = 4) -> None:
-    """Check a :class:`Reducer` against the mode-correctness invariants.
+def _check_reducer_purity(reducer: Reducer, example: Tensor) -> None:
+    """Cheap structural/purity checks (no tracing).
 
-    Raises a clear error on a violation: a non-tensor carry, in-place mutation of
-    the carry / the ``value`` / the reducer instance, a carry structure that changes
-    between ``init`` and ``update``, or code that is not ``fullgraph``-traceable
-    (``.item()``, numpy, data-dependent Python branching).
-
-    Coverage notes: ``finalize`` must return a ``Tensor``.  Attributes of an
-    unknown (non-tensor/scalar/container) type are SKIPPED by the self-mutation
-    check -- value-comparing arbitrary objects is unsound -- so keep mutable
-    state in tensors or standard containers.
-
-    Note: this resets the process-wide Dynamo compile cache
-    (``torch._dynamo.reset()``) to measure traceability in isolation.
+    Rejects a non-tensor carry, in-place mutation of the carry / the ``value`` /
+    the reducer instance, and a carry structure that changes between ``init``
+    and ``update``.  This is what building a :class:`~btorch.monitor.Recorder`
+    runs automatically for every ``fold(reducer)`` whose ``auto_validate`` is
+    on; :func:`validate_reducer` adds the fullgraph traceability check.
     """
     from torch.utils._pytree import tree_flatten
 
@@ -182,6 +184,29 @@ def validate_reducer(reducer: Reducer, example: Tensor, *, steps: int = 4) -> No
             f"Reducer.update returned a carry with structure {new_spec} but init "
             f"produced {init_spec}; the carry pytree must be constant across steps."
         )
+
+
+def validate_reducer(reducer: Reducer, example: Tensor, *, steps: int = 4) -> None:
+    """Check a :class:`Reducer` against the mode-correctness invariants.
+
+    Raises a clear error on a violation: a non-tensor carry, in-place mutation of
+    the carry / the ``value`` / the reducer instance, a carry structure that changes
+    between ``init`` and ``update``, or code that is not ``fullgraph``-traceable
+    (``.item()``, numpy, data-dependent Python branching).
+
+    The structural/purity half of this runs automatically when a recorder is
+    built (:class:`Reducer.auto_validate`); calling this adds the
+    ``torch.compile`` traceability check on top.
+
+    Coverage notes: ``finalize`` must return a ``Tensor``.  Attributes of an
+    unknown (non-tensor/scalar/container) type are SKIPPED by the self-mutation
+    check -- value-comparing arbitrary objects is unsound -- so keep mutable
+    state in tensors or standard containers.
+
+    Note: this resets the process-wide Dynamo compile cache
+    (``torch._dynamo.reset()``) to measure traceability in isolation.
+    """
+    _check_reducer_purity(reducer, example)
 
     def run(x):
         carry = reducer.init(x)
