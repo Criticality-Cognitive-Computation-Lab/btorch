@@ -141,7 +141,10 @@ class CompiledProgram:
                 ref_dev, ref_dt = t.device, t.dtype  # the real device/dtype
                 mval[nid] = t.detach().to("meta")
             elif node.op == "lit":
-                mval[nid] = node.params["value"]
+                v = node.params["value"]
+                # tensor lits must join the meta graph or _apply_ew mixes
+                # devices (meta + cpu -> RuntimeError)
+                mval[nid] = v.detach().to("meta") if isinstance(v, Tensor) else v
             elif node.op in ("elementwise", "mapstep"):
                 args = [mval[i] for i in node.inputs]
                 if node.op == "elementwise":
@@ -170,9 +173,11 @@ class CompiledProgram:
 
         slots: list[_CarrySlot] = []
 
-        def val_slot(key, nid, fill=0.0):
+        def val_slot(key, nid, fill=0.0, dtype=None):
             fv = mval[nid]
-            slots.append(_CarrySlot(key, tuple(fv.shape), fv.dtype, ref_dev, fill))
+            slots.append(
+                _CarrySlot(key, tuple(fv.shape), dtype or fv.dtype, ref_dev, fill)
+            )
 
         def scalar_slot(key, dtype=None):
             slots.append(_CarrySlot(key, (), dtype or ref_dt, ref_dev, 0.0))
@@ -181,6 +186,10 @@ class CompiledProgram:
         for nid in self.reduce_nids:
             kind = g.node(nid).params["kind"]
             cid = g.node(nid).inputs[0]
+            # min/max accumulate +-inf, so their slots must be float even for
+            # integer sources (e.g. spike-count buffers); the recorded result
+            # is then float like torch.minimum(int, int) promoted through us.
+            acc_dtype = torch.promote_types(mval[cid].dtype, torch.float32)
             if kind in ("mean", "sum"):
                 val_slot(f"{nid}:sum", cid)
                 if kind == "mean":
@@ -190,9 +199,9 @@ class CompiledProgram:
             elif kind == "last":
                 val_slot(f"{nid}:val", cid)
             elif kind == "min":
-                val_slot(f"{nid}:val", cid, fill=float("inf"))
+                val_slot(f"{nid}:val", cid, fill=float("inf"), dtype=acc_dtype)
             elif kind == "max":
-                val_slot(f"{nid}:val", cid, fill=float("-inf"))
+                val_slot(f"{nid}:val", cid, fill=float("-inf"), dtype=acc_dtype)
             elif kind == "first":
                 val_slot(f"{nid}:val", cid)
                 scalar_slot(f"{nid}:has")
@@ -297,7 +306,8 @@ class CompiledProgram:
             old = carry[f"{nid}:val"]
             if isinstance(w, Tensor):
                 big = float("inf") if kind == "min" else float("-inf")
-                cand = torch.where(w > 0, x, torch.full_like(x, big))
+                xf = x.to(old.dtype)  # +-inf fill needs a float candidate too
+                cand = torch.where(w > 0, xf, torch.full_like(xf, big))
             else:
                 cand = x
             carry[f"{nid}:val"] = (
@@ -392,9 +402,11 @@ class CompiledProgram:
         elif kind in ("last", "first", "min", "max"):
             r = carry[f"{nid}:val"]
         elif kind == "var":
-            r = carry[f"{nid}:m2"] / torch.clamp(carry[f"{nid}:cnt"], min=1)
+            corr = node.params.get("correction", 1)
+            r = carry[f"{nid}:m2"] / torch.clamp(carry[f"{nid}:cnt"] - corr, min=1)
         elif kind == "std":
-            var = carry[f"{nid}:m2"] / torch.clamp(carry[f"{nid}:cnt"], min=1)
+            corr = node.params.get("correction", 1)
+            var = carry[f"{nid}:m2"] / torch.clamp(carry[f"{nid}:cnt"] - corr, min=1)
             r = torch.sqrt(torch.clamp(var, min=0))
         else:
             raise ValueError(f"unknown reduce {kind!r}")
