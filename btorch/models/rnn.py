@@ -1,7 +1,7 @@
 from abc import abstractmethod
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from functools import partial
-from typing import Any, overload
+from typing import Any, NamedTuple, overload
 
 import torch
 import torch.nn as nn
@@ -9,12 +9,11 @@ from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
 from ..monitor import (
-    EagerFrame,
-    Expr,
     Recorder,
     RecordSpec,
     Resolver,
     TargetRef,
+    split_channel_specs,
 )
 from . import base, environ, synapse
 from .base import StepMode
@@ -60,35 +59,23 @@ def _chunk_to_cpu(z, states: dict):
     return to_cpu(z), {k: to_cpu(v) for k, v in states.items()}
 
 
-def _split_state_specs(
-    spec: RecordSpec | None,
-) -> tuple[list[str] | None, list]:
-    """Split ``update_state_names`` into legacy names + recorder specs.
+class _RecordState(NamedTuple):
+    """Recording accumulator threaded functionally through the chunk loop.
 
-    Plain dotted strings (and ``None`` = all memories) flow through the classic
-    ``stacked_states`` path unchanged; :class:`~btorch.monitor.Expr` /
-    ``grad(...)`` / ``{name: expr}`` specs route to the recording engine and are
-    read via :meth:`get_records`.
-
-    A top-level ``{name: expr}`` mapping is ALL-recorder: every value routes to
-    the engine (plain-string values become ``col(...)``), so the legacy
-    ``stacked_states`` channel is switched off entirely.  Use a mixed *list* to
-    feed both channels at once.
-
-    Returns ``(legacy_names, record_specs)`` where ``legacy_names`` is
-    ``None`` (all memories), else a list of dotted strings; and ``record_specs``
-    is a list of engine specs.
+    Created per call and only ever REPLACED (never mutated in place): a
+    discarded grad-checkpoint recompute must not double-append into
+    lists a previous evaluation already filled.
     """
-    if spec is None:
-        return None, []
-    if isinstance(spec, (str, Expr)):
-        spec = [spec]
-    if isinstance(spec, Mapping):
-        return [], [spec]
-    legacy_names, record_specs = [], []
-    for entry in spec:
-        (legacy_names if isinstance(entry, str) else record_specs).append(entry)
-    return legacy_names, record_specs
+
+    carry: dict | None
+    buffers: dict[int, list]
+    grads: list
+
+    def merged(self, other: "_RecordState") -> "_RecordState":
+        bufs = {k: [*v] for k, v in self.buffers.items()}
+        for k, v in other.buffers.items():
+            bufs.setdefault(k, []).extend(v)
+        return _RecordState(other.carry, bufs, [*self.grads, *other.grads])
 
 
 class RecurrentNNAbstract(base.MemoryModule):
@@ -114,7 +101,8 @@ class RecurrentNNAbstract(base.MemoryModule):
     :mod:`btorch.monitor`) are read via :meth:`get_records`.  Strings and
     Exprs mix freely in one list.  A top-level ``{name: expr}`` mapping routes
     EVERYTHING through the recorder and disables ``stacked_states`` for that
-    network (see :func:`_split_state_specs`).  Value/reduction monitors compose
+    network (see :func:`btorch.monitor.split_channel_specs`).  Value/reduction
+    monitors compose
     with ``cudagraph=True`` (their fold is captured inside the chunk graph),
     single-chunk only; ``grad(...)`` monitors are refused there.
     """
@@ -134,7 +122,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         # `update_state_names` is the single recording spec. Dotted strings (and
         # None = all memories) use the classic stacked_states path; Expr /
         # grad(...) / {name: expr} specs use the recording engine (get_records()).
-        legacy_names, record_specs = _split_state_specs(update_state_names)
+        legacy_names, record_specs = split_channel_specs(update_state_names)
         self.step_mode = step_mode
         self.update_state_names = legacy_names
         self.unroll = unroll
@@ -174,6 +162,19 @@ class RecurrentNNAbstract(base.MemoryModule):
         ``allow_buffer`` argument override this alongside :meth:`_state_module`.
         """
         return False
+
+    def _legacy_states(self):
+        """The legacy stacked_states channel: collect this step's states.
+
+        Both recording channels resolve targets through the same
+        :meth:`_state_module` / :meth:`_state_allow_buffer` pair, so they can
+        never disagree on what is collected.
+        """
+        return filter_hidden_states(
+            self._state_module(),
+            self.update_state_names,
+            allow_buffer=self._state_allow_buffer(),
+        )
 
     def _detect_loop_args(self, *args: Any) -> tuple[int, tuple[int, ...]]:
         """Infer ``(T, loop_args)`` from the first positional argument.
@@ -217,7 +218,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         loop_args: Sequence[int] = (0,),
         record_carry: Any = None,
         **kwargs: Any,
-    ) -> tuple[list[Tensor], dict[str, list[Tensor]], tuple[Any, dict, list]]:
+    ) -> tuple[list[Tensor], dict[str, list[Tensor]], _RecordState]:
         """Inner loop for processing a small chunk.
 
         Returns ``(z_seq, states_seq, record_state)`` where ``record_state`` is
@@ -237,13 +238,12 @@ class RecurrentNNAbstract(base.MemoryModule):
         T = args[loop_args[0]].shape[0]
         z_seq = []
         states_seq = {}
-        carry = record_carry
-        record_buffers: dict[int, list] = {}
-        grad_snapshots: list = []
 
         fold_records = self._records_active
         capture_grad = self._record_has_grad
         grad_refs = self._record_grad_refs
+        rec = _RecordState(record_carry, {}, [])
+        carry = rec.carry
         loop_positions = tuple(loop_args)
         static_args = list(args)
         for t in range(T):
@@ -254,14 +254,15 @@ class RecurrentNNAbstract(base.MemoryModule):
             for k, v in states.items():
                 states_seq.setdefault(k, []).append(v)
             if fold_records:
-                snapshot = self._state_resolver.snapshot()
-                carry, stack = self._recorder.step_kernel(carry, EagerFrame(snapshot))
+                frame = self._state_resolver.frame()
+                carry, stack = self._recorder.step_kernel(carry, frame)
                 for node_id, value in stack.items():
-                    record_buffers.setdefault(node_id, []).append(value)
+                    rec.buffers.setdefault(node_id, []).append(value)
                 if capture_grad:
-                    grad_snapshots.append([snapshot[ref] for ref in grad_refs])
+                    values = frame.values()
+                    rec.grads.append([values[ref] for ref in grad_refs])
 
-        return z_seq, states_seq, (carry, record_buffers, grad_snapshots)
+        return z_seq, states_seq, _RecordState(carry, rec.buffers, rec.grads)
 
     @partial(torch.compiler.disable, recursive=False)
     def _run_chunk_steps(
@@ -271,30 +272,26 @@ class RecurrentNNAbstract(base.MemoryModule):
 
         This function is NOT checkpointed itself, but is the body of the
         checkpoint.  It threads ``record_carry`` across blocks and returns the
-        accumulated ``(carry, record_buffers, grad_snapshots)``.
+        accumulated :class:`_RecordState`.
         """
         chunk_z = []
         chunk_states = {}
-        carry = record_carry
-        record_buffers: dict[int, list] = {}
-        grad_snapshots: list = []
+        rec = _RecordState(record_carry, {}, [])
 
         for sub_args in _split_loop_args(chunk_args, loop_args, unroll_size):
-            z_sub, states_sub, (carry, buffers_sub, grads_sub) = self._run_unroll_block(
+            z_sub, states_sub, sub_rec = self._run_unroll_block(
                 *sub_args,
                 loop_args=loop_args,
-                record_carry=carry,
+                record_carry=rec.carry,
                 **kwargs,
             )
 
             chunk_z.extend(z_sub)
             for k, v in states_sub.items():
                 chunk_states.setdefault(k, []).extend(v)
-            for node_id, values in buffers_sub.items():
-                record_buffers.setdefault(node_id, []).extend(values)
-            grad_snapshots.extend(grads_sub)
+            rec = rec.merged(sub_rec)
 
-        return chunk_z, chunk_states, (carry, record_buffers, grad_snapshots)
+        return chunk_z, chunk_states, rec
 
     def _checkpointed_large_chunk(
         self,
@@ -303,7 +300,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         unroll_size=1,
         record_carry=None,
         **kwargs: Any,
-    ) -> tuple[list[Tensor], dict[str, list[Tensor]], tuple[Any, dict, list]]:
+    ) -> tuple[list[Tensor], dict[str, list[Tensor]], _RecordState]:
         memories = named_hidden_states(self)
         env = environ.all()
 
@@ -387,10 +384,10 @@ class RecurrentNNAbstract(base.MemoryModule):
 
         all_z_list = []
         all_states_lists = {}
-        # Streaming record carry, threaded across chunks (see _run_unroll_block).
-        record_carry = self._init_record_carry() if self._records_active else None
-        record_buffers: dict[int, list] = {}
-        grad_snapshots: list = []
+        # Streaming record state, threaded across chunks (see _run_unroll_block).
+        rec = _RecordState(
+            self._init_record_carry() if self._records_active else None, {}, []
+        )
 
         # ------------------------------------------------------------------
         # Outer Loop: Large Chunks (Checkpointing & CPU Offloading)
@@ -401,20 +398,18 @@ class RecurrentNNAbstract(base.MemoryModule):
                 if use_checkpoint
                 else self._run_chunk_steps
             )
-            z_chunk, states_chunk, (record_carry, buffers_chunk, grads_chunk) = process(
+            z_chunk, states_chunk, sub_rec = process(
                 *chunk_args,
                 loop_args=loop_args,
                 unroll_size=unroll_size,
-                record_carry=record_carry,
+                record_carry=rec.carry,
                 **kwargs,
             )
 
             if self.cpu_offload:
                 z_chunk, states_chunk = _chunk_to_cpu(z_chunk, states_chunk)
             _append_chunk(all_z_list, all_states_lists, z_chunk, states_chunk)
-            for node_id, values in buffers_chunk.items():
-                record_buffers.setdefault(node_id, []).extend(values)
-            grad_snapshots.extend(grads_chunk)
+            rec = rec.merged(sub_rec)
 
         # Stack the legacy update_state_names channel.
         stacked_outputs = torch.stack(all_z_list, dim=0)
@@ -422,7 +417,7 @@ class RecurrentNNAbstract(base.MemoryModule):
 
         # Recording engine: finalise the streamed carry + materialise buffers.
         if self._records_active:
-            self._finalize_records(record_carry, record_buffers, grad_snapshots, T)
+            self._finalize_records(rec.carry, rec.buffers, rec.grads, T)
 
         return (stacked_outputs, stacked_states)
 
@@ -445,7 +440,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         so ``finalize`` sees the whole sequence.
         """
         carry = self._init_record_carry() if self._records_active else None
-        z_chunk, states_chunk, (carry, record_buffers, _grads) = self._run_chunk_steps(
+        z_chunk, states_chunk, rec = self._run_chunk_steps(
             *chunk_args,
             loop_args=loop_args,
             unroll_size=unroll_size,
@@ -455,7 +450,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         stacked_z = torch.stack(z_chunk, dim=0)
         stacked_states = {k: torch.stack(v, dim=0) for k, v in states_chunk.items()}
         records = (
-            self._recorder.finalize(carry, record_buffers)
+            self._recorder.finalize(rec.carry, rec.buffers)
             if self._records_active
             else {}
         )
@@ -595,7 +590,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         Uses the current state buffers as shape/dtype/device examples, so it must
         run after ``init_state``/``reset`` (state exists by the first forward).
         """
-        example = EagerFrame(self._state_resolver.snapshot())
+        example = self._state_resolver.frame()
         return self._recorder.init_carry(example)
 
     def _finalize_records(
@@ -713,11 +708,7 @@ def make_rnn(
                 self, *args: Any, **kwargs: Any
             ) -> tuple[Any, dict[str, Tensor]]:
                 out = self.rnn_cell(*args, **kwargs)
-                states = filter_hidden_states(
-                    self.rnn_cell,
-                    self.update_state_names,
-                    allow_buffer=self.allow_buffer,
-                )
+                states = self._legacy_states()
                 return out, states
 
         RNNWrapped.__name__ = (
@@ -788,9 +779,7 @@ class RecurrentNN(RecurrentNNAbstract):
             x_syn = self.syn_inp_module(x_syn)
         z = self.neuron(self.synapse.psc + x)
         _ = self.synapse(z if x_syn is None else z + x_syn)
-        states = filter_hidden_states(
-            self, self.update_state_names, allow_buffer=self.allow_buffer
-        )
+        states = self._legacy_states()
 
         return z, states
 
@@ -910,9 +899,7 @@ class ApicalRecurrentNN(RecurrentNN):
         if self.synapse_apical is not None:
             _ = self.synapse_apical(z if x_syn is None else z + x_syn)
 
-        states = filter_hidden_states(
-            self, self.update_state_names, allow_buffer=self.allow_buffer
-        )
+        states = self._legacy_states()
         return z, states
 
 

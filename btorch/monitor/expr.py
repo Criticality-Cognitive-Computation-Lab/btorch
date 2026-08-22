@@ -30,6 +30,18 @@ _GRAD_MSG = (
 )
 
 
+def _make_binop(op: str, swap: bool = False):
+    """Binary-dunder factory: build an Elementwise with BOTH operands
+    grad-guarded (``swap`` puts the coerced operand first, for ``r*``)."""
+
+    def fn(self, o) -> Expr:
+        self._no_compose()
+        other = self._operand(o)
+        return Elementwise(op, (other, self) if swap else (self, other))
+
+    return fn
+
+
 class Expr:
     """Base expression node.
 
@@ -56,37 +68,15 @@ class Expr:
         return e
 
     # -- arithmetic (elementwise, streamable) -----------------------------
-    def __add__(self, o) -> Expr:
-        self._no_compose()
-        return Elementwise("add", (self, self._operand(o)))
-
-    def __radd__(self, o) -> Expr:
-        self._no_compose()
-        return Elementwise("add", (self._operand(o), self))
-
-    def __sub__(self, o) -> Expr:
-        self._no_compose()
-        return Elementwise("sub", (self, self._operand(o)))
-
-    def __rsub__(self, o) -> Expr:
-        self._no_compose()
-        return Elementwise("sub", (self._operand(o), self))
-
-    def __mul__(self, o) -> Expr:
-        self._no_compose()
-        return Elementwise("mul", (self, self._operand(o)))
-
-    def __rmul__(self, o) -> Expr:
-        self._no_compose()
-        return Elementwise("mul", (self._operand(o), self))
-
-    def __truediv__(self, o) -> Expr:
-        self._no_compose()
-        return Elementwise("div", (self, self._operand(o)))
-
-    def __rtruediv__(self, o) -> Expr:
-        self._no_compose()
-        return Elementwise("div", (self._operand(o), self))
+    # generated via _binop below: every operand (either side) is grad-guarded
+    __add__ = _make_binop("add")
+    __radd__ = _make_binop("add", swap=True)
+    __sub__ = _make_binop("sub")
+    __rsub__ = _make_binop("sub", swap=True)
+    __mul__ = _make_binop("mul")
+    __rmul__ = _make_binop("mul", swap=True)
+    __truediv__ = _make_binop("div")
+    __rtruediv__ = _make_binop("div", swap=True)
 
     def __neg__(self) -> Expr:
         self._no_compose()
