@@ -2,7 +2,7 @@ channels:
   - conda-forge
   - pyg
 dependencies:
-  - python=3.14.6
+  - python=3.14.7
   - pytorch-gpu
   - torchvision
   - spikingjelly
@@ -21,7 +21,7 @@ dependencies:
   - xarray
   - h5py
   - hdf5plugin
-  - pandas>=3.0.3 # assume CoW
+  - pandas>=3.0.5 # assume CoW
   - numba
   - seaborn
   # dev
