@@ -1,4 +1,4 @@
-from typing import Literal, get_args
+from typing import Any, Literal, get_args
 
 import numpy as np
 import pandas as pd
@@ -8,6 +8,9 @@ import torch.nn as nn
 from jaxtyping import Float
 from torch import Tensor
 
+from .. import config as btorch_config
+from .._sparse_config import SparseBackendConfig, TritonSparseConfig
+from ._sparse_preprocess import preprocess_sparse
 from .base import ParamBufferMixin
 from .constrain import HasConstraint
 
@@ -17,17 +20,21 @@ try:
 except ImportError:
     spmm = None
 
-SparseBackend = Literal["native", "torch_sparse"]
+SparseBackend = Literal["native", "torch_sparse", "triton"]
 
 
 def _resolve_sparse_backend(backend: str | None) -> SparseBackend:
     if backend is None:
-        return "torch_sparse" if spmm is not None else "native"  # type: ignore[return-value]
+        backend = btorch_config.sparse.selected
+        if backend is None:
+            default = "torch_sparse" if spmm is not None else "native"
+            return default  # type: ignore[return-value]
 
     backend = backend.lower()
     if backend not in get_args(SparseBackend):
         raise ValueError(
-            f"sparse_backend must be 'native' or 'torch_sparse', got '{backend}'."
+            "sparse_backend must be 'native', 'torch_sparse', or 'triton', "
+            f"got '{backend}'."
         )
     if backend == "torch_sparse" and spmm is None:
         import warnings
@@ -40,11 +47,24 @@ def _resolve_sparse_backend(backend: str | None) -> SparseBackend:
     return backend  # type: ignore[return-value]
 
 
-def available_sparse_backends() -> list[SparseBackend]:
-    """Return the sparse backends that can be used in this environment."""
+def available_sparse_backends(
+    *, include_experimental: bool = False
+) -> list[SparseBackend]:
+    """Return sparse backends available to the standard test/application path.
+
+    The Triton event-driven backend is opt-in while its hardware-specific path
+    is being evaluated, so it is only included when ``include_experimental`` is
+    true and Triton can be imported.
+    """
+
     backends = list(get_args(SparseBackend))
     if spmm is None and "torch_sparse" in backends:
         backends.remove("torch_sparse")
+    if "triton" in backends:
+        from ._sparse_triton import is_triton_available
+
+        if not include_experimental or not is_triton_available():
+            backends.remove("triton")
     return backends
 
 
@@ -234,6 +254,7 @@ class BaseSparseConn(nn.Module):
         conn: scipy.sparse.sparray,
         bias=None,
         sparse_backend: SparseBackend | None = None,
+        sparse_config: SparseBackendConfig | dict[str, Any] | None = None,
         device=None,
         dtype=None,
     ):
@@ -241,10 +262,17 @@ class BaseSparseConn(nn.Module):
         Args:
             conn (scipy.sparse.sparray): Sparse connection matrix (num_src, num_dst).
             bias (Tensor, optional): Optional bias vector of shape (num_dst,).
-            sparse_backend: "native" or "torch_sparse".
+            sparse_backend: "native", "torch_sparse", or "triton".
+            sparse_config: Optional backend-specific configuration override.
         """
         super().__init__()
         self.sparse_backend = _resolve_sparse_backend(sparse_backend)
+        self.sparse_config = btorch_config.sparse.resolve(
+            self.sparse_backend, sparse_config
+        )
+        self._prepared_sparse_weight: torch.Tensor | None = None
+        self._sparse_prepare_depth = 0
+        self._triton_workspace = None
         if not isinstance(conn, scipy.sparse.coo_array):
             conn = conn.tocoo()
         # transpose A to compute x @ A via A^T @ x^T.
@@ -280,13 +308,130 @@ class BaseSparseConn(nn.Module):
             self.sparse_tensor = native_sparse
         else:
             self.sparse_tensor = None
+        if self.sparse_backend == "triton":
+            self._rebuild_triton_layout()
+            self.register_buffer(
+                "_triton_packed_weight_buffer",
+                torch.empty_like(value),
+                persistent=False,
+            )
         self.bias = nn.Parameter(bias) if bias is not None else None
         self._init_weights(value)
 
     def _apply(self, fn, recurse=True):
+        self._prepared_sparse_weight = None
+        self._sparse_prepare_depth = 0
+        self._triton_workspace = None
         if self.sparse_tensor is not None:
             self.sparse_tensor = fn(self.sparse_tensor)
         return super()._apply(fn, recurse=recurse)
+
+    def _rebuild_triton_layout(self) -> None:
+        if not isinstance(self.sparse_config, TritonSparseConfig):
+            raise TypeError("The triton backend requires TritonSparseConfig.")
+        layout = preprocess_sparse(
+            self.indices,
+            self.shape,
+            config=self.sparse_config,
+        )
+        tensors = {
+            "_triton_source_indptr": layout.source_indptr,
+            "_triton_packed_source": layout.packed_source,
+            "_triton_packed_destination": layout.packed_destination,
+            "_triton_edge_permutation": layout.edge_permutation,
+            "_triton_task_indptr": layout.task_indptr,
+            "_triton_task_source_ids": layout.task_source_ids,
+            "_triton_task_hashable": layout.task_hashable,
+        }
+        for name, tensor in tensors.items():
+            if name in self._buffers:
+                setattr(self, name, tensor)
+            else:
+                self.register_buffer(name, tensor, persistent=False)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        self._prepared_sparse_weight = None
+        self._sparse_prepare_depth = 0
+        if self.sparse_backend == "triton":
+            self._rebuild_triton_layout()
+
+    def _triton_workspace_is_ready(
+        self, batch_size: int, weight: torch.Tensor
+    ) -> bool:
+        workspace = self._triton_workspace
+        if workspace is None:
+            return False
+        task_count = max(0, self._triton_task_indptr.numel() - 1)
+        queue_capacity = max(1, batch_size * task_count)
+        hash_capacity = self.sparse_config.hash_capacity
+        if not self.sparse_config.hash:
+            hash_capacity = 1
+        return (
+            workspace.queue_capacity >= queue_capacity
+            and workspace.direct_queue.device == weight.device
+            and workspace.hash_values.dtype == weight.dtype
+            and workspace.hash_keys.shape[1] == hash_capacity
+        )
+
+    def prepare_sparse(self, batch_size: int | None = None) -> None:
+        """Prepare values reused by repeated calls in one multi-step run."""
+
+        if self.sparse_backend != "triton":
+            return
+        if self._prepared_sparse_weight is None:
+            effective_weight = self._get_effective_weight()
+            packed_weight = effective_weight.index_select(
+                0, self._triton_edge_permutation
+            ).contiguous()
+            if torch.is_grad_enabled():
+                self._prepared_sparse_weight = packed_weight
+            else:
+                self._triton_packed_weight_buffer.copy_(packed_weight)
+                self._prepared_sparse_weight = self._triton_packed_weight_buffer
+        prepared_weight = self._prepared_sparse_weight
+        if batch_size is not None and not self._triton_workspace_is_ready(
+            batch_size, prepared_weight
+        ):
+            from ._sparse_triton import ensure_triton_workspace
+
+            task_count = max(0, self._triton_task_indptr.numel() - 1)
+            self._triton_workspace = ensure_triton_workspace(
+                self._triton_workspace,
+                queue_capacity=max(1, batch_size * task_count),
+                device=prepared_weight.device,
+                dtype=prepared_weight.dtype,
+                config=self.sparse_config,
+            )
+        self._sparse_prepare_depth += 1
+
+    def finish_sparse(self) -> None:
+        """Release references retained for one multi-step run."""
+
+        if self.sparse_backend != "triton":
+            return
+        if self._sparse_prepare_depth <= 0:
+            raise RuntimeError("finish_sparse called without prepare_sparse.")
+        self._sparse_prepare_depth -= 1
+        if self._sparse_prepare_depth == 0:
+            self._prepared_sparse_weight = None
 
     def _init_weights(self, value: torch.Tensor):
         """Abstract method to initialize layer-specific weights.
@@ -339,12 +484,12 @@ class BaseSparseConn(nn.Module):
         if no_batch:
             x = x[None, :]
 
-        effective_value = self._get_effective_weight()
-        if effective_value.device != x.device or effective_value.dtype != x.dtype:
-            effective_value = effective_value.to(device=x.device, dtype=x.dtype)
         leading_shape = x.shape[:-1]
         x_2d = x.reshape(-1, x.shape[-1])
         if self.sparse_backend == "native":
+            effective_value = self._get_effective_weight()
+            if effective_value.device != x.device or effective_value.dtype != x.dtype:
+                effective_value = effective_value.to(device=x.device, dtype=x.dtype)
             sp = self.sparse_tensor
             sp = torch.sparse_coo_tensor(
                 indices=sp.indices(),
@@ -354,9 +499,49 @@ class BaseSparseConn(nn.Module):
             )
             # (A^T @ x^T)^T == x @ A
             out = torch.sparse.mm(sp, x_2d.T).T
-        else:
+        elif self.sparse_backend == "torch_sparse":
+            effective_value = self._get_effective_weight()
+            if effective_value.device != x.device or effective_value.dtype != x.dtype:
+                effective_value = effective_value.to(device=x.device, dtype=x.dtype)
             out = spmm(self.indices, effective_value, *self.shape[::-1], x_2d.T)
             out = out.T
+        else:
+            from ._sparse_triton import ensure_triton_workspace, triton_sparse_mm
+
+            packed_weight = self._prepared_sparse_weight
+            if packed_weight is None:
+                effective_value = self._get_effective_weight()
+                if (
+                    effective_value.device != x.device
+                    or effective_value.dtype != x.dtype
+                ):
+                    effective_value = effective_value.to(
+                        device=x.device, dtype=x.dtype
+                    )
+                packed_weight = effective_value.index_select(
+                    0, self._triton_edge_permutation
+                ).contiguous()
+            if not self._triton_workspace_is_ready(x_2d.shape[0], packed_weight):
+                task_count = max(0, self._triton_task_indptr.numel() - 1)
+                self._triton_workspace = ensure_triton_workspace(
+                    self._triton_workspace,
+                    queue_capacity=max(1, x_2d.shape[0] * task_count),
+                    device=x_2d.device,
+                    dtype=x_2d.dtype,
+                    config=self.sparse_config,
+                )
+            out = triton_sparse_mm(
+                x_2d.contiguous(),
+                packed_weight,
+                packed_source=self._triton_packed_source,
+                packed_destination=self._triton_packed_destination,
+                task_indptr=self._triton_task_indptr,
+                task_source_ids=self._triton_task_source_ids,
+                task_hashable=self._triton_task_hashable,
+                config=self.sparse_config,
+                n_destinations=self.out_features,
+                workspace=self._triton_workspace,
+            )
         out = out.reshape(*leading_shape, self.out_features)
         if no_batch:
             out = out[0, :]
@@ -389,6 +574,7 @@ class SparseConn(BaseSparseConn, HasConstraint):
         bias=None,
         enforce_dale: bool = True,
         sparse_backend: SparseBackend | None = None,
+        sparse_config: SparseBackendConfig | dict[str, Any] | None = None,
         device=None,
         dtype=None,
     ):
@@ -397,13 +583,15 @@ class SparseConn(BaseSparseConn, HasConstraint):
             conn (scipy.sparse.sparray): Sparse connection matrix (num_src, num_dst).
             bias (Tensor, optional): Optional bias vector of shape (num_dst,).
             enforce_dale (bool): If True, enforces Dale's law via fixed sign and ReLU.
-            sparse_backend: "native" or "torch_sparse".
+            sparse_backend: "native", "torch_sparse", or "triton".
+            sparse_config: Optional backend-specific configuration override.
         """
         self.enforce_dale = enforce_dale
         super().__init__(
             conn,
             bias=bias,
             sparse_backend=sparse_backend,
+            sparse_config=sparse_config,
             device=device,
             dtype=dtype,
         )
@@ -452,6 +640,7 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
         enforce_dale: bool = True,
         bias: torch.Tensor | None = None,
         sparse_backend: SparseBackend | None = None,
+        sparse_config: SparseBackendConfig | dict[str, Any] | None = None,
         device=None,
         dtype=None,
         persist_initial_weight: bool = False,
@@ -464,7 +653,8 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
             group IDs (starting from 1).
             enforce_dale (bool): If True, applies ReLU to enforce Dale's law.
             bias (Tensor, optional): Optional bias of shape (num_dst,).
-            sparse_backend: "native" or "torch_sparse".
+            sparse_backend: "native", "torch_sparse", or "triton".
+            sparse_config: Optional backend-specific configuration override.
             persist_initial_weight: If True, saves ``initial_weight`` in
                 ``state_dict`` for checkpoint reproducibility.
         """
@@ -480,6 +670,7 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
             conn,
             bias=bias,
             sparse_backend=sparse_backend,
+            sparse_config=sparse_config,
             device=device,
             dtype=dtype,
         )
@@ -550,6 +741,7 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
         enforce_dale: bool = True,
         bias: torch.Tensor | None = None,
         sparse_backend: SparseBackend | None = None,
+        sparse_config: SparseBackendConfig | dict[str, Any] | None = None,
         device=None,
         dtype=None,
         persist_initial_weight: bool = False,
@@ -562,7 +754,8 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
             receptor_type_index: DataFrame mapping receptor indices to receptor types
             enforce_dale: If True, applies ReLU to enforce Dale's law
             bias: Optional bias of shape (num_dst,)
-            sparse_backend: "native" or "torch_sparse"
+            sparse_backend: "native", "torch_sparse", or "triton".
+            sparse_config: Optional backend-specific configuration override.
             device: Device to place tensors on
             dtype: Data type for tensors
             persist_initial_weight: If True, includes ``initial_weight`` in
@@ -577,6 +770,7 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
             enforce_dale=enforce_dale,
             bias=bias,
             sparse_backend=sparse_backend,
+            sparse_config=sparse_config,
             device=device,
             dtype=dtype,
             persist_initial_weight=persist_initial_weight,
