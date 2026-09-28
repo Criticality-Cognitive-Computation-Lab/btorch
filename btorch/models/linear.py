@@ -335,7 +335,6 @@ class BaseSparseConn(nn.Module):
             config=self.sparse_config,
         )
         tensors = {
-            "_triton_source_indptr": layout.source_indptr,
             "_triton_packed_source": layout.packed_source,
             "_triton_packed_destination": layout.packed_destination,
             "_triton_edge_permutation": layout.edge_permutation,
@@ -373,24 +372,6 @@ class BaseSparseConn(nn.Module):
         if self.sparse_backend == "triton":
             self._rebuild_triton_layout()
 
-    def _triton_workspace_is_ready(
-        self, batch_size: int, weight: torch.Tensor
-    ) -> bool:
-        workspace = self._triton_workspace
-        if workspace is None:
-            return False
-        task_count = max(0, self._triton_task_indptr.numel() - 1)
-        queue_capacity = max(1, batch_size * task_count)
-        hash_capacity = self.sparse_config.hash_capacity
-        if not self.sparse_config.hash:
-            hash_capacity = 1
-        return (
-            workspace.queue_capacity >= queue_capacity
-            and workspace.direct_queue.device == weight.device
-            and workspace.hash_values.dtype == weight.dtype
-            and workspace.hash_keys.shape[1] == hash_capacity
-        )
-
     def prepare_sparse(self, batch_size: int | None = None) -> None:
         """Prepare values reused by repeated calls in one multi-step run."""
 
@@ -407,8 +388,8 @@ class BaseSparseConn(nn.Module):
                 self._triton_packed_weight_buffer.copy_(packed_weight)
                 self._prepared_sparse_weight = self._triton_packed_weight_buffer
         prepared_weight = self._prepared_sparse_weight
-        if batch_size is not None and not self._triton_workspace_is_ready(
-            batch_size, prepared_weight
+        if batch_size is not None and (
+            self._sparse_prepare_depth == 0 or self._triton_workspace is None
         ):
             from ._sparse_triton import ensure_triton_workspace
 
@@ -486,10 +467,11 @@ class BaseSparseConn(nn.Module):
 
         leading_shape = x.shape[:-1]
         x_2d = x.reshape(-1, x.shape[-1])
-        if self.sparse_backend == "native":
+        if self.sparse_backend != "triton":
             effective_value = self._get_effective_weight()
             if effective_value.device != x.device or effective_value.dtype != x.dtype:
                 effective_value = effective_value.to(device=x.device, dtype=x.dtype)
+        if self.sparse_backend == "native":
             sp = self.sparse_tensor
             sp = torch.sparse_coo_tensor(
                 indices=sp.indices(),
@@ -500,16 +482,14 @@ class BaseSparseConn(nn.Module):
             # (A^T @ x^T)^T == x @ A
             out = torch.sparse.mm(sp, x_2d.T).T
         elif self.sparse_backend == "torch_sparse":
-            effective_value = self._get_effective_weight()
-            if effective_value.device != x.device or effective_value.dtype != x.dtype:
-                effective_value = effective_value.to(device=x.device, dtype=x.dtype)
             out = spmm(self.indices, effective_value, *self.shape[::-1], x_2d.T)
             out = out.T
         else:
             from ._sparse_triton import ensure_triton_workspace, triton_sparse_mm
 
+            prepared = self._prepared_sparse_weight is not None
             packed_weight = self._prepared_sparse_weight
-            if packed_weight is None:
+            if not prepared:
                 effective_value = self._get_effective_weight()
                 if (
                     effective_value.device != x.device
@@ -521,7 +501,7 @@ class BaseSparseConn(nn.Module):
                 packed_weight = effective_value.index_select(
                     0, self._triton_edge_permutation
                 ).contiguous()
-            if not self._triton_workspace_is_ready(x_2d.shape[0], packed_weight):
+            if not prepared or self._triton_workspace is None:
                 task_count = max(0, self._triton_task_indptr.numel() - 1)
                 self._triton_workspace = ensure_triton_workspace(
                     self._triton_workspace,

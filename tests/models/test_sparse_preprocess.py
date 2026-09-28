@@ -14,6 +14,28 @@ from btorch.models.linear import SparseConn
 from btorch.models.rnn import make_rnn
 
 
+class _SparseCell(torch.nn.Module):
+    def __init__(self, connection):
+        super().__init__()
+        self.connection = connection
+
+    def forward(self, x):
+        return self.connection(x)
+
+
+def _small_cuda_connection() -> tuple[SparseConn, torch.Tensor]:
+    dense_weight = torch.tensor(
+        [[1.0, 0.0, 2.0], [0.0, -1.0, 3.0], [4.0, 0.0, 0.0]]
+    )
+    connection = SparseConn(
+        scipy.sparse.coo_array(dense_weight.numpy()),
+        enforce_dale=False,
+        sparse_backend="triton",
+        device="cuda",
+    )
+    return connection, dense_weight
+
+
 def _internal_coo(matrix: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
     """Return the exact internal ``(destination, source)`` COO representation."""
 
@@ -198,24 +220,8 @@ def test_triton_sparse_forward_and_backward(reorder, block, hash_enabled):
 def test_triton_sparse_runs_inside_existing_multi_step_wrapper():
     """The existing RNN wrapper prepares and reuses the Triton workspace."""
 
-    class SparseCell(torch.nn.Module):
-        def __init__(self, connection):
-            super().__init__()
-            self.connection = connection
-
-        def forward(self, x):
-            return self.connection(x)
-
-    dense_weight = torch.tensor(
-        [[1.0, 0.0, 2.0], [0.0, -1.0, 3.0], [4.0, 0.0, 0.0]]
-    )
-    connection = SparseConn(
-        scipy.sparse.coo_array(dense_weight.numpy()),
-        enforce_dale=False,
-        sparse_backend="triton",
-        device="cuda",
-    )
-    rnn = make_rnn(SparseCell, unroll=2)(connection)
+    connection, dense_weight = _small_cuda_connection()
+    rnn = make_rnn(_SparseCell, unroll=2)(connection)
     x = torch.tensor(
         [
             [[1.0, 0.0, 1.0], [0.0, 2.0, 0.0]],
@@ -240,24 +246,8 @@ def test_triton_sparse_runs_inside_existing_multi_step_wrapper():
 def test_triton_prepared_fast_path_is_cuda_graph_capturable(monkeypatch):
     """Graph warmup/capture/replay reuse one packed weight and workspace."""
 
-    class SparseCell(torch.nn.Module):
-        def __init__(self, connection):
-            super().__init__()
-            self.connection = connection
-
-        def forward(self, x):
-            return self.connection(x)
-
-    dense_weight = torch.tensor(
-        [[1.0, 0.0, 2.0], [0.0, -1.0, 3.0], [4.0, 0.0, 0.0]]
-    )
-    connection = SparseConn(
-        scipy.sparse.coo_array(dense_weight.numpy()),
-        enforce_dale=False,
-        sparse_backend="triton",
-        device="cuda",
-    )
-    rnn = make_rnn(SparseCell, unroll=2, cudagraph=True)(connection)
+    connection, dense_weight = _small_cuda_connection()
+    rnn = make_rnn(_SparseCell, unroll=2, cudagraph=True)(connection)
     x = torch.randn(4, 2, 3, device="cuda")
     calls = 0
     original_ensure = _sparse_triton.ensure_triton_workspace

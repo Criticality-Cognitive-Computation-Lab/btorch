@@ -426,19 +426,10 @@ def triton_sparse_mm(
     task_hashable: torch.Tensor,
     config: TritonSparseConfig,
     n_destinations: int,
-    workspace: TritonSparseWorkspace | None = None,
+    workspace: TritonSparseWorkspace,
 ) -> torch.Tensor:
     """Apply an event-driven source-major sparse matrix multiplication."""
 
-    if workspace is None:
-        queue_capacity = x.shape[0] * max(0, task_indptr.numel() - 1)
-        workspace = ensure_triton_workspace(
-            None,
-            queue_capacity=max(1, queue_capacity),
-            device=x.device,
-            dtype=x.dtype,
-            config=config,
-        )
     return _TritonSparseMM.apply(
         x,
         packed_weight,

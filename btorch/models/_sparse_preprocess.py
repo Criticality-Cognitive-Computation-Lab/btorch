@@ -14,20 +14,12 @@ from .._sparse_config import TritonSparseConfig
 class SparsePreprocessed:
     """Device-independent tensors derived from a fixed sparse topology."""
 
-    source_indptr: torch.Tensor
     packed_source: torch.Tensor
     packed_destination: torch.Tensor
     edge_permutation: torch.Tensor
     task_indptr: torch.Tensor
     task_source_ids: torch.Tensor
     task_hashable: torch.Tensor
-
-    @property
-    def task_count(self) -> int:
-        """Return the number of static edge tasks."""
-
-        return max(0, self.task_indptr.numel() - 1)
-
 
 def _chunks(values: np.ndarray, size: int) -> list[np.ndarray]:
     return [values[start : start + size] for start in range(0, len(values), size)]
@@ -121,7 +113,6 @@ def preprocess_sparse(
         return torch.as_tensor(values, dtype=dtype, device=indices.device)
 
     return SparsePreprocessed(
-        source_indptr=tensor(source_indptr, torch.int32),
         packed_source=tensor(source[packed_ids], torch.int32),
         packed_destination=tensor(destination[packed_ids], torch.int32),
         edge_permutation=tensor(packed_ids, torch.int64),

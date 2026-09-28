@@ -11,6 +11,18 @@ from . import base
 from .scale import SupportScaleState
 
 
+def _move_net(net: nn.Module, kwargs: dict[str, Any]) -> None:
+    """Move a network only when a concrete device or dtype was requested."""
+
+    move_kwargs = {
+        key: kwargs[key]
+        for key in ("device", "dtype")
+        if kwargs.get(key) is not None
+    }
+    if move_kwargs:
+        net.to(**move_kwargs)
+
+
 def init_net_state(
     net: nn.Module,
     batch_size: int | Sequence[int] | None = None,
@@ -44,13 +56,7 @@ def init_net_state(
                 )
             m.init_state(batch_size, **kwargs)
 
-    move_kwargs = {
-        key: kwargs[key]
-        for key in ("device", "dtype")
-        if kwargs.get(key) is not None
-    }
-    if move_kwargs:
-        net.to(**move_kwargs)
+    _move_net(net, kwargs)
     for m in net.modules():
         fn(m)
 
@@ -87,13 +93,7 @@ def reset_net(
                 )
             m.reset(batch_size, **kwargs)
 
-    move_kwargs = {
-        key: kwargs[key]
-        for key in ("device", "dtype")
-        if kwargs.get(key) is not None
-    }
-    if move_kwargs:
-        net.to(**move_kwargs)
+    _move_net(net, kwargs)
     for m in net.modules():
         fn(m)
 
