@@ -641,6 +641,9 @@ def _convert_sparse_layer(
     dtype,
 ) -> SparseConn | SparseConstrainedConn:
     n_receptor = len(receptor_type_index)
+    sparse_config = (
+        layer.sparse_config if sparse_backend == layer.sparse_backend else None
+    )
     src_conn = _layer_conn_coo(layer)
     persist_initial_weight = (
         layer.persist_initial_weight
@@ -662,6 +665,7 @@ def _convert_sparse_layer(
                 bias=bias_target,
                 enforce_dale=enforce_dale,
                 sparse_backend=sparse_backend,
+                sparse_config=sparse_config,
                 device=device,
                 dtype=dtype,
             )
@@ -678,6 +682,7 @@ def _convert_sparse_layer(
             enforce_dale=enforce_dale,
             bias=bias_target,
             sparse_backend=sparse_backend,
+            sparse_config=sparse_config,
             device=device,
             dtype=dtype,
             persist_initial_weight=persist_initial_weight,
@@ -733,6 +738,7 @@ def _convert_sparse_layer(
             bias=bias_target,
             enforce_dale=enforce_dale,
             sparse_backend=sparse_backend,
+            sparse_config=sparse_config,
             device=device,
             dtype=dtype,
         )
@@ -749,6 +755,7 @@ def _convert_sparse_layer(
         enforce_dale=enforce_dale,
         bias=bias_target,
         sparse_backend=sparse_backend,
+        sparse_config=sparse_config,
         device=device,
         dtype=dtype,
         persist_initial_weight=persist_initial_weight,
