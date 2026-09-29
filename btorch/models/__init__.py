@@ -17,6 +17,7 @@ from . import (
 )
 from .dlif import DBNN, DLIF, DendriticLIF
 from .neurons import alif, glif, lif, two_compartment
+from .sparse_rsnn_cuda import CyclicSparseRSNNCuda
 
 
 __all__ = [
@@ -42,4 +43,5 @@ __all__ = [
     "DendriticLIF",
     "DLIF",
     "DBNN",
+    "CyclicSparseRSNNCuda",
 ]
