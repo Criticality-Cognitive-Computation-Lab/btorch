@@ -147,3 +147,44 @@ with environ.context(dt=cfg.dt):
 | [`diff_conf`](../api/utils.md) | Compute structured diff between two configs |
 | [`get_dotkey`](../api/utils.md) | Read nested field by dot path |
 | [`set_dotkey`](../api/utils.md) | Write nested field by dot path |
+
+## Sparse Backend Configuration
+
+Sparse connections accept a per-module ``sparse_backend`` as before. A backend
+can also be selected globally; each backend owns its configuration shape:
+
+```python
+from btorch import config
+from btorch.models.linear import SparseConn
+
+triton = config.sparse.backend("triton")
+triton.reorder = True
+triton.block = True
+triton.hash = True
+
+conn = SparseConn(connectivity)
+```
+
+The Triton backend defaults to the complete optimization set. Its three switches
+are independent, and disabling all three selects the source-binned direct-atomic
+baseline. A module can override the global template without changing other
+modules:
+
+```python
+conn = SparseConn(
+    connectivity,
+    sparse_backend="triton",
+    sparse_config={"reorder": False, "block": True, "hash": False},
+)
+```
+
+Backend configuration is copied when the module is constructed. Later changes
+to the global template affect new modules only. The Triton backend currently
+requires CUDA float32 tensors and an installed Triton package.
+
+For a complete setup and benchmark walkthrough, see the
+[Triton sparse tutorial](../tutorials/triton_sparse.md). The backend accepts
+any leading batch dimensions, with the source-neuron dimension last, and
+supports first-order autograd backward for both inputs and learnable sparse
+weights. It is not a CPU or mixed-dtype fallback: non-CUDA inputs and dtypes
+other than `float32` are rejected at runtime.

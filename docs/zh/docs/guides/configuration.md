@@ -147,3 +147,56 @@ with environ.context(dt=cfg.dt):
 | [`diff_conf`](../api/utils.md) | 计算两个配置之间的结构化差异 |
 | [`get_dotkey`](../api/utils.md) | 通过点路径读取嵌套字段 |
 | [`set_dotkey`](../api/utils.md) | 通过点路径写入嵌套字段 |
+
+## 稀疏后端配置
+
+稀疏连接可以在模块级通过 `sparse_backend` 选择后端，也可以先选择全局
+后端配置模板。Triton 后端使用事件驱动的稀疏矩阵乘法，适合稀疏脉冲输入：
+
+```python
+from btorch import config
+from btorch.models.linear import SparseConn
+
+triton_config = config.sparse.backend("triton")
+triton_config.reorder = True
+triton_config.block = True
+triton_config.hash = True
+
+connection = SparseConn(connectivity, sparse_backend="triton")
+```
+
+Triton 配置默认开启三项独立优化：源神经元重排（`reorder`）、边分块
+（`block`）和局部哈希聚合（`hash`）。也可以针对单个模块覆盖模板，而不影响
+其他模块：
+
+```python
+connection = SparseConn(
+    connectivity,
+    sparse_backend="triton",
+    sparse_config={"reorder": False, "block": True, "hash": False},
+)
+```
+
+配置在构造模块时复制。之后修改全局模板只会影响新建模块，不会改变已经创建
+的连接。后端需要安装 Triton，并且当前只接受 CUDA 上的 `float32` 输入和
+权重；公开的 `SparseConn` 路径会在内部整理连续布局。CPU、`float16` 和
+`bfloat16` 应使用其他稀疏后端。
+
+对于直接在 Python 时间循环中反复调用 `SparseConn` 的代码，应使用
+[`prepare_sparse_modules`](../api/models.md) 在循环外预打包权重和工作区：
+
+```python
+import torch
+
+from btorch.models.functional import prepare_sparse_modules
+
+with torch.inference_mode(), prepare_sparse_modules(
+    connection, batch_size=batch_size
+):
+    currents = torch.stack([connection(spikes[t]) for t in range(timesteps)])
+```
+
+`RecurrentNN` 和 `make_rnn` 会在多步执行期间自动完成同样的准备，因此通常
+不需要手动包裹。输入支持任意前导批量维度，例如 `(batch, neurons)` 或
+`(time, batch, neurons)`；实现会将前导维度展平为批量桶后再执行稀疏乘法。
+Triton 后端也提供一阶 autograd backward，可对输入和可学习稀疏权重求梯度。

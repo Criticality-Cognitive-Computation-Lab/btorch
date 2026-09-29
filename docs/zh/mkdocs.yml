@@ -12,6 +12,7 @@ nav:
   - tutorials/building_rsnn.md
   - tutorials/training.md
   - tutorials/mixed_neurons.md
+  - tutorials/triton_sparse.md
 - 指南:
   - guides/configuration.md
 - faq.md
