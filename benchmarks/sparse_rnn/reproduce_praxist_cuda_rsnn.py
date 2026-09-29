@@ -23,7 +23,7 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from btorch.models.sparse_rsnn_cuda import CyclicSparseRSNNCuda  # noqa: E402
+from btorch.models.rnn import CyclicIntervalRSNN  # noqa: E402
 
 
 ACTIVITY_HZ = (1.0, 3.0, 10.0, 30.0)
@@ -187,7 +187,7 @@ def metadata(device: torch.device) -> dict[str, object]:
         "compute_capability": f"{props.major}.{props.minor}",
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
-        "provenance": CyclicSparseRSNNCuda.provenance.__dict__,
+        "provenance": CyclicIntervalRSNN.provenance.__dict__,
     }
 
 
@@ -211,7 +211,7 @@ def main() -> None:
         connection = load_graph_entry(entry, catalog).tocsr().astype(np.float32)
         connection.sum_duplicates()
         reference = TorchCsrReference(connection, device)
-        candidate = CyclicSparseRSNNCuda(connection, device=device)
+        candidate = CyclicIntervalRSNN(connection, device=device)
         n = int(connection.shape[0])
         stride = 104729 % n or 1
 

@@ -3,10 +3,8 @@ import pytest
 import scipy.sparse
 import torch
 
-from btorch.models.sparse_rsnn_cuda import (
-    CyclicSparseRSNNCuda,
-    interval_rsnn_reference,
-)
+from btorch.models._interval_rsnn_cuda import interval_rsnn_reference
+from btorch.models.rnn import CyclicIntervalRSNN
 
 
 def _connection() -> scipy.sparse.csr_array:
@@ -28,6 +26,10 @@ def _connection() -> scipy.sparse.csr_array:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize(
+    "strategy",
+    ["cyclic_interval", "hybrid_rangegate", "ed_int32_natural"],
+)
+@pytest.mark.parametrize(
     ("base_start", "active_count", "steps", "stride"),
     [
         (1, 2, 8, 1),
@@ -39,12 +41,12 @@ def _connection() -> scipy.sparse.csr_array:
     ],
 )
 def test_cyclic_sparse_rsnn_matches_torch_reference(
-    base_start: int, active_count: int, steps: int, stride: int
+    strategy: str, base_start: int, active_count: int, steps: int, stride: int
 ):
     """The fused kernel preserves the reference recurrence final state."""
 
     connection = _connection()
-    kernel = CyclicSparseRSNNCuda(connection, device="cuda:0")
+    kernel = CyclicIntervalRSNN(connection, device="cuda:0", strategy=strategy)
 
     actual = kernel(
         base_start,
@@ -71,7 +73,7 @@ def test_output_reuse_and_clone_contract():
     """Default outputs are reusable, while clone_outputs preserves
     snapshots."""
 
-    kernel = CyclicSparseRSNNCuda(_connection(), device="cuda:0")
+    kernel = CyclicIntervalRSNN(_connection(), device="cuda:0")
     first = kernel(0, 2, 8, synchronize=True)
     snapshot = kernel(0, 2, 8, clone_outputs=True, synchronize=True)
     second = kernel(1, 2, 8, synchronize=True)
@@ -87,7 +89,7 @@ def test_output_reuse_and_clone_contract():
 def test_invalid_interval_arguments_fail_before_launch():
     """Invalid activity descriptions fail without submitting CUDA work."""
 
-    kernel = CyclicSparseRSNNCuda(_connection(), device="cuda:0")
+    kernel = CyclicIntervalRSNN(_connection(), device="cuda:0")
 
     with pytest.raises(ValueError, match="base_start"):
         kernel(-1, 1, 8)
@@ -95,3 +97,10 @@ def test_invalid_interval_arguments_fail_before_launch():
         kernel(0, 0, 8)
     with pytest.raises(ValueError, match="steps"):
         kernel(0, 1, 0)
+
+
+def test_invalid_strategy_fails_before_cuda_initialization():
+    """Strategy spelling is validated before the CUDA device is inspected."""
+
+    with pytest.raises(ValueError, match="strategy"):
+        CyclicIntervalRSNN(_connection(), device="cpu", strategy="unknown")

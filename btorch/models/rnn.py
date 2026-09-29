@@ -2,12 +2,17 @@ from collections.abc import Callable, Sequence
 from functools import partial
 from typing import overload
 
+import scipy.sparse
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
 from . import base, environ, synapse
+from ._interval_rsnn_cuda import (
+    SparseRSNNStrategy,
+    _CyclicIntervalRSNNCuda,
+)
 from .cudagraph import CudaGraphRunner
 from .functional import (
     filter_hidden_states,
@@ -481,6 +486,56 @@ def make_rnn(
         "or `None` when used as a decorator."
     )
 
+
+class CyclicIntervalRSNN(_CyclicIntervalRSNNCuda):
+    """Run a fused cyclic-interval sparse recurrent inference sequence.
+
+    This inference-only RSNN owns the complete recurrence rather than acting as
+    a :class:`~btorch.models.linear.SparseConn` backend. It is therefore only
+    appropriate when the active population is a contiguous cyclic interval at
+    every step. General sparse connections belong in :class:`SparseConn`.
+
+    Args:
+        connection: Square SciPy sparse matrix in Btorch's
+            ``(source, destination)`` convention.
+        current_decay: Multiplicative current decay per timestep.
+        voltage_decay: Multiplicative voltage decay per timestep.
+        block_size: CUDA threads per block.
+        device: CUDA device for topology and output tensors.
+        strategy: ``"hybrid_rangegate"`` (default), ``"cyclic_interval"``, or
+            ``"ed_int32_natural"``.
+        reuse_outputs: Reuse final-state buffers across calls.
+
+    Returns:
+        :meth:`forward` returns final ``(spikes, voltage, current)`` tensors.
+
+    Notes:
+        The implementation is float32, inference-only, and asynchronous on the
+        current PyTorch CUDA stream.
+    """
+
+    provenance = _CyclicIntervalRSNNCuda.provenance
+
+    def __init__(
+        self,
+        connection: scipy.sparse.sparray,
+        *,
+        current_decay: float = 0.92,
+        voltage_decay: float = 0.95,
+        block_size: int = 256,
+        device: torch.device | str = "cuda",
+        strategy: SparseRSNNStrategy = "hybrid_rangegate",
+        reuse_outputs: bool = True,
+    ) -> None:
+        super().__init__(
+            connection,
+            current_decay=current_decay,
+            voltage_decay=voltage_decay,
+            block_size=block_size,
+            device=device,
+            strategy=strategy,
+            reuse_outputs=reuse_outputs,
+        )
 
 class RecurrentNN(RecurrentNNAbstract):
     def __init__(

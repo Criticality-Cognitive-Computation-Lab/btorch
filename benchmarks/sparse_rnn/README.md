@@ -36,11 +36,6 @@ whole-network activity rates `{1, 3, 10, 30}` Hz and horizons
 latency, speedup against the unchanged Torch CSR recurrence, final-state
 error, reference-vs-reference error, and registers per thread.
 
-The fused kernel accepts a cyclic contiguous active interval. It is not a
-general arbitrary-pattern SpMSpV implementation. `CyclicSparseRSNNCuda`
-launches asynchronously on PyTorch's current stream and reuses output buffers
-by default; pass `clone_outputs=True` when retaining multiple results.
-
 This benchmark scans input spike rates from 0.1% to 10% at batch size one. It
 measures both 128 independent SpMSpV steps and the existing
 `RecurrentNN(LIF, ExponentialPSC)` path. Both loops are captured as CUDA Graphs

@@ -1,14 +1,4 @@
-"""Fused CUDA inference for cyclic-interval sparse recurrent networks.
-
-This module integrates the confirmed Praxist sparse-RSNN kernel family.  The
-kernel fuses sparse recurrent aggregation, current decay, voltage decay, and
-reset over a complete time horizon.  Its input activity is a contiguous cyclic
-interval that advances by a fixed stride at every step.
-
-The implementation is intentionally separate from :class:`SparseConn`: it is
-an inference-only sequence kernel with a narrower activity contract, not a
-general sparse matrix multiplication replacement.
-"""
+"""Private CUDA implementation for cyclic-interval RSNN inference."""
 
 from __future__ import annotations
 
@@ -17,12 +7,25 @@ import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import scipy.sparse
 import torch
 from torch import nn
+
+
+SparseRSNNStrategy = Literal[
+    "cyclic_interval",
+    "hybrid_rangegate",
+    "ed_int32_natural",
+]
+
+_STRATEGY_FUNCTIONS: dict[SparseRSNNStrategy, bytes] = {
+    "cyclic_interval": b"cyclic_interval_rsnn",
+    "hybrid_rangegate": b"hybrid_rangegate_rsnn",
+    "ed_int32_natural": b"ed_int32_natural_rsnn",
+}
 
 
 _CUDA_SOURCE = r"""
@@ -39,7 +42,8 @@ __device__ __forceinline__ int lower_bound_int32(
     return lo;
 }
 
-extern "C" __global__ void cyclic_sparse_rsnn(
+template <int strategy>
+__device__ __forceinline__ void run_cyclic_sparse_rsnn(
     const int* __restrict__ row_ptr,
     const int* __restrict__ col_idx,
     const float* __restrict__ values,
@@ -67,18 +71,10 @@ extern "C" __global__ void cyclic_sparse_rsnn(
         float recurrent = 0.0f;
 
         if (!empty_row) {
-            const int first_col = span_lo[row];
-            const int last_col = span_hi[row];
-            if (interval_end <= n) {
-                if (first_col >= interval_start && last_col < interval_end) {
-                    for (int edge = row_start; edge < row_end; ++edge) {
-                        recurrent = __fadd_rn(recurrent, values[edge]);
-                    }
-                } else if (last_col < interval_start || first_col >= interval_end) {
-                    // The active interval does not intersect this row.
-                } else {
-                    const int begin = lower_bound_int32(
-                        col_idx, row_start, row_end, interval_start);
+            if constexpr (strategy == 0) {
+                const int begin = lower_bound_int32(
+                    col_idx, row_start, row_end, interval_start);
+                if (interval_end <= n) {
                     if (begin < row_end && col_idx[begin] < interval_end) {
                         const int end = lower_bound_int32(
                             col_idx, begin, row_end, interval_end);
@@ -86,25 +82,61 @@ extern "C" __global__ void cyclic_sparse_rsnn(
                             recurrent = __fadd_rn(recurrent, values[edge]);
                         }
                     }
-                }
-            } else {
-                const int wrap = interval_end - n;
-                if (last_col < wrap || first_col >= interval_start) {
-                    for (int edge = row_start; edge < row_end; ++edge) {
-                        recurrent = __fadd_rn(recurrent, values[edge]);
-                    }
-                } else if (first_col >= wrap && last_col < interval_start) {
-                    // All columns lie in the inactive gap [wrap, interval_start).
                 } else {
+                    const int wrap = interval_end - n;
                     const int low_end = lower_bound_int32(
                         col_idx, row_start, row_end, wrap);
                     for (int edge = row_start; edge < low_end; ++edge) {
                         recurrent = __fadd_rn(recurrent, values[edge]);
                     }
-                    const int high_begin = lower_bound_int32(
-                        col_idx, low_end, row_end, interval_start);
-                    for (int edge = high_begin; edge < row_end; ++edge) {
+                    for (int edge = begin; edge < row_end; ++edge) {
                         recurrent = __fadd_rn(recurrent, values[edge]);
+                    }
+                }
+            } else {
+                const int first_col = strategy == 1
+                    ? span_lo[row]
+                    : col_idx[row_start];
+                const int last_col = strategy == 1
+                    ? span_hi[row]
+                    : col_idx[row_end - 1];
+                if (interval_end <= n) {
+                    if (first_col >= interval_start && last_col < interval_end) {
+                        for (int edge = row_start; edge < row_end; ++edge) {
+                            recurrent = __fadd_rn(recurrent, values[edge]);
+                        }
+                    } else if (last_col < interval_start || first_col >= interval_end) {
+                        // The active interval does not intersect this row.
+                    } else {
+                        const int begin = lower_bound_int32(
+                            col_idx, row_start, row_end, interval_start);
+                        if (begin < row_end && col_idx[begin] < interval_end) {
+                            const int end = lower_bound_int32(
+                                col_idx, begin, row_end, interval_end);
+                            for (int edge = begin; edge < end; ++edge) {
+                                recurrent = __fadd_rn(recurrent, values[edge]);
+                            }
+                        }
+                    }
+                } else {
+                    const int wrap = interval_end - n;
+                    if (last_col < wrap || first_col >= interval_start) {
+                        for (int edge = row_start; edge < row_end; ++edge) {
+                            recurrent = __fadd_rn(recurrent, values[edge]);
+                        }
+                    } else if (first_col >= wrap && last_col < interval_start) {
+                        // All columns lie in the inactive gap [wrap, interval_start).
+                    } else {
+                        const int low_end = lower_bound_int32(
+                            col_idx, row_start, row_end, wrap);
+                        for (int edge = row_start; edge < low_end; ++edge) {
+                            recurrent = __fadd_rn(recurrent, values[edge]);
+                        }
+                        const int high_begin = lower_bound_int32(
+                            col_idx, low_end, row_end, interval_start);
+                        for (int edge = high_begin; edge < row_end; ++edge) {
+                            recurrent = __fadd_rn(recurrent, values[edge]);
+                        }
                     }
                 }
             }
@@ -128,6 +160,25 @@ extern "C" __global__ void cyclic_sparse_rsnn(
     voltage_out[row] = voltage;
     current_out[row] = current;
 }
+
+#define DEFINE_CYCLIC_RNN_KERNEL(name, strategy) \
+extern "C" __global__ void name( \
+    const int* row_ptr, const int* col_idx, const float* values, \
+    const int* span_lo, const int* span_hi, float* spikes_out, \
+    float* voltage_out, float* current_out, int n, int active, \
+    int base_start, int stride, int steps, float current_decay, \
+    float voltage_decay, int last_lo, int last_hi, int last_wrap) { \
+    run_cyclic_sparse_rsnn<strategy>( \
+        row_ptr, col_idx, values, span_lo, span_hi, spikes_out, voltage_out, \
+        current_out, n, active, base_start, stride, steps, current_decay, \
+        voltage_decay, last_lo, last_hi, last_wrap); \
+}
+
+DEFINE_CYCLIC_RNN_KERNEL(cyclic_interval_rsnn, 0)
+DEFINE_CYCLIC_RNN_KERNEL(hybrid_rangegate_rsnn, 1)
+DEFINE_CYCLIC_RNN_KERNEL(ed_int32_natural_rsnn, 2)
+
+#undef DEFINE_CYCLIC_RNN_KERNEL
 """
 
 
@@ -230,7 +281,7 @@ class _MarshalledArguments:
 class _KernelLauncher:
     """Launch one NVRTC-compiled kernel through the CUDA driver API."""
 
-    def __init__(self, cubin: bytes) -> None:
+    def __init__(self, cubin: bytes, function_name: bytes) -> None:
         self._cuda = ctypes.CDLL("libcuda.so.1")
         self._module = ctypes.c_void_p()
         self._function = ctypes.c_void_p()
@@ -248,7 +299,7 @@ class _KernelLauncher:
             self._cuda.cuModuleGetFunction(
                 ctypes.byref(self._function),
                 self._module,
-                b"cyclic_sparse_rsnn",
+                function_name,
             ),
             "cuModuleGetFunction",
         )
@@ -344,20 +395,22 @@ class _KernelLauncher:
         return int(value.value)
 
 
-_LAUNCHERS: dict[tuple[int, int, int], _KernelLauncher] = {}
+_LAUNCHERS: dict[tuple[int, int, int, SparseRSNNStrategy], _KernelLauncher] = {}
 
 
-def _launcher_for(device: torch.device) -> _KernelLauncher:
+def _launcher_for(
+    device: torch.device, strategy: SparseRSNNStrategy
+) -> _KernelLauncher:
     device_index = device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
     major, minor = torch.cuda.get_device_capability(device_index)
-    key = (device_index, major, minor)
+    key = (device_index, major, minor, strategy)
     launcher = _LAUNCHERS.get(key)
     if launcher is None:
         with torch.cuda.device(device_index):
             cubin = _compile_cubin(_CUDA_SOURCE, f"sm_{major}{minor}")
-            launcher = _KernelLauncher(cubin)
+            launcher = _KernelLauncher(cubin, _STRATEGY_FUNCTIONS[strategy])
         _LAUNCHERS[key] = launcher
     return launcher
 
@@ -369,11 +422,14 @@ class SparseRSNNProvenance:
     run: str = "run_v2b"
     confirmed_variant: str = "gen8_peer2_launch_fastpath_repair"
     async_variant: str = "gen12_peer2_nosync_fix"
+    cyclic_interval_variant: str = "gen3_peer7_interval_poolref"
+    hybrid_rangegate_variant: str = "gen6_peer1_hybrid_rangegate"
+    ed_int32_natural_variant: str = "gen5_peer7_ed_int32_natural"
     confirmed_speedup: float = 23.73988443345872
     evaluation_units: int = 456
 
 
-class CyclicSparseRSNNCuda(nn.Module):
+class _CyclicIntervalRSNNCuda(nn.Module):
     """Run a fused sparse recurrent sequence for cyclic interval activity.
 
     The source connection uses Btorch's ``(source, destination)`` convention.
@@ -387,6 +443,10 @@ class CyclicSparseRSNNCuda(nn.Module):
         voltage_decay: Multiplicative voltage decay per step.
         block_size: CUDA threads per block.
         device: CUDA device for topology and outputs.
+        strategy: Sparse aggregation strategy. ``"hybrid_rangegate"`` is the
+            validated default. ``"cyclic_interval"`` uses the baseline binary
+            search path. ``"ed_int32_natural"`` derives range gates directly
+            from the int32 CSR indices.
         reuse_outputs: Reuse the three final-state buffers across calls.  Set
             this to ``False`` when callers retain outputs from multiple calls.
 
@@ -406,12 +466,16 @@ class CyclicSparseRSNNCuda(nn.Module):
         voltage_decay: float = 0.95,
         block_size: int = 256,
         device: torch.device | str = "cuda",
+        strategy: SparseRSNNStrategy = "hybrid_rangegate",
         reuse_outputs: bool = True,
     ) -> None:
         super().__init__()
+        if strategy not in _STRATEGY_FUNCTIONS:
+            choices = ", ".join(sorted(_STRATEGY_FUNCTIONS))
+            raise ValueError(f"strategy must be one of: {choices}")
         device = torch.device(device)
         if device.type != "cuda":
-            raise ValueError("CyclicSparseRSNNCuda requires a CUDA device")
+            raise ValueError("CyclicIntervalRSNN requires a CUDA device")
         if connection.ndim != 2 or connection.shape[0] != connection.shape[1]:
             raise ValueError("connection must be a square sparse matrix")
         if block_size <= 0 or block_size > 1024:
@@ -437,6 +501,7 @@ class CyclicSparseRSNNCuda(nn.Module):
         self.current_decay = float(current_decay)
         self.voltage_decay = float(voltage_decay)
         self.block_size = int(block_size)
+        self.strategy = strategy
         self.reuse_outputs = bool(reuse_outputs)
         self.register_buffer(
             "row_ptr",
@@ -514,7 +579,7 @@ class CyclicSparseRSNNCuda(nn.Module):
         last_wrap = last_hi - n if last_hi > n else 0
         spikes, voltage, current = self._outputs()
         stream = torch.cuda.current_stream(self.values.device)
-        launcher = _launcher_for(self.values.device)
+        launcher = _launcher_for(self.values.device, self.strategy)
         arguments: list[torch.Tensor | int | float] = [
             self.row_ptr,
             self.col_idx,
@@ -555,6 +620,7 @@ class CyclicSparseRSNNCuda(nn.Module):
                 steps,
                 self.current_decay,
                 self.voltage_decay,
+                self.strategy,
             ),
         )
         outputs = (spikes, voltage, current)
@@ -567,14 +633,15 @@ class CyclicSparseRSNNCuda(nn.Module):
     def num_registers(self) -> int:
         """Return registers allocated per CUDA thread."""
 
-        return _launcher_for(self.values.device).num_registers()
+        return _launcher_for(self.values.device, self.strategy).num_registers()
 
     def extra_repr(self) -> str:
         return (
             f"n_neuron={self.n_neuron}, nnz={self.nnz}, "
             f"current_decay={self.current_decay}, "
             f"voltage_decay={self.voltage_decay}, "
-            f"block_size={self.block_size}, reuse_outputs={self.reuse_outputs}"
+            f"block_size={self.block_size}, strategy={self.strategy!r}, "
+            f"reuse_outputs={self.reuse_outputs}"
         )
 
 
@@ -623,7 +690,8 @@ def interval_rsnn_reference(
 
 
 __all__ = [
-    "CyclicSparseRSNNCuda",
+    "SparseRSNNStrategy",
     "SparseRSNNProvenance",
+    "_CyclicIntervalRSNNCuda",
     "interval_rsnn_reference",
 ]

@@ -83,6 +83,7 @@ nav:
   - tutorials/training.md
   - tutorials/mixed_neurons.md
   - tutorials/triton_sparse.md
+  - tutorials/cyclic_interval_rsnn.md
 - Guides:
   - guides/configuration.md
 - FAQ: faq.md
