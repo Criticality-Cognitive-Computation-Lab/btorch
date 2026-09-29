@@ -1,0 +1,31 @@
+{
+  "date": "2026-09-29",
+  "btorch_commit": "149736d",
+  "torch": "2.11.0",
+  "device": "NVIDIA GeForce RTX 5090",
+  "backend": "native",
+  "n_neurons": 32768,
+  "degree": 512,
+  "density": 0.015625,
+  "edges_per_projection": 16646991,
+  "projections": 2,
+  "steps": 1000,
+  "requested_rate": 0.003,
+  "measured_rate": 0.0029990540351718664,
+  "unroll": 8,
+  "dtype": "torch.float32",
+  "recorded_histories": [
+    "spike",
+    "ie",
+    "ii"
+  ],
+  "cudagraph": false,
+  "inductor_cudagraphs": false,
+  "scan": false,
+  "build_s": 7.150741931051016,
+  "eager_ms": 881.1417236328125,
+  "compiled_ms": 903.7372436523438,
+  "compile_speedup": 0.9749976885668513,
+  "first_compile_s": 2.353751314803958,
+  "max_abs_error": 1.4901161193847656e-08
+}
