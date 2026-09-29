@@ -21,6 +21,7 @@ Per-step core dynamics::
 Surrogate is btorch ``surrogate.ATan(alpha=2)``: forward ``H(x) = (x >= 0)``,
 backward ``g'(x) = (alpha / 2) / (1 + (pi / 2 * alpha * x) ** 2)``.
 """
+
 import math
 
 import torch
@@ -62,8 +63,10 @@ def make_core(spike_fn):
     FlexSN traces the core with ``make_fx``, so the surrogate must be captured
     by closure (not passed as a keyword) for the trace to see it.
     """
+
     def core(x, y, v, rho):
         return core_step(x, y, v, rho, spike_fn=spike_fn)
+
     return core
 
 
@@ -77,6 +80,40 @@ def eager_loop(x_seq, y_seq, v0, rho0):
         s1_l.append(s1)
         s2_l.append(s2)
     return torch.stack(s1_l), torch.stack(s2_l), v, rho
+
+
+def eager_loop_save(x_seq, y_seq, v0, rho0):
+    """Unrolled loop that also returns the per-step history FlexSN checkpoints.
+
+    ``h``, the pre-update ``rho`` and ``sigmoid(y)`` are exactly the residuals
+    FlexSN's forward stores and backward reloads. Returning them as outputs is
+    the plain-autograd way to ask AOTAutograd to keep them instead of
+    rematerializing the whole step from ``(x, y, v0, rho0)``.
+    """
+    T = x_seq.shape[0]
+    v, rho = v0, rho0
+    s1_l, s2_l, h_l, rho_prev_l, yy_l = [], [], [], [], []
+    for t in range(T):
+        h = BETA * v + x_seq[t]
+        s1 = atan_sg(h - (rho + 1.0))
+        s2 = atan_sg(h - 1.0)
+        rho_prev_l.append(rho)
+        rho = GAMMA * rho + s1
+        yy = torch.sigmoid(y_seq[t])
+        v = (h * (1.0 - s1)) * yy + (h - s2) * (1.0 - yy)
+        s1_l.append(s1)
+        s2_l.append(s2)
+        h_l.append(h)
+        yy_l.append(yy)
+    return (
+        torch.stack(s1_l),
+        torch.stack(s2_l),
+        v,
+        rho,
+        torch.stack(h_l),
+        torch.stack(rho_prev_l),
+        torch.stack(yy_l),
+    )
 
 
 # ---------- scan HOP ----------
@@ -138,7 +175,7 @@ unrolled_compiled = torch.compile(eager_loop, fullgraph=True, dynamic=False)
 # the saved ``h`` and ``rho`` sequences.
 # --------------------------------------------------------------------------
 
-_VEC = 4                 # neurons per thread (float4 load/store width)
+_VEC = 4  # neurons per thread (float4 load/store width)
 _THREADS_PER_BLOCK = 256
 
 _FORWARD_KERNEL_NAME = "complicated_lif_forward"
@@ -362,8 +399,14 @@ extern "C" __global__ void complicated_lif_backward(
 """
 
 
-def _kernel_source(body: str, *, membrane_leak: float, adapt_decay: float,
-                   surrogate_scale: float, surrogate_curvature: float) -> str:
+def _kernel_source(
+    body: str,
+    *,
+    membrane_leak: float,
+    adapt_decay: float,
+    surrogate_scale: float,
+    surrogate_curvature: float,
+) -> str:
     """Prepend the header that injects this neuron's constants and helpers.
 
     Constants are emitted as ``constexpr`` so the compiler folds them into
@@ -405,8 +448,8 @@ def _grid(numel: int) -> int:
 
 
 def _surrogate_grad_coeffs(surrogate_function) -> tuple[float, float]:
-    """Coefficients ``(scale, curvature)`` so the surrogate gradient is
-    ``scale / (1 + curvature * a^2)``.
+    """Coefficients ``(scale, curvature)`` so the surrogate gradient is ``scale
+    / (1 + curvature * a^2)``.
 
     Matches :class:`btorch.models.surrogate.ATan`, whose derivative is
     ``damping * alpha / (2 * (1 + (pi/2 * alpha * a)^2))``.
@@ -434,8 +477,7 @@ class ComplicatedLIFNodeCuPy(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x_seq, y_seq, v_init, rho_init,
-                forward_kernel, backward_kernel):
+    def forward(ctx, x_seq, y_seq, v_init, rho_init, forward_kernel, backward_kernel):
         import cupy as cp
 
         time_step, numel = x_seq.shape
@@ -452,14 +494,23 @@ class ComplicatedLIFNodeCuPy(torch.autograd.Function):
 
         with cp.cuda.Device(x_seq.device.index):
             forward_kernel(
-                (_grid(numel),), (_THREADS_PER_BLOCK,),
-                (x_seq.data_ptr(), y_seq.data_ptr(),
-                 v_init.data_ptr(), rho_init.data_ptr(),
-                 s1_seq.data_ptr(), s2_seq.data_ptr(),
-                 h_seq.data_ptr(), rho_prev_seq.data_ptr(),
-                 v_final.data_ptr(), rho_final.data_ptr(),
-                 cp.int32(numel), cp.int32(time_step),
-                 cp.int32(1 if need_grad else 0)),
+                (_grid(numel),),
+                (_THREADS_PER_BLOCK,),
+                (
+                    x_seq.data_ptr(),
+                    y_seq.data_ptr(),
+                    v_init.data_ptr(),
+                    rho_init.data_ptr(),
+                    s1_seq.data_ptr(),
+                    s2_seq.data_ptr(),
+                    h_seq.data_ptr(),
+                    rho_prev_seq.data_ptr(),
+                    v_final.data_ptr(),
+                    rho_final.data_ptr(),
+                    cp.int32(numel),
+                    cp.int32(time_step),
+                    cp.int32(1 if need_grad else 0),
+                ),
             )
 
         if need_grad:
@@ -481,20 +532,36 @@ class ComplicatedLIFNodeCuPy(torch.autograd.Function):
         # incoming grads on the returned outputs; None means zero
         grad_s1 = grad_s1.contiguous()
         grad_s2 = grad_s2.contiguous()
-        grad_v_final = (torch.zeros_like(grad_v_init) if grad_v_final is None
-                        else grad_v_final.contiguous())
-        grad_rho_final = (torch.zeros_like(grad_rho_init) if grad_rho_final is None
-                          else grad_rho_final.contiguous())
+        grad_v_final = (
+            torch.zeros_like(grad_v_init)
+            if grad_v_final is None
+            else grad_v_final.contiguous()
+        )
+        grad_rho_final = (
+            torch.zeros_like(grad_rho_init)
+            if grad_rho_final is None
+            else grad_rho_final.contiguous()
+        )
 
         with cp.cuda.Device(h_seq.device.index):
             ctx.backward_kernel(
-                (_grid(numel),), (_THREADS_PER_BLOCK,),
-                (grad_s1.data_ptr(), grad_s2.data_ptr(),
-                 grad_v_final.data_ptr(), grad_rho_final.data_ptr(),
-                 y_seq.data_ptr(), h_seq.data_ptr(), rho_prev_seq.data_ptr(),
-                 grad_x.data_ptr(), grad_y.data_ptr(),
-                 grad_v_init.data_ptr(), grad_rho_init.data_ptr(),
-                 cp.int32(numel), cp.int32(time_step)),
+                (_grid(numel),),
+                (_THREADS_PER_BLOCK,),
+                (
+                    grad_s1.data_ptr(),
+                    grad_s2.data_ptr(),
+                    grad_v_final.data_ptr(),
+                    grad_rho_final.data_ptr(),
+                    y_seq.data_ptr(),
+                    h_seq.data_ptr(),
+                    rho_prev_seq.data_ptr(),
+                    grad_x.data_ptr(),
+                    grad_y.data_ptr(),
+                    grad_v_init.data_ptr(),
+                    grad_rho_init.data_ptr(),
+                    cp.int32(numel),
+                    cp.int32(time_step),
+                ),
             )
 
         return grad_x, grad_y, grad_v_init, grad_rho_init, None, None
@@ -534,18 +601,25 @@ class ComplicatedLIFNode(nn.Module):
         dims are flattened internally. Output spike sequences match that shape.
     """
 
-    def __init__(self, beta: float = BETA, gamma: float = GAMMA,
-                 surrogate_function=None, store_state_seqs: bool = False):
+    def __init__(
+        self,
+        beta: float = BETA,
+        gamma: float = GAMMA,
+        surrogate_function=None,
+        store_state_seqs: bool = False,
+    ):
         super().__init__()
         if surrogate_function is None:
             from btorch.models import surrogate
+
             surrogate_function = surrogate.ATan(alpha=ALPHA)
         self.beta = beta
         self.gamma = gamma
         self.surrogate_function = surrogate_function
         self.store_state_seqs = store_state_seqs
-        self._surrogate_scale, self._surrogate_curvature = (
-            _surrogate_grad_coeffs(surrogate_function))
+        self._surrogate_scale, self._surrogate_curvature = _surrogate_grad_coeffs(
+            surrogate_function
+        )
         self._forward_kernel = None
         self._backward_kernel = None
 
@@ -559,19 +633,30 @@ class ComplicatedLIFNode(nn.Module):
             raise NotImplementedError(
                 f"ComplicatedLIFNode CuPy backend supports float32, got {dtype}."
             )
-        kwargs = dict(membrane_leak=self.beta, adapt_decay=self.gamma,
-                      surrogate_scale=self._surrogate_scale,
-                      surrogate_curvature=self._surrogate_curvature)
+        kwargs = dict(
+            membrane_leak=self.beta,
+            adapt_decay=self.gamma,
+            surrogate_scale=self._surrogate_scale,
+            surrogate_curvature=self._surrogate_curvature,
+        )
         self._forward_kernel = cp.RawKernel(
             _kernel_source(_FORWARD_KERNEL_BODY, **kwargs),
-            _FORWARD_KERNEL_NAME, backend="nvrtc")
+            _FORWARD_KERNEL_NAME,
+            backend="nvrtc",
+        )
         self._backward_kernel = cp.RawKernel(
             _kernel_source(_BACKWARD_KERNEL_BODY, **kwargs),
-            _BACKWARD_KERNEL_NAME, backend="nvrtc")
+            _BACKWARD_KERNEL_NAME,
+            backend="nvrtc",
+        )
 
-    def forward(self, x_seq: torch.Tensor, y_seq: torch.Tensor,
-                v_init: torch.Tensor | None = None,
-                rho_init: torch.Tensor | None = None):
+    def forward(
+        self,
+        x_seq: torch.Tensor,
+        y_seq: torch.Tensor,
+        v_init: torch.Tensor | None = None,
+        rho_init: torch.Tensor | None = None,
+    ):
         if self._forward_kernel is None:
             self._build_kernels(x_seq.dtype)
 
@@ -580,14 +665,25 @@ class ComplicatedLIFNode(nn.Module):
         x_flat = x_seq.reshape(T, -1).contiguous()
         y_flat = y_seq.reshape(T, -1).contiguous()
         numel = x_flat.shape[1]
-        v_init = (x_flat.new_zeros(numel) if v_init is None
-                  else v_init.reshape(-1).contiguous())
-        rho_init = (x_flat.new_zeros(numel) if rho_init is None
-                    else rho_init.reshape(-1).contiguous())
+        v_init = (
+            x_flat.new_zeros(numel)
+            if v_init is None
+            else v_init.reshape(-1).contiguous()
+        )
+        rho_init = (
+            x_flat.new_zeros(numel)
+            if rho_init is None
+            else rho_init.reshape(-1).contiguous()
+        )
 
         s1, s2, v_final, rho_final = ComplicatedLIFNodeCuPy.apply(
-            x_flat, y_flat, v_init, rho_init,
-            self._forward_kernel, self._backward_kernel)
+            x_flat,
+            y_flat,
+            v_init,
+            rho_init,
+            self._forward_kernel,
+            self._backward_kernel,
+        )
 
         s1 = s1.reshape(shape)
         s2 = s2.reshape(shape)
@@ -621,12 +717,19 @@ def make_flexsn(example_shape, device, store_state_seqs=False):
     # with the other backends.
     from spikingjelly.activation_based import surrogate
     from spikingjelly.activation_based.neuron.flexsn import FlexSN
+
     sg = surrogate.ATan(alpha=ALPHA)
 
     def flexsn_core(x, y, v, rho):
         return core_step(x, y, v, rho, spike_fn=sg)
 
     ex = tuple(torch.zeros(example_shape, device=device) for _ in range(4))
-    return FlexSN(core=flexsn_core, num_inputs=2, num_states=2, num_outputs=2,
-                  example_inputs=ex, backend="triton",
-                  store_state_seqs=store_state_seqs)
+    return FlexSN(
+        core=flexsn_core,
+        num_inputs=2,
+        num_states=2,
+        num_outputs=2,
+        example_inputs=ex,
+        backend="triton",
+        store_state_seqs=store_state_seqs,
+    )
