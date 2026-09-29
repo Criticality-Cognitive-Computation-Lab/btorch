@@ -18,6 +18,29 @@ micromamba run -n ml-py312 \
   python benchmarks/sparse_rnn/benchmark_triton_spmspv.py
 ```
 
+To reproduce the Praxist fused CUDA interval-RSNN result without downloading
+data:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
+  /home/fanqixuan/micromamba/envs/ml-py312/bin/python \
+  benchmarks/sparse_rnn/reproduce_praxist_cuda_rsnn.py \
+  --mode smoke --output /tmp/praxist_cuda_rsnn.jsonl
+```
+
+Use `--mode aligned` for FlyWire, Hemibrain, MICrONS, and multiarea, or
+`--mode complete` for every locally cataloged graph at least as large as
+FlyWire plus the mandatory connectomes. The complete protocol evaluates
+whole-network activity rates `{1, 3, 10, 30}` Hz and horizons
+`{8, 128, 2048}`. Results contain synchronized CUDA-event latency, per-step
+latency, speedup against the unchanged Torch CSR recurrence, final-state
+error, reference-vs-reference error, and registers per thread.
+
+The fused kernel accepts a cyclic contiguous active interval. It is not a
+general arbitrary-pattern SpMSpV implementation. `CyclicSparseRSNNCuda`
+launches asynchronously on PyTorch's current stream and reuses output buffers
+by default; pass `clone_outputs=True` when retaining multiple results.
+
 This benchmark scans input spike rates from 0.1% to 10% at batch size one. It
 measures both 128 independent SpMSpV steps and the existing
 `RecurrentNN(LIF, ExponentialPSC)` path. Both loops are captured as CUDA Graphs
