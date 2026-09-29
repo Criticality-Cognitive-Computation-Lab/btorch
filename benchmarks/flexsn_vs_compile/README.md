@@ -27,12 +27,23 @@ python benchmarks/flexsn_vs_compile/bench_short_t.py --N 1048576 --T 2 4 8 16
 # Figure 2: T sweep up to 1024, FlexSN vs compile / CUDA-graph strategies + CuPy
 python benchmarks/flexsn_vs_compile/bench_sweep.py --N 32768 --max-flexsn-T 1024
 
+# Add only the eager torch baseline to an existing sweep
+python benchmarks/flexsn_vs_compile/bench_sweep.py --append --eager-only
+
 # correctness gates
 python benchmarks/flexsn_vs_compile/test_cupy.py     # CuPy backend
 python benchmarks/flexsn_vs_compile/test_flexsn.py   # FlexSN, incl. init-state grads
 
-# render both figures from the JSON results
+# render timing and eager-relative speedup figures from the JSON results
 python benchmarks/flexsn_vs_compile/plot.py
+
+# render PDL / CUDA Graph / persistent speedups for the sparse RSNN study
+python -m benchmarks.flexsn_vs_compile.plot_pdl
+
+# dump inductor- and FlexSN-generated Triton for the same neuron
+# (annotated side-by-side reading: see TRITON_CODEGEN.md;
+#  raw copy-paste snapshots: see codegen/)
+python benchmarks/flexsn_vs_compile/dump_triton.py --T 4 --N 32768
 ```
 
 Long runs are best on SLURM (`short_t.sbatch`, `sweep.sbatch`). The sweep
