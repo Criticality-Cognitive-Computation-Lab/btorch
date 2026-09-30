@@ -3,10 +3,16 @@ import torch
 from .base import SurrogateFunctionBase
 
 
+def _poisson_grad(x: torch.Tensor, k: float, leak: float, damping: float):
+    mask = (x >= 0.0).to(x)
+    return (mask * k + (1.0 - mask) * leak) * damping
+
+
 class _PoissonRandomSpikeFn(torch.autograd.Function):
+    generate_vmap_rule = True
+
     @staticmethod
     def forward(
-        ctx,
         x: torch.Tensor,
         tau: float,
         rho: float,
@@ -15,14 +21,6 @@ class _PoissonRandomSpikeFn(torch.autograd.Function):
         damping: float,
         spiking: bool,
     ):
-        if x.requires_grad:
-            ctx.save_for_backward(x)
-            ctx.tau = tau
-            ctx.rho = rho
-            ctx.leak = leak
-            ctx.k = k
-            ctx.damping = damping
-
         fr = torch.exp(rho * x) / tau
         if spiking:
             return (fr > torch.rand_like(fr)).to(x)
@@ -32,12 +30,24 @@ class _PoissonRandomSpikeFn(torch.autograd.Function):
         return (leak * (1.0 - mask) + k * mask) * x
 
     @staticmethod
+    def setup_context(ctx, inputs, output):
+        x, _tau, _rho, leak, k, damping, _spiking = inputs
+        ctx.save_for_backward(x)
+        ctx.save_for_forward(x)
+        ctx.leak = leak
+        ctx.k = k
+        ctx.damping = damping
+
+    @staticmethod
     def backward(ctx, grad_output):
         (x,) = ctx.saved_tensors
-        mask = (x >= 0.0).to(x)
-        grad_x = mask * ctx.k + (1.0 - mask) * ctx.leak
-        grad_x = grad_x * ctx.damping
+        grad_x = _poisson_grad(x, ctx.k, ctx.leak, ctx.damping)
         return grad_output * grad_x, None, None, None, None, None, None
+
+    @staticmethod
+    def jvp(ctx, x_tangent, *_non_tensor_tangents):
+        (x,) = ctx.saved_tensors
+        return x_tangent * _poisson_grad(x, ctx.k, ctx.leak, ctx.damping)
 
 
 class PoissonRandomSpike(SurrogateFunctionBase):

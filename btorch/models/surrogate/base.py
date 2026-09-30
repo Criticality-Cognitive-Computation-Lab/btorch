@@ -9,13 +9,27 @@ def _heaviside(x: torch.Tensor) -> torch.Tensor:
 
 
 class _SurrogateAutograd(torch.autograd.Function):
+    """Surrogate-gradient autograd function (functorch-compatible).
+
+    Supports ``torch.func.vjp/jvp/vmap`` via ``setup_context``, ``jvp`` and
+    ``generate_vmap_rule``. The surrogate derivative is linear in its
+    ``grad_output`` argument, so the same call serves backward and jvp.
+    """
+
+    generate_vmap_rule = True
+
     @staticmethod
-    def forward(ctx, x: torch.Tensor, module: "SurrogateFunctionBase"):
-        ctx.module = module
-        ctx.save_for_backward(x)
+    def forward(x: torch.Tensor, module: "SurrogateFunctionBase"):
         if module.spiking:
             return _heaviside(x)
         return module.primitive(x)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        x, module = inputs
+        ctx.module = module
+        ctx.save_for_backward(x)
+        ctx.save_for_forward(x)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
@@ -23,6 +37,12 @@ class _SurrogateAutograd(torch.autograd.Function):
         module: SurrogateFunctionBase = ctx.module
         grad_input = module.derivative(x, grad_output, module.damping_factor)
         return grad_input, None
+
+    @staticmethod
+    def jvp(ctx, x_tangent: torch.Tensor, module_tangent):
+        (x,) = ctx.saved_tensors
+        module: SurrogateFunctionBase = ctx.module
+        return module.derivative(x, x_tangent, module.damping_factor)
 
 
 class SurrogateFunctionBase(torch.nn.Module):
