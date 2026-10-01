@@ -9,7 +9,12 @@ from torch.utils.checkpoint import checkpoint
 
 from . import base, environ, synapse
 from .cudagraph import CudaGraphRunner
-from .functional import filter_hidden_states, named_hidden_states, set_hidden_states
+from .functional import (
+    filter_hidden_states,
+    named_hidden_states,
+    prepare_sparse_modules,
+    set_hidden_states,
+)
 
 
 def _cat_chunks(chunks: list[Tensor]) -> Tensor:
@@ -194,9 +199,16 @@ class RecurrentNNAbstract(base.MemoryModule):
     @partial(torch.compiler.disable, recursive=False)
     def multi_step_forward(self, *args, loop_args=None, **kwargs):
         """Run the multi-step loop, optionally as replayed CUDA graphs."""
-        if self.cudagraph:
-            return self._cudagraph_multi_step(*args, loop_args=loop_args, **kwargs)
-        return self._multi_step_forward_impl(*args, loop_args=loop_args, **kwargs)
+        first_input = args[0]
+        batch_size = (
+            first_input[0].numel() // first_input.shape[-1]
+            if torch.is_tensor(first_input) and first_input.ndim >= 2
+            else None
+        )
+        with prepare_sparse_modules(self, batch_size=batch_size):
+            if self.cudagraph:
+                return self._cudagraph_multi_step(*args, loop_args=loop_args, **kwargs)
+            return self._multi_step_forward_impl(*args, loop_args=loop_args, **kwargs)
 
     def _chunk_plan(self, *args, loop_args=None):
         """Resolve T, the loop args, and the two block sizes the time loop

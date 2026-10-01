@@ -10,6 +10,23 @@ and summary tables.
 python benchmark/sparse_rnn/profile_sparse_rnn.py
 ```
 
+To compare the native sparse path with the event-driven Triton backend on the
+local Hemibrain connectome:
+
+```bash
+micromamba run -n ml-py312 \
+  python benchmarks/sparse_rnn/benchmark_triton_spmspv.py
+```
+
+This benchmark scans input spike rates from 0.1% to 10% at batch size one. It
+measures both 128 independent SpMSpV steps and the existing
+`RecurrentNN(LIF, ExponentialPSC)` path. Both loops are captured as CUDA Graphs
+before timing. The Triton packed weights and workspace are prepared once
+outside graph capture and reused by graph warmup, capture, and every replay.
+Connection construction and preparation are reported separately from 10
+warmups and 30 steady-state CUDA-event samples. The default dataset path can be
+replaced with `--dataset`.
+
 By default, outputs land in `fig/benchmark/...` with a timestamped folder.
 
 Optional flags:

@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager
 from typing import Any, Literal
 
 import torch
@@ -8,6 +9,18 @@ from torch import nn
 from ..utils.dict_utils import flatten_dict
 from . import base
 from .scale import SupportScaleState
+
+
+def _move_net(net: nn.Module, kwargs: dict[str, Any]) -> None:
+    """Move a network only when a concrete device or dtype was requested."""
+
+    move_kwargs = {
+        key: kwargs[key]
+        for key in ("device", "dtype")
+        if kwargs.get(key) is not None
+    }
+    if move_kwargs:
+        net.to(**move_kwargs)
 
 
 def init_net_state(
@@ -43,7 +56,7 @@ def init_net_state(
                 )
             m.init_state(batch_size, **kwargs)
 
-    net.to(device=kwargs.get("device"), dtype=kwargs.get("dtype"))
+    _move_net(net, kwargs)
     for m in net.modules():
         fn(m)
 
@@ -80,12 +93,35 @@ def reset_net(
                 )
             m.reset(batch_size, **kwargs)
 
-    net.to(device=kwargs.get("device"), dtype=kwargs.get("dtype"))
+    _move_net(net, kwargs)
     for m in net.modules():
         fn(m)
 
 
 reset_net_state = reset_net
+
+
+@contextmanager
+def prepare_sparse_modules(net: nn.Module, batch_size: int | None = None):
+    """Prepare sparse backend caches for one enclosing multi-step run.
+
+    Modules opt in through ``prepare_sparse``/``finish_sparse`` methods. The
+    helper intentionally knows nothing about a backend's concrete config or
+    workspace layout.
+    """
+
+    from .linear import BaseSparseConn
+
+    prepared = []
+    try:
+        for module in net.modules():
+            if isinstance(module, BaseSparseConn):
+                module.prepare_sparse(batch_size=batch_size)
+                prepared.append(module)
+        yield
+    finally:
+        for module in reversed(prepared):
+            module.finish_sparse()
 
 
 def _strip_self(d: set[str]) -> set[str]:

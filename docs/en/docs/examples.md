@@ -63,6 +63,18 @@ Demonstrates synaptic delays using `SpikeHistory`, `DelayedPSC`, and `HeterSynap
 - API: [`btorch.models.history`](api/models.md) and [`btorch.models.synapse`](api/models.md)
 - Tests: [`tests/connectome/test_delay_expansion.py`](https://github.com/Criticality-Cognitive-Computation-Lab/btorch/blob/main/tests/connectome/test_delay_expansion.py)
 
+## `triton_sparse_manual_loop.py` — Manual Triton Sparse Loop
+
+Shows how to wrap direct, repeated `SparseConn` calls with
+`prepare_sparse_modules`. The scope packs edge weights and prepares the Triton
+workspace once for the whole time loop. `RecurrentNN` and `make_rnn` already do
+this automatically.
+
+**Key patterns:**
+- Manual multi-step use of `SparseConn(..., sparse_backend="triton")`
+- One preparation scope around the complete loop
+- CUDA float32 inference
+
 ## Tests as Examples
 
 Many `tests/` files contain concise, validated usage patterns that are ideal for documentation:
