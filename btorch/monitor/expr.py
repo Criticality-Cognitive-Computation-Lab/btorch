@@ -1,0 +1,337 @@
+"""Polars-style lazy expression DSL for recording temporal state.
+
+The recorded run is a lazy frame: **columns are named state buffers** (dotted
+names like ``"neuron.v"``), **rows are timesteps**.  Aggregations reduce over
+*time*.  An :class:`Expr` is pure, immutable data describing a computation; it is
+compiled once into a dataflow IR (:mod:`btorch.monitor.ir`) and lowered to a
+single per-step kernel.
+
+Native ops carry their own time-semantics (no ``s``/``m`` marker).  The only
+single-step vs multi-step choice is at the custom-function boundary:
+
+* :func:`map_step` -- ``fn(a_t, b_t, ...)`` per timestep on ``[B, N]``; streamable.
+* :func:`map_seq`  -- ``fn(A, B, ...)`` once on the stacked ``[T, B, N]``; materialises.
+
+Aggregations reduce over time; batch/feature dims are preserved and only reachable
+via a custom fn.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass, field
+
+from torch import Tensor
+
+
+_GRAD_MSG = (
+    "grad(...) records raw per-step gradients and cannot be composed with "
+    "expressions; only .alias() may wrap it. Record grad(...) and reduce in post."
+)
+
+
+def _make_binop(op: str, swap: bool = False):
+    """Binary-dunder factory: build an Elementwise with BOTH operands
+    grad-guarded (``swap`` puts the coerced operand first, for ``r*``)."""
+
+    def fn(self, o) -> Expr:
+        self._no_compose()
+        other = self._operand(o)
+        return Elementwise(op, (other, self) if swap else (self, other))
+
+    return fn
+
+
+class Expr:
+    """Base expression node.
+
+    Subclasses are immutable dataclasses.
+    """
+
+    is_grad: bool = False
+
+    # -- internal guard ---------------------------------------------------
+    def _no_compose(self) -> None:
+        """Reject composition of a grad leaf (only .alias() may wrap grad)."""
+        if self.is_grad:
+            raise TypeError(_GRAD_MSG)
+
+    def _operand(self, o) -> Expr:
+        """Coerce a binary operand to an :class:`Expr`, rejecting grad leaves.
+
+        Callers check ``self`` via :meth:`_no_compose`; the *other* operand is
+        checked here, else ``col("v") + grad("h")`` would silently compose a
+        grad leaf into arithmetic.
+        """
+        e = _lit(o)
+        e._no_compose()
+        return e
+
+    # -- arithmetic (elementwise, streamable) -----------------------------
+    # generated via _binop below: every operand (either side) is grad-guarded
+    __add__ = _make_binop("add")
+    __radd__ = _make_binop("add", swap=True)
+    __sub__ = _make_binop("sub")
+    __rsub__ = _make_binop("sub", swap=True)
+    __mul__ = _make_binop("mul")
+    __rmul__ = _make_binop("mul", swap=True)
+    __truediv__ = _make_binop("div")
+    __rtruediv__ = _make_binop("div", swap=True)
+
+    def __neg__(self) -> Expr:
+        self._no_compose()
+        return Elementwise("neg", (self,))
+
+    def __abs__(self) -> Expr:
+        self._no_compose()
+        return Elementwise("abs", (self,))
+
+    def abs(self) -> Expr:
+        return self.__abs__()
+
+    def relu(self) -> Expr:
+        self._no_compose()
+        return Elementwise("relu", (self,))
+
+    def clamp(self, min=None, max=None) -> Expr:
+        self._no_compose()
+        return Elementwise("clamp", (self,), {"min": min, "max": max})
+
+    def pow(self, exponent: float) -> Expr:
+        self._no_compose()
+        return Elementwise("pow", (self,), {"exponent": exponent})
+
+    def __pow__(self, exponent) -> Expr:
+        if isinstance(exponent, Expr):
+            raise TypeError(
+                "col ** col is not supported; use .pow(scalar), map_step for "
+                "tensor exponents."
+            )
+        return self.pow(exponent)
+
+    def __getitem__(self, index) -> Expr:
+        """Per-step (single-step) index into each step's ``[B, N]`` value,
+        stacked over time.
+
+        This indexes FEATURES/BATCH, never the time axis: ``col("v")[:, 0]``
+        gives feature 0 at every step.  To pick a timestep, use
+        ``map_seq(lambda V: V[k])``.
+        """
+        self._no_compose()
+        return Elementwise("getitem", (self,), {"index": index})
+
+    # -- reductions over time (streamable via carry) ----------------------
+    def mean(self) -> Expr:
+        self._no_compose()
+        return Reduce("mean", self)
+
+    def sum(self) -> Expr:
+        self._no_compose()
+        return Reduce("sum", self)
+
+    def last(self) -> Expr:
+        self._no_compose()
+        return Reduce("last", self)
+
+    def first(self) -> Expr:
+        self._no_compose()
+        return Reduce("first", self)
+
+    def min(self) -> Expr:
+        self._no_compose()
+        return Reduce("min", self)
+
+    def max(self) -> Expr:
+        self._no_compose()
+        return Reduce("max", self)
+
+    def count(self) -> Expr:
+        """Number of valid steps (warmup-masked steps excluded), as a float
+        tensor."""
+        self._no_compose()
+        return Reduce("count", self)
+
+    def std(self, correction: int = 1) -> Expr:
+        """Standard deviation over time (per batch/feature element).
+
+        Matches :meth:`torch.Tensor.std`'s default: ``correction=1`` (the
+        unbiased sample estimate, denominator ``count - correction``).  Pass
+        ``correction=0`` for the population statistic.  Streaming (Welford).
+        """
+        self._no_compose()
+        return Reduce("std", self, {"correction": correction})
+
+    def var(self, correction: int = 1) -> Expr:
+        """Variance over time; same ``correction`` convention as
+        :meth:`std`."""
+        self._no_compose()
+        return Reduce("var", self, {"correction": correction})
+
+    # -- windowed (streamable via ring carry) -----------------------------
+    def diff(self, n: int = 1) -> Expr:
+        """The lag-``n`` first difference ``x_t - x_{t-n}`` (NOT the
+        nth-order difference of :func:`torch.diff`, which shrinks T).
+
+        The sequence keeps length T: warmup steps output zeros and are
+        validity-masked out of downstream reductions/counters.
+        """
+        self._no_compose()
+        return Window("diff", n, self)
+
+    def shift(self, n: int = 1) -> Expr:
+        """The value from ``n`` steps earlier, zero-filled during warmup.
+
+        Unlike :func:`torch.roll` there is no wraparound; unlike Polars there
+        are no nulls (zeros + a validity flag instead).
+        """
+        self._no_compose()
+        return Window("shift", n, self)
+
+    # -- custom-function boundary (the s/m marker) ------------------------
+    def map_step(self, fn: Callable[..., Tensor]) -> Expr:
+        self._no_compose()
+        return MapStep(fn, (self,))
+
+    def map_seq(self, fn: Callable[..., Tensor]) -> Expr:
+        self._no_compose()
+        return MapSeq(fn, (self,))
+
+    def pipe(self, fn: Callable[..., Tensor]) -> Expr:
+        """Polars-style alias of :meth:`map_seq`: run ``fn`` on the stacked
+        column."""
+        return self.map_seq(fn)
+
+    def fold(self, reducer) -> Expr:
+        """Reduce this column over time with a custom streaming
+        :class:`~btorch.monitor.reducer.Reducer` (O(1) carry, all-mode-
+        safe)."""
+        self._no_compose()
+        return CustomReduce(reducer, self)
+
+    # -- naming -----------------------------------------------------------
+    def alias(self, name: str) -> Expr:
+        return Alias(name, self)
+
+
+def _lit(o) -> Expr:
+    return o if isinstance(o, Expr) else Lit(o)
+
+
+# ---------------------------------------------------------------------------
+# Node types (immutable)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True, eq=False)
+class Col(Expr):
+    """A state target (column).
+
+    ``target`` is a dotted name or a live tensor.
+    """
+
+    target: str | Tensor
+
+
+@dataclass(frozen=True, eq=False)
+class Lit(Expr):
+    """A constant scalar/tensor broadcast into the per-step computation."""
+
+    value: object
+
+
+@dataclass(frozen=True, eq=False)
+class Grad(Expr):
+    """Per-step gradient of a target.
+
+    Captured backward-time via ``register_hook`` by the consumer: it composes
+    with ``torch.compile`` (the loop region is compiler-disabled) but is
+    refused under ``cudagraph=True`` -- replay never runs backward.
+    """
+
+    target: str | Tensor
+    is_grad: bool = True
+
+
+@dataclass(frozen=True, eq=False)
+class Elementwise(Expr):
+    op: str
+    args: tuple[Expr, ...]
+    params: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True, eq=False)
+class Window(Expr):
+    kind: str  # "diff" | "shift"
+    n: int
+    child: Expr
+
+
+@dataclass(frozen=True, eq=False)
+class Reduce(Expr):
+    kind: str  # mean|sum|last|first|min|max|count|std|var
+    child: Expr
+    params: dict = field(default_factory=dict)  # e.g. {"correction": int}
+
+
+@dataclass(frozen=True, eq=False)
+class MapStep(Expr):
+    fn: Callable[..., Tensor]
+    args: tuple[Expr, ...]
+
+
+@dataclass(frozen=True, eq=False)
+class MapSeq(Expr):
+    fn: Callable[..., Tensor]
+    args: tuple[Expr, ...]
+
+
+@dataclass(frozen=True, eq=False)
+class CustomReduce(Expr):
+    reducer: object  # a btorch.monitor.reducer.Reducer
+    child: Expr
+
+
+@dataclass(frozen=True, eq=False)
+class Alias(Expr):
+    name: str
+    child: Expr
+
+
+# ---------------------------------------------------------------------------
+# Constructors (public)
+# ---------------------------------------------------------------------------
+def col(target: str | Tensor) -> Expr:
+    """Select a state target as a column."""
+    return Col(target)
+
+
+def lit(value) -> Expr:
+    """A constant."""
+    return Lit(value)
+
+
+def grad(target: str | Tensor) -> Expr:
+    """Record per-step gradients of a target (backward-time, via hooks).
+
+    Works under ``torch.compile``; refused under ``cudagraph=True``.  Only
+    ``.alias()`` may wrap it -- reduce the recorded trace in post.
+    """
+    return Grad(target)
+
+
+def _checked_cols(cols) -> tuple[Expr, ...]:
+    """Validate multi-target args: at least one, and no grad leaves."""
+    if not cols:
+        raise ValueError("requires at least one column expression")
+    for c in cols:
+        c._no_compose()
+    return tuple(cols)
+
+
+def map_step(fn: Callable[..., Tensor], *cols: Expr) -> Expr:
+    """``fn(a_t, b_t, ...)`` per step on ``[B, N]`` slices; streamable."""
+    return MapStep(fn, _checked_cols(cols))
+
+
+def map_seq(fn: Callable[..., Tensor], *cols: Expr) -> Expr:
+    """``fn(A, B, ...)`` once on stacked ``[T, B, N]`` columns;
+    materialises."""
+    return MapSeq(fn, _checked_cols(cols))

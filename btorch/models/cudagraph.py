@@ -152,17 +152,19 @@ class CudaGraphRunner:
                 'training, use torch.compile(model, mode="reduce-overhead") instead '
                 "-- its cudagraph trees do capture forward and backward."
             )
-        for attr, why in (
-            # Not merely unsupported: the capture path never routes through
-            # _checkpointed_large_chunk, so this would be silently ignored -- no
-            # recompute, no memory saved -- on top of being backward-only.
-            ("grad_checkpoint", "the capture path would silently ignore it"),
-            ("save_grad_history", "its hooks only fire in the backward pass"),
-        ):
-            if getattr(module, attr, False):
-                raise RuntimeError(
-                    f"cudagraph=True is incompatible with {attr}=True ({why})."
-                )
+        # Not merely unsupported: the capture path never routes through
+        # _checkpointed_large_chunk, so this would be silently ignored -- no
+        # recompute, no memory saved -- on top of being backward-only.
+        if getattr(module, "grad_checkpoint", False):
+            raise RuntimeError(
+                "cudagraph=True is incompatible with grad_checkpoint=True (the "
+                "capture path would silently ignore it)."
+            )
+        # NOTE: value/reduction recording monitors DO compose with cudagraph --
+        # their fold is captured inside the chunk graph (see
+        # RecurrentNNAbstract._stacked_chunk_forward). grad(...) monitors and
+        # multi-chunk recording are refused in _cudagraph_multi_step instead, where
+        # the recorder and chunk count are known.
 
     def _capture(self, module, fn, args, kwargs):
         # Snapshot the entry state *by value*. Warmup and capture both advance the
