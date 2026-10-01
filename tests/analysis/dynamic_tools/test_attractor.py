@@ -2,8 +2,8 @@ import numpy as np
 import pytest
 
 from btorch.analysis.dynamic_tools.attractor_dynamics import (
-    calculate_kaplan_yorke_dimension,
-    calculate_structural_eigenvalue_outliers,
+    compute_kaplan_yorke_dimension,
+    compute_structural_eigenvalue_outliers,
 )
 
 
@@ -36,7 +36,7 @@ from btorch.analysis.dynamic_tools.attractor_dynamics import (
     ],
 )
 def test_kaplan_yorke(spectrum, expected):
-    d_ky = calculate_kaplan_yorke_dimension(spectrum)
+    d_ky = compute_kaplan_yorke_dimension(spectrum)
     assert d_ky == pytest.approx(expected, rel=1e-3, abs=1e-3)
 
 
@@ -49,12 +49,12 @@ def test_structural_outliers():
     # W_ij ~ N(0, g^2/N)
     # Eigenvalues should be confined within radius g
     w_random = rng.normal(0, g / np.sqrt(n), (n, n))
-    results_rand = calculate_structural_eigenvalue_outliers(w_random)
+    results_rand = compute_structural_eigenvalue_outliers(w_random)
     assert results_rand["spectral_radius"] > 0
     assert results_rand["outlier_count"] < n * 0.1
 
     # Provide theoretical radius to be strict (instead of estimation).
-    results_rand_theo = calculate_structural_eigenvalue_outliers(
+    results_rand_theo = compute_structural_eigenvalue_outliers(
         w_random, spectral_radius=g
     )
     assert results_rand_theo["spectral_radius"] == pytest.approx(g)
@@ -71,9 +71,7 @@ def test_structural_outliers():
     strength = 5.0 * g
     w_struct = w_random + strength * (u @ v.T)
 
-    results_struct = calculate_structural_eigenvalue_outliers(
-        w_struct, spectral_radius=g
-    )
+    results_struct = compute_structural_eigenvalue_outliers(w_struct, spectral_radius=g)
     assert results_struct["outlier_count"] >= 1
     max_outlier = np.max(np.abs(results_struct["outliers"]))
     assert max_outlier > g * 3.0

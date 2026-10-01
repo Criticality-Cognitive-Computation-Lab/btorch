@@ -10,15 +10,21 @@ dependencies:
   - pip:
     # profiling
     - tensorboard_plugin_profile
-    # dynamic tools
-    - nolds
+    # btorch[analysis] extra
+    - nolds!=0.6.3
     - powerlaw
     - fastdtw
     - btorch
   - tqdm
   - matplotlib
   - scipy
+  # btorch[io] extra
   - xarray
+  - zarr
+  - numcodecs
+  # btorch[viz] extra
+  - plotly
+  - networkx
   - h5py
   - pyyaml
   - hdf5plugin

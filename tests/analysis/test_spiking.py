@@ -30,7 +30,7 @@ from btorch.analysis.spiking import (
 
 
 def generate_poisson_spikes(
-    rate_hz: float, duration_ms: float, dt_ms: float = 1.0, n_neurons: int = 1
+    rate_hz: float, duration_ms: float, dt: float = 1.0, n_neurons: int = 1
 ) -> np.ndarray:
     """Generate Poisson spike train with given rate.
 
@@ -40,9 +40,9 @@ def generate_poisson_spikes(
     - Fano factor = 1 (for counting windows)
     - LV = 1 (local variation)
     """
-    n_steps = int(duration_ms / dt_ms)
+    n_steps = int(duration_ms / dt)
     # Probability of spike in each bin: p = rate * dt
-    p_spike = rate_hz * dt_ms / 1000.0  # rate in Hz, dt in ms
+    p_spike = rate_hz * dt / 1000.0  # rate in Hz, dt in ms
     return (np.random.rand(n_steps, n_neurons) < p_spike).astype(np.float32)
 
 
@@ -50,7 +50,7 @@ def generate_gamma_spikes(
     rate_hz: float,
     shape_k: float,
     duration_ms: float,
-    dt_ms: float = 1.0,
+    dt: float = 1.0,
     n_neurons: int = 1,
 ) -> np.ndarray:
     """Generate renewal process with Gamma-distributed ISIs.
@@ -60,7 +60,7 @@ def generate_gamma_spikes(
     - For k=1: reduces to exponential (Poisson), CV=1
     - For k→∞: approaches regular spiking, CV→0
     """
-    n_steps = int(duration_ms / dt_ms)
+    n_steps = int(duration_ms / dt)
     mean_isi_ms = 1000.0 / rate_hz  # mean ISI in ms
     scale_theta = mean_isi_ms / shape_k  # θ = mean/k
 
@@ -70,7 +70,7 @@ def generate_gamma_spikes(
         while t < duration_ms:
             isi = np.random.gamma(shape_k, scale_theta)
             t += isi
-            idx = int(t / dt_ms)
+            idx = int(t / dt)
             if idx < n_steps:
                 spikes[idx, n] = 1.0
     return spikes
@@ -79,7 +79,7 @@ def generate_gamma_spikes(
 def generate_regular_spikes(
     rate_hz: float,
     duration_ms: float,
-    dt_ms: float = 1.0,
+    dt: float = 1.0,
     n_neurons: int = 1,
     jitter: float = 0.0,
 ) -> np.ndarray:
@@ -87,7 +87,7 @@ def generate_regular_spikes(
 
     Regular spiking has CV = 0 (or close to 0 with small jitter).
     """
-    n_steps = int(duration_ms / dt_ms)
+    n_steps = int(duration_ms / dt)
     isi_ms = 1000.0 / rate_hz
     spikes = np.zeros((n_steps, n_neurons), dtype=np.float32)
 
@@ -96,7 +96,7 @@ def generate_regular_spikes(
         while t < duration_ms:
             # Add jitter if specified
             actual_t = t + np.random.randn() * jitter if jitter > 0 else t
-            idx = int(actual_t / dt_ms)
+            idx = int(actual_t / dt)
             if 0 <= idx < n_steps:
                 spikes[idx, n] = 1.0
             t += isi_ms
@@ -107,7 +107,7 @@ def generate_bursty_spikes(
     rate_hz: float,
     burst_factor: float,
     duration_ms: float,
-    dt_ms: float = 1.0,
+    dt: float = 1.0,
     n_neurons: int = 1,
 ) -> np.ndarray:
     """Generate bursty spike train with higher CV.
@@ -115,7 +115,7 @@ def generate_bursty_spikes(
     Bursty spiking has CV > 1.
     Uses a two-state model: active (bursting) and silent.
     """
-    n_steps = int(duration_ms / dt_ms)
+    n_steps = int(duration_ms / dt)
     spikes = np.zeros((n_steps, n_neurons), dtype=np.float32)
 
     for n in range(n_neurons):
@@ -125,7 +125,7 @@ def generate_bursty_spikes(
             burst_len = int(np.random.exponential(burst_factor * 10))
             # Burst rate is higher
             burst_rate = rate_hz * burst_factor
-            p_burst = burst_rate * dt_ms / 1000.0
+            p_burst = burst_rate * dt / 1000.0
             for _ in range(burst_len):
                 if t < n_steps and np.random.rand() < p_burst:
                     spikes[t, n] = 1.0
@@ -153,9 +153,9 @@ class TestCVWithStochasticProcesses:
         np.random.seed(42)
         # Generate long Poisson spike train for good statistics
         spikes = generate_poisson_spikes(
-            rate_hz=50.0, duration_ms=50000.0, dt_ms=1.0, n_neurons=10
+            rate_hz=50.0, duration_ms=50000.0, dt=1.0, n_neurons=10
         )
-        cv_values, info = isi_cv(spikes, dt_ms=1.0)
+        cv_values, info = isi_cv(spikes, dt=1.0)
         # New info format: spike_count, isi_mean, isi_std, isi_var arrays
         isi_mean = info.get("isi_mean", np.array([]))
         isi_std = info.get("isi_std", np.array([]))
@@ -192,10 +192,10 @@ class TestCVWithStochasticProcesses:
                 rate_hz=50.0,
                 shape_k=shape_k,
                 duration_ms=100000.0,
-                dt_ms=1.0,
+                dt=1.0,
                 n_neurons=20,
             )
-            cv_values, _ = isi_cv(spikes, dt_ms=1.0)
+            cv_values, _ = isi_cv(spikes, dt=1.0)
 
             valid_cv = cv_values[~np.isnan(cv_values)]
             mean_cv = np.mean(valid_cv)
@@ -212,9 +212,9 @@ class TestCVWithStochasticProcesses:
         """
         np.random.seed(42)
         spikes = generate_regular_spikes(
-            rate_hz=20.0, duration_ms=50000.0, dt_ms=1.0, n_neurons=10
+            rate_hz=20.0, duration_ms=50000.0, dt=1.0, n_neurons=10
         )
-        cv_values, info = isi_cv(spikes, dt_ms=1.0)
+        cv_values, info = isi_cv(spikes, dt=1.0)
         # New info format: spike_count, isi_mean, isi_std, isi_var arrays
         isi_mean = info.get("isi_mean", np.array([]))
         isi_std = info.get("isi_std", np.array([]))
@@ -239,7 +239,7 @@ class TestCVWithStochasticProcesses:
         spikes = generate_bursty_spikes(
             rate_hz=30.0, burst_factor=5.0, duration_ms=100000.0, n_neurons=10
         )
-        cv_values, _ = isi_cv(spikes, dt_ms=1.0)
+        cv_values, _ = isi_cv(spikes, dt=1.0)
 
         valid_cv = cv_values[~np.isnan(cv_values)]
         mean_cv = np.mean(valid_cv)
@@ -258,7 +258,7 @@ class TestCVWithStochasticProcesses:
             dtype=np.float32,
         )
 
-        cv_values, info = isi_cv(spike_data, dt_ms=1.0)
+        cv_values, info = isi_cv(spike_data, dt=1.0)
         # New info format: spike_count, isi_mean, isi_std, isi_var arrays
         spike_count = info.get("spike_count", np.array([]))
 
@@ -270,8 +270,8 @@ class TestCVWithStochasticProcesses:
         np.random.seed(42)
         spikes = generate_poisson_spikes(rate_hz=50.0, duration_ms=10000.0, n_neurons=5)
 
-        cv_np, _ = isi_cv(spikes, dt_ms=1.0)
-        cv_torch, _ = isi_cv(torch.from_numpy(spikes), dt_ms=1.0)
+        cv_np, _ = isi_cv(spikes, dt=1.0)
+        cv_torch, _ = isi_cv(torch.from_numpy(spikes), dt=1.0)
 
         np.testing.assert_allclose(cv_np, cv_torch.cpu().numpy(), rtol=1e-5)
 
@@ -284,11 +284,11 @@ class TestCVWithStochasticProcesses:
         ).reshape(1000, 10, 5)
 
         # Without aggregation: CV per trial
-        cv_no_agg, _ = isi_cv(spikes, dt_ms=1.0, batch_axis=None)
+        cv_no_agg, _ = isi_cv(spikes, dt=1.0, batch_axis=None)
         assert cv_no_agg.shape == (10, 5)
 
         # With aggregation: CV across all trials per neuron
-        cv_agg, _ = isi_cv(spikes, dt_ms=1.0, batch_axis=(1,))
+        cv_agg, _ = isi_cv(spikes, dt=1.0, batch_axis=(1,))
         assert cv_agg.shape == (5,)
 
         # Aggregated CV should still be ≈ 1 for Poisson
@@ -314,7 +314,7 @@ class TestFanoFactorWithStochasticProcesses:
         np.random.seed(42)
         # Long simulation for good statistics
         spikes = generate_poisson_spikes(
-            rate_hz=50.0, duration_ms=50000.0, dt_ms=1.0, n_neurons=20
+            rate_hz=50.0, duration_ms=50000.0, dt=1.0, n_neurons=20
         )
 
         # Use multiple window sizes
@@ -457,9 +457,9 @@ class TestLocalVariationWithStochasticProcesses:
         """Poisson process should have LV ≈ 1."""
         np.random.seed(42)
         spikes = generate_poisson_spikes(
-            rate_hz=50.0, duration_ms=100000.0, dt_ms=1.0, n_neurons=20
+            rate_hz=50.0, duration_ms=100000.0, dt=1.0, n_neurons=20
         )
-        lv_values, _ = local_variation(spikes, dt_ms=1.0)
+        lv_values, _ = local_variation(spikes, dt=1.0)
 
         valid_lv = lv_values[~np.isnan(lv_values)]
         mean_lv = np.mean(valid_lv)
@@ -469,9 +469,9 @@ class TestLocalVariationWithStochasticProcesses:
         """Regular spiking should have LV ≈ 0."""
         np.random.seed(42)
         spikes = generate_regular_spikes(
-            rate_hz=20.0, duration_ms=100000.0, dt_ms=1.0, n_neurons=10
+            rate_hz=20.0, duration_ms=100000.0, dt=1.0, n_neurons=10
         )
-        lv_values, _ = local_variation(spikes, dt_ms=1.0)
+        lv_values, _ = local_variation(spikes, dt=1.0)
 
         valid_lv = lv_values[~np.isnan(lv_values)]
         assert np.all(
@@ -493,9 +493,9 @@ class TestLocalVariationWithStochasticProcesses:
             rate_hz=50.0, burst_factor=3.0, duration_ms=duration_ms, n_neurons=10
         )
 
-        lv_reg, _ = local_variation(regular, dt_ms=1.0)
-        lv_pois, _ = local_variation(poisson, dt_ms=1.0)
-        lv_burst, _ = local_variation(bursty, dt_ms=1.0)
+        lv_reg, _ = local_variation(regular, dt=1.0)
+        lv_pois, _ = local_variation(poisson, dt=1.0)
+        lv_burst, _ = local_variation(bursty, dt=1.0)
 
         mean_reg = np.nanmean(lv_reg)
         mean_pois = np.nanmean(lv_pois)
@@ -511,8 +511,8 @@ class TestLocalVariationWithStochasticProcesses:
         np.random.seed(42)
         spikes = generate_poisson_spikes(rate_hz=50.0, duration_ms=10000.0, n_neurons=5)
 
-        lv_np, _ = local_variation(spikes, dt_ms=1.0)
-        lv_torch, _ = local_variation(torch.from_numpy(spikes), dt_ms=1.0)
+        lv_np, _ = local_variation(spikes, dt=1.0)
+        lv_torch, _ = local_variation(torch.from_numpy(spikes), dt=1.0)
 
         np.testing.assert_allclose(lv_np, lv_torch.cpu().numpy(), rtol=1e-5)
 
@@ -593,7 +593,7 @@ class TestUtilityFunctions:
         """Test firing rate computation."""
         np.random.seed(42)
         spikes = generate_poisson_spikes(
-            rate_hz=100.0, duration_ms=1000.0, dt_ms=1.0, n_neurons=5
+            rate_hz=100.0, duration_ms=1000.0, dt=1.0, n_neurons=5
         )
 
         # Rate per neuron
@@ -640,14 +640,14 @@ class TestGPU:
         spikes = generate_poisson_spikes(rate_hz=50.0, duration_ms=10000.0, n_neurons=5)
         spikes_gpu = torch.from_numpy(spikes).cuda()
 
-        cv_gpu, _ = isi_cv(spikes_gpu, dt_ms=1.0)
+        cv_gpu, _ = isi_cv(spikes_gpu, dt=1.0)
 
         assert isinstance(cv_gpu, torch.Tensor)
         assert cv_gpu.device.type == "cuda"
         assert cv_gpu.shape == (5,)
 
         # Result should be similar to CPU
-        cv_cpu, _ = isi_cv(spikes, dt_ms=1.0)
+        cv_cpu, _ = isi_cv(spikes, dt=1.0)
         np.testing.assert_allclose(cv_cpu, cv_gpu.cpu().numpy(), rtol=1e-4)
 
     def test_fano_gpu(self):
@@ -667,7 +667,7 @@ class TestGPU:
         spikes = generate_poisson_spikes(rate_hz=50.0, duration_ms=10000.0, n_neurons=5)
         spikes_gpu = torch.from_numpy(spikes).cuda()
 
-        lv_gpu, _ = local_variation(spikes_gpu, dt_ms=1.0)
+        lv_gpu, _ = local_variation(spikes_gpu, dt=1.0)
 
         assert isinstance(lv_gpu, torch.Tensor)
         assert lv_gpu.device.type == "cuda"
@@ -678,7 +678,7 @@ class TestGPU:
         spikes = generate_poisson_spikes(rate_hz=50.0, duration_ms=10000.0, n_neurons=5)
         spikes_gpu = torch.from_numpy(spikes).cuda()
 
-        cv_temp_gpu, _ = cv_temporal(spikes_gpu, dt_ms=1.0, window=100, step=10)
+        cv_temp_gpu, _ = cv_temporal(spikes_gpu, dt=1.0, window=100, step=10)
 
         assert isinstance(cv_temp_gpu, torch.Tensor)
         assert cv_temp_gpu.device.type == "cuda"
@@ -716,11 +716,11 @@ class TestCVTemporal:
         np.random.seed(42)
         # Generate long Poisson spike train for good statistics
         spikes = generate_poisson_spikes(
-            rate_hz=50.0, duration_ms=50000.0, dt_ms=1.0, n_neurons=10
+            rate_hz=50.0, duration_ms=50000.0, dt=1.0, n_neurons=10
         )
 
         # Use sliding windows
-        cv_temp, info = cv_temporal(spikes, dt_ms=1.0, window=500, step=100)
+        cv_temp, info = cv_temporal(spikes, dt=1.0, window=500, step=100)
 
         # Shape should be [n_windows, n_neurons]
         n_expected_windows = (50000 - 500) // 100 + 1
@@ -754,10 +754,10 @@ class TestCVTemporal:
         """
         np.random.seed(42)
         spikes = generate_regular_spikes(
-            rate_hz=20.0, duration_ms=50000.0, dt_ms=1.0, n_neurons=10
+            rate_hz=20.0, duration_ms=50000.0, dt=1.0, n_neurons=10
         )
 
-        cv_temp, info = cv_temporal(spikes, dt_ms=1.0, window=500, step=100)
+        cv_temp, info = cv_temporal(spikes, dt=1.0, window=500, step=100)
 
         # Shape verification
         n_expected_windows = (50000 - 500) // 100 + 1
@@ -780,15 +780,15 @@ class TestCVTemporal:
         half_duration = int(duration_ms / 2)
 
         spikes_low = generate_poisson_spikes(
-            rate_hz=20.0, duration_ms=half_duration, dt_ms=1.0, n_neurons=5
+            rate_hz=20.0, duration_ms=half_duration, dt=1.0, n_neurons=5
         )
         spikes_high = generate_poisson_spikes(
-            rate_hz=80.0, duration_ms=half_duration, dt_ms=1.0, n_neurons=5
+            rate_hz=80.0, duration_ms=half_duration, dt=1.0, n_neurons=5
         )
         spikes = np.concatenate([spikes_low, spikes_high], axis=0)
 
         # Compute temporal CV with overlapping windows
-        cv_temp, info = cv_temporal(spikes, dt_ms=1.0, window=1000, step=200)
+        cv_temp, info = cv_temporal(spikes, dt=1.0, window=1000, step=200)
 
         # Check shape
         assert cv_temp.shape[0] > 10  # Should have multiple windows
@@ -812,9 +812,9 @@ class TestCVTemporal:
         np.random.seed(42)
         spikes = generate_poisson_spikes(rate_hz=50.0, duration_ms=10000.0, n_neurons=5)
 
-        cv_temp_np, _ = cv_temporal(spikes, dt_ms=1.0, window=200, step=50)
+        cv_temp_np, _ = cv_temporal(spikes, dt=1.0, window=200, step=50)
         cv_temp_torch, _ = cv_temporal(
-            torch.from_numpy(spikes), dt_ms=1.0, window=200, step=50
+            torch.from_numpy(spikes), dt=1.0, window=200, step=50
         )
 
         np.testing.assert_allclose(
@@ -830,15 +830,13 @@ class TestCVTemporal:
         ).reshape(2000, 10, 5)
 
         # Without aggregation: CV per trial
-        cv_no_agg, _ = cv_temporal(
-            spikes, dt_ms=1.0, window=200, step=50, batch_axis=None
-        )
+        cv_no_agg, _ = cv_temporal(spikes, dt=1.0, window=200, step=50, batch_axis=None)
         # Shape should be [n_windows, trials, neurons]
         assert cv_no_agg.shape[1:] == (10, 5)
 
         # With aggregation: aggregate across trials (axis 1)
         # Note: cv_temporal applies batch_axis per window but maintains shape
-        cv_agg, _ = cv_temporal(spikes, dt_ms=1.0, window=200, step=50, batch_axis=(1,))
+        cv_agg, _ = cv_temporal(spikes, dt=1.0, window=200, step=50, batch_axis=(1,))
         # Shape maintains original structure [n_windows, trials, neurons]
         # but values are computed from aggregated spikes
         assert cv_agg.shape[1:] == (10, 5)
@@ -858,7 +856,7 @@ class TestCVTemporal:
         # Test different window sizes
         for window in [100, 200, 500]:
             for step in [10, 50, 100]:
-                cv_temp, info = cv_temporal(spikes, dt_ms=1.0, window=window, step=step)
+                cv_temp, info = cv_temporal(spikes, dt=1.0, window=window, step=step)
 
                 # Calculate expected number of windows
                 n_expected = (10000 - window) // step + 1
@@ -898,7 +896,7 @@ class TestFanoTemporal:
         # Generate long Poisson spike train with many neurons
         # Need many neurons to compute population Fano within each window
         spikes = generate_poisson_spikes(
-            rate_hz=50.0, duration_ms=10000.0, dt_ms=1.0, n_neurons=100
+            rate_hz=50.0, duration_ms=10000.0, dt=1.0, n_neurons=100
         )
 
         # Use sliding windows
@@ -941,7 +939,7 @@ class TestFanoTemporal:
             rate_hz=50.0,
             burst_factor=3.0,
             duration_ms=duration_ms,
-            dt_ms=1.0,
+            dt=1.0,
             n_neurons=n_neurons,
         )
 
@@ -969,7 +967,7 @@ class TestFanoTemporal:
 
         # Generate Poisson spikes
         spikes = generate_poisson_spikes(
-            rate_hz=50.0, duration_ms=duration_ms, dt_ms=1.0, n_neurons=n_neurons
+            rate_hz=50.0, duration_ms=duration_ms, dt=1.0, n_neurons=n_neurons
         )
 
         window = 500

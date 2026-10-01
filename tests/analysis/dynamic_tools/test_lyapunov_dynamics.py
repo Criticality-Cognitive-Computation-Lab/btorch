@@ -1,10 +1,15 @@
 import numpy as np
+import pytest
 
 from btorch.analysis.dynamic_tools.lyapunov_dynamics import (
     compute_expansion_to_contraction_ratio,
     compute_lyapunov_exponent_spectrum,
     compute_max_lyapunov_exponent,
 )
+
+
+# Optional extras: skip this module when the library is not installed.
+pytest.importorskip("nolds")
 
 
 def _logistic_map(r: float, x0: float, n_steps: int, burn_in: int = 300):

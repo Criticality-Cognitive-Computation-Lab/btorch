@@ -1,9 +1,10 @@
 from collections.abc import Sequence
 
 import numpy as np
-from fastdtw import fastdtw
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import euclidean as _scipy_euclidean, squareform
+
+from ..utils._optional import require
 
 
 def _euclidean(u: np.ndarray | float, v: np.ndarray | float) -> float:
@@ -35,6 +36,7 @@ def cluster_traces(
 ) -> tuple[dict[int, list[int]], np.ndarray, np.ndarray, np.ndarray]:
     """Cluster traces of voltages or currents using hierarchical agglomerative
     clustering with DTW distance."""
+    fastdtw = require("fastdtw", "analysis", "DTW clustering").fastdtw
     num_traces = len(traces)
 
     distance_matrix = np.zeros((num_traces, num_traces))

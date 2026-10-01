@@ -56,16 +56,16 @@ import numpy as np
 from btorch.analysis import isi_cv, fano, firing_rate
 
 # Generate sample spike data [time, batch, neurons]
-spike_data = np.random.rand(1000, 10, 50) > 0.95
+spikes = np.random.rand(1000, 10, 50) > 0.95
 
 # Coefficient of variation of ISIs
-cv, isi_total, isi_stats = isi_cv(spike_data, dt_ms=1.0)
+cv, info = isi_cv(spikes, dt=1.0)
 
 # Fano factor (variance/mean of spike counts)
-fano_values, fano_stats = fano(spike_data, window_ms=100, dt_ms=1.0)
+fano_values, fano_stats = fano(spikes, window=100)
 
 # Firing rate via convolution
-rates = firing_rate(spike_data, dt_ms=1.0, smooth_ms=50)
+rates = firing_rate(spikes, width=50, dt=1.0)
 ```
 
 ## Shape Conventions

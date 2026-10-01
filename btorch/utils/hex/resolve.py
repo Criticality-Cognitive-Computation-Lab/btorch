@@ -10,7 +10,7 @@ layouts via :data:`_TO_PIXEL`. Both are plain dicts mapping string
 keys to converter functions.
 """
 
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -26,6 +26,25 @@ from .offset import (
 )
 from .transform import axial_from_cube, to_pixel
 
+
+CoordFormat = Literal[
+    "axial",
+    "odd_r",
+    "even_r",
+    "odd_q",
+    "even_q",
+    "doublewidth",
+    "doubleheight",
+    "zigzag",
+    "flywire",
+    "cube",
+    "pixel",
+]
+"""Coordinate formats accepted by :func:`resolve_hex` and the hex plots.
+
+``"flywire"`` is an alias of ``"zigzag"``; ``"pixel"`` means the inputs are
+already screen coordinates.
+"""
 
 _TO_AXIAL = {
     "axial": lambda c1, c2: (
@@ -80,7 +99,7 @@ _HEX_SYMBOLS = {
 def resolve_hex(
     c1: np.ndarray,
     c2: np.ndarray,
-    coord_format: str = "axial",
+    coord_format: CoordFormat = "axial",
     layout: str = "pointy",
     size: float = 1.0,
     **layout_kw: Any,

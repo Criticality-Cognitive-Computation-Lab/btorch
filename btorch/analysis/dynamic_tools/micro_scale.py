@@ -3,7 +3,7 @@ import torch
 from scipy.stats import kurtosis, skew
 
 
-def calculate_fr_distribution(
+def compute_fr_distribution(
     spikes: np.ndarray | torch.Tensor,
     dt: float = 1.0,
 ) -> dict:
@@ -33,7 +33,7 @@ def calculate_fr_distribution(
     }
 
 
-def calculate_cv_isi(
+def compute_cv_isi(
     spikes: np.ndarray | torch.Tensor,
     dt: float = 1.0,
 ) -> dict:
@@ -76,7 +76,7 @@ def calculate_cv_isi(
     }
 
 
-def calculate_spike_distance(
+def compute_spike_distance(
     spikes: np.ndarray | torch.Tensor,
     dt: float = 1.0,
     subset_size: int = 100,

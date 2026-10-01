@@ -31,7 +31,7 @@ def test_compare_fano_methods_failure_is_nan_not_string(monkeypatch):
 
     monkeypatch.setattr(dyn_spiking, "fano_mean_matching", boom)
     with pytest.warns(UserWarning, match="mean_matching"):
-        results = dyn_spiking.compare_fano_methods(_spikes(), dt_ms=1.0)
+        results = dyn_spiking.compare_fano_methods(_spikes(), dt=1.0)
 
     assert np.isnan(results["mean_matching"])
     # No value in the result dict may be a string.
@@ -46,7 +46,7 @@ def test_compare_fano_methods_programming_errors_propagate(monkeypatch):
 
     monkeypatch.setattr(dyn_spiking, "fano_mean_matching", bug)
     with pytest.raises(TypeError):
-        dyn_spiking.compare_fano_methods(_spikes(), dt_ms=1.0)
+        dyn_spiking.compare_fano_methods(_spikes(), dt=1.0)
 
 
 def test_fano_operational_time_rejects_overlap():
@@ -111,7 +111,7 @@ class _Linear(torch.nn.Module):
 def test_gain_stability_missing_layer_raises():
     """A model without brain.synapse.linear raises instead of returning 0.0."""
     with pytest.raises(AttributeError, match="brain.synapse.linear"):
-        complexity.calculate_gain_stability_sensitivity(
+        complexity.compute_gain_stability_sensitivity(
             torch.nn.Linear(1, 1), [{"input": torch.zeros(1, 4, 1)}], device="cpu"
         )
 
@@ -144,7 +144,7 @@ def test_gain_stability_restores_weights_and_returns_nan(monkeypatch):
         raise ValueError("series too short")
 
     monkeypatch.setattr(complexity, "compute_max_lyapunov_exponent", le_fail)
-    slope, intercept, g, lam = complexity.calculate_gain_stability_sensitivity(
+    slope, intercept, g, lam = complexity.compute_gain_stability_sensitivity(
         model, loader, g_values=np.array([1.0, 2.0, 3.0]), device="cpu"
     )
     assert np.isnan(slope) and np.isnan(intercept)
@@ -156,13 +156,13 @@ def test_gain_stability_restores_weights_and_returns_nan(monkeypatch):
 
     monkeypatch.setattr(complexity, "compute_max_lyapunov_exponent", hard_fail)
     with pytest.raises(KeyError):
-        complexity.calculate_gain_stability_sensitivity(
+        complexity.compute_gain_stability_sensitivity(
             model, loader, g_values=np.array([5.0]), device="cpu"
         )
     assert torch.equal(model.brain.synapse.linear.magnitude.data, torch.ones(2))
 
 
-def test_calculate_pcist_svd_failure_is_nan_with_warning(monkeypatch):
+def test_compute_pcist_svd_failure_is_nan_with_warning(monkeypatch):
     """A non-converging SVD yields NaN plus a warning, never a fake 0.0."""
 
     def boom(*args, **kwargs):
@@ -172,7 +172,7 @@ def test_calculate_pcist_svd_failure_is_nan_with_warning(monkeypatch):
     resp = torch.randn(50, 4)
     base = torch.randn(50, 4)
     with pytest.warns(UserWarning, match="SVD failed"):
-        score = complexity.calculate_pcist(resp, base)
+        score = complexity.compute_pcist(resp, base)
     assert np.isnan(score)
 
 

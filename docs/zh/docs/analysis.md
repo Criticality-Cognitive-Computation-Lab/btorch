@@ -30,8 +30,8 @@ from btorch.analysis.spiking import cv_from_spikes, fano_factor_from_spikes
 
 # NumPy 输入，跨 trial 进行批次聚合
 cv, isi_total, isi_stats = cv_from_spikes(
-    spike_data,           # 形状: [T, B, N] 
-    dt_ms=1.0,
+    spikes,           # 形状: [T, B, N] 
+    dt=1.0,
     batch_axis=(1,),      # 跨批次维度聚合
     percentile=(0.1, 0.5, 0.9)  # 计算第 10、50、90 百分位数
 )
@@ -41,8 +41,8 @@ cv, isi_total, isi_stats = cv_from_spikes(
 # Torch GPU 输入
 import torch
 cv_gpu, _, _ = cv_from_spikes(
-    torch.from_numpy(spike_data).cuda(),
-    dt_ms=1.0,
+    torch.from_numpy(spikes).cuda(),
+    dt=1.0,
     batch_axis=(1,)
 )
 # 返回 GPU 张量，使用 CPU/GPU 混合模式以提高效率
@@ -64,7 +64,7 @@ fano_sweep = fano_factor_from_spikes(
 # 局部变异度 (LV) - 比 CV 对速率变化的敏感度更低
 lv, lv_stats = local_variation_from_spikes(
     spikes,
-    dt_ms=1.0,
+    dt=1.0,
     percentile=(0.25, 0.75)
 )
 ```

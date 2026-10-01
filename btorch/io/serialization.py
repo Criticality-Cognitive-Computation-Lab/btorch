@@ -33,24 +33,20 @@ Partial recordings (only a subset of neurons recorded) are expanded to full
 size by filling missing entries with NaN (float) or 0 (integer/bool).
 """
 
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 import scipy.sparse as sp
 import torch
-import xarray as xr
+
+from ..utils._optional import require
 
 
-try:
-    from zarr.codecs import BloscCodec
-except ImportError:  # Zarr v2
-    BloscCodec = None
-
-try:
-    from numcodecs import Blosc
-except ImportError:  # Zarr v3-only environment
-    Blosc = None
+if TYPE_CHECKING:
+    import xarray as xr
 
 
 def _to_numpy(val: Any) -> np.ndarray | sp.spmatrix | sp.sparray:
@@ -562,6 +558,7 @@ def memories_to_xarray(
                 np.arange(np.prod(shape)).reshape(shape),
             )
 
+    xr = require("xarray", "io", "xarray/Zarr serialization")
     ds = xr.Dataset(ds_vars)
     if "root_id" in ds:
         ds = ds.set_coords("root_id")
@@ -612,7 +609,7 @@ def xarray_to_memories(
 
 
 def save_memories_to_xarray(
-    data: dict[str, Any],
+    memories: dict[str, Any],
     path: str | Path,
     dim_counts: Sequence[int] | None = None,
     dim_names: Sequence[str] = ("time", "batch", "neuron"),
@@ -623,6 +620,7 @@ def save_memories_to_xarray(
     spike_suffix: str = "spike",
     spike_dtype: Any = bool,
     sparse_threshold: float = 0.05,
+    force_sparse: bool | Sequence[str] = False,
     compression_level: int = 5,
     chunks: dict[str, int] | None = None,
     overwrite: bool = True,
@@ -633,7 +631,7 @@ def save_memories_to_xarray(
     with compression and optional chunking.
 
     Args:
-        data: Nested dictionary of arrays/tensors to save.
+        memories: Nested dictionary of arrays/tensors to save.
         path: Path to the output Zarr store.
         dim_counts: Dimension counts per logical group (see
             ``memories_to_xarray``).
@@ -645,14 +643,17 @@ def save_memories_to_xarray(
         spike_suffix: Substring identifying spike arrays.
         spike_dtype: Dtype for spike conversion.
         sparse_threshold: Sparsity threshold for sparse encoding.
+        force_sparse: Force sparse encoding for all spike arrays (True) or for
+            the listed variable names (see ``memories_to_xarray``).
         compression_level: Zstd compression level (1-9, higher=smaller).
         chunks: Optional chunk sizes per dimension, e.g.,
             ``{"time": 100, "neuron": -1}``.
         overwrite: If True, overwrite existing store. If False, raise error
             if store exists.
     """
+    require("zarr", "io", "Zarr serialization")
     ds = memories_to_xarray(
-        data,
+        memories,
         dim_counts=dim_counts,
         dim_names=dim_names,
         neuron_ids=neuron_ids,
@@ -662,9 +663,19 @@ def save_memories_to_xarray(
         spike_suffix=spike_suffix,
         spike_dtype=spike_dtype,
         sparse_threshold=sparse_threshold,
+        force_sparse=force_sparse,
     )
 
     encoding = {}
+
+    try:
+        from zarr.codecs import BloscCodec
+    except ImportError:  # Zarr v2
+        BloscCodec = None
+    try:
+        from numcodecs import Blosc
+    except ImportError:  # Zarr v3-only environment
+        Blosc = None
 
     if BloscCodec is not None:
         # Zarr v3 expects native codecs in `compressors`.
@@ -680,8 +691,9 @@ def save_memories_to_xarray(
         compressor_value = compressor
     else:
         raise ImportError(
-            "No Blosc codec is available. Install `numcodecs` for Zarr v2, "
-            "or use Zarr v3 with `zarr.codecs.BloscCodec`."
+            "No Blosc codec is available. Install `numcodecs` for Zarr v2 "
+            '(pip install "btorch[io]"), or use Zarr v3 with '
+            "`zarr.codecs.BloscCodec`."
         )
 
     for v_name in ds.variables:
@@ -714,5 +726,7 @@ def load_memories_from_xarray(
     Returns:
         Nested dictionary with restored structure.
     """
+    xr = require("xarray", "io", "xarray/Zarr serialization")
+    require("zarr", "io", "Zarr serialization")
     ds = xr.open_zarr(path, consolidated=True, chunks="auto" if dask else None)
     return xarray_to_memories(ds, return_sparse_2d=return_sparse_2d)

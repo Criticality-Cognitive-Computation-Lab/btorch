@@ -35,35 +35,35 @@ from btorch.analysis.statistics import use_percentiles, use_stats
 
 
 def _estimate_rate_numpy(
-    spike_data: np.ndarray,
-    dt_ms: float,
+    spikes: np.ndarray,
+    dt: float,
     window_ms: float | None = None,
 ) -> np.ndarray:
     """Estimate instantaneous firing rate using sliding window.
 
     Args:
-        spike_data: Spike train of shape [T, ...]. First dimension is time.
-        dt_ms: Time step in milliseconds.
-        window_ms: Window size for rate estimation. If None, uses T//20 * dt_ms.
+        spikes: Spike train of shape [T, ...]. First dimension is time.
+        dt: Time step in milliseconds.
+        window_ms: Window size for rate estimation. If None, uses T//20 * dt.
 
     Returns:
         Estimated rate in Hz [T, ...].
     """
-    T = spike_data.shape[0]
+    T = spikes.shape[0]
 
     if window_ms is None:
         window_bins = max(10, T // 20)
     else:
-        window_bins = max(1, int(window_ms / dt_ms))
+        window_bins = max(1, int(window_ms / dt))
 
     # Simple moving average for rate estimation
-    kernel = np.ones(window_bins) / (window_bins * dt_ms / 1000.0)
+    kernel = np.ones(window_bins) / (window_bins * dt / 1000.0)
 
     # Convolve along time axis for each neuron independently
     rate = np.apply_along_axis(
         lambda x: np.convolve(x, kernel, mode="same"),
         axis=0,
-        arr=spike_data,
+        arr=spikes,
     )
 
     # Ensure minimum rate to avoid division by zero
@@ -71,34 +71,32 @@ def _estimate_rate_numpy(
 
 
 def _estimate_rate_torch(
-    spike_data: torch.Tensor,
-    dt_ms: float,
+    spikes: torch.Tensor,
+    dt: float,
     window_ms: float | None = None,
 ) -> torch.Tensor:
     """Torch implementation of rate estimation."""
-    T = spike_data.shape[0]
+    T = spikes.shape[0]
 
     if window_ms is None:
         window_bins = max(10, T // 20)
     else:
-        window_bins = max(1, int(window_ms / dt_ms))
+        window_bins = max(1, int(window_ms / dt))
 
     # Pad with edge values to handle boundaries
     pad = window_bins // 2
 
     # Handle different dimensions
-    original_shape = spike_data.shape
-    if spike_data.ndim == 1:
-        spike_data = spike_data.unsqueeze(-1)  # [T, 1]
+    original_shape = spikes.shape
+    if spikes.ndim == 1:
+        spikes = spikes.unsqueeze(-1)  # [T, 1]
 
     # Pad using constant mode (replicate edge values)
-    spike_padded = torch.nn.functional.pad(
-        spike_data, (0, 0, pad, pad), mode="constant"
-    )
+    spike_padded = torch.nn.functional.pad(spikes, (0, 0, pad, pad), mode="constant")
     # Fill padding with edge values (replicate)
     if pad > 0:
-        spike_padded[:pad] = spike_data[0]
-        spike_padded[-pad:] = spike_data[-1]
+        spike_padded[:pad] = spikes[0]
+        spike_padded[-pad:] = spikes[-1]
 
     cumsum = torch.cumsum(spike_padded, dim=0)
     moving_sum = cumsum[window_bins:] - cumsum[:-window_bins]
@@ -113,7 +111,7 @@ def _estimate_rate_torch(
         pad_right = T - moving_sum.shape[0]
         moving_sum = torch.nn.functional.pad(moving_sum, (0, 0, 0, pad_right))
 
-    rate = moving_sum / (window_bins * dt_ms / 1000.0)
+    rate = moving_sum / (window_bins * dt / 1000.0)
 
     # Restore original shape
     rate = rate.reshape(original_shape)
@@ -122,10 +120,10 @@ def _estimate_rate_torch(
 
 
 def _compute_operational_fano_numpy(
-    spike_data: np.ndarray,
+    spikes: np.ndarray,
     rate_hz: np.ndarray,
     window_op: float,
-    dt_ms: float,
+    dt: float,
     batch_axis: tuple[int, ...] | None,
 ) -> tuple[np.ndarray, dict]:
     """Compute Fano factor in operational time for NumPy arrays.
@@ -139,23 +137,21 @@ def _compute_operational_fano_numpy(
     computing statistics as if rate = 1 everywhere.
 
     Args:
-        spike_data: Spike train [T, ...]
+        spikes: Spike train [T, ...]
         rate_hz: Estimated rate in Hz [T, ...] or scalar
         window_op: Window size in operational time units
-        dt_ms: Time step in milliseconds
+        dt: Time step in milliseconds
         batch_axis: Axes to aggregate across
 
     Returns:
         fano_op: Operational time Fano factor
         info: Computation info
     """
-    T = spike_data.shape[0]
-    rest_shape = spike_data.shape[1:]
+    T = spikes.shape[0]
+    rest_shape = spikes.shape[1:]
     n_elements = np.prod(rest_shape) if rest_shape else 1
 
-    flat_spikes = (
-        spike_data.reshape(T, -1) if n_elements > 0 else spike_data.reshape(T, 1)
-    )
+    flat_spikes = spikes.reshape(T, -1) if n_elements > 0 else spikes.reshape(T, 1)
     flat_rate = (
         rate_hz.reshape(T, -1)
         if isinstance(rate_hz, np.ndarray) and rate_hz.ndim > 0
@@ -182,7 +178,7 @@ def _compute_operational_fano_numpy(
     # Then compute variance/mean of normalized counts
 
     # For simplicity, use fixed window in original time and normalize
-    window_bins = max(5, int(window_op / np.median(median_rate) / (dt_ms / 1000.0)))
+    window_bins = max(5, int(window_op / np.median(median_rate) / (dt / 1000.0)))
     window_bins = min(window_bins, T // 3)  # Ensure reasonable size
 
     if window_bins < 2:
@@ -217,7 +213,7 @@ def _compute_operational_fano_numpy(
             n_neurons, flat_rate if np.isscalar(flat_rate) else np.mean(flat_rate)
         )
 
-    window_duration_s = window_bins * dt_ms / 1000.0
+    window_duration_s = window_bins * dt / 1000.0
     expected_counts = mean_rate * window_duration_s  # [n_neurons]
 
     # Normalized counts (as if rate = 1)
@@ -254,21 +250,19 @@ def _compute_operational_fano_numpy(
 
 
 def _compute_operational_fano_torch(
-    spike_data: torch.Tensor,
+    spikes: torch.Tensor,
     rate_hz: torch.Tensor | float,
     window_op: float,
-    dt_ms: float,
+    dt: float,
     batch_axis: tuple[int, ...] | None,
 ) -> tuple[torch.Tensor, dict]:
     """Compute Fano factor in operational time for Torch tensors."""
-    device = spike_data.device
-    T = spike_data.shape[0]
-    rest_shape = spike_data.shape[1:]
+    device = spikes.device
+    T = spikes.shape[0]
+    rest_shape = spikes.shape[1:]
     n_elements = int(np.prod(rest_shape)) if rest_shape else 1
 
-    flat_spikes = (
-        spike_data.reshape(T, -1) if n_elements > 0 else spike_data.reshape(T, 1)
-    )
+    flat_spikes = spikes.reshape(T, -1) if n_elements > 0 else spikes.reshape(T, 1)
 
     if isinstance(rate_hz, torch.Tensor):
         flat_rate = rate_hz.reshape(T, -1) if rate_hz.numel() > 1 else rate_hz.item()
@@ -286,7 +280,7 @@ def _compute_operational_fano_torch(
         median_rate = torch.full((n_neurons,), scalar_rate, device=device)
 
     median_rate_val = torch.median(median_rate).item()
-    window_bins = max(5, int(window_op / median_rate_val / (dt_ms / 1000.0)))
+    window_bins = max(5, int(window_op / median_rate_val / (dt / 1000.0)))
     window_bins = min(window_bins, T // 3)
 
     if window_bins < 2:
@@ -319,7 +313,7 @@ def _compute_operational_fano_torch(
         )
         mean_rate = torch.full((n_neurons,), scalar_rate, device=device)
 
-    window_duration_s = window_bins * dt_ms / 1000.0
+    window_duration_s = window_bins * dt / 1000.0
     expected_counts = mean_rate * window_duration_s
 
     # Normalized counts
@@ -357,12 +351,12 @@ def _compute_operational_fano_torch(
 @use_percentiles(value_key="fano_op")
 @use_stats(value_key="fano_op")
 def fano_operational_time(
-    spike_data: np.ndarray | torch.Tensor,
+    spikes: np.ndarray | torch.Tensor,
     window: float | None = None,
-    overlap: float | None = None,
+    overlap: int | None = None,
     rate_hz: np.ndarray | torch.Tensor | float | None = None,
-    dt_ms: float = 1.0,
-    batch_axis: tuple[int, ...] | None = None,
+    dt: float = 1.0,
+    batch_axis: int | tuple[int, ...] | None = None,
 ) -> tuple[np.ndarray | torch.Tensor, dict]:
     """Compute Fano factor in operational time (rate-independent).
 
@@ -378,9 +372,10 @@ def fano_operational_time(
         Information", Front. Comput. Neurosci.
 
         Args:
-            spike_data: Spike train of shape [T, ...]. First dimension is time.
+            spikes: Spike train of shape [T, ...]. First dimension is time.
                 Values are binary (0/1) or spike counts.
-            window: Window size in operational time units (default: 1.0).
+            window: Window size in operational time units (default: 1.0). This is a
+                dimensionless expected spike count, not a number of time bins.
                 This is the expected count at rate=1 (i.e., 1 spike expected).
             overlap: Unsupported. Operational-time windows are disjoint; any
                 value other than ``None`` or ``0`` raises ``ValueError``.
@@ -388,7 +383,7 @@ def fano_operational_time(
                 - Scalar: homogeneous rate
                 - Array [T, ...]: time-varying rate
                 - None: estimated from data using sliding window
-            dt_ms: Time step in milliseconds for original time axis.
+            dt: Time step in milliseconds for original time axis.
             batch_axis: Axes to average across for FF computation.
 
         Returns:
@@ -403,6 +398,8 @@ def fano_operational_time(
             >>> ff_high, _ = fano_operational_time(spikes_high_rate)
             >>> # Both should be ≈ 1 regardless of rate difference
     """
+    if isinstance(batch_axis, int):
+        batch_axis = (batch_axis,)
     if overlap:
         raise ValueError(
             "fano_operational_time does not support overlapping windows; "
@@ -411,23 +408,19 @@ def fano_operational_time(
     if window is None:
         window = 1.0  # Unit operational time window
 
-    is_torch = isinstance(spike_data, torch.Tensor)
+    is_torch = isinstance(spikes, torch.Tensor)
 
     # Estimate rate if not provided
     if rate_hz is None:
         if is_torch:
-            rate_hz = _estimate_rate_torch(spike_data, dt_ms)
+            rate_hz = _estimate_rate_torch(spikes, dt)
         else:
-            rate_hz = _estimate_rate_numpy(spike_data, dt_ms)
+            rate_hz = _estimate_rate_numpy(spikes, dt)
 
     if is_torch:
-        return _compute_operational_fano_torch(
-            spike_data, rate_hz, window, dt_ms, batch_axis
-        )
+        return _compute_operational_fano_torch(spikes, rate_hz, window, dt, batch_axis)
     else:
-        return _compute_operational_fano_numpy(
-            spike_data, rate_hz, window, dt_ms, batch_axis
-        )
+        return _compute_operational_fano_numpy(spikes, rate_hz, window, dt, batch_axis)
 
 
 # =============================================================================
@@ -641,13 +634,13 @@ def _compute_weighted_fano_torch(
 @use_percentiles(value_key="fano_mm")
 @use_stats(value_key="fano_mm")
 def fano_mean_matching(
-    spike_data: np.ndarray | torch.Tensor,
+    spikes: np.ndarray | torch.Tensor,
     window: int | None = None,
     overlap: int = 0,
     condition_axis: int = 1,
     n_bins: int = 10,
     n_resamples: int = 50,
-    batch_axis: tuple[int, ...] | None = None,
+    batch_axis: int | tuple[int, ...] | None = None,
 ) -> tuple[np.ndarray | torch.Tensor, dict]:
     """Compute mean-matched Fano factor controlling for rate effects.
 
@@ -660,9 +653,10 @@ def fano_mean_matching(
         variability: a widespread cortical phenomenon", Nature Neurosci.
 
         Args:
-            spike_data: Spike train of shape [T, n_conditions, ...] or
+            spikes: Spike train of shape [T, n_conditions, ...] or
                 [T, n_trials, ...]. First dimension is time.
-            window: Window size for spike counting. If None, uses T//10.
+            window: Window size in time bins (not ms) for spike counting.
+                If None, uses T//10.
             overlap: Overlap between consecutive windows.
             condition_axis: Axis representing conditions/trials (default 1).
             n_bins: Number of bins for mean count histogram matching.
@@ -674,13 +668,15 @@ def fano_mean_matching(
             info: Dictionary with matching info and computed statistics.
 
         Example:
-            >>> # spike_data shape: [T, n_conditions, n_neurons]
+            >>> # spikes shape: [T, n_conditions, n_neurons]
             >>> ff_mm, info = fano_mean_matching(
-            ...     spike_data, condition_axis=1, n_bins=10
+            ...     spikes, condition_axis=1, n_bins=10
             ... )
     """
-    is_torch = isinstance(spike_data, torch.Tensor)
-    T = spike_data.shape[0]
+    is_torch = isinstance(spikes, torch.Tensor)
+    if isinstance(batch_axis, int):
+        batch_axis = (batch_axis,)
+    T = spikes.shape[0]
 
     if window is None:
         window = max(1, T // 10)
@@ -694,25 +690,21 @@ def fano_mean_matching(
 
     # Move condition axis to position 1 for processing
     if condition_axis != 1:
-        perm = list(range(spike_data.ndim))
+        perm = list(range(spikes.ndim))
         perm[1], perm[condition_axis] = perm[condition_axis], perm[1]
-        spike_data = (
-            spike_data.transpose(*perm) if not is_torch else spike_data.permute(*perm)
-        )
+        spikes = spikes.transpose(*perm) if not is_torch else spikes.permute(*perm)
 
-    n_conditions = spike_data.shape[1]
+    n_conditions = spikes.shape[1]
 
     # Flatten non-time, non-condition dimensions
-    rest_shape = spike_data.shape[2:]
-    spike_flat = spike_data.reshape(T, n_conditions, -1)
+    rest_shape = spikes.shape[2:]
+    spike_flat = spikes.reshape(T, n_conditions, -1)
     n_neurons_flat = spike_flat.shape[2]
 
     n_windows = (T - window) // step + 1
     if n_windows < 2:
         if is_torch:
-            result = torch.full(
-                (n_neurons_flat,), float("nan"), device=spike_data.device
-            )
+            result = torch.full((n_neurons_flat,), float("nan"), device=spikes.device)
         else:
             result = np.full((n_neurons_flat,), np.nan)
         warnings.warn(
@@ -725,7 +717,7 @@ def fano_mean_matching(
 
     if is_torch:
         counts = torch.zeros(
-            (n_windows, n_conditions, n_neurons_flat), device=spike_data.device
+            (n_windows, n_conditions, n_neurons_flat), device=spikes.device
         )
     else:
         counts = np.zeros((n_windows, n_conditions, n_neurons_flat))
@@ -909,7 +901,7 @@ def _flexible_overdispersion_moments(
 @use_percentiles(value_key="fano_model")
 @use_stats(value_key="fano_model")
 def fano_model_based(
-    spike_data: np.ndarray | torch.Tensor,
+    spikes: np.ndarray | torch.Tensor,
     window: int | None = None,
     overlap: int = 0,
     model: Literal[
@@ -917,7 +909,7 @@ def fano_model_based(
     ] = "modulated_poisson",
     model_params: dict | None = None,
     stimulus_drive: np.ndarray | torch.Tensor | None = None,
-    batch_axis: tuple[int, ...] | None = None,
+    batch_axis: int | tuple[int, ...] | None = None,
 ) -> tuple[np.ndarray | torch.Tensor, dict]:
     """Compute model-based Fano factor with rate compensation.
 
@@ -940,8 +932,9 @@ def fano_model_based(
     - Charles et al. (2018) "Dethroning the Fano factor"
 
     Args:
-        spike_data: Spike train of shape [T, ...]. First dimension is time.
-        window: Window size for spike counting. If None, uses T//10.
+        spikes: Spike train of shape [T, ...]. First dimension is time.
+        window: Window size in time bins (not ms) for spike counting.
+            If None, uses T//10.
         overlap: Overlap between consecutive windows.
         model: Model type to use.
         model_params: Model-specific parameters.
@@ -954,20 +947,22 @@ def fano_model_based(
 
     Example:
         >>> ff_mod, info = fano_model_based(
-        ...     spike_data,
+        ...     spikes,
         ...     model="modulated_poisson",
         ...     model_params={"gain_mean": 1.0, "gain_var": 0.5}
         ... )
     """
-    is_torch = isinstance(spike_data, torch.Tensor)
-    T = spike_data.shape[0]
+    if isinstance(batch_axis, int):
+        batch_axis = (batch_axis,)
+    is_torch = isinstance(spikes, torch.Tensor)
+    T = spikes.shape[0]
 
     if window is None:
         window = max(1, T // 10)
 
     model_params = model_params or {}
 
-    flat_spike = spike_data.reshape(T, -1)
+    flat_spike = spikes.reshape(T, -1)
     n_flat = flat_spike.shape[1]
 
     step = window - overlap
@@ -975,10 +970,10 @@ def fano_model_based(
 
     if n_windows < 2:
         if is_torch:
-            result = torch.full((n_flat,), float("nan"), device=spike_data.device)
+            result = torch.full((n_flat,), float("nan"), device=spikes.device)
         else:
             result = np.full((n_flat,), np.nan)
-        rest_shape = spike_data.shape[1:]
+        rest_shape = spikes.shape[1:]
         warnings.warn(
             f"Too few windows ({n_windows} < 2) for model-based Fano; returning NaN",
             stacklevel=2,
@@ -986,7 +981,7 @@ def fano_model_based(
         return result.reshape(rest_shape), {"n_windows": n_windows}
 
     if is_torch:
-        counts = torch.zeros((n_windows, n_flat), device=spike_data.device)
+        counts = torch.zeros((n_windows, n_flat), device=spikes.device)
     else:
         counts = np.zeros((n_windows, n_flat))
 
@@ -1060,7 +1055,7 @@ def fano_model_based(
         raise ValueError(f"Unknown model: {model}")
 
     # Reshape to original non-time dimensions
-    rest_shape = spike_data.shape[1:]
+    rest_shape = spikes.shape[1:]
     fano_model = fano_model.reshape(rest_shape)
 
     if batch_axis is not None:
@@ -1080,7 +1075,7 @@ def fano_model_based(
 @use_percentiles(value_key="fano")
 @use_stats(value_key="fano")
 def fano_compensated(
-    spike_data: np.ndarray | torch.Tensor,
+    spikes: np.ndarray | torch.Tensor,
     method: Literal[
         "operational_time",
         "mean_matching",
@@ -1105,7 +1100,7 @@ def fano_compensated(
       nonlinearities. Good for testing different rate-FF relationships.
 
     Args:
-        spike_data: Spike train of shape [T, ...]. First dimension is time.
+        spikes: Spike train of shape [T, ...]. First dimension is time.
         method: Compensation method to use.
         **kwargs: Method-specific arguments passed to underlying functions.
 
@@ -1129,12 +1124,12 @@ def fano_compensated(
     if method == "operational_time":
         # Filter out model_params if accidentally passed
         kwargs.pop("model_params", None)
-        return fano_operational_time(spike_data, **kwargs)
+        return fano_operational_time(spikes, **kwargs)
     elif method == "mean_matching":
         kwargs.pop("model_params", None)
-        return fano_mean_matching(spike_data, **kwargs)
+        return fano_mean_matching(spikes, **kwargs)
     elif method in ("modulated_poisson", "flexible_overdispersion"):
-        return fano_model_based(spike_data, model=method, **kwargs)
+        return fano_model_based(spikes, model=method, **kwargs)
     else:
         raise ValueError(f"Unknown method: {method}")
 
@@ -1145,8 +1140,8 @@ def fano_compensated(
 
 
 def compare_fano_methods(
-    spike_data: np.ndarray | torch.Tensor,
-    dt_ms: float = 1.0,
+    spikes: np.ndarray | torch.Tensor,
+    dt: float = 1.0,
     **kwargs: Any,
 ) -> dict:
     """Compare different Fano factor compensation methods.
@@ -1154,8 +1149,8 @@ def compare_fano_methods(
     Computes Fano factor using multiple methods for comparison.
 
     Args:
-        spike_data: Spike train of shape [T, ...].
-        dt_ms: Time step in milliseconds.
+        spikes: Spike train of shape [T, ...].
+        dt: Time step in milliseconds.
         **kwargs: Additional arguments passed to methods.
 
     Returns:
@@ -1173,7 +1168,7 @@ def compare_fano_methods(
     from btorch.analysis.spiking import fano as standard_fano
 
     results["standard"], _ = standard_fano(
-        spike_data,
+        spikes,
         **{k: v for k, v in kwargs.items() if k in ["window", "overlap", "batch_axis"]},
     )
 
@@ -1197,8 +1192,8 @@ def compare_fano_methods(
     _run(
         "operational_time",
         lambda: fano_operational_time(
-            spike_data,
-            dt_ms=dt_ms,
+            spikes,
+            dt=dt,
             **{
                 k: v
                 for k, v in kwargs.items()
@@ -1209,15 +1204,15 @@ def compare_fano_methods(
     _run(
         "mean_matching",
         lambda: fano_mean_matching(
-            spike_data, **{k: v for k, v in kwargs.items() if k not in ["dt_ms"]}
+            spikes, **{k: v for k, v in kwargs.items() if k not in ["dt"]}
         ),
     )
     _run(
         "modulated_poisson",
         lambda: fano_model_based(
-            spike_data,
+            spikes,
             model="modulated_poisson",
-            **{k: v for k, v in kwargs.items() if k not in ["dt_ms"]},
+            **{k: v for k, v in kwargs.items() if k not in ["dt"]},
         ),
     )
 

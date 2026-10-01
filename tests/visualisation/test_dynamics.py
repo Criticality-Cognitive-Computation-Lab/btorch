@@ -23,6 +23,11 @@ from btorch.visualisation.dynamics import (
 )
 
 
+# Optional extras: skip this module when the library is not installed.
+pytest.importorskip("nolds")
+pytest.importorskip("powerlaw")
+
+
 def generate_spike_data(n_time=5000, n_neurons=50, rate=0.05):
     """Generate synthetic spike data."""
     spikes = (np.random.rand(n_time, n_neurons) < rate).astype(float)

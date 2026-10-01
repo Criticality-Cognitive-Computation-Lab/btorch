@@ -25,7 +25,7 @@ class AllenSweepBatch:
     Args:
         specimen_id: Allen specimen identifier.
         sweep_number: Sweep number within the NWB file.
-        dt_ms: Simulation timestep in milliseconds.
+        dt: Simulation timestep in milliseconds.
         i_soma: Somatic current tensor shaped ``(T, B, N)``.
         v_true: Recorded voltage tensor shaped ``(T, B, N)``.
         spike_true: Binary spike tensor shaped ``(T, B, N)``.
@@ -35,7 +35,7 @@ class AllenSweepBatch:
 
     specimen_id: int
     sweep_number: int
-    dt_ms: float
+    dt: float
     i_soma: Tensor
     v_true: Tensor
     spike_true: Tensor
@@ -49,7 +49,7 @@ class FitEvaluation:
 
     specimen_id: int
     sweep_number: int
-    dt_ms: float
+    dt: float
     metrics: dict[str, float]
     traces: dict[str, np.ndarray]
 
@@ -338,20 +338,20 @@ def detect_spikes_from_voltage(
 def resample_trace(
     trace: np.ndarray | Tensor,
     *,
-    source_dt_ms: float,
-    target_dt_ms: float,
+    source_dt: float,
+    target_dt: float,
 ) -> Tensor:
     """Resample a 1D trace to a new timestep using linear interpolation."""
-    if target_dt_ms <= 0.0:
-        raise ValueError(f"target_dt_ms must be positive, got {target_dt_ms}.")
+    if target_dt <= 0.0:
+        raise ValueError(f"target_dt must be positive, got {target_dt}.")
     trace_t = torch.as_tensor(trace, dtype=torch.float32)
     if trace_t.ndim != 1:
         raise ValueError(f"Expected a 1D trace, got shape {tuple(trace_t.shape)}.")
-    if abs(source_dt_ms - target_dt_ms) < 1e-12:
+    if abs(source_dt - target_dt) < 1e-12:
         return trace_t
 
-    duration_ms = max((trace_t.shape[0] - 1) * source_dt_ms, 0.0)
-    target_steps = max(int(round(duration_ms / target_dt_ms)) + 1, 1)
+    duration_ms = max((trace_t.shape[0] - 1) * source_dt, 0.0)
+    target_steps = max(int(round(duration_ms / target_dt)) + 1, 1)
     source_time = torch.linspace(0.0, duration_ms, trace_t.shape[0])
     target_time = torch.linspace(0.0, duration_ms, target_steps)
 
@@ -367,7 +367,7 @@ def load_allen_sweep(
     specimen_id: int,
     sweep_number: int,
     *,
-    dt_ms: float = 0.5,
+    dt: float = 0.5,
     manifest_file: str | Path | None = None,
     cache: Any | None = None,
     voltage_spike_threshold: float = 0.0,
@@ -392,16 +392,16 @@ def load_allen_sweep(
     index_start, index_stop = sweep["index_range"]
     sl = slice(int(index_start), int(index_stop) + 1)
 
-    source_dt_ms = 1000.0 / sampling_rate
+    source_dt = 1000.0 / sampling_rate
     voltage = resample_trace(
         response[sl],
-        source_dt_ms=source_dt_ms,
-        target_dt_ms=dt_ms,
+        source_dt=source_dt,
+        target_dt=dt,
     )
     current = resample_trace(
         stimulus[sl],
-        source_dt_ms=source_dt_ms,
-        target_dt_ms=dt_ms,
+        source_dt=source_dt,
+        target_dt=dt,
     )
     voltage = voltage * float(voltage_scale)
     current = current * float(current_scale)
@@ -413,7 +413,7 @@ def load_allen_sweep(
     return AllenSweepBatch(
         specimen_id=specimen_id,
         sweep_number=sweep_number,
-        dt_ms=dt_ms,
+        dt=dt,
         i_soma=current[:, None, None],
         v_true=voltage[:, None, None],
         spike_true=spike_true[:, None, None],
@@ -452,12 +452,12 @@ def exponential_filter_spike_train(
     spike_train: Tensor,
     *,
     tau_ms: float,
-    dt_ms: float,
+    dt: float,
 ) -> Tensor:
     """Apply a causal exponential filter to a spike train."""
     if tau_ms <= 0.0:
         raise ValueError(f"tau_ms must be positive, got {tau_ms}.")
-    alpha = float(np.exp(-dt_ms / tau_ms))
+    alpha = float(np.exp(-dt / tau_ms))
     filtered = torch.zeros_like(spike_train)
     filtered[0] = spike_train[0]
     for t in range(1, spike_train.shape[0]):
@@ -475,7 +475,7 @@ def spike_timing_stats(
     spike_true: Tensor,
     spike_pred: Tensor,
     *,
-    dt_ms: float,
+    dt: float,
     match_window_ms: float = 10.0,
 ) -> dict[str, float]:
     """Match predicted and true spikes using a tolerance-window cost."""
@@ -523,9 +523,7 @@ def spike_timing_stats(
             "matched_fraction": 0.0,
         }
 
-    distance_ms = (
-        np.abs(true_idx[:, None] - pred_idx[None, :]).astype(np.float64) * dt_ms
-    )
+    distance_ms = np.abs(true_idx[:, None] - pred_idx[None, :]).astype(np.float64) * dt
     row_ind, col_ind = linear_sum_assignment(distance_ms)
     matched_distance = distance_ms[row_ind, col_ind]
     within_window = matched_distance <= match_window_ms
@@ -559,7 +557,7 @@ def spike_timing_loss(
     spike_true: Tensor,
     spike_pred: Tensor,
     *,
-    dt_ms: float,
+    dt: float,
     match_window_ms: float = 10.0,
     miss_penalty_ms: float | None = None,
 ) -> Tensor:
@@ -568,7 +566,7 @@ def spike_timing_loss(
     stats = spike_timing_stats(
         spike_true,
         spike_pred,
-        dt_ms=dt_ms,
+        dt=dt,
         match_window_ms=match_window_ms,
     )
     matched = stats["matched_spikes"]
@@ -591,7 +589,7 @@ def two_compartment_loss(
     spike_pred: Tensor,
     v_true: Tensor,
     spike_true: Tensor,
-    dt_ms: float,
+    dt: float,
     w_Ca: Tensor | None = None,
     voltage_weight: float = 1.0,
     spike_weight: float = 1.0,
@@ -624,7 +622,7 @@ def two_compartment_loss(
         spike_pred=spike_pred,
         v_true=v_true,
         spike_true=spike_true,
-        dt_ms=dt_ms,
+        dt=dt,
         w_Ca=w_Ca,
         config=config,
     )
@@ -636,13 +634,13 @@ def _loss_from_config(
     spike_pred: Tensor,
     v_true: Tensor,
     spike_true: Tensor,
-    dt_ms: float,
+    dt: float,
     w_Ca: Tensor | None,
     config: FitLossConfig,
 ) -> dict[str, Tensor]:
     """Config-taking implementation of :func:`two_compartment_loss`."""
     c = config
-    refractory_bins = int(round(c.post_spike_mask_ms / dt_ms))
+    refractory_bins = int(round(c.post_spike_mask_ms / dt))
     mask = mask_post_spike_voltage_samples(
         spike_true,
         refractory_bins=refractory_bins,
@@ -656,12 +654,12 @@ def _loss_from_config(
     spike_pred_smooth = exponential_filter_spike_train(
         spike_pred,
         tau_ms=c.spike_tau_ms,
-        dt_ms=dt_ms,
+        dt=dt,
     )
     spike_true_smooth = exponential_filter_spike_train(
         spike_true,
         tau_ms=c.spike_tau_ms,
-        dt_ms=dt_ms,
+        dt=dt,
     )
     spike_loss = F.smooth_l1_loss(spike_pred_smooth, spike_true_smooth)
     spike_count_pred = (spike_pred > 0.5).to(spike_pred.dtype).sum(dim=0)
@@ -677,7 +675,7 @@ def _loss_from_config(
     spike_timing_event_loss = spike_timing_loss(
         spike_true,
         spike_pred,
-        dt_ms=dt_ms,
+        dt=dt,
         match_window_ms=c.spike_match_window_ms,
         miss_penalty_ms=c.spike_miss_penalty_ms,
     )
@@ -809,7 +807,7 @@ def evaluate_two_compartment_fit(
     )
 
     with torch.no_grad():
-        with environ.context(dt=float(sweep.dt_ms)):
+        with environ.context(dt=float(sweep.dt)):
             rollout = rollout_two_compartment(model, i_soma, i_apical)
 
     losses = two_compartment_loss(
@@ -817,7 +815,7 @@ def evaluate_two_compartment_fit(
         spike_pred=rollout["spike"],
         v_true=v_true,
         spike_true=spike_true,
-        dt_ms=sweep.dt_ms,
+        dt=sweep.dt,
         w_Ca=getattr(model, "w_Ca", None),
         spike_tau_ms=spike_tau_ms,
         post_spike_mask_ms=post_spike_mask_ms,
@@ -831,10 +829,10 @@ def evaluate_two_compartment_fit(
     timing_stats = spike_timing_stats(
         spike_true,
         rollout["spike"],
-        dt_ms=sweep.dt_ms,
+        dt=sweep.dt,
         match_window_ms=spike_match_window_ms,
     )
-    refractory_bins = int(round(post_spike_mask_ms / sweep.dt_ms))
+    refractory_bins = int(round(post_spike_mask_ms / sweep.dt))
     voltage_mask = mask_post_spike_voltage_samples(
         spike_true,
         refractory_bins=refractory_bins,
@@ -844,7 +842,7 @@ def evaluate_two_compartment_fit(
     spike_true_np = _to_1d_numpy(spike_true)
     spike_pred_np = _to_1d_numpy(rollout["spike"])
     i_soma_np = _to_1d_numpy(i_soma)
-    time_ms = np.arange(v_true_np.shape[0], dtype=np.float64) * float(sweep.dt_ms)
+    time_ms = np.arange(v_true_np.shape[0], dtype=np.float64) * float(sweep.dt)
 
     mask_np = _to_1d_numpy(voltage_mask.to(dtype=torch.float32)) > 0.5
     if mask_np.any():
@@ -889,7 +887,7 @@ def evaluate_two_compartment_fit(
     return FitEvaluation(
         specimen_id=sweep.specimen_id,
         sweep_number=sweep.sweep_number,
-        dt_ms=sweep.dt_ms,
+        dt=sweep.dt,
         metrics=metrics,
         traces={
             "time_ms": time_ms,
@@ -990,7 +988,7 @@ def save_fit_report(
             {
                 "specimen_id": ev.specimen_id,
                 "sweep_number": ev.sweep_number,
-                "dt_ms": ev.dt_ms,
+                "dt_ms": ev.dt,
                 "metrics": ev.metrics,
             }
             for ev in evaluations
@@ -1061,14 +1059,14 @@ def _fit_sweeps_once(
                 model, sweep, device=device, dtype=dtype
             )
 
-            with environ.context(dt=float(sweep.dt_ms)):
+            with environ.context(dt=float(sweep.dt)):
                 rollout = rollout_two_compartment(model, i_soma, i_apical)
                 losses = _loss_from_config(
                     v_pred=rollout["v"],
                     spike_pred=rollout["spike"],
                     v_true=v_true,
                     spike_true=spike_true,
-                    dt_ms=sweep.dt_ms,
+                    dt=sweep.dt,
                     w_Ca=getattr(model, "w_Ca", None),
                     config=loss,
                 )
@@ -1380,7 +1378,7 @@ def _fit_two_compartment_model_tbptt(
             initialized = True
             optimizer.zero_grad()
 
-            with environ.context(dt=float(sweep.dt_ms)):
+            with environ.context(dt=float(sweep.dt)):
                 for start in range(0, i_soma.shape[0], chunk_size):
                     if start > 0:
                         functional.detach_net(model)
@@ -1396,7 +1394,7 @@ def _fit_two_compartment_model_tbptt(
                         spike_pred=rollout["spike"],
                         v_true=v_true[start:stop],
                         spike_true=spike_true[start:stop],
-                        dt_ms=sweep.dt_ms,
+                        dt=sweep.dt,
                         w_Ca=getattr(model, "w_Ca", None),
                         config=loss,
                     )

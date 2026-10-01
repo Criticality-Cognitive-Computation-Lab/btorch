@@ -9,14 +9,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import RegularPolygon
 
-from ...utils.hex.resolve import resolve_hex
+from ...utils.hex.resolve import CoordFormat, resolve_hex
 from ...utils.hex.transform import to_pixel
 
 
 def _resolve_to_pixel(
     c1: np.ndarray,
     c2: np.ndarray,
-    coord_format: str,
+    coord_format: CoordFormat,
     size: float = 1.0,
     orientation: str = "pointy",
     layout: str | None = None,
@@ -27,7 +27,8 @@ def _resolve_to_pixel(
     Returns:
         ((pixel_x, pixel_y), effective_layout)
     """
-    effective = layout or ("flat" if coord_format == "zigzag" else orientation)
+    is_flat = coord_format in ("zigzag", "flywire")
+    effective = layout or ("flat" if is_flat else orientation)
     kw = {}
     if rotation_deg:
         kw["rotation_deg"] = rotation_deg
@@ -277,9 +278,7 @@ def scatter(
     c1: np.ndarray,
     c2: np.ndarray,
     values: np.ndarray,
-    coord_format: (
-        Literal["axial", "zigzag", "flywire", "doublewidth", "pixel"]
-    ) = "axial",
+    coord_format: CoordFormat = "axial",
     layout: str | None = None,
     size: float = 1.0,
     orientation: str = "pointy",
@@ -301,7 +300,7 @@ def scatter(
     Args:
         c1, c2: Coordinates (interpreted based on coord_format)
         values: Color values for each hex
-        coord_format: Which coordinate system to use
+        coord_format: Any :data:`~btorch.utils.hex.resolve.CoordFormat`
         size: Hexagon size (for axial/zigzag conversion to pixel)
         orientation: "pointy" or "flat"
         rotation_deg: Optional global display rotation in degrees
@@ -397,7 +396,7 @@ def quiver(
     c2: np.ndarray,
     dc1: np.ndarray,
     dc2: np.ndarray,
-    coord_format: Literal["axial", "zigzag", "doublewidth", "pixel"] = "axial",
+    coord_format: CoordFormat = "axial",
     layout: str | None = None,
     size: float = 1.0,
     orientation: str = "pointy",
@@ -414,7 +413,7 @@ def quiver(
     Args:
         c1, c2: Coordinates
         dc1, dc2: Vector components
-        coord_format: Coordinate system
+        coord_format: Any :data:`~btorch.utils.hex.resolve.CoordFormat`
         size: Hexagon size
         orientation: "pointy" or "flat"
         scale: Vector scale factor

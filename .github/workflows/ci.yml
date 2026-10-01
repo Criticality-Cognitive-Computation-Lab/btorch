@@ -65,7 +65,7 @@ jobs:
           UV_SYSTEM_PYTHON: "1"
         run: |
           # uv sync handles torch (pytorch-cpu index) via lockfile
-          uv sync --group dev --no-install-package torch-scatter --no-install-package torch-sparse --frozen
+          uv sync --group dev --all-extras --no-install-package torch-scatter --no-install-package torch-sparse --frozen
           # sparse packages are CUDA-variant-specific; install from PyG after torch is resolved
           TORCH_VER=$(uv run python -c "import torch; print(torch.__version__.split('+')[0])")
           uv pip install torch-scatter torch-sparse -f "https://data.pyg.org/whl/torch-${TORCH_VER}+cpu.html"
@@ -133,7 +133,7 @@ jobs:
         env:
           UV_SYSTEM_PYTHON: "1"
         run: |
-          uv sync --group test --no-install-package torch-scatter --no-install-package torch-sparse --frozen
+          uv sync --group test --all-extras --no-install-package torch-scatter --no-install-package torch-sparse --frozen
           TORCH_VER=$(uv run python -c "import torch; print(torch.__version__.split('+')[0])")
           uv pip install torch-scatter torch-sparse -f "https://data.pyg.org/whl/torch-${TORCH_VER}+cpu.html"
 

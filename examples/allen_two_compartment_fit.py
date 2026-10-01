@@ -135,10 +135,10 @@ def _summarize_sweep(sweep) -> SweepSummary:
     spikes = torch.nonzero(sweep.spike_true[:, 0, 0] > 0.5).flatten()
     spike_count = int(spikes.numel())
     if spike_count > 0:
-        first_spike_ms = float(spikes[0].item() * sweep.dt_ms)
-        last_spike_ms = float(spikes[-1].item() * sweep.dt_ms)
+        first_spike_ms = float(spikes[0].item() * sweep.dt)
+        last_spike_ms = float(spikes[-1].item() * sweep.dt)
         spike_span_ms = last_spike_ms - first_spike_ms
-        onset_delay_ms = first_spike_ms - float(start_idx * sweep.dt_ms)
+        onset_delay_ms = first_spike_ms - float(start_idx * sweep.dt)
     else:
         first_spike_ms = None
         last_spike_ms = None
@@ -160,8 +160,8 @@ def _summarize_sweep(sweep) -> SweepSummary:
     return SweepSummary(
         spike_count=spike_count,
         amplitude_pa=amplitude_pa,
-        stimulus_start_ms=float(start_idx * sweep.dt_ms),
-        stimulus_stop_ms=float(stop_idx * sweep.dt_ms),
+        stimulus_start_ms=float(start_idx * sweep.dt),
+        stimulus_stop_ms=float(stop_idx * sweep.dt),
         first_spike_ms=first_spike_ms,
         last_spike_ms=last_spike_ms,
         spike_span_ms=spike_span_ms,
@@ -487,7 +487,7 @@ def main() -> None:
             load_allen_sweep(
                 specimen_id=specimen_id,
                 sweep_number=int(sweep["sweep_number"]),
-                dt_ms=args.dt_ms,
+                dt=args.dt_ms,
                 manifest_file=args.manifest_file,
                 cache=cache,
             )

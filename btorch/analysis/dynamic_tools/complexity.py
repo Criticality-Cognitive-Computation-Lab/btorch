@@ -9,7 +9,7 @@ from .lyapunov_dynamics import (
 )
 
 
-def calculate_ra(spike_initial: torch.Tensor, spike_final: torch.Tensor) -> float:
+def compute_ra(spike_initial: torch.Tensor, spike_final: torch.Tensor) -> float:
     """Calculate Representation Alignment (RA) using spike data.
 
     RA = Trace(G_final * G_initial) / (||G_final|| * ||G_initial||)
@@ -72,7 +72,7 @@ def calculate_ra(spike_initial: torch.Tensor, spike_final: torch.Tensor) -> floa
     return ra.item()
 
 
-def calculate_pcist(
+def compute_pcist(
     response: torch.Tensor, baseline: torch.Tensor, threshold_factor: float = 3.0
 ) -> float:
     """Calculate the Perturbational Complexity Index based on State Transitions
@@ -119,9 +119,7 @@ def calculate_pcist(
         for i in range(batch_size):
             # Handle corresponding baseline
             b_sample = baseline[i] if baseline.ndim == 3 else baseline
-            pcist_values.append(
-                calculate_pcist(response[i], b_sample, threshold_factor)
-            )
+            pcist_values.append(compute_pcist(response[i], b_sample, threshold_factor))
         return sum(pcist_values) / len(pcist_values)
 
     # 1. Center data based on baseline mean
@@ -139,9 +137,7 @@ def calculate_pcist(
         # SVD did not converge (e.g. non-finite input). Report NaN rather than
         # a fake score of 0.0, which would be indistinguishable from "no
         # complexity".
-        warnings.warn(
-            f"SVD failed in calculate_pcist, returning NaN: {e}", stacklevel=2
-        )
+        warnings.warn(f"SVD failed in compute_pcist, returning NaN: {e}", stacklevel=2)
         return float("nan")
 
     V = Vh.T  # (N, K)
@@ -190,7 +186,7 @@ def calculate_pcist(
     return pcist_score.item()
 
 
-def calculate_lyapunov_exponent(spike_train: torch.Tensor, dt: float = 0.1) -> float:
+def compute_lyapunov_exponent(spike_train: torch.Tensor, dt: float = 0.1) -> float:
     """Calculate the maximum Lyapunov exponent for a given spike train.
 
     Args:
@@ -221,7 +217,7 @@ def calculate_lyapunov_exponent(spike_train: torch.Tensor, dt: float = 0.1) -> f
     return lyapunov_exponent
 
 
-def calculate_gain_stability_sensitivity(
+def compute_gain_stability_sensitivity(
     model: torch.nn.Module,
     dataloader: torch.utils.data.DataLoader,
     g_values: np.ndarray | None = None,

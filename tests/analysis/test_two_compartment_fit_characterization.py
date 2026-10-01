@@ -40,7 +40,7 @@ def _sweep(seed: int = 0, steps: int = 12, spike: bool = False) -> AllenSweepBat
     return AllenSweepBatch(
         specimen_id=1,
         sweep_number=seed,
-        dt_ms=1.0,
+        dt=1.0,
         i_soma=torch.randn(steps, 1, 1, generator=g),
         v_true=torch.zeros(steps, 1, 1),
         spike_true=spike_true,
@@ -56,7 +56,7 @@ def test_loss_total_is_weighted_sum_of_components():
         spike_pred=spike_pred,
         v_true=v_true,
         spike_true=spike_true,
-        dt_ms=1.0,
+        dt=1.0,
         w_Ca=torch.tensor([2.0]),
     )
     losses = two_compartment_loss(
@@ -96,7 +96,7 @@ def test_loss_rejects_nonpositive_count_weights():
             spike_pred=spike_pred,
             v_true=v_true,
             spike_true=spike_true,
-            dt_ms=1.0,
+            dt=1.0,
             spike_count_over_weight=0.0,
         )
 
@@ -200,7 +200,7 @@ def test_fit_loss_config_matches_public_loss_kwargs():
         spike_pred=spike_pred,
         v_true=v_true,
         spike_true=spike_true,
-        dt_ms=1.0,
+        dt=1.0,
         w_Ca=None,
         config=cfg,
     )
@@ -209,7 +209,7 @@ def test_fit_loss_config_matches_public_loss_kwargs():
         spike_pred=spike_pred,
         v_true=v_true,
         spike_true=spike_true,
-        dt_ms=1.0,
+        dt=1.0,
         voltage_weight=0.4,
         spike_count_weight=0.2,
         spike_timing_weight=0.3,

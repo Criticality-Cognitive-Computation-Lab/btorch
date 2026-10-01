@@ -23,15 +23,19 @@ requirements:
     - h5py
     - hdf5plugin
     - pyyaml
-    - fastdtw
     - omegaconf
-    - plotly
-    - nolds !=0.6.3
-    - powerlaw
     - matplotlib-base >=3.7
+  # Optional extras (pip: btorch[io], btorch[analysis], btorch[viz]); not
+  # installed by default, constrained here so conda keeps compatible versions.
+  run_constrained:
     - xarray
     - zarr
     - numcodecs
+    - powerlaw
+    - nolds !=0.6.3
+    - fastdtw
+    - plotly
+    - networkx
 
 test:
   requires:

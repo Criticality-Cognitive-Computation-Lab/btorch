@@ -2,9 +2,14 @@ import numpy as np
 import pytest
 
 from btorch.analysis.dynamic_tools.criticality import (
-    calculate_dfa,
     compute_avalanche_statistics,
+    compute_dfa,
 )
+
+
+# Optional extras: skip this module when the library is not installed.
+pytest.importorskip("powerlaw")
+pytest.importorskip("nolds")
 
 
 def test_criticality():
@@ -60,6 +65,6 @@ def test_dfa(series_fn, alpha_min, alpha_max):
     series = series_fn(rng, n_steps)
     # 3. Pink Noise (1/f) -> Expected alpha ~ 1.0
     # Harder to generate simply, but we can verify the other two.
-    alpha = calculate_dfa(series, bin_size=1)
+    alpha = compute_dfa(series, bin_size=1)
 
     assert alpha_min < alpha < alpha_max

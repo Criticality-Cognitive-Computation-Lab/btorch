@@ -23,7 +23,7 @@ import torch
 from matplotlib.figure import Figure
 
 from ..analysis.aggregation import agg_by_neuron, agg_by_neuropil
-from ..analysis.dynamic_tools.micro_scale import calculate_cv_isi
+from ..analysis.dynamic_tools.micro_scale import compute_cv_isi
 from ..analysis.spiking import fano
 
 
@@ -443,9 +443,9 @@ def plot_dfa_analysis(
     spikes = _to_numpy(spikes)
 
     # Compute DFA
-    from ..analysis.dynamic_tools.criticality import calculate_dfa
+    from ..analysis.dynamic_tools.criticality import compute_dfa
 
-    alpha = calculate_dfa(spikes, bin_size=bin_size)
+    alpha = compute_dfa(spikes, bin_size=bin_size)
 
     # Create simple plot showing the result
     fig, ax = plt.subplots(1, 1, figsize=(8, 6))
@@ -540,7 +540,7 @@ def plot_isi_cv(
     spikes = _to_numpy(spikes)
 
     # Compute ISI CV
-    cv_results = calculate_cv_isi(spikes, dt=dt)
+    cv_results = compute_cv_isi(spikes, dt=dt)
     cv_values = cv_results["cv_isi"]
 
     # Create figure based on mode
@@ -721,11 +721,11 @@ def plot_eigenvalue_spectrum(
         >>> print(f"Spectral radius: {results['spectral_radius']:.2f}")
     """
     from ..analysis.dynamic_tools.attractor_dynamics import (
-        calculate_structural_eigenvalue_outliers,
+        compute_structural_eigenvalue_outliers,
     )
 
     W = _to_numpy(weight_matrix)
-    results = calculate_structural_eigenvalue_outliers(W)
+    results = compute_structural_eigenvalue_outliers(W)
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 6))
@@ -793,7 +793,7 @@ def plot_lyapunov_spectrum(
         >>> # Positive exponents indicate chaotic dynamics
     """
     from ..analysis.dynamic_tools.attractor_dynamics import (
-        calculate_kaplan_yorke_dimension,
+        compute_kaplan_yorke_dimension,
     )
 
     spec = _to_numpy(spectrum)
@@ -810,7 +810,7 @@ def plot_lyapunov_spectrum(
     ax.axhline(0, color="k", linestyle="--", linewidth=0.8)
 
     # Calculate Kaplan-Yorke Dim
-    ky_dim = calculate_kaplan_yorke_dimension(spec)
+    ky_dim = compute_kaplan_yorke_dimension(spec)
 
     title = f"Lyapunov Spectrum (D_KY = {ky_dim:.2f})"
     ax.set_title(title)
@@ -846,10 +846,10 @@ def plot_firing_rate_distribution(
         >>> fig, stats = plot_firing_rate_distribution(spikes, dt=1.0)
         >>> print(f"Mean rate: {stats['mean']:.1f} Hz")
     """
-    from ..analysis.dynamic_tools.micro_scale import calculate_fr_distribution
+    from ..analysis.dynamic_tools.micro_scale import compute_fr_distribution
 
     spikes = _to_numpy(spikes)
-    stats = calculate_fr_distribution(spikes, dt=dt)
+    stats = compute_fr_distribution(spikes, dt=dt)
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 4))
@@ -901,7 +901,7 @@ def plot_micro_dynamics(
         >>> fig, stats = plot_micro_dynamics(spikes, dt=1.0)
         >>> print(f"Rate: {stats['fr']['mean']:.1f} Hz, CV: {stats['cv']['mean']:.2f}")
     """
-    from ..analysis.dynamic_tools.micro_scale import calculate_cv_isi
+    from ..analysis.dynamic_tools.micro_scale import compute_cv_isi
 
     # Plot FR
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
@@ -911,7 +911,7 @@ def plot_micro_dynamics(
     # Plot CV (Re-implementing simplified version or using plot_isi_cv logic)
     # reusing logic from plot_isi_cv for consistency but without full overhead
     spikes_np = _to_numpy(spikes)
-    cv_results = calculate_cv_isi(spikes_np, dt=dt)
+    cv_results = compute_cv_isi(spikes_np, dt=dt)
     cv_values = cv_results["cv_isi"]
     valid_cv = cv_values[~np.isnan(cv_values)]
 

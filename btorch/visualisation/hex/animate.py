@@ -6,14 +6,14 @@ Supports multiple coordinate formats: axial (q,r), zigzag (x,y), pixel (px,py).
 Code adapted from flyvis (MIT License).
 """
 
-from typing import Any, Literal
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
 from matplotlib.axes import Axes
 
-from ...utils.hex.resolve import resolve_hex
+from ...utils.hex.resolve import CoordFormat, resolve_hex
 
 
 class HexScatter:
@@ -22,7 +22,8 @@ class HexScatter:
     Args:
         values: Time-series data, shape (n_frames, n_hexes)
         c1, c2: Coordinates (interpreted based on coord_format)
-        coord_format: "axial" (q,r), "zigzag" (x,y), or "pixel" (px,py)
+        coord_format: Any :data:`~btorch.utils.hex.resolve.CoordFormat`, e.g. "axial"
+            (q,r), "zigzag" (x,y), or "pixel" (px,py)
         figsize: Figure size
         cmap: Colormap
         vmin, vmax: Color limits
@@ -38,7 +39,7 @@ class HexScatter:
         values: np.ndarray,
         c1: np.ndarray,
         c2: np.ndarray,
-        coord_format: Literal["axial", "zigzag", "pixel"] = "axial",
+        coord_format: CoordFormat = "axial",
         layout: str | None = None,
         figsize: tuple[float, float] = (6, 6),
         cmap: str = "viridis",
@@ -53,7 +54,8 @@ class HexScatter:
         self.coord_format = coord_format
         self.n_frames = values.shape[0]
 
-        effective = layout or ("flat" if coord_format == "zigzag" else "pointy")
+        is_flat = coord_format in ("zigzag", "flywire")
+        effective = layout or ("flat" if is_flat else "pointy")
         _, _, self.x, self.y = resolve_hex(
             c1,
             c2,
@@ -124,7 +126,8 @@ class HexQuiver:
         flow: Flow data, shape (n_frames, 2, n_hexes) where
             [:, 0, :] = dc1, [:, 1, :] = dc2
         c1, c2: Coordinates (interpreted based on coord_format)
-        coord_format: "axial" (q,r), "zigzag" (x,y), or "pixel" (px,py)
+        coord_format: Any :data:`~btorch.utils.hex.resolve.CoordFormat`, e.g. "axial"
+            (q,r), "zigzag" (x,y), or "pixel" (px,py)
         scale: Vector scale factor
         cwheel: Show colorwheel for direction encoding
 
@@ -138,7 +141,7 @@ class HexQuiver:
         flow: np.ndarray,
         c1: np.ndarray,
         c2: np.ndarray,
-        coord_format: Literal["axial", "zigzag", "pixel"] = "axial",
+        coord_format: CoordFormat = "axial",
         layout: str | None = None,
         figsize: tuple[float, float] = (6, 6),
         scale: float = 1.0,
@@ -154,7 +157,8 @@ class HexQuiver:
         self.n_frames = flow.shape[0]
         self.scale = scale
 
-        effective = layout or ("flat" if coord_format == "zigzag" else "pointy")
+        is_flat = coord_format in ("zigzag", "flywire")
+        effective = layout or ("flat" if is_flat else "pointy")
         _, _, self.x, self.y = resolve_hex(
             c1,
             c2,

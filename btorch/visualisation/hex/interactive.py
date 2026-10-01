@@ -12,20 +12,31 @@ Supports axial (q,r), zigzag (x,y), pixel (px,py), and connectome-style
 string indices ("x,y" double-width coordinates).
 """
 
-from typing import Literal
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-from plotly.colors import sample_colorscale
 
+from ...utils._optional import require
 from ...utils.hex.offset import (
     axial_to_zigzag,
     flywire_to_pixel,
     zigzag_to_axial,
     zigzag_to_pixel,
 )
+from ...utils.hex.resolve import CoordFormat, resolve_hex
 from ...utils.hex.transform import to_pixel as hex_to_pixel
+
+
+if TYPE_CHECKING:
+    import plotly.graph_objects as go
+
+
+def _plotly_go():
+    """Return ``plotly.graph_objects``, or raise with an install hint."""
+    return require("plotly.graph_objects", "viz", "interactive hex plots")
 
 
 _POINTS_PER_INCH = 72
@@ -87,7 +98,7 @@ def _compute_pixel_dims(sizing: dict, dpi: int) -> tuple[float, float, float, fl
 def _resolve_coords(
     c1: np.ndarray,
     c2: np.ndarray,
-    coord_format: str,
+    coord_format: CoordFormat,
     orientation: str = "flat",
     layout: str | None = None,
     rotation_deg: float = 0.0,
@@ -123,7 +134,16 @@ def _resolve_coords(
         nan = np.full_like(x, np.nan, dtype=float)
         return nan, nan, nan, nan, x, y
 
-    raise ValueError(f"Unknown coord_format: {coord_format}")
+    # Remaining formats (offset, doubled, cube) go through the shared resolver.
+    q, r, x, y = resolve_hex(
+        c1,
+        c2,
+        coord_format=coord_format,
+        layout="flywire" if layout == "flywire" else orientation,
+        rotation_deg=rotation_deg,
+    )
+    zx, zy = axial_to_zigzag(np.rint(q).astype(int), np.rint(r).astype(int))
+    return q, r, zx.astype(float), zy.astype(float), x, y
 
 
 def _colorbar_dict(style: dict, sizing: dict, f_ticks: float, f_title: float) -> dict:
@@ -223,6 +243,9 @@ def _values_to_colors(
         t = np.full(len(values), 0.5)
     else:
         t = np.clip((np.asarray(values, dtype=float) - vmin) / (vmax - vmin), 0, 1)
+    sample_colorscale = require(
+        "plotly.colors", "viz", "interactive hex plots"
+    ).sample_colorscale
     return sample_colorscale(colorscale, t.tolist())
 
 
@@ -254,7 +277,7 @@ def heatmap(
     title: str | None = None,
     colorbar: bool = True,
     value_name: str = "value",
-    coord_format: Literal["axial", "zigzag", "flywire", "pixel"] = "axial",
+    coord_format: CoordFormat = "axial",
     orientation: Literal["pointy", "flat"] = "flat",
     layout: str | None = None,
     rotation_deg: float = 0.0,
@@ -285,6 +308,7 @@ def heatmap(
         colorbar: Whether to show colour bar (default ``True``).
         value_name: Label for values in hover tooltip.
         coord_format: How to interpret ``'p'``/``'q'`` columns —
+            any :data:`~btorch.utils.hex.resolve.CoordFormat`, e.g.
             ``"axial"``, ``"zigzag"``, ``"flywire"``, or ``"pixel"``.
         orientation: ``"flat"`` or ``"pointy"`` hex orientation.
         layout: Set to ``"flywire"`` to use the flywire pixel projection.
@@ -299,6 +323,7 @@ def heatmap(
         >>> fig = heatmap(data_df, background_df)
         >>> fig.show()
     """
+    go = _plotly_go()
     sty = _merge_style(style)
     sz = _merge_sizing(sizing)
     area_w, area_h, f_ticks, f_title = _compute_pixel_dims(sz, dpi)
@@ -737,6 +762,7 @@ def grid(
     Returns:
         Plotly Figure with hex grid.
     """
+    go = _plotly_go()
     from ...utils.hex.coords import disk
     from ...utils.hex.offset import axial_to_zigzag
 
@@ -825,7 +851,7 @@ def quiver(
     c2: np.ndarray,
     dc1: np.ndarray,
     dc2: np.ndarray,
-    coord_format: str = "axial",
+    coord_format: CoordFormat = "axial",
     orientation: str = "pointy",
     scale: float = 1.0,
     custom_colorscale: list | None = None,
@@ -841,7 +867,9 @@ def quiver(
     Args:
         c1, c2: Hex coordinates.
         dc1, dc2: Vector components in hex coordinates.
-        coord_format: ``"axial"``, ``"zigzag"``, or ``"pixel"``.
+        coord_format: Any :data:`~btorch.utils.hex.resolve.CoordFormat`, e.g.
+            ``"axial"``, ``"zigzag"`` (alias ``"flywire"``), ``"doublewidth"``
+            or ``"pixel"``.
         orientation: ``"pointy"`` or ``"flat"``.
         scale: Vector scale factor.
         custom_colorscale: Plotly colourscale for magnitude.
@@ -855,6 +883,7 @@ def quiver(
     Returns:
         Plotly Figure with quiver plot.
     """
+    go = _plotly_go()
 
     _, _, _, _, x, y = _resolve_coords(c1, c2, coord_format, orientation)
 

@@ -21,7 +21,7 @@ def test_hdf5_roundtrip_nested(tmp_path):
         "skipped": None,  # None values are silently dropped on save
     }
     # Use the (folder, filename) calling convention.
-    save_dict_to_hdf5(tmp_path, data, filename="x.h5")
+    save_dict_to_hdf5(data, tmp_path, filename="x.h5")
     out = load_dict_from_hdf5(tmp_path / "x.h5")
 
     assert "skipped" not in out
@@ -35,7 +35,7 @@ def test_hdf5_compression_threshold(tmp_path):
     arr = np.zeros(1000, dtype=np.float32)
     # threshold of 0 forces the compression branch; gzip avoids plugin needs.
     save_dict_to_hdf5(
-        tmp_path / "c.h5", {"arr": arr}, compression="gzip", compression_threshold=0
+        {"arr": arr}, tmp_path / "c.h5", compression="gzip", compression_threshold=0
     )
     out = load_dict_from_hdf5(tmp_path, "c.h5")
     np.testing.assert_array_equal(out["arr"], arr)

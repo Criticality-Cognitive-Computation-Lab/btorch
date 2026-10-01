@@ -20,14 +20,7 @@ dependencies = [
     "h5py",
     "hdf5plugin",
     "pyyaml",
-    "fastdtw",
-    "plotly",
-    "nolds!=0.6.3",
-    "powerlaw",
     "matplotlib>=3.7",
-    "xarray",
-    "zarr",
-    "numcodecs",
 ]
 classifiers = [
     'Natural Language :: English',
@@ -71,6 +64,29 @@ sparse = [
 ]
 viz = [
   "networkx",
+  "plotly",
+]
+io = [
+  "xarray",
+  "zarr",
+  "numcodecs",
+]
+analysis = [
+  "powerlaw",
+  "nolds!=0.6.3",
+  "fastdtw",
+]
+all = [
+  "torch_scatter",
+  "torch_sparse",
+  "networkx",
+  "plotly",
+  "xarray",
+  "zarr",
+  "numcodecs",
+  "powerlaw",
+  "nolds!=0.6.3",
+  "fastdtw",
 ]
 
 [dependency-groups]
@@ -129,7 +145,7 @@ allow-direct-references = true
 
 # Docs: uv sync --only-group docs
 # Tests: uv sync --only-group test
-# Dev: uv sync --group dev
+# Dev: uv sync --group dev --all-extras
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "I001"]

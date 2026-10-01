@@ -2,13 +2,17 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 import torch
-import xarray as xr
 
 from btorch.io.serialization import (
     load_memories_from_xarray,
     memories_to_xarray,
     save_memories_to_xarray,
 )
+
+
+# Optional extra [io]: skip this module when xarray/zarr are not installed.
+xr = pytest.importorskip("xarray")
+pytest.importorskip("zarr")
 
 
 def test_save_load_roundtrip(tmp_path):

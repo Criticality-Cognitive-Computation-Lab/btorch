@@ -32,7 +32,7 @@ def compute_eci(
     I_i: torch.Tensor | np.ndarray,
     *,
     I_ext: torch.Tensor | np.ndarray | None = None,
-    batch_axis: tuple[int, ...] | int | None = None,
+    batch_axis: int | tuple[int, ...] | None = None,
     dtype: torch.dtype | np.dtype | None = None,
     **kwargs: Any,
 ) -> torch.Tensor | np.ndarray:
@@ -86,7 +86,7 @@ def _compute_eci(
     I_i: torch.Tensor | np.ndarray,
     *,
     I_ext: torch.Tensor | np.ndarray | None = None,
-    batch_axis: tuple[int, ...] | int | None = None,
+    batch_axis: int | tuple[int, ...] | None = None,
     dtype: torch.dtype | np.dtype | None = None,
 ) -> torch.Tensor | np.ndarray:
     if isinstance(batch_axis, int):
@@ -150,7 +150,7 @@ def compute_lag_correlation(
     *,
     dt: float = 1.0,
     max_lag_ms: float = 30.0,
-    batch_axis: tuple[int, ...] | int | None = None,
+    batch_axis: int | tuple[int, ...] | None = None,
     use_fft: bool = True,
     dtype: torch.dtype | np.dtype | None = None,
     **kwargs: Any,
@@ -226,7 +226,7 @@ def _compute_lag_correlation(
     *,
     dt: float = 1.0,
     max_lag_ms: float = 30.0,
-    batch_axis: tuple[int, ...] | int | None = None,
+    batch_axis: int | tuple[int, ...] | None = None,
     use_fft: bool = True,
     dtype: torch.dtype | np.dtype | None = None,
 ):
@@ -442,7 +442,7 @@ def compute_ei_balance(
     I_ext: torch.Tensor | np.ndarray | None = None,
     dt: float = 1.0,
     max_lag_ms: float = 30.0,
-    batch_axis: tuple[int, ...] | int | None = None,
+    batch_axis: int | tuple[int, ...] | None = None,
     dtype: torch.dtype | np.dtype | None = None,
     **kwargs: Any,
 ) -> tuple:

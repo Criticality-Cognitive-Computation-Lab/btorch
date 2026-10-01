@@ -27,6 +27,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: heavy dependencies are now optional extras.** `plotly`, `xarray`,
+  `zarr`, `numcodecs`, `powerlaw`, `nolds` and `fastdtw` are no longer installed
+  with `pip install btorch`. Install `btorch[io]` (xarray, zarr, numcodecs),
+  `btorch[analysis]` (powerlaw, nolds, fastdtw), `btorch[viz]` (networkx, plotly)
+  or `btorch[all]`. They are imported lazily; using a feature without its extra
+  raises an `ImportError` with the matching install command.
+- **Breaking: analysis / io / visualisation / utils API made consistent.** No
+  aliases are kept; update call sites.
+  - Time step: `dt_ms` -> `dt` (milliseconds) in `isi_cv`, `isi_cv_population`,
+    `cv_temporal`, `local_variation`, `fano_operational_time`,
+    `compare_fano_methods`, and in `btorch.analysis.two_compartment_fit`
+    (`AllenSweepBatch.dt_ms`, `FitEvaluation.dt_ms`, `load_allen_sweep`,
+    `exponential_filter_spike_train`, `spike_timing_stats`, loss helpers;
+    `resample_trace(source_dt_ms, target_dt_ms)` -> `(source_dt, target_dt)`).
+    The `dt_ms` key in the saved fit report JSON is unchanged.
+  - Spike input: `spike` (`fano`, `kurtosis`, `fano_population`,
+    `kurtosis_population`, `fano_temporal`, `fano_sweep`) and `spike_data`
+    (`isi_cv`, `isi_cv_population`, `cv_temporal`, `local_variation`, all
+    `btorch.analysis.dynamic_tools.spiking` functions) -> `spikes`.
+  - `batch_axis` is annotated `int | tuple[int, ...] | None` everywhere and an
+    `int` is now accepted by `fano_temporal`, `local_variation`,
+    `fano_operational_time`, `fano_mean_matching` and `fano_model_based`.
+    `fano_operational_time(overlap=...)` is annotated `int | None`.
+  - `btorch.analysis.dynamic_tools`: `calculate_*` -> `compute_*`
+    (`calculate_ra`, `calculate_pcist`, `calculate_lyapunov_exponent`,
+    `calculate_gain_stability_sensitivity`, `calculate_dfa`,
+    `calculate_kaplan_yorke_dimension`,
+    `calculate_structural_eigenvalue_outliers`, `calculate_fr_distribution`,
+    `calculate_cv_isi`, `calculate_spike_distance`).
+  - Save helpers are object-first: `save_dict_to_hdf5(folder_or_filename, data, ...)`
+    -> `save_dict_to_hdf5(data, folder_or_file, ...)` (matching `save_yaml`,
+    `save_memories_to_xarray`); the path parameter of the HDF5 helpers is now
+    `folder_or_file`; `save_yaml(args, ...)` -> `save_yaml(obj, ...)`;
+    `save_memories_to_xarray(data, ...)` -> `save_memories_to_xarray(memories, ...)`.
+  - `save_memories_to_xarray` gains `force_sparse` (forwarded to
+    `memories_to_xarray`); it sits before `compression_level` positionally.
+  - Hex plots: one shared `btorch.utils.hex.CoordFormat` literal is used for
+    `coord_format` in static/interactive `scatter`, `quiver`, `heatmap` and the
+    animation classes; the interactive resolver now supports every format.
+  - `make_hetersynapse_conn` and `neuron_subset_to_conn_mat` gained
+    `typing.overload` signatures keyed on `return_dict` / `return_mode`.
+
 - **Surrogate autograd functions are `torch.func`-compatible** — `_SurrogateAutograd`
   and the Poisson random spike function use `setup_context`/`jvp`/
   `generate_vmap_rule`, so `torch.func.jvp/vjp/vmap` work through them.

@@ -13,8 +13,8 @@ import hdf5plugin
 
 
 def save_dict_to_hdf5(
-    folder_or_filename: "str | Path",
     data: dict,
+    folder_or_file: "str | Path",
     compression: Any = hdf5plugin.Blosc2(),
     filename: str | None = None,
     compression_threshold: int = 1024 * 1024,  # 1MiB
@@ -26,11 +26,11 @@ def save_dict_to_hdf5(
     with the specified compression filter.
 
     Args:
-        folder_or_filename: Directory path if ``filename`` is provided,
-            otherwise full file path.
         data: Nested dictionary with array-like values to serialize.
+        folder_or_file: Directory path if ``filename`` is provided,
+            otherwise full file path.
         compression: Compression filter (default: Blosc2).
-        filename: Optional filename when ``folder_or_filename`` is a directory.
+        filename: Optional filename when ``folder_or_file`` is a directory.
         compression_threshold: Minimum array size in bytes to trigger
             compression (default: 1 MiB).
     """
@@ -54,32 +54,28 @@ def save_dict_to_hdf5(
                 h5file.create_dataset(f"{path}/{k}", data=v)
 
     file = (
-        folder_or_filename
-        if filename is None
-        else os.path.join(folder_or_filename, filename)
+        folder_or_file if filename is None else os.path.join(folder_or_file, filename)
     )
     with h5py.File(file, "w") as f:
         save_group(f, "", data)
 
 
 def load_dict_from_hdf5(
-    folder_or_filename: "str | Path",
+    folder_or_file: "str | Path",
     filename: str | None = None,
 ) -> dict:
     """Load nested dictionary from HDF5 file.
 
     Args:
-        folder_or_filename: Directory path if ``filename`` is provided,
+        folder_or_file: Directory path if ``filename`` is provided,
             otherwise full file path.
-        filename: Optional filename when ``folder_or_filename`` is a directory.
+        filename: Optional filename when ``folder_or_file`` is a directory.
 
     Returns:
         Nested dictionary with restored array values.
     """
     file = (
-        folder_or_filename
-        if filename is None
-        else os.path.join(folder_or_filename, filename)
+        folder_or_file if filename is None else os.path.join(folder_or_file, filename)
     )
 
     def load_group(h5file, path):

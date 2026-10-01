@@ -56,16 +56,16 @@ import numpy as np
 from btorch.analysis import isi_cv, fano, firing_rate
 
 # 生成示例脉冲数据 [time, batch, neurons]
-spike_data = np.random.rand(1000, 10, 50) > 0.95
+spikes = np.random.rand(1000, 10, 50) > 0.95
 
 # ISI（脉冲间隔）的变异系数
-cv, isi_total, isi_stats = isi_cv(spike_data, dt_ms=1.0)
+cv, info = isi_cv(spikes, dt=1.0)
 
 # Fano 因子（脉冲计数的方差/均值）
-fano_values, fano_stats = fano(spike_data, window_ms=100, dt_ms=1.0)
+fano_values, fano_stats = fano(spikes, window=100)
 
 # 通过卷积计算发放率
-rates = firing_rate(spike_data, dt_ms=1.0, smooth_ms=50)
+rates = firing_rate(spikes, width=50, dt=1.0)
 ```
 
 ## 形状约定

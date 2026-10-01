@@ -59,6 +59,14 @@ pip install btorch
 uv pip install btorch
 ```
 
+可选功能以 extras 形式安装（`btorch[io]`：xarray/Zarr 序列化；`btorch[analysis]`：
+临界性/Lyapunov/DTW 分析工具；`btorch[viz]`：plotly 交互式绘图；`btorch[sparse]`：
+`torch_sparse`；`btorch[all]`：全部）：
+
+```bash
+pip install "btorch[all]"
+```
+
 ### conda / mamba
 
 ```bash

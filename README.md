@@ -61,6 +61,15 @@ or
 uv pip install btorch
 ```
 
+Optional features are installed as extras (`btorch[io]` for xarray/Zarr
+serialization, `btorch[analysis]` for criticality/Lyapunov/DTW tools,
+`btorch[viz]` for interactive plotly plots, `btorch[sparse]` for `torch_sparse`,
+or `btorch[all]` for everything):
+
+```bash
+pip install "btorch[all]"
+```
+
 ### conda or mamba
 
 ```bash

@@ -34,7 +34,7 @@ from btorch.analysis.spiking import fano as standard_fano
 def generate_poisson_spikes(
     rate_hz: float,
     duration_ms: float,
-    dt_ms: float = 1.0,
+    dt: float = 1.0,
     n_neurons: int = 1,
     seed: int | None = None,
 ) -> np.ndarray:
@@ -51,9 +51,9 @@ def generate_poisson_spikes(
     if seed is not None:
         np.random.seed(seed)
 
-    n_steps = int(duration_ms / dt_ms)
+    n_steps = int(duration_ms / dt)
     # Probability of spike in each bin: p = rate * dt
-    p_spike = rate_hz * dt_ms / 1000.0  # rate in Hz, dt in ms
+    p_spike = rate_hz * dt / 1000.0  # rate in Hz, dt in ms
     return (np.random.rand(n_steps, n_neurons) < p_spike).astype(np.float32)
 
 
@@ -61,7 +61,7 @@ def generate_gamma_renewal_spikes(
     rate_hz: float,
     shape_k: float,
     duration_ms: float,
-    dt_ms: float = 1.0,
+    dt: float = 1.0,
     n_neurons: int = 1,
     seed: int | None = None,
 ) -> np.ndarray:
@@ -76,7 +76,7 @@ def generate_gamma_renewal_spikes(
     if seed is not None:
         np.random.seed(seed)
 
-    n_steps = int(duration_ms / dt_ms)
+    n_steps = int(duration_ms / dt)
     mean_isi_ms = 1000.0 / rate_hz  # mean ISI in ms
     scale_theta = mean_isi_ms / shape_k  # θ = mean/k
 
@@ -86,7 +86,7 @@ def generate_gamma_renewal_spikes(
         while t < duration_ms:
             isi = np.random.gamma(shape_k, scale_theta)
             t += isi
-            idx = int(t / dt_ms)
+            idx = int(t / dt)
             if idx < n_steps:
                 spikes[idx, n] = 1.0
     return spikes
@@ -97,7 +97,7 @@ def generate_rate_modulated_spikes(
     modulation_freq_hz: float,
     modulation_amp: float,
     duration_ms: float,
-    dt_ms: float = 1.0,
+    dt: float = 1.0,
     n_neurons: int = 1,
     seed: int | None = None,
 ) -> np.ndarray:
@@ -111,15 +111,15 @@ def generate_rate_modulated_spikes(
     if seed is not None:
         np.random.seed(seed)
 
-    n_steps = int(duration_ms / dt_ms)
-    t = np.arange(n_steps) * dt_ms / 1000.0  # time in seconds
+    n_steps = int(duration_ms / dt)
+    t = np.arange(n_steps) * dt / 1000.0  # time in seconds
 
     # Time-varying rate
     rate_t = base_rate_hz + modulation_amp * np.sin(2 * np.pi * modulation_freq_hz * t)
     rate_t = np.maximum(rate_t, 1e-6)  # Ensure positive rate
 
     # Generate spikes with time-varying probability
-    p_spike = rate_t * dt_ms / 1000.0
+    p_spike = rate_t * dt / 1000.0
     p_spike = np.clip(p_spike, 0, 1)
 
     spikes = np.zeros((n_steps, n_neurons), dtype=np.float32)
@@ -134,7 +134,7 @@ def generate_modulated_poisson_spikes(
     gain_mean: float,
     gain_std: float,
     duration_ms: float,
-    dt_ms: float = 1.0,
+    dt: float = 1.0,
     n_neurons: int = 1,
     n_trials: int = 1,
     seed: int | None = None,
@@ -149,7 +149,7 @@ def generate_modulated_poisson_spikes(
     if seed is not None:
         np.random.seed(seed)
 
-    n_steps = int(duration_ms / dt_ms)
+    n_steps = int(duration_ms / dt)
 
     # Generate gain samples for each trial and neuron
     # Log-normal parameters
@@ -163,7 +163,7 @@ def generate_modulated_poisson_spikes(
             # Sample gain for this trial/neuron
             g = np.random.lognormal(mu_g, sigma_g)
             rate_trial = base_rate_hz * g
-            p_spike = rate_trial * dt_ms / 1000.0
+            p_spike = rate_trial * dt / 1000.0
             p_spike = min(p_spike, 1.0)
             spikes[:, trial, n] = (np.random.rand(n_steps) < p_spike).astype(np.float32)
 
@@ -198,7 +198,7 @@ class TestFanoOperationalTime:
             spikes = generate_poisson_spikes(
                 rate_hz=rate, duration_ms=duration_ms, n_neurons=10
             )
-            ff_op, info = fano_operational_time(spikes, dt_ms=1.0)
+            ff_op, info = fano_operational_time(spikes, dt=1.0)
             ff_values.append(np.nanmean(ff_op))
 
         # All rates should give similar operational FF ≈ 1
@@ -237,8 +237,8 @@ class TestFanoOperationalTime:
         ff_std_high, _ = standard_fano(spikes_high, window=50)
 
         # Operational time Fano factor
-        ff_op_low, _ = fano_operational_time(spikes_low, dt_ms=1.0)
-        ff_op_high, _ = fano_operational_time(spikes_high, dt_ms=1.0)
+        ff_op_low, _ = fano_operational_time(spikes_low, dt=1.0)
+        ff_op_high, _ = fano_operational_time(spikes_high, dt=1.0)
 
         # Standard FF and operational FF values
         ff_std_diff = abs(np.nanmean(ff_std_low) - np.nanmean(ff_std_high))
@@ -267,7 +267,7 @@ class TestFanoOperationalTime:
                 duration_ms=5000.0,
                 n_neurons=20,
             )
-            ff_op, _ = fano_operational_time(spikes, dt_ms=1.0)
+            ff_op, _ = fano_operational_time(spikes, dt=1.0)
             ff_op_mean = np.nanmean(ff_op)
 
             # Allow generous tolerance for finite sample effects
@@ -293,7 +293,7 @@ class TestFanoOperationalTime:
             n_neurons=10,
         )
 
-        ff_op, info = fano_operational_time(spikes, dt_ms=1.0, rate_hz=None)
+        ff_op, info = fano_operational_time(spikes, dt=1.0, rate_hz=None)
         ff_op_mean = np.nanmean(ff_op)
 
         assert (
@@ -305,11 +305,11 @@ class TestFanoOperationalTime:
         np.random.seed(42)
         spikes = generate_poisson_spikes(rate_hz=50.0, duration_ms=5000.0, n_neurons=5)
 
-        ff_np, _ = fano_operational_time(spikes, dt_ms=1.0)
+        ff_np, _ = fano_operational_time(spikes, dt=1.0)
 
         # Skip torch test if there are implementation differences
         try:
-            ff_torch, _ = fano_operational_time(torch.from_numpy(spikes), dt_ms=1.0)
+            ff_torch, _ = fano_operational_time(torch.from_numpy(spikes), dt=1.0)
             # Allow some tolerance due to implementation differences
             np.testing.assert_allclose(
                 ff_np, ff_torch.cpu().numpy(), rtol=0.3, atol=0.3
@@ -322,7 +322,7 @@ class TestFanoOperationalTime:
         np.random.seed(42)
         spikes = generate_poisson_spikes(rate_hz=50.0, duration_ms=5000.0, n_neurons=5)
 
-        ff_op, info = fano_operational_time(spikes, dt_ms=1.0)
+        ff_op, info = fano_operational_time(spikes, dt=1.0)
 
         assert "method" in info
         assert info["method"] == "operational_time"
@@ -593,7 +593,7 @@ class TestCompareFanoMethods:
         np.random.seed(42)
         spikes = generate_poisson_spikes(rate_hz=50.0, duration_ms=5000.0, n_neurons=5)
 
-        results = compare_fano_methods(spikes, dt_ms=1.0)
+        results = compare_fano_methods(spikes, dt=1.0)
 
         assert "standard" in results
         assert "operational_time" in results
@@ -606,7 +606,7 @@ class TestCompareFanoMethods:
         # Data that might cause issues for some methods
         spikes = generate_poisson_spikes(rate_hz=50.0, duration_ms=1000.0, n_neurons=2)
 
-        results = compare_fano_methods(spikes, dt_ms=1.0)
+        results = compare_fano_methods(spikes, dt=1.0)
 
         # Should have attempted all methods
         assert len(results) >= 3
@@ -647,7 +647,7 @@ class TestTheoreticalConsistency:
             )
 
             # Compute operational time Fano factor
-            ff_op, _ = fano_operational_time(spikes, dt_ms=1.0)
+            ff_op, _ = fano_operational_time(spikes, dt=1.0)
             ff_op_mean = np.nanmean(ff_op)
 
             # Should be close to CV² = 1/k (allow generous tolerance)
@@ -669,7 +669,7 @@ class TestTheoreticalConsistency:
         ff_std, _ = standard_fano(spikes, window=100)
 
         # Operational time Fano
-        ff_op, _ = fano_operational_time(spikes, dt_ms=1.0)
+        ff_op, _ = fano_operational_time(spikes, dt=1.0)
 
         ff_std_mean = np.nanmean(ff_std)
         ff_op_mean = np.nanmean(ff_op)
@@ -697,8 +697,8 @@ class TestTheoreticalConsistency:
         # Scale by repeating (approximate rate scaling)
         spikes_scaled = np.repeat(spikes_base, 2, axis=0)[: spikes_base.shape[0]]
 
-        ff_base, _ = fano_operational_time(spikes_base, dt_ms=1.0)
-        ff_scaled, _ = fano_operational_time(spikes_scaled, dt_ms=1.0)
+        ff_base, _ = fano_operational_time(spikes_base, dt=1.0)
+        ff_scaled, _ = fano_operational_time(spikes_scaled, dt=1.0)
 
         # Both should give similar results (allowing for finite sample)
         diff = abs(np.nanmean(ff_base) - np.nanmean(ff_scaled))
@@ -717,7 +717,7 @@ class TestEdgeCases:
         """Handle spike trains with no spikes gracefully."""
         spikes = np.zeros((100, 5), dtype=np.float32)
 
-        ff_op, _ = fano_operational_time(spikes, dt_ms=1.0)
+        ff_op, _ = fano_operational_time(spikes, dt=1.0)
         # Should return NaN or handle gracefully
         assert isinstance(ff_op, np.ndarray)
 
@@ -726,7 +726,7 @@ class TestEdgeCases:
         np.random.seed(42)
         spikes = generate_poisson_spikes(rate_hz=50.0, duration_ms=5000.0, n_neurons=1)
 
-        ff_op, _ = fano_operational_time(spikes, dt_ms=1.0)
+        ff_op, _ = fano_operational_time(spikes, dt=1.0)
         assert ff_op.shape == () or ff_op.shape == (1,)
 
     def test_short_duration(self):
@@ -738,7 +738,7 @@ class TestEdgeCases:
             n_neurons=5,  # Only 100ms
         )
 
-        ff_op, _ = fano_operational_time(spikes, dt_ms=1.0)
+        ff_op, _ = fano_operational_time(spikes, dt=1.0)
         assert isinstance(ff_op, np.ndarray)
 
     def test_torch_gpu_if_available(self):
@@ -751,7 +751,7 @@ class TestEdgeCases:
         spikes_gpu = torch.from_numpy(spikes).cuda()
 
         try:
-            ff_op, info = fano_operational_time(spikes_gpu, dt_ms=1.0)
+            ff_op, info = fano_operational_time(spikes_gpu, dt=1.0)
 
             assert isinstance(ff_op, torch.Tensor)
             assert ff_op.device.type == "cuda"

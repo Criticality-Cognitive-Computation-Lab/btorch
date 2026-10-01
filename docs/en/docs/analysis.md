@@ -30,8 +30,8 @@ from btorch.analysis.spiking import cv_from_spikes, fano_factor_from_spikes
 
 # NumPy input with batch aggregation across trials
 cv, isi_total, isi_stats = cv_from_spikes(
-    spike_data,           # shape: [T, B, N] 
-    dt_ms=1.0,
+    spikes,           # shape: [T, B, N] 
+    dt=1.0,
     batch_axis=(1,),      # aggregate across batch dimension
     percentile=(0.1, 0.5, 0.9)  # compute 10th, 50th, 90th percentiles
 )
@@ -41,8 +41,8 @@ cv, isi_total, isi_stats = cv_from_spikes(
 # Torch GPU input
 import torch
 cv_gpu, _, _ = cv_from_spikes(
-    torch.from_numpy(spike_data).cuda(),
-    dt_ms=1.0,
+    torch.from_numpy(spikes).cuda(),
+    dt=1.0,
     batch_axis=(1,)
 )
 # Returns GPU tensor, uses hybrid CPU/GPU for efficiency
@@ -64,7 +64,7 @@ fano_sweep = fano_factor_from_spikes(
 # Local Variation (LV) - less sensitive to rate changes than CV
 lv, lv_stats = local_variation_from_spikes(
     spikes,
-    dt_ms=1.0,
+    dt=1.0,
     percentile=(0.25, 0.75)
 )
 ```

@@ -107,11 +107,11 @@ def benchmark_cv(T=1000, B=8, N=100000, device="cpu", dtype=torch.float32):
     cv_values = None
 
     def warmup():
-        isi_cv(spikes, dt_ms=1.0, batch_axis=(1,))
+        isi_cv(spikes, dt=1.0, batch_axis=(1,))
 
     def run():
         nonlocal cv_values
-        cv_values, _ = isi_cv(spikes, dt_ms=1.0, batch_axis=(1,))
+        cv_values, _ = isi_cv(spikes, dt=1.0, batch_axis=(1,))
 
     return _run_benchmark(
         label="CV",
@@ -179,11 +179,11 @@ def benchmark_lv(T=1000, B=8, N=100000, device="cpu", dtype=torch.float32):
     lv_values = None
 
     def warmup():
-        local_variation(spikes, dt_ms=1.0, batch_axis=(1,))
+        local_variation(spikes, dt=1.0, batch_axis=(1,))
 
     def run():
         nonlocal lv_values
-        lv_values, _ = local_variation(spikes, dt_ms=1.0, batch_axis=(1,))
+        lv_values, _ = local_variation(spikes, dt=1.0, batch_axis=(1,))
 
     return _run_benchmark(
         label="LV",

@@ -15,7 +15,7 @@ matplotlib.use("Agg")
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
+import pytest
 
 from btorch.utils.file import fig_path
 from btorch.utils.hex.coords import disk
@@ -34,6 +34,10 @@ from btorch.visualisation.hex.interactive import (
     heatmap,
     quiver,
 )
+
+
+# Optional extra [viz]: skip this module when plotly is not installed.
+go = pytest.importorskip("plotly.graph_objects")
 
 
 OUT = fig_path()

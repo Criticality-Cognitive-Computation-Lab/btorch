@@ -1,22 +1,16 @@
 import warnings
 
 import numpy as np
-import powerlaw
-
-
-try:
-    import nolds
-
-    HAS_NOLDS = True
-except ImportError:
-    HAS_NOLDS = False
 from scipy.optimize import curve_fit
+
+from ...utils._optional import require
 
 
 def _fit_distribution(data):
     """Helper to fit power law distribution using powerlaw package."""
     if len(data) < 10:
         return np.nan, None
+    powerlaw = require("powerlaw", "analysis", "power-law fitting")
     try:
         # discrete=True because sizes/durations are counts (integers)
         fit = powerlaw.Fit(data, discrete=True, verbose=False)
@@ -187,7 +181,7 @@ def compute_avalanche_statistics(spike_train: np.ndarray, bin_size: int = 1) -> 
     return results
 
 
-def calculate_dfa(spike_train: np.ndarray, bin_size: int = 1) -> float:
+def compute_dfa(spike_train: np.ndarray, bin_size: int = 1) -> float:
     """Calculate Detrended Fluctuation Analysis (DFA) exponent alpha.
 
     Meaning of alpha:
@@ -203,11 +197,7 @@ def calculate_dfa(spike_train: np.ndarray, bin_size: int = 1) -> float:
     Returns:
         float: The DFA exponent alpha.
     """
-    if not HAS_NOLDS:
-        raise ImportError(
-            "nolds package is required for DFA analysis. "
-            "Install with: pip install nolds"
-        )
+    nolds = require("nolds", "analysis", "DFA analysis")
 
     # Ensure input is numpy array
     spike_train = np.array(spike_train)

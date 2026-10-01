@@ -20,6 +20,11 @@ from btorch.visualisation.dynamics import (
 )
 
 
+# Optional extras: skip this module when the library is not installed.
+pytest.importorskip("nolds")
+pytest.importorskip("powerlaw")
+
+
 # -----------------------------------------------------------------------------
 # 1. Simple Dynamical System (Reservoir / Echo State Network)
 # -----------------------------------------------------------------------------
@@ -132,7 +137,7 @@ def test_criticality_analysis(simulation_data):
     plt.close(fig_av)
 
     # 2. DFA Calculation (Scalar)
-    dfa_alpha = criticality.calculate_dfa(baseline_spikes.numpy(), bin_size=1)
+    dfa_alpha = criticality.compute_dfa(baseline_spikes.numpy(), bin_size=1)
     # Just ensure it runs and returns a float/nan
     assert isinstance(dfa_alpha, float)
 
@@ -146,11 +151,11 @@ def test_complexity_analysis(simulation_data):
     baseline_activity = simulation_data["baseline_activity"]
 
     # 1. RA
-    ra_score = complexity.calculate_ra(baseline_spikes, final_spikes)
+    ra_score = complexity.compute_ra(baseline_spikes, final_spikes)
     assert isinstance(ra_score, float)
 
     # 2. PCIst
-    pcist_score = complexity.calculate_pcist(
+    pcist_score = complexity.compute_pcist(
         perturb_activity.squeeze(0), baseline_activity.squeeze(0)[:500]
     )
     assert isinstance(pcist_score, float)
@@ -208,9 +213,7 @@ def test_micro_dynamics(simulation_data):
 
     # 2. Spike Distance
     try:
-        spike_dist = micro_scale.calculate_spike_distance(
-            baseline_spikes.numpy(), dt=dt
-        )
+        spike_dist = micro_scale.compute_spike_distance(baseline_spikes.numpy(), dt=dt)
     except Exception:
         spike_dist = 0.0
     assert isinstance(spike_dist, float)

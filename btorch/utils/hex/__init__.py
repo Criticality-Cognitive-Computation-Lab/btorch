@@ -67,7 +67,7 @@ from .offset import (
 from .range import range_intersection, range_union, ranges_intersect
 
 # Resolve pipeline
-from .resolve import hex_symbol_for, resolve_hex
+from .resolve import CoordFormat, hex_symbol_for, resolve_hex
 
 # Storage
 from .storage import (
@@ -172,6 +172,7 @@ __all__ = [
     "range_union",
     "ranges_intersect",
     # Resolve
+    "CoordFormat",
     "resolve_hex",
     "hex_symbol_for",
     # Data structures

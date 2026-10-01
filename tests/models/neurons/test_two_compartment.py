@@ -156,7 +156,7 @@ def test_two_compartment_loss_masks_post_spike_samples_and_regularizes_w_ca():
         spike_pred=spike_pred,
         v_true=v_true,
         spike_true=spike_true,
-        dt_ms=1.0,
+        dt=1.0,
         w_Ca=torch.tensor([2.0]),
         post_spike_mask_ms=2.0,
         sparsity_weight=0.5,
@@ -172,7 +172,7 @@ def test_two_compartment_loss_masks_post_spike_samples_and_regularizes_w_ca():
 
 def test_exponential_filter_spike_train_is_causal_and_stable():
     spikes = torch.tensor([0.0, 1.0, 0.0, 0.0]).view(4, 1, 1)
-    filtered = exponential_filter_spike_train(spikes, tau_ms=2.0, dt_ms=1.0)
+    filtered = exponential_filter_spike_train(spikes, tau_ms=2.0, dt=1.0)
 
     assert filtered.shape == spikes.shape
     assert filtered[0].item() == 0.0
@@ -187,7 +187,7 @@ def test_spike_timing_stats_reward_close_matches():
     stats = spike_timing_stats(
         spike_true,
         spike_pred,
-        dt_ms=1.0,
+        dt=1.0,
         match_window_ms=1.5,
     )
 
@@ -207,7 +207,7 @@ def test_tbptt_fit_loop_runs_on_synthetic_sweep():
     sweep = AllenSweepBatch(
         specimen_id=1,
         sweep_number=1,
-        dt_ms=1.0,
+        dt=1.0,
         i_soma=torch.randn(16, 1, 1),
         v_true=torch.zeros(16, 1, 1),
         spike_true=torch.zeros(16, 1, 1),
@@ -273,7 +273,7 @@ def test_global_fit_improves_tau_s_from_poor_initialization():
     sweep = AllenSweepBatch(
         specimen_id=1,
         sweep_number=1,
-        dt_ms=1.0,
+        dt=1.0,
         i_soma=i_soma,
         v_true=v_true.detach(),
         spike_true=spike_true.detach(),
@@ -362,7 +362,7 @@ def test_staged_fit_runs_with_mixed_sweeps():
         AllenSweepBatch(
             specimen_id=1,
             sweep_number=1,
-            dt_ms=1.0,
+            dt=1.0,
             i_soma=silent_i,
             v_true=silent_v.detach(),
             spike_true=silent_spike.detach(),
@@ -371,7 +371,7 @@ def test_staged_fit_runs_with_mixed_sweeps():
         AllenSweepBatch(
             specimen_id=1,
             sweep_number=2,
-            dt_ms=1.0,
+            dt=1.0,
             i_soma=spiking_i,
             v_true=spiking_v.detach(),
             spike_true=spiking_spike.detach(),
@@ -420,7 +420,7 @@ def test_fit_evaluation_and_report_outputs(tmp_path):
     sweep = AllenSweepBatch(
         specimen_id=11,
         sweep_number=7,
-        dt_ms=1.0,
+        dt=1.0,
         i_soma=i_soma,
         v_true=v_true.detach(),
         spike_true=spike_true.detach(),

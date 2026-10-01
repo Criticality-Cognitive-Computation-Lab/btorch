@@ -1,7 +1,7 @@
 import numpy as np
 
 
-def calculate_kaplan_yorke_dimension(lyapunov_spectrum: np.ndarray) -> float:
+def compute_kaplan_yorke_dimension(lyapunov_spectrum: np.ndarray) -> float:
     """Calculate the Kaplan-Yorke Dimension (D_KY), also known as the Lyapunov
     Dimension.
 
@@ -61,7 +61,7 @@ def calculate_kaplan_yorke_dimension(lyapunov_spectrum: np.ndarray) -> float:
     return d_ky
 
 
-def calculate_structural_eigenvalue_outliers(
+def compute_structural_eigenvalue_outliers(
     weight_matrix: np.ndarray, spectral_radius: float = None
 ) -> dict:
     """Analyze the eigenvalues of the weight matrix to identify structural

@@ -1,7 +1,7 @@
 import itertools
 import warnings
 from collections import OrderedDict
-from typing import Literal, Sequence
+from typing import Literal, Sequence, overload
 
 import numpy as np
 import pandas as pd
@@ -46,6 +46,41 @@ def make_sparse_mat(
     )
 
     return ret
+
+
+@overload
+def neuron_subset_to_conn_mat(
+    subset: Sequence[int] | pd.Series | pd.DataFrame,
+    id_type: IdType,
+    size: int,
+    neurons: pd.DataFrame | None = None,
+    remove_nan: bool = False,
+    return_mode: Literal["scatter"] = "scatter",
+) -> np.ndarray: ...
+
+
+@overload
+def neuron_subset_to_conn_mat(
+    subset: Sequence[int] | pd.Series | pd.DataFrame,
+    id_type: IdType,
+    size: int,
+    neurons: pd.DataFrame | None = None,
+    remove_nan: bool = False,
+    *,
+    return_mode: Literal["sparray"],
+) -> scipy.sparse.sparray: ...
+
+
+@overload
+def neuron_subset_to_conn_mat(
+    subset: Sequence[int] | pd.Series | pd.DataFrame,
+    id_type: IdType,
+    size: int,
+    neurons: pd.DataFrame | None = None,
+    remove_nan: bool = False,
+    *,
+    return_mode: Literal["sparray", "scatter"],
+) -> scipy.sparse.sparray | np.ndarray: ...
 
 
 def neuron_subset_to_conn_mat(
@@ -246,6 +281,48 @@ def make_spatial_localised_conn(
     )
 
     return conn_matrix
+
+
+@overload
+def make_hetersynapse_conn(
+    neurons: pd.DataFrame,
+    connections: scipy.sparse.sparray | pd.DataFrame,
+    receptor_type_col="EI",
+    receptor_type_mode: ReceptorTypeMode = "neuron",
+    return_dict: Literal[False] = False,
+    dropna: DropNaMode = "error",
+    ignore_post_type: bool = False,
+    delay_col: str | None = None,
+    n_delay_bins: int = 5,
+) -> tuple[scipy.sparse.sparray, pd.DataFrame]: ...
+
+
+@overload
+def make_hetersynapse_conn(
+    neurons: pd.DataFrame,
+    connections: scipy.sparse.sparray | pd.DataFrame,
+    receptor_type_col="EI",
+    receptor_type_mode: ReceptorTypeMode = "neuron",
+    return_dict: Literal[True] = ...,
+    dropna: DropNaMode = "error",
+    ignore_post_type: bool = False,
+    delay_col: str | None = None,
+    n_delay_bins: int = 5,
+) -> tuple[OrderedDict, pd.DataFrame]: ...
+
+
+@overload
+def make_hetersynapse_conn(
+    neurons: pd.DataFrame,
+    connections: scipy.sparse.sparray | pd.DataFrame,
+    receptor_type_col="EI",
+    receptor_type_mode: ReceptorTypeMode = "neuron",
+    return_dict: bool = ...,
+    dropna: DropNaMode = "error",
+    ignore_post_type: bool = False,
+    delay_col: str | None = None,
+    n_delay_bins: int = 5,
+) -> tuple[scipy.sparse.sparray, pd.DataFrame] | tuple[OrderedDict, pd.DataFrame]: ...
 
 
 def make_hetersynapse_conn(

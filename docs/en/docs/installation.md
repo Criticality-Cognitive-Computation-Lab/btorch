@@ -14,6 +14,26 @@ or
 uv pip install btorch
 ```
 
+### Optional extras
+
+The core install is lightweight. Heavy libraries are optional extras and are
+imported lazily; calling a feature whose library is missing raises an
+`ImportError` with the exact `pip install "btorch[...]"` command.
+
+| Extra | Installs | Enables |
+| --- | --- | --- |
+| *(core)* | torch, numpy, pandas, scipy, h5py, matplotlib, ... | models, connectome tools, static plots |
+| `btorch[io]` | xarray, zarr, numcodecs | `btorch.io.serialization` (xarray/Zarr save and load) |
+| `btorch[analysis]` | powerlaw, nolds, fastdtw | avalanche/DFA criticality, Lyapunov and entropy estimates, DTW trace clustering |
+| `btorch[viz]` | networkx, plotly | interactive hex plots (`btorch.visualisation.hex.interactive`), graph plots |
+| `btorch[sparse]` | torch_scatter, torch_sparse | faster sparse backend (see below; needs PyG wheels) |
+| `btorch[all]` | every extra above | everything |
+
+```bash
+pip install "btorch[io,analysis]"   # combine extras
+pip install "btorch[all]"
+```
+
 ### CUDA support
 
 `btorch` depends on PyTorch. PyPI ships CPU-only torch by default. For CUDA,
@@ -81,7 +101,7 @@ If you use `uv`, clone and sync the lockfile:
 ```bash
 git clone https://github.com/Criticality-Cognitive-Computation-Lab/btorch.git
 cd btorch
-uv sync --group dev
+uv sync --group dev --all-extras
 source .venv/bin/activate
 pip install -e . --config-settings editable_mode=strict
 ```
