@@ -114,7 +114,7 @@ def save_checkpoint(model, optimizer, epoch, path):
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "epoch": epoch,
-        "memories_rv": functional.named_memory_reset_values(model),
+        "memory_reset_values": functional.named_memory_reset_values(model),
     }, path)
 
 def load_checkpoint(model, optimizer, path):
@@ -125,8 +125,8 @@ def load_checkpoint(model, optimizer, path):
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
 
     # Restore memory reset values
-    if "memories_rv" in ckpt:
-        functional.set_memory_reset_values(model, ckpt["memories_rv"])
+    if "memory_reset_values" in ckpt:
+        functional.set_memory_reset_values(model, ckpt["memory_reset_values"])
     if "hidden_states" in ckpt:
         functional.set_hidden_states(model, ckpt["hidden_states"])
 
@@ -155,7 +155,7 @@ for t in range(0, T, chunk_size):
 
 1. **Always reset state** before a new batch with `functional.reset_net`.
 2. **Always wrap forward** in `environ.context(dt=...)`.
-3. **Save `memories_rv`** when checkpointing; `state_dict()` does not include dynamic states.
+3. **Save `memory_reset_values`** when checkpointing; `state_dict()` does not include dynamic states.
 4. **Use `detach_net`** for truncated BPTT on long sequences.
 
 See the [FAQ](../faq.md) for common errors and troubleshooting.

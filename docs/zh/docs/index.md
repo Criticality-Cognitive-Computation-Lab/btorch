@@ -29,8 +29,6 @@ hide:
     稀疏连接矩阵、延迟扩展，
     以及兼容 Flywire 的数据处理。
 
-    [:octicons-arrow-right-24: 连接转换](connection_conversion.md)
-
 -   :material-chart-line:{ .lg .middle } __分析与可视化__
 
     ---

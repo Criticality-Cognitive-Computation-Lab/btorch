@@ -27,6 +27,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (analysis / utils / io cleanup):**
+  - Two-compartment fitting: `fit_two_compartment_model`, `two_compartment_loss`,
+    `evaluate_two_compartment_fit` and `evaluate_fit_across_sweeps` no longer take
+    the loose loss keywords (`voltage_weight`, `spike_weight`, `spike_count_weight`,
+    `spike_timing_weight`, `spike_count_over_weight`, `spike_count_under_weight`,
+    `sparsity_weight`, `spike_tau_ms`, `post_spike_mask_ms`,
+    `spike_match_window_ms`, `spike_miss_penalty_ms`); pass one
+    `loss=FitLossConfig(...)` instead (`FitLossConfig` is now exported from
+    `btorch.analysis`). The evaluate helpers now honour every config field, so
+    `total_loss` in their metrics uses the real weights (previously only a subset
+    was forwarded and the other weights silently stayed at their defaults).
+  - `btorch.analysis.dynamic_tools.spiking` -> `btorch.analysis.dynamic_tools.fano`
+    (it only holds the rate-compensated Fano factor methods).
+  - `btorch.analysis.dynamic_tools.micro_scale.compute_cv_isi` removed; use
+    `btorch.analysis.isi_cv` (the single ISI-CV implementation). Neurons with
+    exactly two spikes now give NaN instead of CV = 0 (a CV needs two ISIs).
+  - `micro_scale.compute_spike_distance` returns NaN (was 0.0) when fewer than two
+    neurons are given.
+  - `firing_rate(axis=...)` -> `firing_rate(batch_axis=...)`.
+  - `plot_micro_dynamics` lost its unused `ax` parameter.
+  - Decorated analysis functions (`isi_cv`, `fano`, `kurtosis`, `local_variation`,
+    `cv_temporal`, `fano_temporal`, `isi_cv_population`, `compute_eci`,
+    `compute_lag_correlation`, `compute_ei_balance`) no longer accept (and
+    silently ignore) arbitrary `**kwargs`; unknown keywords raise `TypeError`.
+  - `use_stats` / `use_percentiles` are typed with `StatsDecorated` /
+    `PercentilesDecorated` protocols (added kwargs and the `(*values, info)`
+    return are visible to type checkers). `compute_stat` / `compute_stats_batch`
+    share one implementation: `compute_stat` on a multi-element torch result now
+    returns the tensor instead of raising, and `compute_stats_batch` raises
+    `ValueError` for an unknown stat name.
+  - Internal `_compute_stat`, `_compute_stats_batch` and `_compute_eci` forwarders
+    removed.
+  - `utils.conf.get_dotkey` no longer masks an `AttributeError` raised inside a
+    property getter (it propagates); only genuinely missing segments return
+    `default`.
+  - Hetero spelling unified to `hetersynapse` in `connectome.connection`
+    internals (`hetero_conn_df` -> `hetersynapse_conn_df`, column
+    `post_hetero` -> `post_hetersynapse`) and in tests/docs.
+- **New:** `btorch.utils.array.to_numpy` (shared tensor/array-like -> NumPy helper,
+  replacing duplicate private `_to_numpy` copies in `visualisation`).
+- **Breaking (models cleanup):**
+  - `btorch.models.dlif` moved to `btorch.models.neurons.dlif`
+    (`DendriticLIF`, `DLIF`, `DBNN` keep their names; still exported from
+    `btorch.models` and `btorch.models.neurons`).
+  - `MemoryModule._memories_rv` -> `_memory_reset_values`; property
+    `memories_rv` -> `memory_reset_values` (now read-only: its setter duplicated
+    the method); `set_memories_rv()` -> `set_memory_reset_values()`.
+    Checkpoints written by the examples use the key `"memory_reset_values"`
+    instead of `"memories_rv"`.
+  - Removed the deprecated `scale.SupportScaleState` and its wrappers
+    `functional.scale_net`, `unscale_net`, `scale_state`, `unscale_state`
+    (no users). `scale.scale_state_` is unchanged.
+  - `environ.DEFAULT_SETTINGS` is now private and copy-on-write (lock-free,
+    consistent reads under concurrent `set`); use `environ.set()`/`get()`/`all()`,
+    and the new `environ.unset()` to drop a default.
+  - `MemoryModule._batch_dim_detect` -> `_detect_batch_shape`; unused
+    `_batch_dim_exist` removed. `RecurrentNNAbstract._process_small_chunk` ->
+    `_run_unroll_block`, `_process_large_chunk_impl` -> `_run_chunk_steps`.
+  - `MemoryModule.single_step_forward` (and `RecurrentNNAbstract`'s) now raise
+    `NotImplementedError` instead of silently returning `None`;
+    `RecurrentNNAbstract._detect_loop_args` raises `ValueError` rather than
+    `assert` when no time dim can be inferred.
+  - `BaseSparseConn.sparse_tensor` (native-backend cache) removed; see Fixed.
+  - `constrain_net`'s parameter is named `net` (was `mod`).
+- **Breaking: numerical results change — PSC spike timing.** For every PSC type a
+  spike delivered to `single_step_forward` at step `t` now already changes the
+  PSC returned at step `t` (first response at the delivery step, delay 0, as
+  `ExponentialPSC` always did). `AlphaPSC`, `AlphaPSCBilleh` and
+  `DualExponentialPSC` previously responded one `dt` late (`psc[0] == 0` for a
+  spike at step 0). New impulse responses (`get_kernel` and
+  `multi_step_forward` match `single_step_forward` exactly):
+  - `ExponentialPSC`: `k[t] = a^t`, `a = exp(-dt/tau)` (unchanged).
+  - `AlphaPSC`: `k[t] = g_max (t+1)(1-a) a^t` (was `t (1-a) a^(t-1)`, `k[0]=0`).
+  - `AlphaPSCBilleh`: `k[t] = (t+1) (e/tau) a^(t+1)` (was `t (e/tau) a^t`); the
+    unit-amplitude peak now falls at kernel index `tau-1`.
+  - `DualExponentialPSC`: `k[t] = A' (a_d^(t+1) - a_r^(t+1))` (was
+    `A' (a_d^t - a_r^t)`, `k[0]=0`).
+  `DelayedPSC(max_delay_steps=d)` still shifts the base response by exactly `d`
+  steps. `DBNN`/`DLIF`-style cells and any model using these PSCs fire one step
+  earlier than before.
+- **Breaking:** neuron constructors no longer have mutable / instance default
+  arguments. `trainable_param`, `surrogate_function` (and GLIF3 `k`,
+  `asc_amps`) default to `None` and are built per neuron, so two default
+  neurons no longer share one surrogate `nn.Module` / one set.
+- **Breaking:** `tau_ref` now defaults to `None` (refractory disabled, no
+  `tau_ref` buffer or `refractory` state) in every neuron; `ELIF` and `GLIF3`
+  previously defaulted to `0.0` (behaviourally identical, but it allocated
+  state and a `tau_ref` entry in `state_dict`). Pass `tau_ref=0.0` explicitly
+  to keep the old state layout.
+- **Breaking:** `StepModule.supported_step_mode` is now a property, consistent
+  with `supported_backends` (no call parentheses).
+- `environ.set()` now really sets process-global defaults visible from every
+  thread; `environ.context()` remains a thread-local override stack that wins
+  over the defaults inside its `with` block. Previously defaults set in one
+  thread were invisible to others. `environ.DEFAULT` is replaced by
+  `environ.DEFAULT_SETTINGS`.
 - **Breaking: heavy dependencies are now optional extras.** `plotly`, `xarray`,
   `zarr`, `numcodecs`, `powerlaw`, `nolds` and `fastdtw` are no longer installed
   with `pip install btorch`. Install `btorch[io]` (xarray, zarr, numcodecs),
@@ -79,7 +175,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `FiringRateLoss` now defaults to a valid `loss_type` (`"huber_pinball"`).
 
 ### Fixed
+- **Breaking:** `GLIF3.forward_exact_no_spike(x, t, v0, Iasc0, update_state)` has an explicit
+  shape contract: `t` is a scalar or a 1-D `(n_time,)` tensor (was `dt` with four accepted
+  shape unions), the batch shape comes from the state, outputs are
+  `(n_time, *state[, n_Iasc])`, and the module state is only written when
+  `update_state=True` (it used to be overwritten with the whole time series whenever `v0` and
+  `Iasc0` were omitted). The `tau == 1/k` branch no longer risks NaN gradients.
 
+- `SparseConn`/`SparseConstrainedConn` (native backend) cached a sparse tensor
+  at construction whose indices were not in the state dict; after a `.to()` /
+  `.double()` followed by `load_state_dict` with a different wiring the forward
+  used stale connectivity. The sparse tensor is now built from the `indices`
+  buffer on each call.
+- `IF.neuronal_charge` referenced a non-existent `self.V` and raised
+  `AttributeError`; it now uses `self.v`.
+- `MemoryModule.set_reset_value(name, ResetValue, strict=False)` for a new name
+  skipped the sizes / `has_batch` validation of the normal registration path;
+  it is now validated (and copied instead of aliased).
 - `is_broadcastable` now checks "first broadcasts to second" on shapes only.
 - `MemoryModule.init_state`/`reset` no longer leak one memory's dtype/persistent/
   batch-size override into later memories; explicit `persistent=False` is honored.
@@ -87,6 +199,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolved the path and then loaded the original relative one), and raises
   `FileNotFoundError`/`ValueError` instead of a bare `assert`.
 - `exp_euler_step` no longer returns NaN when the linear term is exactly zero.
+- `compute_lyapunov_exponent` (analysis.dynamic_tools.complexity) raised `ValueError` on any
+  spike train: it passed a 2D rate to nolds and put `dt` in the `emb_dim` slot. It now
+  uses the mean population rate with default embedding parameters.
 - `init_net_state`/`reset_net` no longer raise `AttributeError` for plain (non-
   compiled) modules; they warn as intended.
 - `SupportScaleState` guards now actually raise (`enforce="assert"` used to assert a
@@ -100,10 +215,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `calculate_gain_stability_sensitivity` imported a nonexistent `model` package.
 - Declared `h5py`, `pyyaml` and `fastdtw`; dropped unused `spikingjelly` and
   `typing-extensions`; aligned the pandas minimum across manifests.
+- **Two-compartment fitting** (`btorch.analysis.two_compartment_fit`): the
+  global-search objective now uses the full `FitLossConfig` (`spike_tau_ms`,
+  `post_spike_mask_ms`, match window, miss penalty) instead of only the weights,
+  and staged fitting ranks stages with the same smoothing / mask settings.
+  Fit results with non-default settings change intentionally.
+- **`plot_raster`**: `show_group_strip=True` honours an explicit per-neuron
+  `spike_color`; `group_rate` without `group_key` raises `ValueError` instead of
+  drawing an empty rate panel; the strip legend no longer reads `A / A` when
+  there are no subgroups; an all-zero spike matrix with a strip and
+  `neuron_specs` no longer fails.
+- **`plot_neuron_traces`**: a batched 3D `psc` next to 3D `voltage` is no longer
+  misdetected as multi-component (and `(time, batch, neurons, n_psc)` now works);
+  `separate_figures=True` honours `neuron_specs`; `dt` defaults to `None`
+  (taken from `states`, else 1.0), so an explicit `dt=1.0` is no longer silently
+  overridden by `states.dt`.
+- **`memories_to_xarray`** raises `ValueError` when `neuron_ids` cannot fill the
+  neuron dims instead of silently dropping `root_id`; removed the dead `partial`
+  argument of `_infer_dim_counts` and the unused `unique_val_dims`.
+- **`do_bench`** in duration mode always takes at least one sample (a tiny `rep`
+  used to return NaN from an empty sample list).
+- **`compute_avalanche_statistics`** returns the same keys on the failure path
+  (`avg_size_by_duration`, `gamma_stats=None`); failure semantics are documented.
+- The `plot_neuron_traces`/`plot_raster` characterization fixture is now the
+  tracked `tests/visualisation/timeseries_characterization.json` (was `.golden`
+  because of the `*.json` ignore rule), records numpy/matplotlib versions and
+  the test skips when they differ.
 
 ### Removed
 
 - `btorch.config.SPARSE_BACKEND` (no consumers).
+- **Breaking:** `btorch.models.connection_conversion` (`convert_connection_layer`,
+  `convert_connection_layer_from_checkpoint`) and its docs page; the module is to be
+  rewritten. `ReceptorTypeMode` now lives only in `btorch.connectome.connection`.
 - `btorch.io.dict_to_xarray`, `xarray_to_dict`, `save_dict_to_xarray`,
   `load_dict_from_xarray` (unused aliases of the `memories_*` functions).
 - `btorch.models.parametrize` (unused; superseded by `constrain`).
@@ -131,6 +275,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in `btorch.models.functional` no longer use callback parameters.
 - Library `print()` calls became `warnings.warn`; broad `except Exception`
   blocks in analysis were narrowed to the expected exceptions.
+- `benchmarks/numpy_model.py` became the test reference
+  `tests/models/numpy_reference.py` (pure-numpy LIF/GLIF3, all PSC types and a
+  recurrent network), with step-by-step float64 parity tests in
+  `tests/models/test_numpy_parity.py`. The manual `benchmarks/draw_glif.py` and
+  `benchmarks/vis_glif.py` demos were removed; their useful checks
+  (`GLIF3.forward_exact_no_spike` vs the discrete simulation, bfloat16 gradient
+  finiteness) now live in `tests/models/neurons/test_glif.py`.
 
 ## [0.1.0]
 

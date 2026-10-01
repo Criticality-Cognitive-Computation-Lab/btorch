@@ -192,11 +192,6 @@ def from_spike_sparse(
     return out, used_vars
 
 
-def unique_val_dims(dims: Sequence[str]) -> set[str]:
-    """Return unique dimension names from a sequence."""
-    return set(dims)
-
-
 def _expand_dim_names(dim_names: Sequence[str], dim_counts: Sequence[int]) -> list[str]:
     """Expand logical dimension groups into physical names.
 
@@ -217,7 +212,6 @@ def _expand_dim_names(dim_names: Sequence[str], dim_counts: Sequence[int]) -> li
 def _infer_dim_counts(
     val: np.ndarray,
     neuron_ids: np.ndarray | None,
-    partial: bool = False,
     dim_names: Sequence[str] = ("time", "batch", "neuron"),
 ) -> tuple[int, int, int]:
     """Infer dim_counts (T, B, N) from a representative array.
@@ -233,10 +227,6 @@ def _infer_dim_counts(
     # This is a fallback heuristic. Better to have user hint.
     # If val is (T_d, B_d, N_d)
     ndim = val.ndim
-
-    if partial:
-        # Partial arrays might strictly be (T, B, N_partial)
-        pass
 
     # Unspecified counts: fall back to conservative defaults by rank.
     if ndim == 3:
@@ -450,9 +440,7 @@ def memories_to_xarray(
                     f"dimensions unknown. Provide 'hint_field' or 'neuron_ids'."
                 )
 
-        # Determine dimensions for this variable
-        n_dims = val.ndim
-
+        # Determine dimensions for this variable.
         # Alignment contract: core dims (e.g. T, B, N) are a fixed prefix of every
         # array; extra trailing dims (e.g. a synapse state of shape (T, B, N, 2))
         # get private names. Lower-rank arrays are right-aligned to the core dims.
@@ -548,8 +536,11 @@ def memories_to_xarray(
                     n_ids_arr.reshape(expected_shape),
                 )
             else:
-                # Mismatch, warning?
-                pass
+                raise ValueError(
+                    f"neuron_ids of shape {n_ids_arr.shape} cannot fill the "
+                    f"neuron dims {list(neuron_group_dims)} of shape "
+                    f"{expected_shape} for 'root_id'."
+                )
         else:
             # Default IDs
             shape = tuple(dim_registry[d] for d in neuron_group_dims)

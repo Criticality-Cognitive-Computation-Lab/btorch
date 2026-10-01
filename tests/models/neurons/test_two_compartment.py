@@ -3,6 +3,7 @@ import torch
 
 from btorch.analysis.two_compartment_fit import (
     AllenSweepBatch,
+    FitLossConfig,
     evaluate_fit_across_sweeps,
     exponential_filter_spike_train,
     fit_two_compartment_model,
@@ -158,8 +159,7 @@ def test_two_compartment_loss_masks_post_spike_samples_and_regularizes_w_ca():
         spike_true=spike_true,
         dt=1.0,
         w_Ca=torch.tensor([2.0]),
-        post_spike_mask_ms=2.0,
-        sparsity_weight=0.5,
+        loss=FitLossConfig(post_spike_mask_ms=2.0, sparsity_weight=0.5),
     )
     mask = mask_post_spike_voltage_samples(spike_true, refractory_bins=2)
 

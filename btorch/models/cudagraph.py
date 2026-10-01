@@ -56,6 +56,7 @@ loop's state mutation defeats. The runner refuses grad-recording calls up front
 rather than let them fail later and elsewhere.
 """
 
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import torch
@@ -90,7 +91,14 @@ class _Entry:
 
     __slots__ = ("graph", "static_args", "static_state_in", "state_out", "outputs")
 
-    def __init__(self, graph, static_args, static_state_in, state_out, outputs):
+    def __init__(
+        self,
+        graph: torch.cuda.CUDAGraph,
+        static_args: tuple,
+        static_state_in: dict[str, torch.Tensor],
+        state_out: dict[str, Any],
+        outputs: Any,
+    ) -> None:
         self.graph = graph
         self.static_args = static_args
         self.static_state_in = static_state_in
@@ -110,12 +118,12 @@ class CudaGraphRunner:
     runs the loop and ``module`` owns the hidden state that ``fn`` advances.
     """
 
-    def __init__(self, warmup: int = 3):
+    def __init__(self, warmup: int = 3) -> None:
         self.warmup = warmup
         self.entries: dict[tuple, _Entry] = {}
 
     @staticmethod
-    def _key(args, kwargs):
+    def _key(args: Sequence, kwargs: Mapping[str, Any]) -> tuple:
         def describe(v):
             if torch.is_tensor(v):
                 return ("t", tuple(v.shape), v.dtype, v.device)
@@ -127,7 +135,11 @@ class CudaGraphRunner:
         )
 
     @staticmethod
-    def _check_supported(module, args, incompatible=None):
+    def _check_supported(
+        module: torch.nn.Module,
+        args: Sequence,
+        incompatible: Mapping[str, str] | None = None,
+    ) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("cudagraph=True requires CUDA to be available.")
         devices = {a.device for a in args if torch.is_tensor(a)}
@@ -157,7 +169,13 @@ class CudaGraphRunner:
                 f"cudagraph=True is incompatible with {attr}=True ({why})."
             )
 
-    def _capture(self, module, fn, args, kwargs):
+    def _capture(
+        self,
+        module: torch.nn.Module,
+        fn: Callable[..., Any],
+        args: Sequence,
+        kwargs: Mapping[str, Any],
+    ) -> _Entry:
         # Snapshot the entry state *by value*. Warmup and capture both advance the
         # module, and capture only records kernels without running them, so what
         # the module holds afterwards is not a state at all -- it is uninitialised
@@ -200,8 +218,14 @@ class CudaGraphRunner:
         return _Entry(graph, static_args, static_state_in, state_out, outputs)
 
     def __call__(
-        self, module, fn, args, kwargs=None, clone_outputs=True, incompatible=None
-    ):
+        self,
+        module: torch.nn.Module,
+        fn: Callable[..., Any],
+        args: Sequence,
+        kwargs: Mapping[str, Any] | None = None,
+        clone_outputs: bool = True,
+        incompatible: Mapping[str, str] | None = None,
+    ) -> Any:
         """Replay ``fn(*args, **kwargs)``, capturing it first if needed.
 
         Set ``clone_outputs=False`` only if the caller copies the results out of
@@ -236,6 +260,6 @@ class CudaGraphRunner:
         set_hidden_states(module, entry.state_out)
         return clone_graph_outputs(entry.outputs) if clone_outputs else entry.outputs
 
-    def reset(self):
+    def reset(self) -> None:
         """Drop captured graphs and their memory pools."""
         self.entries.clear()

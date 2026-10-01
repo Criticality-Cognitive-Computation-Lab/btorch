@@ -21,6 +21,7 @@ class StepModule:
     ``multi_step_forward`` for a more efficient batched implementation.
     """
 
+    @property
     def supported_step_mode(self) -> tuple[str, ...]:
         return ("s", "m")
 
@@ -30,10 +31,9 @@ class StepModule:
 
     @step_mode.setter
     def step_mode(self, value: str) -> None:
-        if value not in self.supported_step_mode():
+        if value not in self.supported_step_mode:
             raise ValueError(
-                f"step_mode can only be {self.supported_step_mode()}, "
-                f'but got "{value}"!'
+                f'step_mode can only be {self.supported_step_mode}, but got "{value}"!'
             )
         self._step_mode = value
 
@@ -535,8 +535,6 @@ class ResetValue:
     # mark self.value stores batch axis additionally.
     # intended for e.g. different init values for each batch axis
     has_batch: bool = False
-    # use case for this?
-    # extra_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 def _validate_sizes(reset_val: ResetValue | dict) -> None:
@@ -706,11 +704,18 @@ class MemoryModule(StepModule, torch.nn.Module):
 
     @abstractmethod
     def single_step_forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
-        pass
+        raise NotImplementedError
 
     def multi_step_forward(
         self, x_seq: torch.Tensor, *args: Any, **kwargs: Any
     ) -> torch.Tensor:
+        """Run ``single_step_forward`` over the leading time dim of ``x_seq``.
+
+        The generic ``*args, **kwargs`` are forwarded to every step. Subclasses
+        may override this with extra, subclass-specific optional arguments
+        (e.g. ``kernel_len`` for PSC convolution) as long as the sequence stays
+        the first positional argument.
+        """
         T = x_seq.shape[0]
         y_seq = []
         for t in range(T):
@@ -720,7 +725,7 @@ class MemoryModule(StepModule, torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self._memories_rv: dict[str, ResetValue] = {}
+        self._memory_reset_values: dict[str, ResetValue] = {}
         self._backend = "torch"
         self._step_mode = "s"
 
@@ -746,10 +751,10 @@ class MemoryModule(StepModule, torch.nn.Module):
         return str(value)
 
     def _memories_repr(self) -> str:
-        if not self._memories_rv:
+        if not self._memory_reset_values:
             return ""
         entries = []
-        for name, reset_val in self._memories_rv.items():
+        for name, reset_val in self._memory_reset_values.items():
             extra = []
             if reset_val.dtype is not None:
                 extra.append(str(reset_val.dtype).replace("torch.", ""))
@@ -810,48 +815,46 @@ class MemoryModule(StepModule, torch.nn.Module):
                     f"value for memory '{name}' must be a ResetValueType, number or "
                     f"ResetValue, got {type(value).__name__}"
                 )
-            if name not in self._memories_rv and len(reset_kwargs) == 0:
-                if not strict:
-                    self._memories_rv[name] = value
-                    return
+            # A ResetValue for a new name goes through the same sizes/has_batch
+            # validation below (and is copied rather than aliased).
             reset_kwargs = {**value.__dict__, **reset_kwargs}
 
         if "value" not in reset_kwargs:
-            raise ValueError(f"'value' is required for register_memory_rv('{name}')")
-        if name not in self._memories_rv:
+            raise ValueError(f"'value' is required for set_reset_value('{name}')")
+        if name not in self._memory_reset_values:
             if "sizes" not in reset_kwargs:
                 raise ValueError(
-                    f"'sizes' is required when registering new memory_rv '{name}'"
+                    f"'sizes' is required when registering new memory '{name}'"
                 )
             if "has_batch" not in reset_kwargs:
                 reset_kwargs["has_batch"] = False
 
             _validate_sizes(reset_kwargs)
             _validate_has_batch(reset_kwargs)
-            self._memories_rv[name] = ResetValue(**reset_kwargs)
+            self._memory_reset_values[name] = ResetValue(**reset_kwargs)
             return
 
         if "sizes" in reset_kwargs:
-            if strict and self._memories_rv[name].sizes != reset_kwargs["sizes"]:
+            existing_sizes = self._memory_reset_values[name].sizes
+            if strict and existing_sizes != reset_kwargs["sizes"]:
                 raise ValueError(
-                    f"Memory_rv '{name}' sizes mismatch: "
-                    f"existing={self._memories_rv[name].sizes}, "
+                    f"Memory '{name}' sizes mismatch: "
+                    f"existing={existing_sizes}, "
                     f"new={reset_kwargs['sizes']}"
                 )
         else:
-            reset_kwargs["sizes"] = self._memories_rv[name].sizes
+            reset_kwargs["sizes"] = self._memory_reset_values[name].sizes
 
         _validate_sizes(reset_kwargs)
 
         if "has_batch" not in reset_kwargs:
-            reset_kwargs["has_batch"] = self._memories_rv[name].has_batch
+            reset_kwargs["has_batch"] = self._memory_reset_values[name].has_batch
 
         _validate_has_batch(reset_kwargs)
-        for k, v in self._memories_rv[name].__dict__.items():
-            # if k not in ("has_batch", "sizes"):
+        for k, v in self._memory_reset_values[name].__dict__.items():
             reset_kwargs.setdefault(k, v)
 
-        self._memories_rv[name] = ResetValue(**reset_kwargs)
+        self._memory_reset_values[name] = ResetValue(**reset_kwargs)
 
     @torch.no_grad()
     def init_state(
@@ -863,7 +866,7 @@ class MemoryModule(StepModule, torch.nn.Module):
         skip_mem_name: tuple[str, ...] = (),
     ) -> None:
         skip_mem_name_set = set(skip_mem_name)
-        for key, reset_val in self._memories_rv.items():
+        for key, reset_val in self._memory_reset_values.items():
             if key in skip_mem_name_set:
                 continue
             # Resolve per-memory overrides into locals so one memory's override
@@ -875,15 +878,14 @@ class MemoryModule(StepModule, torch.nn.Module):
             )
             self.register_buffer(key, v, persistent=mem_persistent)
 
-    def _batch_dim_detect(self, mem_name):
-        sizes = self._memories_rv[mem_name].sizes
+    def _detect_batch_shape(self, mem_name: str) -> torch.Size | None:
+        """Return the leading batch shape of a memory buffer, or None if
+        unbatched."""
+        sizes = self._memory_reset_values[mem_name].sizes
         buffer = self._buffers[mem_name]
         if (buffer is not None) and (buffer.shape != sizes):
             return buffer.shape[: -len(sizes)]
         return None
-
-    def _batch_dim_exist(self, mem_name: str):
-        return self._batch_dim_detect(mem_name) is not None
 
     @torch.no_grad()
     def reset(
@@ -917,7 +919,7 @@ class MemoryModule(StepModule, torch.nn.Module):
                 existing buffer's shape.
         """
         skip_mem_name_set = set(skip_mem_name)
-        for key, reset_val in self._memories_rv.items():
+        for key, reset_val in self._memory_reset_values.items():
             if key in skip_mem_name_set:
                 continue
             # Per-memory locals: overrides/detected batch must not leak.
@@ -929,7 +931,7 @@ class MemoryModule(StepModule, torch.nn.Module):
             }
             mem_batch_size = batch_size
             if mem_batch_size is None:
-                mem_batch_size = self._batch_dim_detect(key)
+                mem_batch_size = self._detect_batch_shape(key)
 
             if not inplace:
                 setattr(
@@ -956,23 +958,23 @@ class MemoryModule(StepModule, torch.nn.Module):
         torch.nn.Module.__setattr__(self, name, value)
 
     def __delattr__(self, name):
-        if name in self._memories_rv:
-            del self._memories_rv[name]
+        if name in self._memory_reset_values:
+            del self._memory_reset_values[name]
         torch.nn.Module.__delattr__(self, name)
 
     def __dir__(self):
         return torch.nn.Module.__dir__(self)
 
     def memories(self) -> Iterator[Tensor]:
-        for name in self._memories_rv.keys():
+        for name in self._memory_reset_values.keys():
             yield self._buffers[name]
 
     def named_memories(self) -> Iterator[tuple[str, Tensor]]:
-        for name in self._memories_rv.keys():
+        for name in self._memory_reset_values.keys():
             yield name, self._buffers[name]
 
     def detach(self) -> None:
-        for key in self._memories_rv.keys():
+        for key in self._memory_reset_values.keys():
             self._buffers[key].detach_()
 
     def _apply(self, fn):
@@ -983,15 +985,15 @@ class MemoryModule(StepModule, torch.nn.Module):
         return replica
 
     def _check_memory_key(self, key: str) -> None:
-        if key not in self._memories_rv:
+        if key not in self._memory_reset_values:
             raise KeyError(
                 f"'{key}' is not a registered memory; "
-                f"registered: {list(self._memories_rv)}"
+                f"registered: {list(self._memory_reset_values)}"
             )
 
     @property
     def _memories(self):
-        return {name: self._buffers[name] for name in self._memories_rv.keys()}
+        return {name: self._buffers[name] for name in self._memory_reset_values.keys()}
 
     @_memories.setter
     def _memories(self, value: dict):
@@ -1000,19 +1002,23 @@ class MemoryModule(StepModule, torch.nn.Module):
             setattr(self, k, v)
 
     @property
-    def memories_rv(self) -> dict[str, "ResetValue"]:
-        return self._memories_rv
+    def memory_reset_values(self) -> dict[str, "ResetValue"]:
+        """Registered reset values, keyed by memory name (read-only view)."""
+        return self._memory_reset_values
 
-    def set_memories_rv(self, value: dict, strict: bool = False) -> None:
+    def set_memory_reset_values(self, value: dict, strict: bool = False) -> None:
+        """Update the reset value of several registered memories.
+
+        Args:
+            value: Mapping ``memory name -> new reset value``.
+            strict: Passed through to :meth:`set_reset_value`.
+
+        Raises:
+            KeyError: If a key is not a registered memory.
+        """
         for k, v in value.items():
             self._check_memory_key(k)
             self.set_reset_value(k, v, strict=strict)
-
-    @memories_rv.setter
-    def memories_rv(self, value: dict) -> None:
-        for k, v in value.items():
-            self._check_memory_key(k)
-            self.set_reset_value(k, v, strict=False)
 
 
 # TODO: pre_spike_v should be merged with v to avoid double memory consumption
@@ -1027,8 +1033,9 @@ class BaseNode(ParamBufferMixin, MemoryModule):
         n_neuron: Number of neurons (int or tuple).
         v_threshold: Firing threshold. Default: 1.0.
         v_reset: Reset voltage. Default: 0.0.
-        trainable_param: Trainable parameter names. Default: ().
-        surrogate_function: Surrogate for backprop. Default: Sigmoid().
+        trainable_param: Trainable parameter names. Default: None (empty).
+        surrogate_function: Surrogate for backprop. Default: None, which builds
+            a fresh Sigmoid() per neuron.
         detach_reset: Detach reset signal. Default: False.
         hard_reset: Hard vs soft reset. Default: False.
         pre_spike_v: Store pre-spike voltage. Default: False.
@@ -1050,8 +1057,8 @@ class BaseNode(ParamBufferMixin, MemoryModule):
         n_neuron: int | Sequence[int],
         v_threshold: float | Float[TensorLike, " n_neuron"] = 1.0,
         v_reset: float | Float[TensorLike, " n_neuron"] = 0.0,
-        trainable_param: set[str] = set(),
-        surrogate_function: Callable = Sigmoid(),
+        trainable_param: set[str] | None = None,
+        surrogate_function: Callable | None = None,
         detach_reset: bool = False,
         hard_reset: bool = False,
         pre_spike_v: bool = False,
@@ -1081,7 +1088,7 @@ class BaseNode(ParamBufferMixin, MemoryModule):
                 "v_pre_spike", v_reset, self.n_neuron, persistent=False
             )
 
-        self.trainable_param = set(trainable_param)
+        self.trainable_param = set(trainable_param or ())
         self.def_param(
             "v_threshold",
             v_threshold,
@@ -1098,6 +1105,10 @@ class BaseNode(ParamBufferMixin, MemoryModule):
         )
 
         self.detach_reset = detach_reset
+        # Built per call: a ``Sigmoid()`` default argument would be a single
+        # nn.Module instance shared (as a submodule) by every neuron.
+        if surrogate_function is None:
+            surrogate_function = Sigmoid()
         self.surrogate_function = surrogate_function
         self.hard_reset = hard_reset
 
@@ -1149,10 +1160,8 @@ class BaseNode(ParamBufferMixin, MemoryModule):
             self.v_pre_spike = self.v.clone()
 
         if self.hard_reset:
-            # hard reset
             self.v = self.v - (self.v - self.v_reset) * spike_d
         else:
-            # soft reset
             self.v = self.v - (self.v_threshold - self.v_reset) * spike_d
 
     def neuronal_adaptation(self) -> None:

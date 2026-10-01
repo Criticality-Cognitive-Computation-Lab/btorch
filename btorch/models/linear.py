@@ -1,4 +1,4 @@
-from typing import Literal, cast, get_args
+from typing import Any, Literal, cast, get_args
 
 import numpy as np
 import pandas as pd
@@ -139,9 +139,6 @@ class LearnableScale(ParamBufferMixin, nn.Module):
         return nn.functional.softplus(self.bias)
 
 
-# TODO: cleanup and abstract out the logic of native and torch_sparse backends
-
-
 class DenseConn(nn.Linear, HasConstraint):
     # Matrix product using y = x @ A.
     mask: Tensor | None
@@ -155,8 +152,8 @@ class DenseConn(nn.Linear, HasConstraint):
         bias: Tensor | None = None,
         mask: float | Tensor | None = None,
         enforce_dale: bool = False,
-        device=None,
-        dtype=None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
     ) -> None:
         """Dense connection layer with optional weight masking and Dale's Law
         enforcement.
@@ -198,7 +195,7 @@ class DenseConn(nn.Linear, HasConstraint):
         else:
             self.initial_sign = None
 
-    def constrain(self, *args, **kwargs):
+    def constrain(self, *args: Any, **kwargs: Any) -> None:
         """Apply the weight mask and Dale's Law constraints to the weight
         matrix."""
         if self.mask is not None:
@@ -219,8 +216,6 @@ class BaseSparseConn(nn.Module):
         shape (Tuple[int, int]): Shape of the internal sparse matrix
             (num_dst, num_src) used for sparse @ dense.
         indices (Tensor): Stacked row/col indices for the transposed matrix.
-        native_sparse_tensor (Tensor | None): Cached native sparse tensor.
-        sparse_tensor (SparseTensor): Sparse tensor for torch_sparse mode.
         bias (Parameter or None): Optional bias term
     """
 
@@ -228,16 +223,15 @@ class BaseSparseConn(nn.Module):
     out_features: int
     shape: tuple[int, int]
     indices: torch.Tensor
-    sparse_tensor: torch.Tensor | None
     bias: torch.nn.Parameter | None
 
     def __init__(
         self,
         conn: scipy.sparse.sparray,
-        bias=None,
+        bias: torch.Tensor | None = None,
         sparse_backend: SparseBackend | None = None,
-        device=None,
-        dtype=None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
     ):
         """
         Args:
@@ -265,28 +259,10 @@ class BaseSparseConn(nn.Module):
         self.register_buffer("indices", indices)
         value = torch.tensor(conn.data, dtype=dtype, device=device)
 
-        # TODO: should update at each time of mod.load_state
-        #       maybe a source of checkpoint loading bug!!
-        self.sparse_tensor = None
         if dtype is None:
             value = value.to(torch.float32)
-        if self.sparse_backend == "native":
-            native_sparse = torch.sparse_coo_tensor(
-                indices=indices,
-                values=value,
-                size=conn.shape,
-                device=device,
-                dtype=dtype,
-                is_coalesced=True,
-            )
-            self.sparse_tensor = native_sparse
         self.bias = nn.Parameter(bias) if bias is not None else None
         self._init_weights(value)
-
-    def _apply(self, fn, recurse=True):
-        if self.sparse_tensor is not None:
-            self.sparse_tensor = fn(self.sparse_tensor)
-        return super()._apply(fn, recurse=recurse)
 
     def _init_weights(self, value: torch.Tensor):
         """Abstract method to initialize layer-specific weights.
@@ -345,11 +321,12 @@ class BaseSparseConn(nn.Module):
         leading_shape = x.shape[:-1]
         x_2d = x.reshape(-1, x.shape[-1])
         if self.sparse_backend == "native":
-            sp = self.sparse_tensor
+            # Built from the ``indices`` buffer on every call (no cached tensor),
+            # so ``load_state_dict`` / ``.to()`` can never leave stale wiring.
             sp = torch.sparse_coo_tensor(
-                indices=sp.indices(),
+                indices=self.indices,
                 values=effective_value,
-                size=sp.shape,
+                size=self.shape[::-1],
                 is_coalesced=True,
             )
             # (A^T @ x^T)^T == x @ A
@@ -386,11 +363,11 @@ class SparseConn(BaseSparseConn, HasConstraint):
     def __init__(
         self,
         conn: scipy.sparse.sparray,
-        bias=None,
+        bias: torch.Tensor | None = None,
         enforce_dale: bool = True,
         sparse_backend: SparseBackend | None = None,
-        device=None,
-        dtype=None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
     ):
         """
         Args:
@@ -416,7 +393,7 @@ class SparseConn(BaseSparseConn, HasConstraint):
     def _get_effective_weight(self):
         return self.magnitude
 
-    def constrain(self, *args, **kwargs):
+    def constrain(self, *args: Any, **kwargs: Any) -> None:
         if self.enforce_dale:
             self.magnitude.data = (self.magnitude * self.initial_sign).relu() * (
                 self.initial_sign
@@ -452,8 +429,8 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
         enforce_dale: bool = True,
         bias: torch.Tensor | None = None,
         sparse_backend: SparseBackend | None = None,
-        device=None,
-        dtype=None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
         persist_initial_weight: bool = False,
     ):
         """
@@ -536,7 +513,7 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
         magnitude = self.magnitude[self._constraint_scatter_indices]
         return self.initial_weight * magnitude
 
-    def constrain(self, *args, **kwargs):
+    def constrain(self, *args: Any, **kwargs: Any) -> None:
         if self.enforce_dale:
             self.magnitude.data = self.magnitude.relu()
 
@@ -549,8 +526,8 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
         enforce_dale: bool = True,
         bias: torch.Tensor | None = None,
         sparse_backend: SparseBackend | None = None,
-        device=None,
-        dtype=None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
         persist_initial_weight: bool = False,
     ) -> "SparseConstrainedConn":
         """Create from make_hetersynapse_constrained_conn() output.
@@ -619,7 +596,6 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
 
         df = pd.DataFrame(group_info)
 
-        # Add receptor type info if available
         if self.constraint_info is not None:
             receptor_idx = self.constraint_info["receptor_type_index"]
             # Note: Constraint groups may not directly map to receptor indices
@@ -634,7 +610,7 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
         group_id: int | None = None,
         receptor_pair: tuple[str, str] | None = None,
         value: float | torch.Tensor = 1.0,
-    ):
+    ) -> None:
         """Set magnitude for a specific constraint group.
 
         Args:

@@ -7,6 +7,7 @@ import pytest
 from btorch.utils.conf import (
     diff_conf,
     diff_conf_records,
+    get_dotkey,
     load_config,
     to_dotlist,
 )
@@ -522,3 +523,38 @@ def test_load_config_missing_file_raises(tmp_path):
             search_path=tmp_path,
             argv_arglist=["config_path=nope.yaml"],
         )
+
+
+# ---------------------------------------------------------------------------
+# get_dotkey on plain objects
+# ---------------------------------------------------------------------------
+
+
+class _Inner:
+    value = 3
+
+    @property
+    def broken(self):
+        # A buggy property: the AttributeError is raised *inside* the getter.
+        return self.does_not_exist  # noqa: B018
+
+
+class _Outer:
+    inner = _Inner()
+
+
+def test_get_dotkey_traverses_and_defaults_for_missing_segments():
+    """Existing paths resolve; genuinely missing segments give ``default``."""
+    assert get_dotkey(_Outer(), "inner.value") == 3
+    assert get_dotkey(_Outer(), "inner.nope", default="d") == "d"
+    assert get_dotkey(_Outer(), "nope.value", default=None) is None
+
+
+def test_get_dotkey_does_not_mask_errors_inside_property_getters():
+    """An AttributeError raised by a property getter is a real bug.
+
+    The attribute *exists*, so it must propagate instead of silently turning
+    into ``default``.
+    """
+    with pytest.raises(AttributeError, match="does_not_exist"):
+        get_dotkey(_Outer(), "inner.broken", default="masked")

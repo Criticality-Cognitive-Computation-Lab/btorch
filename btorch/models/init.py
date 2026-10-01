@@ -14,12 +14,10 @@ def _tensor_with_default(
         if cond:
             v = default
         else:
-            # fallback generic range
             v = default_fallback
     return torch.as_tensor(v, device=device)
 
 
-# store the random init information for a network somewhere
 @torch.no_grad()
 def uniform_state_(
     neuron: base.BaseNode,
@@ -56,13 +54,11 @@ def uniform_state_(
         >>> uniform_state_(neuron, "v", low=-60.0, high=-45.0)
     """
 
-    # Convert names to list
     if isinstance(name, str):
         names = [name]
     else:
         names = list(name)
 
-    # Setup RNG
     if isinstance(rng, int):
         generator = torch.Generator(device=next(neuron.parameters()).device)
         generator.manual_seed(rng)
@@ -71,13 +67,11 @@ def uniform_state_(
 
     for var in names:
         x: torch.Tensor = getattr(neuron, var)
-        batch_size = neuron._batch_dim_detect(var)
+        batch_size = neuron._detect_batch_shape(var)
 
-        # ----- default range -----
         lo = _tensor_with_default(low, var == "v", neuron.v_reset, 0.0, x.device)
         hi = _tensor_with_default(high, var == "v", neuron.v_threshold, 1.0, x.device)
 
-        # ----- random sampling -----
         if rand_batch:
             # unique value for each batch entry
             val = torch.rand(
@@ -118,7 +112,7 @@ def uniform_v_(
     set_reset_value: bool = False,
     rand_batch: bool = False,
     rng: torch.Generator | int | None = None,
-):
+) -> base.BaseNode:
     """Uniformly initialize the membrane voltage ``v`` of a neuron.
 
     This is a convenience wrapper around :func:`uniform_state_` for the

@@ -34,7 +34,7 @@ A full training pipeline for Fashion-MNIST classification using a GLIF3-based RS
 - `AlphaPSCBilleh` synapse with heterogeneous time constants
 - `VoltageRegularizer` for membrane-voltage regularization
 - Manual training loop with `reset_net` per batch
-- Checkpointing `memories_rv` alongside `state_dict()`
+- Checkpointing `memory_reset_values` alongside `state_dict()`
 
 **See also:**
 - [Tutorial 2: Training an SNN](tutorials/training.md)
@@ -46,7 +46,7 @@ The same Fashion-MNIST model factored into a PyTorch Lightning `LightningModule`
 
 **Key patterns:**
 - Lightning `training_step` with `reset_net`
-- `scale_net` / `unscale_net` for neuron-parameter scaling
+- `scale_state_` for scaling neuron-parameter dicts
 - Validation loop with state recording
 
 ## `delayed_synapse_demo.py` — Synaptic Delays

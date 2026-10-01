@@ -107,10 +107,8 @@ def rotate_hex(
     Returns:
         Rotated data with same shape as input
     """
-    # Get permutation index
     perm = permute(radius, n)
 
-    # Apply permutation
     if isinstance(x, torch.Tensor):
         return x[..., perm]
     else:
@@ -130,10 +128,8 @@ def reflect_hex(
     Returns:
         Reflected data with same shape as input
     """
-    # Get permutation index
     perm = reflect_index(radius, axis)
 
-    # Apply permutation
     if isinstance(x, torch.Tensor):
         return x[..., perm]
     else:

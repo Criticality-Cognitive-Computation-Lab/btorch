@@ -59,10 +59,29 @@ SweepKind = Literal["all", "silent", "lowrate", "spiking", "countcal"]
 
 @dataclass(frozen=True)
 class FitLossConfig:
-    """Loss weights and spike-matching settings shared by the fitting helpers.
+    """Loss weights and spike-matching settings for the two-compartment fit.
 
-    Mirrors the keyword arguments of :func:`two_compartment_loss`; private
-    helpers pass one instance instead of forwarding each field.
+    This is the single public way to configure the loss: pass one instance as
+    ``loss=`` to :func:`two_compartment_loss`,
+    :func:`evaluate_two_compartment_fit`, :func:`evaluate_fit_across_sweeps`
+    and :func:`fit_two_compartment_model`.
+
+    Args:
+        voltage_weight: Weight of the masked voltage reconstruction loss.
+        spike_weight: Weight of the smoothed spike-train loss.
+        spike_count_weight: Weight of the spike-count matching penalty.
+        spike_timing_weight: Weight of the hard spike-timing event loss.
+        spike_count_over_weight: Weight of over-prediction in the count loss
+            (must be positive).
+        spike_count_under_weight: Weight of under-prediction in the count loss
+            (must be positive).
+        sparsity_weight: Weight of the ``w_Ca`` sparsity penalty.
+        spike_tau_ms: Smoothing constant (ms) of the spike-train loss.
+        post_spike_mask_ms: Duration (ms) of the post-spike voltage mask.
+        spike_match_window_ms: Tolerance window (ms) for matching predicted
+            and true spikes.
+        spike_miss_penalty_ms: Per-event penalty (ms) assigned to unmatched
+            spikes in the hard timing loss. Defaults to the match window.
     """
 
     voltage_weight: float = 1.0
@@ -238,7 +257,7 @@ def get_cell_types_cache(
     manifest_file: str | Path | None = None,
     *,
     cache: Any | None = None,
-):
+) -> Any:
     """Create or reuse an AllenSDK ``CellTypesCache`` instance."""
     if cache is not None:
         return cache
@@ -591,55 +610,29 @@ def two_compartment_loss(
     spike_true: Tensor,
     dt: float,
     w_Ca: Tensor | None = None,
-    voltage_weight: float = 1.0,
-    spike_weight: float = 1.0,
-    spike_count_weight: float = 0.0,
-    spike_timing_weight: float = 0.0,
-    spike_count_over_weight: float = 1.0,
-    spike_count_under_weight: float = 1.0,
-    sparsity_weight: float = 1e-4,
-    spike_tau_ms: float = 10.0,
-    post_spike_mask_ms: float = 3.0,
-    spike_match_window_ms: float = 10.0,
-    spike_miss_penalty_ms: float | None = None,
+    loss: FitLossConfig | None = None,
 ) -> dict[str, Tensor]:
-    """Compute a composite fitting loss for the two-compartment model."""
-    config = FitLossConfig(
-        voltage_weight=voltage_weight,
-        spike_weight=spike_weight,
-        spike_count_weight=spike_count_weight,
-        spike_timing_weight=spike_timing_weight,
-        spike_count_over_weight=spike_count_over_weight,
-        spike_count_under_weight=spike_count_under_weight,
-        sparsity_weight=sparsity_weight,
-        spike_tau_ms=spike_tau_ms,
-        post_spike_mask_ms=post_spike_mask_ms,
-        spike_match_window_ms=spike_match_window_ms,
-        spike_miss_penalty_ms=spike_miss_penalty_ms,
-    )
-    return _loss_from_config(
-        v_pred=v_pred,
-        spike_pred=spike_pred,
-        v_true=v_true,
-        spike_true=spike_true,
-        dt=dt,
-        w_Ca=w_Ca,
-        config=config,
-    )
+    """Compute a composite fitting loss for the two-compartment model.
 
+    Args:
+        v_pred: Predicted voltage, shape ``[T, B, N]``.
+        spike_pred: Predicted spikes, shape ``[T, B, N]``.
+        v_true: Recorded voltage, same shape as ``v_pred``.
+        spike_true: Recorded spikes, same shape as ``spike_pred``.
+        dt: Simulation step in ms.
+        w_Ca: Optional calcium-coupling weights for the sparsity penalty.
+        loss: Loss weights and spike-matching settings. ``None`` uses the
+            :class:`FitLossConfig` defaults.
 
-def _loss_from_config(
-    *,
-    v_pred: Tensor,
-    spike_pred: Tensor,
-    v_true: Tensor,
-    spike_true: Tensor,
-    dt: float,
-    w_Ca: Tensor | None,
-    config: FitLossConfig,
-) -> dict[str, Tensor]:
-    """Config-taking implementation of :func:`two_compartment_loss`."""
-    c = config
+    Returns:
+        Dict with the weighted ``"total"`` and the unweighted components
+        ``"voltage"``, ``"spike"``, ``"spike_count"``, ``"spike_timing"`` and
+        ``"sparsity"``.
+
+    Raises:
+        ValueError: If the spike-count over/under weights are not positive.
+    """
+    c = FitLossConfig() if loss is None else loss
     refractory_bins = int(round(c.post_spike_mask_ms / dt))
     mask = mask_post_spike_voltage_samples(
         spike_true,
@@ -699,6 +692,17 @@ def _loss_from_config(
         "spike_count": spike_count_loss,
         "spike_timing": spike_timing_event_loss,
         "sparsity": sparsity_loss,
+    }
+
+
+def _loss_floats(losses: dict[str, Tensor]) -> dict[str, float]:
+    """Convert a :func:`two_compartment_loss` result to float history entries.
+
+    Keys are ``"<component>_loss"`` for every loss term, e.g. ``"total_loss"``
+    and ``"spike_count_loss"``.
+    """
+    return {
+        f"{name}_loss": float(value.detach().cpu()) for name, value in losses.items()
     }
 
 
@@ -792,16 +796,19 @@ def evaluate_two_compartment_fit(
     *,
     device: str | torch.device | None = None,
     dtype: torch.dtype = torch.float32,
-    spike_tau_ms: float = 10.0,
-    post_spike_mask_ms: float = 3.0,
-    spike_count_weight: float = 0.0,
-    spike_timing_weight: float = 0.0,
-    spike_count_over_weight: float = 1.0,
-    spike_count_under_weight: float = 1.0,
-    spike_match_window_ms: float = 10.0,
-    spike_miss_penalty_ms: float | None = None,
+    loss: FitLossConfig | None = None,
 ) -> FitEvaluation:
-    """Evaluate a fitted model on a single sweep and collect metrics."""
+    """Evaluate a fitted model on a single sweep and collect metrics.
+
+    Args:
+        model: Fitted two-compartment neuron.
+        sweep: Sweep to roll the model out on.
+        device: Torch device; defaults to the model's device.
+        dtype: Torch dtype used for the rollout.
+        loss: Loss weights and spike-matching settings (defaults to
+            :class:`FitLossConfig`).
+    """
+    config = FitLossConfig() if loss is None else loss
     i_soma, v_true, spike_true, i_apical = _prepare_sweep(
         model, sweep, device=device, dtype=dtype
     )
@@ -817,22 +824,15 @@ def evaluate_two_compartment_fit(
         spike_true=spike_true,
         dt=sweep.dt,
         w_Ca=getattr(model, "w_Ca", None),
-        spike_tau_ms=spike_tau_ms,
-        post_spike_mask_ms=post_spike_mask_ms,
-        spike_count_weight=spike_count_weight,
-        spike_timing_weight=spike_timing_weight,
-        spike_count_over_weight=spike_count_over_weight,
-        spike_count_under_weight=spike_count_under_weight,
-        spike_match_window_ms=spike_match_window_ms,
-        spike_miss_penalty_ms=spike_miss_penalty_ms,
+        loss=config,
     )
     timing_stats = spike_timing_stats(
         spike_true,
         rollout["spike"],
         dt=sweep.dt,
-        match_window_ms=spike_match_window_ms,
+        match_window_ms=config.spike_match_window_ms,
     )
-    refractory_bins = int(round(post_spike_mask_ms / sweep.dt))
+    refractory_bins = int(round(config.post_spike_mask_ms / sweep.dt))
     voltage_mask = mask_post_spike_voltage_samples(
         spike_true,
         refractory_bins=refractory_bins,
@@ -863,12 +863,7 @@ def evaluate_two_compartment_fit(
     f1_score = _f1_score_from_binary_traces(spike_true_np, spike_pred_np)
 
     metrics = {
-        "total_loss": float(losses["total"].detach().cpu()),
-        "voltage_loss": float(losses["voltage"].detach().cpu()),
-        "spike_loss": float(losses["spike"].detach().cpu()),
-        "spike_count_loss": float(losses["spike_count"].detach().cpu()),
-        "spike_timing_loss": float(losses["spike_timing"].detach().cpu()),
-        "sparsity_loss": float(losses["sparsity"].detach().cpu()),
+        **_loss_floats(losses),
         "voltage_rmse": voltage_rmse,
         "voltage_r2": voltage_r2,
         "spike_mae": spike_mae,
@@ -906,30 +901,28 @@ def evaluate_fit_across_sweeps(
     *,
     device: str | torch.device | None = None,
     dtype: torch.dtype = torch.float32,
-    spike_tau_ms: float = 10.0,
-    post_spike_mask_ms: float = 3.0,
-    spike_count_weight: float = 0.0,
-    spike_timing_weight: float = 0.0,
-    spike_count_over_weight: float = 1.0,
-    spike_count_under_weight: float = 1.0,
-    spike_match_window_ms: float = 10.0,
-    spike_miss_penalty_ms: float | None = None,
+    loss: FitLossConfig | None = None,
 ) -> tuple[list[FitEvaluation], dict[str, float]]:
-    """Evaluate a fitted model on multiple sweeps and aggregate metrics."""
+    """Evaluate a fitted model on multiple sweeps and aggregate metrics.
+
+    Args:
+        model: Fitted two-compartment neuron.
+        sweeps: Sweeps to evaluate; at least one is required.
+        device: Torch device; defaults to the model's device.
+        dtype: Torch dtype used for the rollouts.
+        loss: Loss weights and spike-matching settings (defaults to
+            :class:`FitLossConfig`).
+
+    Returns:
+        Per-sweep evaluations and the aggregate (``mean_*`` plus per regime
+        ``silent_/lowrate_/spiking_`` means) metric dictionary.
+
+    Raises:
+        ValueError: If ``sweeps`` is empty.
+    """
     evaluations = [
         evaluate_two_compartment_fit(
-            model,
-            sweep,
-            device=device,
-            dtype=dtype,
-            spike_tau_ms=spike_tau_ms,
-            post_spike_mask_ms=post_spike_mask_ms,
-            spike_count_weight=spike_count_weight,
-            spike_timing_weight=spike_timing_weight,
-            spike_count_over_weight=spike_count_over_weight,
-            spike_count_under_weight=spike_count_under_weight,
-            spike_match_window_ms=spike_match_window_ms,
-            spike_miss_penalty_ms=spike_miss_penalty_ms,
+            model, sweep, device=device, dtype=dtype, loss=loss
         )
         for sweep in sweeps
     ]
@@ -1044,15 +1037,12 @@ def _fit_sweeps_once(
     dtype: torch.dtype = torch.float32,
     loss: FitLossConfig,
 ) -> dict[str, float]:
-    """Evaluate the current model parameters on one or more sweeps."""
-    total_loss = 0.0
-    total_voltage = 0.0
-    total_spike = 0.0
-    total_spike_count = 0.0
-    total_spike_timing = 0.0
-    total_sparsity = 0.0
-    sweep_count = 0
+    """Evaluate the current model parameters on one or more sweeps.
 
+    Returns the per-sweep loss terms (see :func:`_loss_floats`) averaged over
+    sweeps.
+    """
+    rows: list[dict[str, float]] = []
     with torch.no_grad():
         for sweep in sweeps:
             i_soma, v_true, spike_true, i_apical = _prepare_sweep(
@@ -1061,35 +1051,21 @@ def _fit_sweeps_once(
 
             with environ.context(dt=float(sweep.dt)):
                 rollout = rollout_two_compartment(model, i_soma, i_apical)
-                losses = _loss_from_config(
+                losses = two_compartment_loss(
                     v_pred=rollout["v"],
                     spike_pred=rollout["spike"],
                     v_true=v_true,
                     spike_true=spike_true,
                     dt=sweep.dt,
                     w_Ca=getattr(model, "w_Ca", None),
-                    config=loss,
+                    loss=loss,
                 )
+            rows.append(_loss_floats(losses))
 
-            total_loss += float(losses["total"].detach().cpu())
-            total_voltage += float(losses["voltage"].detach().cpu())
-            total_spike += float(losses["spike"].detach().cpu())
-            total_spike_count += float(losses["spike_count"].detach().cpu())
-            total_spike_timing += float(losses["spike_timing"].detach().cpu())
-            total_sparsity += float(losses["sparsity"].detach().cpu())
-            sweep_count += 1
-
-    if sweep_count == 0:
+    if not rows:
         raise ValueError("At least one sweep is required for fitting.")
 
-    return {
-        "total_loss": total_loss / sweep_count,
-        "voltage_loss": total_voltage / sweep_count,
-        "spike_loss": total_spike / sweep_count,
-        "spike_count_loss": total_spike_count / sweep_count,
-        "spike_timing_loss": total_spike_timing / sweep_count,
-        "sparsity_loss": total_sparsity / sweep_count,
-    }
+    return {key: sum(row[key] for row in rows) / len(rows) for key in rows[0]}
 
 
 def _pack_trainable_parameters(
@@ -1293,18 +1269,6 @@ def _restore_parameter_values(
                 param.copy_(snapshot[name].to(device=param.device, dtype=param.dtype))
 
 
-def _stage_eval_kwargs(loss: FitLossConfig) -> dict[str, float | None]:
-    """Evaluation kwargs used to rank stages (smoothing/mask keep defaults)."""
-    return {
-        "spike_count_weight": loss.spike_count_weight,
-        "spike_timing_weight": loss.spike_timing_weight,
-        "spike_count_over_weight": loss.spike_count_over_weight,
-        "spike_count_under_weight": loss.spike_count_under_weight,
-        "spike_match_window_ms": loss.spike_match_window_ms,
-        "spike_miss_penalty_ms": loss.spike_miss_penalty_ms,
-    }
-
-
 def _stage_objective_score(metrics: dict[str, float]) -> tuple[float, float, float]:
     """Rank stage outcomes by firing regime first, then timing, then
     voltage."""
@@ -1389,14 +1353,14 @@ def _fit_two_compartment_model_tbptt(
                         i_soma[start:stop],
                         None if i_apical is None else i_apical[start:stop],
                     )
-                    losses = _loss_from_config(
+                    losses = two_compartment_loss(
                         v_pred=rollout["v"],
                         spike_pred=rollout["spike"],
                         v_true=v_true[start:stop],
                         spike_true=spike_true[start:stop],
                         dt=sweep.dt,
                         w_Ca=getattr(model, "w_Ca", None),
-                        config=loss,
+                        loss=loss,
                     )
                     losses["total"].backward()
                     optimizer.step()
@@ -1409,16 +1373,7 @@ def _fit_two_compartment_model_tbptt(
                             "specimen_id": float(sweep.specimen_id),
                             "sweep_number": float(sweep.sweep_number),
                             "chunk_start": float(start),
-                            "total_loss": float(losses["total"].detach().cpu()),
-                            "voltage_loss": float(losses["voltage"].detach().cpu()),
-                            "spike_loss": float(losses["spike"].detach().cpu()),
-                            "spike_count_loss": float(
-                                losses["spike_count"].detach().cpu()
-                            ),
-                            "spike_timing_loss": float(
-                                losses["spike_timing"].detach().cpu()
-                            ),
-                            "sparsity_loss": float(losses["sparsity"].detach().cpu()),
+                            **_loss_floats(losses),
                         }
                     )
     return history
@@ -1443,17 +1398,6 @@ def _fit_two_compartment_model_global(
     x0, slices = _pack_trainable_parameters(model)
     bounds = _build_parameter_bounds(model, slices, param_bounds=param_bounds)
     history: list[dict[str, float | str]] = []
-    # The search objective only honours the weights, not the smoothing / mask /
-    # matching settings (those keep their defaults); final metrics use ``loss``.
-    search_loss = FitLossConfig(
-        voltage_weight=loss.voltage_weight,
-        spike_weight=loss.spike_weight,
-        spike_count_weight=loss.spike_count_weight,
-        spike_timing_weight=loss.spike_timing_weight,
-        spike_count_over_weight=loss.spike_count_over_weight,
-        spike_count_under_weight=loss.spike_count_under_weight,
-        sparsity_weight=loss.sparsity_weight,
-    )
 
     def objective(x: np.ndarray) -> float:
         _set_trainable_parameters(model, x, slices)
@@ -1462,7 +1406,7 @@ def _fit_two_compartment_model_global(
             sweep_list,
             device=device,
             dtype=dtype,
-            loss=search_loss,
+            loss=loss,
         )
         return metrics["total_loss"]
 
@@ -1565,7 +1509,7 @@ def _fit_two_compartment_model_staged(
         sweep_list,
         device=device,
         dtype=dtype,
-        **_stage_eval_kwargs(loss),
+        loss=loss,
     )
     best_score = _stage_objective_score(best_metrics)
 
@@ -1612,7 +1556,7 @@ def _fit_two_compartment_model_staged(
             sweep_list,
             device=device,
             dtype=dtype,
-            **_stage_eval_kwargs(loss),
+            loss=loss,
         )
         stage_score = _stage_objective_score(stage_metrics)
 
@@ -1627,7 +1571,7 @@ def _fit_two_compartment_model_staged(
 
     if not history:
         raise ValueError(
-            "No staged fitting steps ran because no stage had " "trainable parameters."
+            "No staged fitting steps ran because no stage had trainable parameters."
         )
 
     return history
@@ -1643,17 +1587,7 @@ def fit_two_compartment_model(
     chunk_size: int = 500,
     device: str | torch.device | None = None,
     dtype: torch.dtype = torch.float32,
-    voltage_weight: float = 1.0,
-    spike_weight: float = 1.0,
-    spike_count_weight: float = 0.0,
-    spike_timing_weight: float = 0.0,
-    spike_count_over_weight: float = 1.0,
-    spike_count_under_weight: float = 1.0,
-    sparsity_weight: float = 1e-4,
-    spike_tau_ms: float = 10.0,
-    post_spike_mask_ms: float = 3.0,
-    spike_match_window_ms: float = 10.0,
-    spike_miss_penalty_ms: float | None = None,
+    loss: FitLossConfig | None = None,
     param_bounds: dict[str, tuple[float, float]] | None = None,
     global_maxiter: int = 20,
     global_popsize: int = 8,
@@ -1678,17 +1612,10 @@ def fit_two_compartment_model(
         chunk_size: Truncated-BPTT chunk length.
         device: Torch device for evaluation and refinement.
         dtype: Torch dtype used during fitting.
-        voltage_weight: Weight of the masked voltage reconstruction loss.
-        spike_weight: Weight of the smoothed spike-train loss.
-        spike_count_weight: Weight of the spike-count matching penalty.
-        spike_timing_weight: Weight of the hard spike-timing event loss.
-        sparsity_weight: Weight of the ``w_Ca`` sparsity penalty.
-        spike_tau_ms: Smoothing constant for the spike-train loss.
-        post_spike_mask_ms: Duration of the post-spike voltage mask.
-        spike_match_window_ms: Tolerance window for matching predicted and
-            true spikes.
-        spike_miss_penalty_ms: Per-event penalty assigned to unmatched spikes
-            in the hard spike-timing loss. Defaults to the match window.
+        loss: Loss weights and spike-matching settings; ``None`` uses the
+            :class:`FitLossConfig` defaults. In ``method="staged"`` the
+            per-stage weights override the weight fields of this config while
+            its spike-matching settings are kept.
         param_bounds: Optional per-parameter bounds override for the global
             search. Unspecified parameters use
             ``DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS``.
@@ -1709,19 +1636,7 @@ def fit_two_compartment_model(
         search handles the large basin-finding problem more robustly than pure
         BPTT, while the optional TBPTT stage can still fine-tune the result.
     """
-    loss = FitLossConfig(
-        voltage_weight=voltage_weight,
-        spike_weight=spike_weight,
-        spike_count_weight=spike_count_weight,
-        spike_timing_weight=spike_timing_weight,
-        spike_count_over_weight=spike_count_over_weight,
-        spike_count_under_weight=spike_count_under_weight,
-        sparsity_weight=sparsity_weight,
-        spike_tau_ms=spike_tau_ms,
-        post_spike_mask_ms=post_spike_mask_ms,
-        spike_match_window_ms=spike_match_window_ms,
-        spike_miss_penalty_ms=spike_miss_penalty_ms,
-    )
+    loss = FitLossConfig() if loss is None else loss
     sweep_list = list(sweeps)
     if method == "tbptt":
         return _fit_two_compartment_model_tbptt(
@@ -1787,6 +1702,7 @@ __all__ = [
     "DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS",
     "DEFAULT_TWO_COMPARTMENT_FIT_STAGES",
     "FitEvaluation",
+    "FitLossConfig",
     "TwoCompartmentFitStage",
     "choose_current_clamp_sweeps",
     "detect_spikes_from_voltage",

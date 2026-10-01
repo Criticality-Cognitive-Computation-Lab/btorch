@@ -27,7 +27,6 @@ def get_continuous_spiking_rate(
     # sigma is in ms, dt in ms: convert to bins
     sigma_bins = sigma / dt
 
-    # Apply Gaussian filter along the time axis (axis 0)
     rates = gaussian_filter1d(spikes.astype(float), sigma=sigma_bins, axis=0)
 
     return rates

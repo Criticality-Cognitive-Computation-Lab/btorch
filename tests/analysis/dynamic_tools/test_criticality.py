@@ -68,3 +68,40 @@ def test_dfa(series_fn, alpha_min, alpha_max):
     alpha = compute_dfa(series, bin_size=1)
 
     assert alpha_min < alpha < alpha_max
+
+
+def test_failure_return_contract_has_stable_keys():
+    """Too few avalanches: same keys as a successful fit, NaN/None payloads.
+
+    Before, the early-failure result lacked ``avg_size_by_duration`` and
+    ``gamma_stats`` so callers had to special-case it.
+    """
+    full = compute_avalanche_statistics(
+        np.random.default_rng(0).random((5000, 50)) < 0.01
+    )
+    spikes = np.zeros((50, 3))
+    spikes[5, 0] = 1  # a single avalanche
+    with pytest.warns(UserWarning, match="Not enough avalanches"):
+        failed = compute_avalanche_statistics(spikes)
+    assert set(failed) == set(full)
+    assert np.isnan(failed["tau"]) and failed["fit_S"] is None
+    assert failed["gamma_stats"] is None
+    durations, mean_sizes = failed["avg_size_by_duration"]
+    assert list(durations) == [1] and list(mean_sizes) == [1.0]
+
+    with pytest.warns(UserWarning, match="Not enough avalanches"):
+        empty = compute_avalanche_statistics(np.zeros((50, 3)))
+    assert empty["avg_size_by_duration"][0].size == 0
+    assert set(empty) == set(full)
+
+
+def test_fit_helper_failure_shape_is_tuple():
+    """Both fit helpers return ``(np.nan, None)`` on failure."""
+    from btorch.analysis.dynamic_tools.criticality import (
+        _fit_distribution,
+        _fit_scaling,
+    )
+
+    for out in (_fit_distribution(np.arange(3)), _fit_scaling([1, 2], [1, 2])):
+        assert isinstance(out, tuple) and len(out) == 2
+        assert np.isnan(out[0]) and out[1] is None

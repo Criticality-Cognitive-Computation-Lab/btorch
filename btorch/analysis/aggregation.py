@@ -9,10 +9,15 @@ import torch
 from ..types import TensorLike
 
 
+AggName = Literal["mean", "sum", "std"]
+"""Reduction names resolved on ``numpy`` / ``torch`` by the ``agg_*``
+helpers."""
+
+
 def agg_by_neuron(
     y,
     neurons: pd.DataFrame,
-    agg: Literal["mean", "sum", "std"] = "mean",
+    agg: AggName = "mean",
     neuron_type_column: str = "cell_type",
     **kwargs,
 ) -> dict:
@@ -31,9 +36,9 @@ def agg_by_neuropil(
     neurons: pd.DataFrame | None = None,
     connections: pd.DataFrame | None = None,
     mode: Literal["top_innervated", "all_innervated"] = "all_innervated",
-    agg: Literal["mean", "sum", "std"] = "mean",
+    agg: AggName = "mean",
     use_polars: bool = False,
-):
+) -> tuple[dict, dict]:
     """Aggregate activations by neuropil under a validated aggregation mode."""
     agg_func = getattr(np, agg) if isinstance(y, np.ndarray) else getattr(torch, agg)
     if use_polars:
@@ -118,8 +123,8 @@ def agg_conn(
     neurons: pd.DataFrame | None = None,
     mode: Literal["neuropil", "neuron"] = "neuron",
     neuron_type_column: str = "cell_type",
-    agg: Literal["mean", "sum", "std"] = "mean",
-):
+    agg: AggName = "mean",
+) -> pd.Series:
     """Aggregate connectivity weights by neuropil or neuron-type pairs."""
     if conn_weight is not None:
         conn_weight = conn_weight.tocoo()

@@ -242,3 +242,30 @@ def test_partial_map_without_neuron_dims_raises():
             dim_names=("time", "batch", "neuron"),
             partial_map={"v": np.array([0])},
         )
+
+
+def test_root_id_shape_mismatch_raises():
+    """neuron_ids that cannot fill the neuron dims must raise, not vanish.
+
+    Two physical neuron dims (2 x 3 = 6 neurons) cannot hold 5 root ids.
+    Previously the ``root_id`` variable was silently dropped.
+    """
+    data = {"v": np.zeros((4, 1, 2, 3))}
+    with pytest.raises(ValueError, match="root_id"):
+        memories_to_xarray(data, dim_counts=(1, 1, 2), neuron_ids=np.arange(5))
+
+    # A flat id array with the right number of entries is reshaped.
+    ds = memories_to_xarray(data, dim_counts=(1, 1, 2), neuron_ids=np.arange(6))
+    assert ds["root_id"].shape == (2, 3)
+
+
+def test_infer_dim_counts_defaults_by_rank():
+    """The heuristic depends only on rank (the dead ``partial`` arg is
+    gone)."""
+    from btorch.io.serialization import _infer_dim_counts
+
+    assert _infer_dim_counts(np.zeros((2, 3, 4)), None) == (1, 1, 1)
+    assert _infer_dim_counts(np.zeros((2, 3)), None) == (1, 0, 1)
+    assert _infer_dim_counts(np.zeros(3), None) == (0, 0, 1)
+    with pytest.raises(TypeError):
+        _infer_dim_counts(np.zeros(3), None, partial=True)

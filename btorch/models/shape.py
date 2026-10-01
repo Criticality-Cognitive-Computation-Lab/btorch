@@ -8,8 +8,8 @@ def expand_dims(
     target_shape: int | tuple[int, ...],
     match_full_shape: bool,
     position: Literal["leading", "trailing"],
-    broadcast_only=False,
-    view=True,
+    broadcast_only: bool = False,
+    view: bool = True,
 ) -> torch.Tensor:
     if isinstance(target_shape, int):
         target_shape = (target_shape,)
@@ -41,8 +41,8 @@ def expand_leading_dims(
     tensor: torch.Tensor,
     target_leading_shape: int | tuple[int, ...],
     match_full_shape: bool = False,
-    broadcast_only=False,
-    view=True,
+    broadcast_only: bool = False,
+    view: bool = True,
 ) -> torch.Tensor:
     return expand_dims(
         tensor,
@@ -59,7 +59,7 @@ def expand_trailing_dims(
     target_trailing_shape: int | tuple[int, ...],
     match_full_shape: bool = False,
     broadcast_only: bool = False,
-    view=True,
+    view: bool = True,
 ) -> torch.Tensor:
     return expand_dims(
         tensor,

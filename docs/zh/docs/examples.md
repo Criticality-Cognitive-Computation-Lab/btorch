@@ -34,7 +34,7 @@
 - 具有异构时间常数的 `AlphaPSCBilleh` 突触
 - 用于膜电压正则化的 `VoltageRegularizer`
 - 每批次手动调用 `reset_net` 的训练循环
-- 与 `state_dict()` 一起保存 `memories_rv`
+- 与 `state_dict()` 一起保存 `memory_reset_values`
 
 **另请参阅：**
 - [教程 2：训练 SNN](tutorials/training.md)
@@ -46,7 +46,7 @@
 
 **关键模式：**
 - 带 `reset_net` 的 Lightning `training_step`
-- 用于神经元参数缩放的 `scale_net` / `unscale_net`
+- 用于神经元参数字典缩放的 `scale_state_`
 - 带状态记录的验证循环
 
 ## `delayed_synapse_demo.py` — 突触延迟

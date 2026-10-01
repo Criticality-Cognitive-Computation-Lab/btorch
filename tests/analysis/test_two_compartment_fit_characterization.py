@@ -59,13 +59,16 @@ def test_loss_total_is_weighted_sum_of_components():
         dt=1.0,
         w_Ca=torch.tensor([2.0]),
     )
+    # All loss settings travel in ONE FitLossConfig (the public API).
     losses = two_compartment_loss(
         **kwargs,
-        voltage_weight=0.5,
-        spike_weight=2.0,
-        spike_count_weight=0.3,
-        spike_timing_weight=0.1,
-        sparsity_weight=0.25,
+        loss=tcf.FitLossConfig(
+            voltage_weight=0.5,
+            spike_weight=2.0,
+            spike_count_weight=0.3,
+            spike_timing_weight=0.1,
+            sparsity_weight=0.25,
+        ),
     )
     expected = (
         0.5 * losses["voltage"]
@@ -97,15 +100,19 @@ def test_loss_rejects_nonpositive_count_weights():
             v_true=v_true,
             spike_true=spike_true,
             dt=1.0,
-            spike_count_over_weight=0.0,
+            loss=tcf.FitLossConfig(spike_count_over_weight=0.0),
         )
 
 
 def test_evaluate_fit_across_sweeps_is_deterministic():
     model = TwoCompartmentGLIF(n_neuron=1)
     sweeps = [_sweep(0), _sweep(1, spike=True)]
-    _, agg1 = evaluate_fit_across_sweeps(model, sweeps, spike_count_weight=0.1)
-    _, agg2 = evaluate_fit_across_sweeps(model, sweeps, spike_count_weight=0.1)
+    _, agg1 = evaluate_fit_across_sweeps(
+        model, sweeps, loss=tcf.FitLossConfig(spike_count_weight=0.1)
+    )
+    _, agg2 = evaluate_fit_across_sweeps(
+        model, sweeps, loss=tcf.FitLossConfig(spike_count_weight=0.1)
+    )
     assert agg1 == agg2
     assert agg1["n_sweeps"] == 2.0
     assert agg1["n_silent_sweeps"] == 1.0
@@ -163,8 +170,7 @@ def test_fit_entry_point_history_schema(method):
         global_maxiter=1,
         global_popsize=4,
         local_maxiter=1,
-        spike_count_weight=0.1,
-        spike_timing_weight=0.1,
+        loss=tcf.FitLossConfig(spike_count_weight=0.1, spike_timing_weight=0.1),
     )
     assert history
     for row in history:
@@ -189,35 +195,61 @@ def test_plot_and_report_reexports(tmp_path):
     assert paths["plot"].exists() and paths["metrics"].exists()
 
 
-def test_fit_loss_config_matches_public_loss_kwargs():
-    """The private config path and the public keyword path agree exactly."""
+def test_loss_none_equals_default_config():
+    """``loss=None`` is exactly ``FitLossConfig()`` (the documented
+    defaults)."""
     v_pred, spike_pred, v_true, spike_true = _tiny_traces()
-    cfg = tcf.FitLossConfig(
-        voltage_weight=0.4, spike_count_weight=0.2, spike_timing_weight=0.3
-    )
-    via_config = tcf._loss_from_config(
+    kwargs = dict(
         v_pred=v_pred,
         spike_pred=spike_pred,
         v_true=v_true,
         spike_true=spike_true,
         dt=1.0,
-        w_Ca=None,
-        config=cfg,
     )
-    via_kwargs = two_compartment_loss(
-        v_pred=v_pred,
-        spike_pred=spike_pred,
-        v_true=v_true,
-        spike_true=spike_true,
-        dt=1.0,
-        voltage_weight=0.4,
-        spike_count_weight=0.2,
-        spike_timing_weight=0.3,
-    )
-    for key, value in via_kwargs.items():
-        torch.testing.assert_close(via_config[key], value)
-    # Config defaults equal the public keyword defaults.
+    implicit = two_compartment_loss(**kwargs)
+    explicit = two_compartment_loss(**kwargs, loss=tcf.FitLossConfig())
+    for key, value in explicit.items():
+        torch.testing.assert_close(implicit[key], value)
     assert tcf.FitLossConfig().sparsity_weight == 1e-4
+
+
+def test_fit_loss_config_is_public_and_loose_kwargs_are_gone():
+    """FitLossConfig is exported; the old loose loss kwargs no longer exist."""
+    import btorch.analysis as analysis
+
+    assert analysis.FitLossConfig is tcf.FitLossConfig
+    model = TwoCompartmentGLIF(n_neuron=1)
+    with pytest.raises(TypeError):
+        evaluate_fit_across_sweeps(model, [_sweep(0)], spike_count_weight=0.1)
+    with pytest.raises(TypeError):
+        fit_two_compartment_model(model, [_sweep(0)], voltage_weight=2.0)
+
+
+def test_evaluation_total_loss_uses_full_config():
+    """Evaluation now honours every config field (previously weights such as
+    voltage_weight were silently ignored by the evaluate_* helpers)."""
+    model = TwoCompartmentGLIF(n_neuron=1)
+    sw = _sweep(1, spike=True)
+    base, _ = evaluate_fit_across_sweeps(model, [sw])
+    zero_v, _ = evaluate_fit_across_sweeps(
+        model, [sw], loss=tcf.FitLossConfig(voltage_weight=0.0)
+    )
+    # Components are weight independent; only the total changes.
+    assert base[0].metrics["voltage_loss"] == zero_v[0].metrics["voltage_loss"]
+    # With voltage_weight=0 only spike (weight 1) and sparsity (1e-4) remain.
+    # (Compared against the components rather than total - voltage, which
+    # would cancel catastrophically in float32 for a large voltage loss.)
+    m = zero_v[0].metrics
+    expected = m["spike_loss"] + 1e-4 * m["sparsity_loss"]
+    assert m["total_loss"] == pytest.approx(expected, rel=1e-5)
+
+
+def test_loss_floats_maps_components_to_history_keys():
+    """The shared helper turns loss tensors into ``<name>_loss`` floats."""
+    out = tcf._loss_floats(
+        {"total": torch.tensor(1.5), "spike_count": torch.tensor(2.0)}
+    )
+    assert out == {"total_loss": 1.5, "spike_count_loss": 2.0}
 
 
 def test_prepare_sweep_converts_dtype_and_resets_state():
@@ -229,3 +261,41 @@ def test_prepare_sweep_converts_dtype_and_resets_state():
     assert i_soma.dtype == v_true.dtype == spike_true.dtype == torch.float64
     assert i_apical is not None and i_apical.dtype == torch.float64
     assert model.v.shape[0] == i_soma.shape[1]
+
+
+# ---------------------------------------------------------------------------
+# Deliberate behaviour change: the global-search objective and the staged
+# stage-ranking evaluation now use the FULL user-supplied ``FitLossConfig``
+# (spike_tau_ms, post_spike_mask_ms, match window, miss penalty).  Previously
+# the search objective only honoured the weight fields and the stage ranking
+# kept smoothing/mask defaults, so fit results change intentionally when
+# non-default smoothing/mask/window settings are used.
+# ---------------------------------------------------------------------------
+
+
+def test_global_search_objective_uses_full_loss_config(monkeypatch):
+    """The DE/L-BFGS objective must see the user's full loss config."""
+    seen = []
+    real = tcf._fit_sweeps_once
+
+    def spy(model, sweeps, *, loss, **kw):
+        seen.append(loss)
+        return real(model, sweeps, loss=loss, **kw)
+
+    monkeypatch.setattr(tcf, "_fit_sweeps_once", spy)
+    model = TwoCompartmentGLIF(n_neuron=1, trainable_param={"w_Ca"})
+    cfg = tcf.FitLossConfig(
+        spike_tau_ms=3.0,
+        post_spike_mask_ms=7.0,
+        spike_match_window_ms=4.0,
+        spike_miss_penalty_ms=9.0,
+    )
+    tcf._fit_two_compartment_model_global(
+        model,
+        [_sweep(0, spike=True)],
+        loss=cfg,
+        global_maxiter=1,
+        global_popsize=2,
+        local_maxiter=1,
+    )
+    assert seen and all(c is cfg for c in seen)

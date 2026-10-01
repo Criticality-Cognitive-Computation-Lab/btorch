@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import argparse
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
 
 from btorch.analysis.two_compartment_fit import (
     DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS,
+    FitLossConfig,
     choose_current_clamp_sweeps,
     evaluate_fit_across_sweeps,
     fit_two_compartment_model,
@@ -571,6 +572,15 @@ def main() -> None:
         },
     ).to(device)
 
+    # One FitLossConfig carries every loss setting (built from the CLI flags).
+    loss_config = FitLossConfig(
+        voltage_weight=args.voltage_weight,
+        spike_weight=args.spike_weight,
+        spike_count_weight=args.spike_count_weight,
+        spike_timing_weight=args.spike_timing_weight,
+        spike_match_window_ms=args.spike_match_window_ms,
+        sparsity_weight=args.sparsity_weight,
+    )
     history = fit_two_compartment_model(
         model,
         train_sweeps,
@@ -578,12 +588,7 @@ def main() -> None:
         lr=args.lr,
         epochs=args.epochs,
         chunk_size=args.chunk_size,
-        voltage_weight=args.voltage_weight,
-        spike_weight=args.spike_weight,
-        spike_count_weight=args.spike_count_weight,
-        spike_timing_weight=args.spike_timing_weight,
-        spike_match_window_ms=args.spike_match_window_ms,
-        sparsity_weight=args.sparsity_weight,
+        loss=loss_config,
         global_maxiter=args.global_maxiter,
         global_popsize=args.global_popsize,
         local_maxiter=args.local_maxiter,
@@ -599,12 +604,12 @@ def main() -> None:
             lr=args.tbptt_refine_lr,
             epochs=args.tbptt_refine_epochs,
             chunk_size=args.chunk_size,
-            voltage_weight=max(args.voltage_weight, 2.0),
-            spike_weight=args.spike_weight,
-            spike_count_weight=max(args.spike_count_weight, 25.0),
-            spike_timing_weight=max(args.spike_timing_weight, 12.0),
-            spike_match_window_ms=args.spike_match_window_ms,
-            sparsity_weight=args.sparsity_weight,
+            loss=replace(
+                loss_config,
+                voltage_weight=max(args.voltage_weight, 2.0),
+                spike_count_weight=max(args.spike_count_weight, 25.0),
+                spike_timing_weight=max(args.spike_timing_weight, 12.0),
+            ),
             device=device,
         )
         history.extend(tbptt_history)
@@ -612,9 +617,7 @@ def main() -> None:
         model,
         train_sweeps,
         device=device,
-        spike_count_weight=args.spike_count_weight,
-        spike_timing_weight=args.spike_timing_weight,
-        spike_match_window_ms=args.spike_match_window_ms,
+        loss=loss_config,
     )
     train_paths = save_fit_report(
         model,
@@ -631,9 +634,7 @@ def main() -> None:
             model,
             test_sweeps,
             device=device,
-            spike_count_weight=args.spike_count_weight,
-            spike_timing_weight=args.spike_timing_weight,
-            spike_match_window_ms=args.spike_match_window_ms,
+            loss=loss_config,
         )
         test_paths = save_fit_report(
             model,

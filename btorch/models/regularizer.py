@@ -78,8 +78,8 @@ class QuantileDistributionLoss(nn.Module):
     def __init__(
         self,
         loss_type: Literal["pinball", "huber_pinball"] = "huber_pinball",
-        kappa=0.002,
-        reduction="mean",
+        kappa: float = 0.002,
+        reduction: Literal["sum", "mean"] = "mean",
         sorted: bool = False,
     ):
         super().__init__()
@@ -116,7 +116,6 @@ class QuantileDistributionLoss(nn.Module):
 
         *batch_dims, N = pred.shape
 
-        # Sort along last dimension
         pred_sorted, _ = torch.sort(pred, dim=-1)
         if not self.sorted:
             target, _ = torch.sort(target, dim=-1)
@@ -186,7 +185,7 @@ class FiringRateLoss(nn.Module):
         input_type: Literal["spike", "firing_rate"] = "spike",
         n_neuron: int | None = None,
         loss_type: Literal["pinball", "huber_pinball"] = "huber_pinball",
-        kappa=0.002,
+        kappa: float = 0.002,
         reduction: Literal["sum", "mean"] = "mean",
         rng: torch.Generator | int | None = None,
         sorted: bool = False,
@@ -209,7 +208,7 @@ class FiringRateLoss(nn.Module):
 
         self.register_buffer("target", target_tensor)
 
-    def forward(self, x: Float[torch.Tensor, "... n_neuron"]):
+    def forward(self, x: Float[torch.Tensor, "... n_neuron"]) -> torch.Tensor:
         """Compute firing rate loss.
 
         Args:

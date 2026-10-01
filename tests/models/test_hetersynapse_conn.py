@@ -333,7 +333,7 @@ def test_hetersynapse_psc_get_psc_autodetection():
     linear = torch.nn.Linear(n_neurons, n_neurons * n_receptor, bias=False)
 
     with environ.context(dt=1.0):
-        hetero_psc = HeterSynapsePSC(
+        hetersynapse_psc = HeterSynapsePSC(
             n_neuron=n_neurons,
             n_receptor=n_receptor,
             receptor_type_index=receptor_idx,
@@ -342,11 +342,11 @@ def test_hetersynapse_psc_get_psc_autodetection():
             tau_syn=2.0,
         )
 
-        init_net_state(hetero_psc, dtype=torch.float32)
+        init_net_state(hetersynapse_psc, dtype=torch.float32)
 
         # Run a forward pass
         z = torch.randn(1, n_neurons)
-        hetero_psc.single_step_forward(z)
+        hetersynapse_psc.single_step_forward(z)
 
     # Test autodetection with neuron mode (tuple input)
     if "pre_receptor_type" in receptor_idx.columns:
@@ -360,8 +360,8 @@ def test_hetersynapse_psc_get_psc_autodetection():
             post_type = post_types[0]
 
             # get_psc should use the psc from base_psc, pass it explicitly
-            psc = hetero_psc.get_psc(
-                receptor_type=(pre_type, post_type), psc=hetero_psc.base_psc.psc
+            psc = hetersynapse_psc.get_psc(
+                receptor_type=(pre_type, post_type), psc=hetersynapse_psc.base_psc.psc
             )
             assert psc is not None
             assert psc.shape[-1] == n_neurons
@@ -370,7 +370,7 @@ def test_hetersynapse_psc_get_psc_autodetection():
             print(f"  Retrieved PSC for ({pre_type}, {post_type})")
 
     # Get total PSC (None argument) - returns base_psc.psc with all receptor types
-    psc_total = hetero_psc.get_psc(receptor_type=None)
+    psc_total = hetersynapse_psc.get_psc(receptor_type=None)
     # The total PSC includes all receptor types, so shape is (n_neurons * n_receptor,)
     assert psc_total.shape[-1] == n_neurons * n_receptor
 
@@ -386,7 +386,7 @@ def test_sparse_constrained_conn_from_hetersynapse():
     neurons = create_test_neurons(n_neurons=50)
     connections = create_test_connections(neurons, density=0.15)
 
-    # Create heterosynapse connection and constraint
+    # Create hetersynapse connection and constraint
     conn, constraint, receptor_idx = make_hetersynapse_constrained_conn(
         neurons,
         connections,
@@ -849,7 +849,7 @@ def test_hetersynapse_psc_with_max_delay_steps_matches_manual():
     linear = SparseConn(conn_d, enforce_dale=False)
 
     with environ.context(dt=1.0):
-        hetero_psc = HeterSynapsePSC(
+        hetersynapse_psc = HeterSynapsePSC(
             n_neuron=n_neurons,
             n_receptor=n_receptor,
             receptor_type_index=receptor_idx,
@@ -859,7 +859,7 @@ def test_hetersynapse_psc_with_max_delay_steps_matches_manual():
             max_delay_steps=n_delay_bins,
             use_circular_buffer=False,
         )
-        init_net_state(hetero_psc, batch_size=1, dtype=torch.float32)
+        init_net_state(hetersynapse_psc, batch_size=1, dtype=torch.float32)
 
         # Manual pipeline with separate SpikeHistory
         manual_history = SpikeHistory(
@@ -878,7 +878,7 @@ def test_hetersynapse_psc_with_max_delay_steps_matches_manual():
         z_seq = torch.randn(5, 1, n_neurons)
 
         for t in range(z_seq.shape[0]):
-            out_hetero = hetero_psc.single_step_forward(z_seq[t])
+            out_hetersynapse = hetersynapse_psc.single_step_forward(z_seq[t])
 
             manual_history.update(z_seq[t])
             z_delayed = manual_history.get_flattened(n_delay_bins)
@@ -887,7 +887,9 @@ def test_hetersynapse_psc_with_max_delay_steps_matches_manual():
                 *out_manual.shape[:-1], n_neurons, n_receptor
             ).sum(-1)
 
-            torch.testing.assert_close(out_hetero, out_manual, atol=1e-6, rtol=0.0)
+            torch.testing.assert_close(
+                out_hetersynapse, out_manual, atol=1e-6, rtol=0.0
+            )
 
 
 def test_hetersynapse_psc_delay_state_init_reset():
@@ -915,7 +917,7 @@ def test_hetersynapse_psc_delay_state_init_reset():
 
     for use_circular in (True, False):
         with environ.context(dt=1.0):
-            hetero_psc = HeterSynapsePSC(
+            hetersynapse_psc = HeterSynapsePSC(
                 n_neuron=n_neurons,
                 n_receptor=n_receptor,
                 receptor_type_index=receptor_idx,
@@ -925,22 +927,22 @@ def test_hetersynapse_psc_delay_state_init_reset():
                 max_delay_steps=n_delay_bins,
                 use_circular_buffer=use_circular,
             )
-            init_net_state(hetero_psc, batch_size=2, dtype=torch.float32)
+            init_net_state(hetersynapse_psc, batch_size=2, dtype=torch.float32)
 
-            assert hetero_psc.history is not None
-            assert hetero_psc.history.history.shape == (2, 4, n_neurons)
+            assert hetersynapse_psc.history is not None
+            assert hetersynapse_psc.history.history.shape == (2, 4, n_neurons)
 
             z = torch.ones(2, n_neurons)
-            hetero_psc.single_step_forward(z)
+            hetersynapse_psc.single_step_forward(z)
 
             # History should be non-zero after update
-            assert hetero_psc.history.history.abs().sum() > 0
+            assert hetersynapse_psc.history.history.abs().sum() > 0
 
-            reset_net(hetero_psc, batch_size=2)
+            reset_net(hetersynapse_psc, batch_size=2)
 
             # After reset, history should be zeroed
-            assert hetero_psc.history.history.abs().sum() == 0
-            assert hetero_psc.psc.abs().sum() == 0
+            assert hetersynapse_psc.history.history.abs().sum() == 0
+            assert hetersynapse_psc.psc.abs().sum() == 0
 
 
 def test_hetersynapse_psc_no_delay_when_max_delay_steps_one():
@@ -960,7 +962,7 @@ def test_hetersynapse_psc_no_delay_when_max_delay_steps_one():
     linear = torch.nn.Linear(n_neurons, n_neurons * n_receptor, bias=False)
 
     with environ.context(dt=1.0):
-        hetero_psc = HeterSynapsePSC(
+        hetersynapse_psc = HeterSynapsePSC(
             n_neuron=n_neurons,
             n_receptor=n_receptor,
             receptor_type_index=receptor_idx,
@@ -969,10 +971,10 @@ def test_hetersynapse_psc_no_delay_when_max_delay_steps_one():
             tau_syn=2.0,
             max_delay_steps=1,
         )
-        init_net_state(hetero_psc, batch_size=1, dtype=torch.float32)
+        init_net_state(hetersynapse_psc, batch_size=1, dtype=torch.float32)
 
-        assert hetero_psc.history is None
+        assert hetersynapse_psc.history is None
 
         z = torch.randn(1, n_neurons)
-        out = hetero_psc.single_step_forward(z)
+        out = hetersynapse_psc.single_step_forward(z)
         assert out.shape == (1, n_neurons)

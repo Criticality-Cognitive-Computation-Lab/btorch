@@ -23,7 +23,6 @@ from ...types import TensorLike
 from .. import environ
 from ..base import BaseNode
 from ..ode import euler_step
-from ..surrogate import Sigmoid
 
 
 class LIF(BaseNode):
@@ -48,9 +47,9 @@ class LIF(BaseNode):
         tau_ref: Refractory period duration (ms). None disables refractory
             behavior. Default: None.
         trainable_param: Set of parameter names to make trainable.
-            Default: empty set.
+            Default: None (empty set).
         surrogate_function: Surrogate gradient function for backpropagation.
-            Default: Sigmoid().
+            Default: None, which builds a fresh Sigmoid() per neuron.
         detach_reset: If True, detach reset signal from computation graph.
             Default: False.
         hard_reset: If True, reset to v_reset directly. If False, subtract
@@ -89,8 +88,8 @@ class LIF(BaseNode):
         c_m: float | Float[TensorLike, " n_neuron"] = 1.0,
         tau: float | Float[TensorLike, " n_neuron"] = 20.0,
         tau_ref: float | Float[TensorLike, " n_neuron"] | None = None,
-        trainable_param: set[str] = set(),
-        surrogate_function: Callable = Sigmoid(),
+        trainable_param: set[str] | None = None,
+        surrogate_function: Callable | None = None,
         detach_reset: bool = False,
         hard_reset: bool = False,
         pre_spike_v: bool = False,
@@ -219,7 +218,8 @@ class IF(LIF):
         tau: Time constant (inherited from LIF but not used in dynamics).
         tau_ref: Refractory period duration. Default: None.
         trainable_param: Set of parameter names to make trainable.
-        surrogate_function: Surrogate gradient function. Default: Sigmoid().
+        surrogate_function: Surrogate gradient function. Default: None, which builds
+            a fresh Sigmoid() per neuron.
         detach_reset: If True, detach reset signal. Default: False.
         hard_reset: If True, use hard reset. Default: False.
         pre_spike_v: If True, store pre-spike voltage. Default: False.
@@ -251,5 +251,5 @@ class IF(LIF):
         Args:
             x: Input current, shape (*batch, n_neuron).
         """
-        v = euler_step(self.dV, self.V, x, dt=environ.get("dt"))
+        v = euler_step(self.dV, self.v, x, dt=environ.get("dt"))
         self.v = v

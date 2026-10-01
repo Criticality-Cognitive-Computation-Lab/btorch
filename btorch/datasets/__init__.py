@@ -22,24 +22,24 @@ Noise Types
 
 Functional API
 --------------
-    - [`ou_noise`](btorch/datasets/noise.py:25): Generate OU noise sequence
-    - [`ou_noise_like`](btorch/datasets/noise.py:123): OU noise with
+    - :func:`~btorch.datasets.noise.ou_noise`: Generate OU noise sequence
+    - :func:`~btorch.datasets.noise.ou_noise_like`: OU noise with
       reference tensor
-    - [`poisson_noise`](btorch/datasets/noise.py:156): Generate Poisson
+    - :func:`~btorch.datasets.noise.poisson_noise`: Generate Poisson
       events
-    - [`poisson_noise_like`](btorch/datasets/noise.py:192): Poisson with
+    - :func:`~btorch.datasets.noise.poisson_noise_like`: Poisson with
       reference tensor
-    - [`pink_noise`](btorch/datasets/noise.py:284): Generate pink noise
-    - [`pink_noise_like`](btorch/datasets/noise.py:344): Pink noise with
+    - :func:`~btorch.datasets.noise.pink_noise`: Generate pink noise
+    - :func:`~btorch.datasets.noise.pink_noise_like`: Pink noise with
       reference tensor
 
 Layer API
 ---------
-    - [`OUNoiseLayer`](btorch/datasets/noise.py:367): Stateful OU noise
+    - :class:`~btorch.datasets.noise.OUNoiseLayer`: Stateful OU noise
       module with single/multi-step modes
-    - [`PoissonNoiseLayer`](btorch/datasets/noise.py:510): Stateless Poisson
+    - :class:`~btorch.datasets.noise.PoissonNoiseLayer`: Stateless Poisson
       encoder/generator module
-    - [`PinkNoiseLayer`](btorch/datasets/noise.py:603): Stateful pink noise
+    - :class:`~btorch.datasets.noise.PinkNoiseLayer`: Stateful pink noise
       module with FIR history
 
 All noise functions support:

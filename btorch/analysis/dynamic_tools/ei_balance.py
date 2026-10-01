@@ -34,7 +34,6 @@ def compute_eci(
     I_ext: torch.Tensor | np.ndarray | None = None,
     batch_axis: int | tuple[int, ...] | None = None,
     dtype: torch.dtype | np.dtype | None = None,
-    **kwargs: Any,
 ) -> torch.Tensor | np.ndarray:
     """Compute Excitatory-Inhibitory Cancellation Index (ECI).
 
@@ -46,8 +45,8 @@ def compute_eci(
     where I_rec = I_e + I_i
 
     This function is decorated with `@use_stats` and `@use_percentiles`.
-    See [`use_stats()`](btorch/analysis/statistics.py:483) and
-    [`use_percentiles()`](btorch/analysis/statistics.py:777) for detailed usage.
+    See :func:`~btorch.analysis.statistics.use_stats` and
+    :func:`~btorch.analysis.statistics.use_percentiles` for detailed usage.
 
     Args:
         I_e: Excitatory current [T,..., N]
@@ -61,34 +60,23 @@ def compute_eci(
     Keyword Args:
         stat (str | None): Aggregation statistic to return instead of per-neuron values.
             Options: "mean", "median", "max", "min", "std", "var", "argmax",
-            "argmin", "cv". See [`use_stats()`](btorch/analysis/statistics.py:483).
+            "argmin", "cv". See :func:`~btorch.analysis.statistics.use_stats`.
         stat_info (str | list[str] | None): Additional statistics to compute
             and store in info dict.
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         nan_policy (str | None): How to handle NaN values ("skip", "warn", "assert").
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         inf_policy (str | None): How to handle Inf values ("propagate", "skip", "warn",
-            "assert"). See [`use_stats()`](btorch/analysis/statistics.py:483).
+            "assert"). See :func:`~btorch.analysis.statistics.use_stats`.
         percentiles (float | tuple[float, ...] | None): Percentile level(s) in
             [0, 100] to compute.
-            See [`use_percentiles()`](btorch/analysis/statistics.py:777).
+            See :func:`~btorch.analysis.statistics.use_percentiles`.
 
     Returns:
         eci: ECI values per neuron (shape depends on batch_axis).
             If `stat` is provided, returns the aggregated statistic instead.
         info: Dictionary with additional statistics and optional percentile data.
     """
-    return _compute_eci(I_e, I_i, I_ext=I_ext, batch_axis=batch_axis, dtype=dtype)
-
-
-def _compute_eci(
-    I_e: torch.Tensor | np.ndarray,
-    I_i: torch.Tensor | np.ndarray,
-    *,
-    I_ext: torch.Tensor | np.ndarray | None = None,
-    batch_axis: int | tuple[int, ...] | None = None,
-    dtype: torch.dtype | np.dtype | None = None,
-) -> torch.Tensor | np.ndarray:
     if isinstance(batch_axis, int):
         batch_axis = (batch_axis,)
 
@@ -153,16 +141,15 @@ def compute_lag_correlation(
     batch_axis: int | tuple[int, ...] | None = None,
     use_fft: bool = True,
     dtype: torch.dtype | np.dtype | None = None,
-    **kwargs: Any,
-) -> tuple:
+) -> tuple[Any, ...]:
     """Compute lagged cross-correlation between two signals.
 
     Uses FFT-based correlation for efficiency. Returns correlation values
     and best lag per neuron.
 
     This function is decorated with `@use_stats` and `@use_percentiles`.
-    See [`use_stats()`](btorch/analysis/statistics.py:483) and
-    [`use_percentiles()`](btorch/analysis/statistics.py:777) for detailed usage.
+    See :func:`~btorch.analysis.statistics.use_stats` and
+    :func:`~btorch.analysis.statistics.use_percentiles` for detailed usage.
 
     Args:
         x: First signal [T, ...] or [T, B, ...]
@@ -179,19 +166,19 @@ def compute_lag_correlation(
         stat (str | dict | None): Aggregation statistic per return position.
             Can be a single stat or dict mapping position to stat
             (e.g., {0: "mean", 1: "median"}).
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         stat_info (str | list[str] | dict | None): Additional statistics to
             compute and store in info dict. Can be a single stat, iterable,
             or dict mapping position to stat(s).
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         nan_policy (str | None): How to handle NaN values ("skip", "warn", "assert").
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         inf_policy (str | None): How to handle Inf values ("propagate", "skip", "warn",
-            "assert"). See [`use_stats()`](btorch/analysis/statistics.py:483).
+            "assert"). See :func:`~btorch.analysis.statistics.use_stats`.
         percentiles (float | tuple[float, ...] | dict | None): Percentile level(s)
             in [0, 100] to compute per position. Can be a single value or dict
             mapping position to percentile(s).
-            See [`use_percentiles()`](btorch/analysis/statistics.py:777).
+            See :func:`~btorch.analysis.statistics.use_percentiles`.
 
     Returns:
         peak_corr: Correlation values at best lag per neuron.
@@ -201,7 +188,6 @@ def compute_lag_correlation(
         info: Dictionary with correlation over lags, best lags, etc.
 
     Example:
-        # Get per-neuron values
         peak, lag, info = compute_lag_correlation(x, y)
 
         # Aggregate: max peak correlation, mean best lag
@@ -328,14 +314,12 @@ def _cross_correlation_fft(
         if fft_dtype is not None:
             x = x.to(dtype=fft_dtype)
             y = y.to(dtype=fft_dtype)
-        # Demean and compute FFT
         x_demean = x - x.mean(dim=0, keepdim=True, dtype=fft_dtype)
         y_demean = y - y.mean(dim=0, keepdim=True, dtype=fft_dtype)
         X = torch.fft.rfft(x_demean, n=n_fft, dim=0)
         Y = torch.fft.rfft(y_demean, n=n_fft, dim=0)
         cross_spec = X * Y.conj()
         corr_full = torch.fft.irfft(cross_spec, n=n_fft, dim=0)
-        # Normalize
         x_std = x.std(dim=0, keepdim=True) + torch.finfo(x.dtype).eps
         y_std = y.std(dim=0, keepdim=True) + torch.finfo(y.dtype).eps
         corr_norm = corr_full / (x_std * y_std * T)
@@ -444,13 +428,12 @@ def compute_ei_balance(
     max_lag_ms: float = 30.0,
     batch_axis: int | tuple[int, ...] | None = None,
     dtype: torch.dtype | np.dtype | None = None,
-    **kwargs: Any,
-) -> tuple:
+) -> tuple[Any, ...]:
     """Compute E/I balance metrics including ECI and lag correlation.
 
     This function is decorated with `@use_stats` and `@use_percentiles`.
-    See [`use_stats()`](btorch/analysis/statistics.py:483) and
-    [`use_percentiles()`](btorch/analysis/statistics.py:777) for detailed usage.
+    See :func:`~btorch.analysis.statistics.use_stats` and
+    :func:`~btorch.analysis.statistics.use_percentiles` for detailed usage.
 
     Args:
         I_e: Excitatory current [T, ..., N]
@@ -464,16 +447,16 @@ def compute_ei_balance(
 
     Keyword Args:
         stat (str | dict | None): Aggregation statistic per return position.
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         stat_info (str | list[str] | dict | None): Additional statistics per position.
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         nan_policy (str | None): How to handle NaN values ("skip", "warn", "assert").
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         inf_policy (str | None): How to handle Inf values ("propagate", "skip", "warn",
-            "assert"). See [`use_stats()`](btorch/analysis/statistics.py:483).
+            "assert"). See :func:`~btorch.analysis.statistics.use_stats`.
         percentiles (float | tuple[float, ...] | dict | None): Percentile level(s)
             in [0, 100] to compute per position.
-            See [`use_percentiles()`](btorch/analysis/statistics.py:777).
+            See :func:`~btorch.analysis.statistics.use_percentiles`.
 
     Returns:
         eci: ECI values per neuron

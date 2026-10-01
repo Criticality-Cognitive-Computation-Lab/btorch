@@ -281,7 +281,6 @@ class Brain(torch.nn.Module):
         else:
             out = None
 
-        # states = functional.unscale_state(self.brain, states, enforce="ignore")
         brain_out = unflatten_dict(states, dot=True)
 
         return out, brain_out

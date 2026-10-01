@@ -5,6 +5,7 @@ Provides CLI-style dotlist conversion and diff operations for
 configuration management workflows.
 """
 
+import inspect
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal, TypeVar, overload
@@ -134,7 +135,7 @@ def to_dotlist(
     exclude: set | None = None,
     subfield: str | None = None,
     missing_subfield_policy: Literal["raise", "empty"] = "raise",
-):
+) -> list[str]:
     """Flatten DictConfig/ListConfig to CLI-style dotlist.
 
     Parameters
@@ -194,7 +195,7 @@ def to_dotlist(
             )
         return cur
 
-    def flatten_conf(cfg, path=""):
+    def flatten_conf(cfg, path="") -> None:
         nonlocal ret
         # Recurse through OmegaConf containers and emit scalar leaves.
         if isinstance(cfg, DictConfig):
@@ -588,16 +589,26 @@ def get_dotkey(obj: Any, key: str, default: Any = None) -> Any:
         default: Value to return if key not found.
 
     Returns:
-        Value at the nested path, or ``default`` if not found.
+        Value at the nested path, or ``default`` if a path segment does not
+        exist.
+
+    Raises:
+        AttributeError: If a segment exists (e.g. a property) but its getter
+            itself raises ``AttributeError``; that is a real error and is not
+            masked by ``default``.
     """
     if isinstance(obj, (DictConfig, ListConfig)):
         return OmegaConf.select(obj, key, default=default)
-    try:
-        for part in key.split("."):
+    for part in key.split("."):
+        try:
             obj = getattr(obj, part)
-        return obj
-    except AttributeError:
-        return default
+        except AttributeError:
+            try:
+                inspect.getattr_static(obj, part)
+            except AttributeError:
+                return default  # the segment genuinely does not exist
+            raise  # it exists, so the AttributeError came from its getter
+    return obj
 
 
 def set_dotkey(obj: Any, key: str, value: Any) -> None:

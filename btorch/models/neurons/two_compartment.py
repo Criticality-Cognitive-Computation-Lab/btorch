@@ -70,6 +70,7 @@ class TwoCompartmentGLIF(ParamBufferMixin, MemoryModule):
         w_as: Apical-to-somatic coupling weight for top-down drive.
         trainable_param: Names of parameters to optimize.
         surrogate_function: Surrogate gradient function for soma spikes.
+            Default: None, which builds a fresh ``ATan()`` per neuron.
         detach_reset: If ``True``, detach the reset signal from the graph.
         step_mode: ``"s"`` for single-step or ``"m"`` for multi-step dispatch.
         backend: Backend label for consistency with other neuron modules.
@@ -137,8 +138,8 @@ class TwoCompartmentGLIF(ParamBufferMixin, MemoryModule):
         theta_Ca: float | Float[TensorLike, " n_neuron"] = 1.0,
         w_sa: float | Float[TensorLike, " n_neuron"] = 0.5,
         w_as: float | Float[TensorLike, " n_neuron"] = 1.0,
-        trainable_param: set[str] = set(),
-        surrogate_function: Callable = ATan(),
+        trainable_param: set[str] | None = None,
+        surrogate_function: Callable | None = None,
         detach_reset: bool = False,
         step_mode: Literal["s", "m"] = "s",
         backend: Literal["torch"] = "torch",
@@ -147,7 +148,9 @@ class TwoCompartmentGLIF(ParamBufferMixin, MemoryModule):
     ):
         super().__init__()
         self.n_neuron, self.size = normalize_n_neuron(n_neuron)
-        self.trainable_param = set(trainable_param)
+        self.trainable_param = set(trainable_param or ())
+        if surrogate_function is None:
+            surrogate_function = ATan()
         self.surrogate_function = surrogate_function
         self.detach_reset = detach_reset
         self.step_mode = step_mode

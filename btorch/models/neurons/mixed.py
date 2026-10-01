@@ -47,7 +47,6 @@ class MixedNeuronPopulation(nn.Module):
         if not groups:
             raise ValueError("groups must contain at least one population.")
 
-        # Normalise to a list of (name, count, neuron).
         if isinstance(groups, Mapping):
             items = [(name, count, neuron) for name, (count, neuron) in groups.items()]
         else:
@@ -98,12 +97,10 @@ class MixedNeuronPopulation(nn.Module):
                 )
             if isinstance(val, nn.Parameter):
                 val = val.data
-            # TODO: ParamBufferMixin conflates uniform (scalar) and heterogeneous
-            #   (per-neuron tensor) params. When a param is trainable it becomes an
-            #   nn.Parameter and may be scalar or per-neuron depending on how it was
-            #   initialised, so broadcasting here is fragile. ParamBufferMixin should
-            #   be extended to always expose a per-neuron view, making this broadcast
-            #   unnecessary and removing the ambiguity for downstream consumers.
+            # A sub-population may hold a uniform parameter as a 0-dim tensor
+            # (``ParamBufferMixin`` keeps scalar and per-neuron values behind the
+            # same attribute), so a scalar is broadcast to the group's size to
+            # give a per-neuron vector of the right length for concatenation.
             if val.dim() == 0:
                 count = self._cumsum[idx + 1] - self._cumsum[idx]
                 val = val.expand(count)

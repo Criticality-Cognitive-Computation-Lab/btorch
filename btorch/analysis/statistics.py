@@ -28,9 +28,10 @@ Example:
 """
 
 import inspect
+import warnings
 from collections.abc import Callable, Iterable
 from functools import wraps
-from typing import Any, Literal
+from typing import Any, Literal, Protocol, overload
 
 import numpy as np
 import torch
@@ -41,6 +42,15 @@ StatChoice = Literal[
 ]
 NanPolicy = Literal["skip", "warn", "assert"]
 InfPolicy = Literal["propagate", "skip", "warn", "assert"]
+DimSpec = int | tuple[int, ...] | dict[int, int | tuple[int, ...] | None] | None
+StatSpec = StatChoice | dict[int, StatChoice] | None
+StatInfoSpec = (
+    StatChoice
+    | Iterable[StatChoice]
+    | dict[int, StatChoice | Iterable[StatChoice]]
+    | None
+)
+PercentileSpec = float | tuple[float, ...] | dict[int, float | tuple[float, ...]] | None
 
 
 def describe_array(array: np.ndarray, verbose: bool = True) -> dict[str, float]:
@@ -164,6 +174,131 @@ def compute_percentiles(
     }
 
 
+_TORCH_REDUCERS: dict[str, Callable[[torch.Tensor, Any], torch.Tensor]] = {
+    # Non-int ``dim`` (None was already flattened, tuples) reduces over all
+    # elements, matching the historical behaviour of this module.
+    "mean": lambda v, d: v.mean(dim=d) if isinstance(d, int) else v.mean(),
+    "median": lambda v, d: v.median(dim=d).values if isinstance(d, int) else v.median(),
+    "max": lambda v, d: v.max(dim=d).values if isinstance(d, int) else v.max(),
+    "min": lambda v, d: v.min(dim=d).values if isinstance(d, int) else v.min(),
+    "std": lambda v, d: v.std(dim=d) if isinstance(d, int) else v.std(),
+    "var": lambda v, d: v.var(dim=d) if isinstance(d, int) else v.var(),
+    "argmax": lambda v, d: v.argmax(dim=d) if isinstance(d, int) else v.argmax(),
+    "argmin": lambda v, d: v.argmin(dim=d) if isinstance(d, int) else v.argmin(),
+}
+_NUMPY_REDUCERS: dict[str, Callable[[np.ndarray, Any], np.ndarray]] = {
+    "mean": lambda v, d: v.mean(axis=d),
+    "median": lambda v, d: np.median(v, axis=d),
+    "max": lambda v, d: v.max(axis=d),
+    "min": lambda v, d: v.min(axis=d),
+    "std": lambda v, d: v.std(axis=d),
+    "var": lambda v, d: v.var(axis=d),
+    "argmax": lambda v, d: v.argmax(axis=d),
+    "argmin": lambda v, d: v.argmin(axis=d),
+}
+
+
+def _apply_value_policy(
+    values: np.ndarray | torch.Tensor,
+    *,
+    name: str,
+    policy: str,
+    detect: Callable[[Any], Any],
+) -> np.ndarray | torch.Tensor:
+    """Apply a NaN/Inf policy (``name`` is ``"NaN"`` or ``"Inf"``).
+
+    ``detect`` is ``isnan``/``isinf`` of the matching backend. Offending
+    elements are dropped for ``"skip"`` and ``"warn"`` (which also warns).
+    """
+    if policy == "propagate":
+        return values
+    bad = detect(values)
+    if not bad.any():
+        return values
+    if policy == "assert":
+        raise ValueError(f"{name} values found in input")
+    if policy == "warn":
+        warnings.warn(f"{name} values found in input", UserWarning, stacklevel=4)
+    return values[~bad]
+
+
+def compute_stats_batch(
+    values: np.ndarray | torch.Tensor,
+    stats: Iterable[StatChoice],
+    *,
+    nan_policy: NanPolicy = "skip",
+    inf_policy: InfPolicy = "propagate",
+    dim: int | tuple[int, ...] | None = None,
+) -> dict[str, Any]:
+    """Compute multiple statistics efficiently on an array or tensor.
+
+    This function optimizes computation by reusing mean and std calculations
+    when computing cv (coefficient of variation).
+
+    Works with both numpy arrays and PyTorch tensors, preserving the input type.
+    Torch results with a single element become Python scalars; NumPy results
+    are returned as produced by NumPy. Note that ``std``/``var``/``cv`` follow
+    each backend's native convention (torch: unbiased, NumPy: population).
+
+    Args:
+        values: Input array or tensor
+        stats: Statistics to compute
+        nan_policy: How to handle NaN values
+        inf_policy: How to handle Inf values
+        dim: Dimension(s) to aggregate over. If None, flattens all dimensions.
+
+    Returns:
+        Dict mapping each stat to its computed value
+
+    Raises:
+        ValueError: If a stat is unknown or a policy is ``"assert"`` and the
+            offending values are present.
+
+    Example:
+        >>> import numpy as np
+        >>> data = np.random.randn(100)
+        >>> compute_stats_batch(data, ["mean", "std", "cv"])
+        {'mean': 0.1, 'std': 1.0, 'cv': 10.0}
+    """
+    stats = [str(s) for s in stats]
+    for name in stats:
+        if name != "cv" and name not in _NUMPY_REDUCERS:
+            raise ValueError(f"Unknown stat: {name}")
+
+    is_tensor = isinstance(values, torch.Tensor)
+    nan_detect, inf_detect = (
+        (torch.isnan, torch.isinf) if is_tensor else (np.isnan, np.isinf)
+    )
+    values = _apply_value_policy(
+        values, name="NaN", policy=nan_policy, detect=nan_detect
+    )
+    values = _apply_value_policy(
+        values, name="Inf", policy=inf_policy, detect=inf_detect
+    )
+    if dim is None:
+        values = values.flatten()
+        dim = 0
+
+    reducers = _TORCH_REDUCERS if is_tensor else _NUMPY_REDUCERS
+    cache: dict[str, Any] = {}
+
+    def reduce(name: str) -> Any:
+        # mean/std are shared between their own request and ``cv``.
+        if name not in cache:
+            cache[name] = reducers[name](values, dim)
+        return cache[name]
+
+    results: dict[str, Any] = {}
+    for name in stats:
+        value = (
+            reduce("std") / (reduce("mean") + 1e-10) if name == "cv" else reduce(name)
+        )
+        if is_tensor and value.numel() == 1:
+            value = value.item()
+        results[name] = value
+    return results
+
+
 def compute_stat(
     values: np.ndarray | torch.Tensor,
     stat: StatChoice,
@@ -175,6 +310,7 @@ def compute_stat(
     """Compute a single statistic on an array or tensor.
 
     Works with both numpy arrays and PyTorch tensors, preserving the input type.
+    See :func:`compute_stats_batch` for the shared implementation.
 
     Args:
         values: Input array or tensor
@@ -193,316 +329,19 @@ def compute_stat(
     Returns:
         Computed statistic value
 
+    Raises:
+        ValueError: If ``stat`` is unknown or a policy is ``"assert"`` and the
+            offending values are present.
+
     Example:
         >>> import numpy as np
         >>> data = np.random.randn(100)
         >>> compute_stat(data, "mean")
         0.1
     """
-    return _compute_stat(values, stat, nan_policy, inf_policy, dim)
-
-
-def _compute_stat(
-    values: np.ndarray | torch.Tensor,
-    stat: str,
-    nan_policy: NanPolicy,
-    inf_policy: InfPolicy,
-    dim: int | tuple[int, ...] | None,
-) -> Any:
-    """Internal implementation of compute_stat."""
-    # Import warnings here to avoid issues with torch.jit
-    import warnings
-
-    is_tensor = isinstance(values, torch.Tensor)
-
-    if nan_policy != "propagate":
-        has_nan = (
-            torch.isnan(values).any().item() if is_tensor else np.isnan(values).any()
-        )
-        if has_nan:
-            if nan_policy == "assert":
-                raise ValueError("NaN values found in input")
-            elif nan_policy == "warn":
-                warnings.warn("NaN values found in input", UserWarning)
-            # "skip" - filter out NaN values
-            if is_tensor:
-                values = values[~torch.isnan(values)]
-            else:
-                values = values[~np.isnan(values)]
-
-    if inf_policy != "propagate":
-        has_inf = (
-            torch.isinf(values).any().item() if is_tensor else np.isinf(values).any()
-        )
-        if has_inf:
-            if inf_policy == "assert":
-                raise ValueError("Inf values found in input")
-            elif inf_policy == "warn":
-                warnings.warn("Inf values found in input", UserWarning)
-            # "skip" - filter out Inf values
-            if is_tensor:
-                values = values[~torch.isinf(values)]
-            else:
-                values = values[~np.isinf(values)]
-
-    if dim is None:
-        if is_tensor:
-            values = values.flatten()
-        else:
-            values = values.flatten()
-        dim = 0
-
-    if stat == "mean":
-        if is_tensor:
-            return (
-                values.mean(dim=dim).item()
-                if isinstance(dim, int)
-                else values.mean().item()
-            )
-        return values.mean(axis=dim)
-    elif stat == "median":
-        if is_tensor:
-            return (
-                values.median(dim=dim).values.item()
-                if isinstance(dim, int)
-                else values.median().item()
-            )
-        return np.median(values, axis=dim)
-    elif stat == "max":
-        if is_tensor:
-            return (
-                values.max(dim=dim).values.item()
-                if isinstance(dim, int)
-                else values.max().item()
-            )
-        return values.max(axis=dim)
-    elif stat == "min":
-        if is_tensor:
-            return (
-                values.min(dim=dim).values.item()
-                if isinstance(dim, int)
-                else values.min().item()
-            )
-        return values.min(axis=dim)
-    elif stat == "std":
-        if is_tensor:
-            return (
-                values.std(dim=dim).item()
-                if isinstance(dim, int)
-                else values.std().item()
-            )
-        return values.std(axis=dim)
-    elif stat == "var":
-        if is_tensor:
-            return (
-                values.var(dim=dim).item()
-                if isinstance(dim, int)
-                else values.var().item()
-            )
-        return values.var(axis=dim)
-    elif stat == "argmax":
-        if is_tensor:
-            return (
-                values.argmax(dim=dim).item()
-                if isinstance(dim, int)
-                else values.argmax().item()
-            )
-        return values.argmax(axis=dim)
-    elif stat == "argmin":
-        if is_tensor:
-            return (
-                values.argmin(dim=dim).item()
-                if isinstance(dim, int)
-                else values.argmin().item()
-            )
-        return values.argmin(axis=dim)
-    elif stat == "cv":
-        # Coefficient of variation = std / mean
-        if is_tensor:
-            mean_val = values.mean(dim=dim) if isinstance(dim, int) else values.mean()
-            std_val = values.std(dim=dim) if isinstance(dim, int) else values.std()
-            cv = std_val / (mean_val + 1e-10)
-            return cv.item() if cv.numel() == 1 else cv
-        mean_val = values.mean(axis=dim)
-        std_val = values.std(axis=dim)
-        return std_val / (mean_val + 1e-10)
-    else:
-        raise ValueError(f"Unknown stat: {stat}")
-
-
-def _compute_stats_batch(
-    values: np.ndarray | torch.Tensor,
-    stats: list[str],
-    nan_policy: NanPolicy,
-    inf_policy: InfPolicy,
-    dim: int | tuple[int, ...] | None,
-) -> dict[str, Any]:
-    """Compute multiple stats efficiently, reusing mean/std for cv.
-
-    Returns dict mapping stat name to computed value.
-    """
-    # Import warnings here to avoid issues with torch.jit
-    import warnings
-
-    is_tensor = isinstance(values, torch.Tensor)
-
-    if nan_policy != "propagate":
-        has_nan = (
-            torch.isnan(values).any().item() if is_tensor else np.isnan(values).any()
-        )
-        if has_nan:
-            if nan_policy == "assert":
-                raise ValueError("NaN values found in input")
-            elif nan_policy == "warn":
-                warnings.warn("NaN values found in input", UserWarning)
-            if is_tensor:
-                values = values[~torch.isnan(values)]
-            else:
-                values = values[~np.isnan(values)]
-
-    if inf_policy != "propagate":
-        has_inf = (
-            torch.isinf(values).any().item() if is_tensor else np.isinf(values).any()
-        )
-        if has_inf:
-            if inf_policy == "assert":
-                raise ValueError("Inf values found in input")
-            elif inf_policy == "warn":
-                warnings.warn("Inf values found in input", UserWarning)
-            if is_tensor:
-                values = values[~torch.isinf(values)]
-            else:
-                values = values[~np.isinf(values)]
-
-    if dim is None:
-        if is_tensor:
-            values = values.flatten()
-        else:
-            values = values.flatten()
-        dim = 0
-
-    results = {}
-
-    # Pre-compute mean and std if needed (for cv optimization)
-    needs_mean = any(s in stats for s in ["mean", "cv"])
-    needs_std = "cv" in stats
-
-    if needs_mean:
-        if is_tensor:
-            mean_val = values.mean(dim=dim) if isinstance(dim, int) else values.mean()
-        else:
-            mean_val = values.mean(axis=dim)
-
-    if needs_std:
-        if is_tensor:
-            std_val = values.std(dim=dim) if isinstance(dim, int) else values.std()
-        else:
-            std_val = values.std(axis=dim)
-
-    for stat in stats:
-        if stat == "mean":
-            if is_tensor:
-                results[stat] = mean_val.item() if mean_val.numel() == 1 else mean_val
-            else:
-                results[stat] = mean_val
-        elif stat == "std":
-            if is_tensor:
-                val = values.std(dim=dim) if isinstance(dim, int) else values.std()
-                results[stat] = val.item() if val.numel() == 1 else val
-            else:
-                results[stat] = values.std(axis=dim)
-        elif stat == "var":
-            if is_tensor:
-                val = values.var(dim=dim) if isinstance(dim, int) else values.var()
-                results[stat] = val.item() if val.numel() == 1 else val
-            else:
-                results[stat] = values.var(axis=dim)
-        elif stat == "median":
-            if is_tensor:
-                val = (
-                    values.median(dim=dim).values
-                    if isinstance(dim, int)
-                    else values.median()
-                )
-                results[stat] = val.item() if val.numel() == 1 else val
-            else:
-                results[stat] = np.median(values, axis=dim)
-        elif stat == "max":
-            if is_tensor:
-                val = (
-                    values.max(dim=dim).values if isinstance(dim, int) else values.max()
-                )
-                results[stat] = val.item() if val.numel() == 1 else val
-            else:
-                results[stat] = values.max(axis=dim)
-        elif stat == "min":
-            if is_tensor:
-                val = (
-                    values.min(dim=dim).values if isinstance(dim, int) else values.min()
-                )
-                results[stat] = val.item() if val.numel() == 1 else val
-            else:
-                results[stat] = values.min(axis=dim)
-        elif stat == "argmax":
-            if is_tensor:
-                val = (
-                    values.argmax(dim=dim) if isinstance(dim, int) else values.argmax()
-                )
-                results[stat] = val.item() if val.numel() == 1 else val
-            else:
-                results[stat] = values.argmax(axis=dim)
-        elif stat == "argmin":
-            if is_tensor:
-                val = (
-                    values.argmin(dim=dim) if isinstance(dim, int) else values.argmin()
-                )
-                results[stat] = val.item() if val.numel() == 1 else val
-            else:
-                results[stat] = values.argmin(axis=dim)
-        elif stat == "cv":
-            cv = std_val / (mean_val + 1e-10)
-            if is_tensor:
-                results[stat] = cv.item() if cv.numel() == 1 else cv
-            else:
-                results[stat] = cv
-
-    return results
-
-
-def compute_stats_batch(
-    values: np.ndarray | torch.Tensor,
-    stats: list[StatChoice],
-    *,
-    nan_policy: NanPolicy = "skip",
-    inf_policy: InfPolicy = "propagate",
-    dim: int | tuple[int, ...] | None = None,
-) -> dict[str, Any]:
-    """Compute multiple statistics efficiently on an array or tensor.
-
-    This function optimizes computation by reusing mean and std calculations
-    when computing cv (coefficient of variation).
-
-    Works with both numpy arrays and PyTorch tensors, preserving the input type.
-
-    Args:
-        values: Input array or tensor
-        stats: List of statistics to compute
-        nan_policy: How to handle NaN values
-        inf_policy: How to handle Inf values
-        dim: Dimension(s) to aggregate over. If None, flattens all dimensions.
-
-    Returns:
-        Dict mapping each stat to its computed value
-
-    Example:
-        >>> import numpy as np
-        >>> data = np.random.randn(100)
-        >>> compute_stats_batch(data, ["mean", "std", "cv"])
-        {'mean': 0.1, 'std': 1.0, 'cv': 10.0}
-    """
-    return _compute_stats_batch(
-        values, [str(s) for s in stats], nan_policy, inf_policy, dim
-    )
+    return compute_stats_batch(
+        values, [stat], nan_policy=nan_policy, inf_policy=inf_policy, dim=dim
+    )[stat]
 
 
 def _unpack_result(
@@ -545,25 +384,117 @@ def _unpack_result(
         return (result,), {}
 
 
+class _Outputs:
+    """Resolve per-position values, info keys and dims of a decorated
+    result."""
+
+    def __init__(
+        self,
+        values: tuple[Any, ...],
+        value_key: str | dict[int, str],
+        dim: DimSpec = None,
+    ) -> None:
+        self.values = values
+        self.value_key = value_key
+        self.dim = dim
+
+    def get(self, pos: int) -> Any:
+        if pos < 0 or pos >= len(self.values):
+            raise IndexError(
+                f"Position {pos} out of range for return tuple "
+                f"of length {len(self.values)}"
+            )
+        return self.values[pos]
+
+    def key(self, pos: int) -> str:
+        """Info-key prefix of output ``pos`` used by :func:`use_stats`."""
+        if isinstance(self.value_key, dict):
+            return self.value_key.get(pos, f"values{pos}")
+        if len(self.values) > 1:
+            return f"{self.value_key}{pos}"
+        return self.value_key
+
+    def dim_for(self, pos: int) -> int | tuple[int, ...] | None:
+        if isinstance(self.dim, dict):
+            return self.dim.get(pos, None)
+        return self.dim
+
+
+def _percentile_key(value_key: str | dict[int, str], pos: int) -> str:
+    """Info-key prefix of output ``pos`` used by :func:`use_percentiles`."""
+    if isinstance(value_key, dict):
+        return value_key.get(pos, f"values{pos}")
+    return f"{value_key}{pos}"
+
+
+class StatsDecorated(Protocol):
+    """Signature of a function wrapped by :func:`use_stats`.
+
+    The positional/keyword arguments of the wrapped function are forwarded
+    unchanged; ``stat``, ``stat_info``, ``nan_policy`` and ``inf_policy`` are
+    added. The call always returns ``(*values, info)``.
+    """
+
+    def __call__(
+        self,
+        *args: Any,
+        stat: StatSpec = ...,
+        stat_info: StatInfoSpec = ...,
+        nan_policy: NanPolicy | None = ...,
+        inf_policy: InfPolicy | None = ...,
+        **kwargs: Any,
+    ) -> tuple[Any, ...]: ...
+
+
+class PercentilesDecorated(Protocol):
+    """Signature of a function wrapped by :func:`use_percentiles`.
+
+    The arguments of the wrapped function are forwarded unchanged and
+    ``percentiles`` is added. The call returns ``(*values, info)``.
+    """
+
+    def __call__(
+        self,
+        *args: Any,
+        percentiles: PercentileSpec = ...,
+        **kwargs: Any,
+    ) -> tuple[Any, ...]: ...
+
+
+@overload
+def use_stats(func: Callable[..., Any], /) -> StatsDecorated: ...
+
+
+@overload
 def use_stats(
-    func: Callable | None = None,
+    func: None = None,
+    /,
+    *,
+    value_key: str | dict[int, str] = ...,
+    dim: DimSpec = ...,
+    default_stat: StatSpec = ...,
+    default_stat_info: StatInfoSpec = ...,
+    default_nan_policy: NanPolicy = ...,
+    default_inf_policy: InfPolicy = ...,
+) -> Callable[[Callable[..., Any]], StatsDecorated]: ...
+
+
+def use_stats(
+    func: Callable[..., Any] | None = None,
+    /,
     *,
     value_key: str | dict[int, str] = "values",
-    dim: int | tuple[int, ...] | dict[int, int | tuple[int, ...] | None] | None = None,
-    default_stat: StatChoice | dict[int, StatChoice] | None = None,
-    default_stat_info: (
-        StatChoice
-        | Iterable[StatChoice]
-        | dict[int, StatChoice | Iterable[StatChoice]]
-        | None
-    ) = None,
+    dim: DimSpec = None,
+    default_stat: StatSpec = None,
+    default_stat_info: StatInfoSpec = None,
     default_nan_policy: NanPolicy = "skip",
     default_inf_policy: InfPolicy = "propagate",
-) -> Callable:
+) -> StatsDecorated | Callable[[Callable[..., Any]], StatsDecorated]:
     """Decorator to add stat and stat_info args for aggregation.
 
     This decorator adds `stat`, `stat_info`, `nan_policy`, and `inf_policy`
-    parameters to a function that returns per-neuron values.
+    parameters to a function that returns per-neuron values. The decorated
+    function always returns ``(*values, info)`` (see :class:`StatsDecorated`).
 
     - `stat`: If not None, returns the aggregated value instead of per-neuron
       values. The aggregation is stored in info[f"{value_key}_stat"].
@@ -602,6 +533,7 @@ def use_stats(
         default_nan_policy: Default nan_policy for this decorated function
         default_inf_policy: Default inf_policy for this decorated function
         default_stat: Default stat for this decorated function
+        default_stat_info: Default stat_info for this decorated function
 
     Returns:
         Decorated function with added stat, stat_info, nan_policy, and
@@ -609,12 +541,10 @@ def use_stats(
 
     Example:
         ```python
-        @use_stat
+        @use_stats
         def compute_metric(
             data,
             *,
-            stat=None,
-            stat_info=None,
             nan_policy="skip",
             inf_policy="propagate",
         ):
@@ -629,8 +559,8 @@ def use_stats(
         )  # extra stats in info
 
         # Multi-value return with dict stat:
-        @use_stat
-        def compute_multiple(data, *, stat=None, stat_info=None):
+        @use_stats
+        def compute_multiple(data):
             eci = compute_eci(data)  # per-neuron
             lag = compute_lag(data)  # per-neuron
             return eci, lag, {}  # multiple values
@@ -642,7 +572,7 @@ def use_stats(
         ```
     """
 
-    def decorator(f: Callable) -> Callable:
+    def decorator(f: Callable[..., Any]) -> StatsDecorated:
         # Inspect the wrapped function to determine what arguments it accepts
         sig = inspect.signature(f)
         f_accepts_nan_policy = "nan_policy" in sig.parameters
@@ -650,184 +580,57 @@ def use_stats(
 
         @wraps(f)
         def wrapper(
-            *args,
-            stat: StatChoice | dict[int, StatChoice] | None = default_stat,
-            stat_info: StatChoice
-            | Iterable[StatChoice]
-            | dict[int, StatChoice | Iterable[StatChoice]]
-            | None = default_stat_info,
+            *args: Any,
+            stat: StatSpec = default_stat,
+            stat_info: StatInfoSpec = default_stat_info,
             nan_policy: NanPolicy | None = None,
             inf_policy: InfPolicy | None = None,
-            **kwargs,
+            **kwargs: Any,
         ) -> tuple[Any, ...]:
-            # Use effective policies (passed value > decorator default > "skip")
-            effective_nan_policy = (
-                nan_policy if nan_policy is not None else default_nan_policy
-            )
-            effective_inf_policy = (
-                inf_policy if inf_policy is not None else default_inf_policy
-            )
+            # Use effective policies (passed value > decorator default)
+            nan_pol = nan_policy if nan_policy is not None else default_nan_policy
+            inf_pol = inf_policy if inf_policy is not None else default_inf_policy
+            policies = {"nan_policy": nan_pol, "inf_policy": inf_pol}
 
             # Pass policies to the wrapped function if it accepts them
             if f_accepts_nan_policy:
-                kwargs["nan_policy"] = effective_nan_policy
+                kwargs["nan_policy"] = nan_pol
             if f_accepts_inf_policy:
-                kwargs["inf_policy"] = effective_inf_policy
+                kwargs["inf_policy"] = inf_pol
 
-            # Call the original function
-            result = f(*args, **kwargs)
+            values_tuple, info = _unpack_result(f(*args, **kwargs), value_key)
+            outputs = _Outputs(values_tuple, value_key, dim)
+            updated_info = dict(info or {})
 
-            # Unpack result using shared helper
-            values_tuple, info = _unpack_result(result, value_key)
-
-            # Ensure info is a dict
-            if info is None:
-                info = {}
-
-            updated_info = dict(info)
-
-            # Helper to get value key name for a position
-            def _get_value_key_name(pos: int) -> str:
-                if isinstance(value_key, dict):
-                    return value_key.get(pos, f"values{pos}")
-                if len(values_tuple) > 1:
-                    return f"{value_key}{pos}"
-                return value_key
-
-            # Helper to get values at a position
-            def _get_values(pos: int) -> Any:
-                if pos < 0 or pos >= len(values_tuple):
-                    raise IndexError(
-                        f"Position {pos} out of range for return tuple "
-                        f"of length {len(values_tuple)}"
-                    )
-                return values_tuple[pos]
-
-            # Helper to get effective dim for a position
-            def _get_dim_for_pos(pos: int) -> int | tuple[int, ...] | None:
-                if dim is None:
-                    return None
-                if isinstance(dim, dict):
-                    return dim.get(pos, None)
-                return dim
-
-            # Handle stat parameter
             if stat is not None:
-                # Check if stat is a dict mapping positions to stats
-                if isinstance(stat, dict):
-                    # Multiple position aggregation with dict stat
-                    results = []
-                    for pos, stat_choice in stat.items():
-                        values = _get_values(pos)
-                        key_name = _get_value_key_name(pos)
-                        effective_dim = _get_dim_for_pos(pos)
-                        stat_value = _compute_stat(
-                            values,
-                            stat_choice,
-                            effective_nan_policy,
-                            effective_inf_policy,
-                            effective_dim,
-                        )
-                        results.append(stat_value)
-                        updated_info[key_name] = values
-                        updated_info[f"{key_name}_{stat_choice}"] = stat_value
-                    return tuple(results) + (updated_info,)
-                else:
-                    # Single stat - apply to position 0
-                    values = _get_values(0)
-                    key_name = _get_value_key_name(0)
-                    effective_dim = _get_dim_for_pos(0)
-                    stat_value = _compute_stat(
-                        values,
-                        stat,
-                        effective_nan_policy,
-                        effective_inf_policy,
-                        effective_dim,
+                # A single stat applies to output 0; a dict maps position->stat.
+                stat_map = stat if isinstance(stat, dict) else {0: stat}
+                aggregated = []
+                for pos, choice in stat_map.items():
+                    values = outputs.get(pos)
+                    key_name = outputs.key(pos)
+                    stat_value = compute_stat(
+                        values, choice, dim=outputs.dim_for(pos), **policies
                     )
+                    aggregated.append(stat_value)
                     updated_info[key_name] = values
-                    updated_info[f"{key_name}_{stat}"] = stat_value
-                    return stat_value, updated_info
+                    updated_info[f"{key_name}_{choice}"] = stat_value
+                return (*aggregated, updated_info)
 
-            # Handle stat_info parameter
             if stat_info is not None:
-                # Check if stat_info is a dict mapping positions to stats
-                if isinstance(stat_info, dict):
-                    # Dict format: {position: stat_or_stats}
-                    for pos, stats in stat_info.items():
-                        # Normalize to iterable
-                        if isinstance(stats, str):
-                            stats_list = [stats]
-                        else:
-                            stats_list = list(stats)
+                # A bare spec applies to output 0; a dict maps position->spec.
+                info_map = stat_info if isinstance(stat_info, dict) else {0: stat_info}
+                for pos, spec in info_map.items():
+                    names = [spec] if isinstance(spec, str) else list(spec)
+                    key_name = outputs.key(pos)
+                    batch = compute_stats_batch(
+                        outputs.get(pos), names, dim=outputs.dim_for(pos), **policies
+                    )
+                    for name in names:
+                        updated_info[f"{key_name}_{name}"] = batch[str(name)]
 
-                        # Use batch computation for efficiency
-                        values = _get_values(pos)
-                        key_name = _get_value_key_name(pos)
-                        effective_dim = _get_dim_for_pos(pos)
-                        if len(stats_list) > 1:
-                            batch_results = _compute_stats_batch(
-                                values,
-                                [str(s) for s in stats_list],
-                                effective_nan_policy,
-                                effective_inf_policy,
-                                effective_dim,
-                            )
-                            for s in stats_list:
-                                updated_info[f"{key_name}_{s}"] = batch_results[str(s)]
-                        else:
-                            # Single stat - no need for batch optimization
-                            stat_value = _compute_stat(
-                                values,
-                                stats_list[0],
-                                effective_nan_policy,
-                                effective_inf_policy,
-                                effective_dim,
-                            )
-                            updated_info[f"{key_name}_{stats_list[0]}"] = stat_value
-                else:
-                    # Original format: apply to position 0
-                    # Normalize to iterable
-                    if isinstance(stat_info, str):
-                        stat_info_list = [stat_info]
-                    else:
-                        stat_info_list = list(stat_info)
-
-                    # Use batch computation for efficiency (reuses mean/std for cv)
-                    values = _get_values(0)
-                    key_name = _get_value_key_name(0)
-                    effective_dim = _get_dim_for_pos(0)
-                    if len(stat_info_list) > 1:
-                        batch_results = _compute_stats_batch(
-                            values,
-                            [str(s) for s in stat_info_list],
-                            effective_nan_policy,
-                            effective_inf_policy,
-                            effective_dim,
-                        )
-                        for s in stat_info_list:
-                            updated_info[f"{key_name}_{s}"] = batch_results[str(s)]
-                    else:
-                        # Single stat - no need for batch optimization
-                        stat_value = _compute_stat(
-                            values,
-                            stat_info_list[0],
-                            effective_nan_policy,
-                            effective_inf_policy,
-                            effective_dim,
-                        )
-                        updated_info[f"{key_name}_{stat_info_list[0]}"] = stat_value
-
-                # Return original values with updated info
-                if len(values_tuple) > 1:
-                    return values_tuple + (updated_info,)
-                else:
-                    return (values_tuple[0], updated_info)
-
-            # No stat or stat_info - return original values with info
-            if len(values_tuple) > 1:
-                return values_tuple + (updated_info,)
-            else:
-                return (values_tuple[0], updated_info)
+            # Original values with the (possibly extended) info
+            return (*values_tuple, updated_info)
 
         return wrapper
 
@@ -839,17 +642,35 @@ def use_stats(
 # TODO: compat with use_stats
 #   the return value may become a scalar e.g. if use_stats(f)(stat="mean"),
 #   need to get the original value from info
+@overload
+def use_percentiles(func: Callable[..., Any], /) -> PercentilesDecorated: ...
+
+
+@overload
 def use_percentiles(
-    func: Callable | None = None,
+    func: None = None,
+    /,
+    *,
+    value_key: str | dict[int, str] = ...,
+    default_percentiles: float | tuple[float, ...] | None = ...,
+) -> Callable[[Callable[..., Any]], PercentilesDecorated]: ...
+
+
+def use_percentiles(
+    func: Callable[..., Any] | None = None,
+    /,
     *,
     value_key: str | dict[int, str] = "values",
     default_percentiles: float | tuple[float, ...] | None = None,
-) -> Callable:
+) -> PercentilesDecorated | Callable[[Callable[..., Any]], PercentilesDecorated]:
     """Decorator to add percentiles arg and optionally compute percentiles.
 
     This decorator adds a `percentiles` parameter to a function that returns
     per-neuron values. Percentiles are only computed if percentiles is not None.
-    Results are stored in info[f"{value_key}_percentile"].
+    Results are stored in info[f"{value_key}_percentiles"] and
+    info[f"{value_key}_levels"]. The decorated function returns whatever the
+    wrapped function returns when ``percentiles`` is None, otherwise
+    ``(*values, info)`` (see :class:`PercentilesDecorated`).
 
     Can also accept a dict mapping return positions to labels for functions
     returning multiple values (e.g., {1: "eci", 3: "lag"}).
@@ -862,6 +683,7 @@ def use_percentiles(
     Args:
         func: The function to decorate (or None if using with parentheses)
         value_key: Key to use in info dict for the percentile result
+        default_percentiles: Percentiles used when the caller passes none.
 
     Returns:
         Decorated function with added percentiles parameter
@@ -869,85 +691,55 @@ def use_percentiles(
     Example:
         ```python
         @use_percentiles
-        def compute_metric(data, *, percentiles=None):
+        def compute_metric(data):
             values = some_computation(data)  # per-neuron values
             return values, {"raw": values}
 
         # Usage:
         values, info = compute_metric(data)  # no percentiles computed
-        values, info = compute_metric(data, percentiles=0.5)  # compute median
+        values, info = compute_metric(data, percentiles=50)  # compute median
         values, info = compute_metric(
-            data, percentiles=(0.25, 0.5, 0.75)
+            data, percentiles=(25, 50, 75)
         )  # compute quartiles
         ```
     """
 
-    def decorator(f: Callable) -> Callable:
+    def decorator(f: Callable[..., Any]) -> PercentilesDecorated:
         @wraps(f)
         def wrapper(
-            *args,
-            percentiles: float
-            | tuple[float, ...]
-            | dict[int, float | tuple[float, ...]]
-            | None = default_percentiles,
-            **kwargs,
+            *args: Any,
+            percentiles: PercentileSpec = default_percentiles,
+            **kwargs: Any,
         ) -> tuple[Any, ...]:
-            # Call the original function
             result = f(*args, **kwargs)
             if percentiles is None:
                 return result
 
-            # Unpack result using shared helper
             values_tuple, info = _unpack_result(result, value_key)
+            outputs = _Outputs(values_tuple, value_key)
+            updated_info = dict(info or {})
 
-            # Ensure info is a dict
-            if info is None:
-                info = {}
-
-            updated_info = dict(info)
-
-            # Helper to get value key name for a position
-            def _get_value_key_name(pos: int) -> str:
-                if isinstance(value_key, dict):
-                    return value_key.get(pos, f"values{pos}")
-                return f"{value_key}{pos}"
-
-            # Helper to get values at a position
-            def _get_values(pos: int) -> Any:
-                if pos < 0 or pos >= len(values_tuple):
-                    raise IndexError(
-                        f"Position {pos} out of range for return tuple "
-                        f"of length {len(values_tuple)}"
-                    )
-                return values_tuple[pos]
-
+            # Resolve ``{position: (info key prefix, percentile levels)}``.
             if isinstance(percentiles, dict):
-                # Dict format: {position: percentile_value(s)}
-                # Allows different percentiles for different return values
-                for pos, perc_value in percentiles.items():
-                    values = _get_values(pos)
-                    key_name = _get_value_key_name(pos)
-                    perc_result = compute_percentiles(values, perc_value)
-                    updated_info[f"{key_name}_percentiles"] = perc_result["percentiles"]
-                    updated_info[f"{key_name}_levels"] = perc_result["levels"]
+                # Different percentiles for different return values
+                targets = {
+                    pos: (_percentile_key(value_key, pos), levels)
+                    for pos, levels in percentiles.items()
+                }
             elif isinstance(value_key, dict):
-                # Dict value_key with single percentiles value:
-                for pos, label in value_key.items():
-                    values = _get_values(pos)
-                    perc_result = compute_percentiles(values, percentiles)
-                    updated_info[f"{label}_percentiles"] = perc_result["percentiles"]
-                    updated_info[f"{label}_levels"] = perc_result["levels"]
+                # One percentiles value applied to every labelled output
+                targets = {
+                    pos: (label, percentiles) for pos, label in value_key.items()
+                }
             else:
-                # Single percentiles format - apply to position 0
-                values = _get_values(0)
-                perc_result = compute_percentiles(values, percentiles)
-                updated_info[f"{value_key}_percentiles"] = perc_result["percentiles"]
-                updated_info[f"{value_key}_levels"] = perc_result["levels"]
+                targets = {0: (value_key, percentiles)}
 
-            if len(values_tuple) > 1:
-                return values_tuple + (updated_info,)
-            else:
-                return values_tuple[0], updated_info
+            for pos, (key_name, levels) in targets.items():
+                perc = compute_percentiles(outputs.get(pos), levels)
+                updated_info[f"{key_name}_percentiles"] = perc["percentiles"]
+                updated_info[f"{key_name}_levels"] = perc["levels"]
+
+            return (*values_tuple, updated_info)
 
         return wrapper
 

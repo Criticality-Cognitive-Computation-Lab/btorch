@@ -33,49 +33,6 @@ def compute_fr_distribution(
     }
 
 
-def compute_cv_isi(
-    spikes: np.ndarray | torch.Tensor,
-    dt: float = 1.0,
-) -> dict:
-    """Compute the CV of the ISI for each neuron in the population and
-    characterize its distribution.
-
-    Args:
-        spikes: Spike matrix of shape ``(Time, Neurons)``.
-        dt: Simulation time step in ms.
-
-    Returns:
-        Dictionary with keys ``cv_isi`` and ``mean``.
-    """
-    if isinstance(spikes, torch.Tensor):
-        spikes = spikes.detach().cpu().numpy()
-
-    num_neurons = spikes.shape[1]
-    cv_isi_list = []
-
-    for n in range(num_neurons):
-        spike_times = np.where(spikes[:, n] > 0)[0] * dt  # convert to ms
-        if len(spike_times) < 2:
-            cv_isi_list.append(np.nan)  # fewer than two spikes: ISI undefined
-            continue
-
-        isis = np.diff(spike_times)
-        if np.mean(isis) == 0:
-            cv_isi_list.append(np.nan)
-            continue
-
-        cv_isi = np.std(isis) / np.mean(isis)
-        cv_isi_list.append(cv_isi)
-
-    cv_isi_array = np.array(cv_isi_list)
-    mean_cv_isi = np.nanmean(cv_isi_array)  # ignore NaNs when averaging
-
-    return {
-        "cv_isi": cv_isi_array,
-        "mean": mean_cv_isi,
-    }
-
-
 def compute_spike_distance(
     spikes: np.ndarray | torch.Tensor,
     dt: float = 1.0,
@@ -94,7 +51,8 @@ def compute_spike_distance(
         seed: Random seed for neuron sampling.
 
     Returns:
-        Mean SPIKE-distance across all neuron pairs.
+        Mean SPIKE-distance across all neuron pairs; ``float("nan")`` when
+        there are fewer than two neurons (no pair exists).
     """
     if isinstance(spikes, torch.Tensor):
         spikes = spikes.detach().cpu().numpy()
@@ -134,7 +92,6 @@ def compute_spike_distance(
         # searchsorted alone does not handle ties correctly at spike times,
         # so we fill with explicit linear scans instead.
 
-        # t_prev
         curr_spike = 0.0
         spike_idx = 0
         for t_idx, t in enumerate(times):
@@ -146,7 +103,6 @@ def compute_spike_distance(
                     curr_spike = spike_times[spike_idx]
             t_prev[n, t_idx] = curr_spike
 
-        # t_next
         curr_spike = times[-1]
         spike_idx = len(spike_times) - 1
         for t_idx in range(T_steps - 1, -1, -1):
@@ -187,6 +143,7 @@ def compute_spike_distance(
             pairwise_distances.append(dist)
 
     if not pairwise_distances:
-        return 0.0
+        # Fewer than two neurons: the pairwise distance is undefined.
+        return float("nan")
 
     return np.mean(pairwise_distances)

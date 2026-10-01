@@ -4,8 +4,8 @@ import pytest
 import torch
 
 from btorch.models import environ
-from btorch.models.dlif import DBNN, DLIF
 from btorch.models.functional import init_net_state, reset_net
+from btorch.models.neurons.dlif import DBNN, DLIF
 from btorch.models.rnn import make_rnn
 from tests.utils.compile import compile_or_skip
 

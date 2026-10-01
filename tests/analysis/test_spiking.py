@@ -597,11 +597,11 @@ class TestUtilityFunctions:
         )
 
         # Rate per neuron
-        fr = firing_rate(spikes, width=10, dt=1.0, axis=None)
+        fr = firing_rate(spikes, width=10, dt=1.0, batch_axis=None)
         assert fr.shape == spikes.shape
 
         # Population rate (average across neurons)
-        fr_pop = firing_rate(spikes, width=10, dt=1.0, axis=-1)
+        fr_pop = firing_rate(spikes, width=10, dt=1.0, batch_axis=-1)
         assert fr_pop.shape == (1000,)
 
         # Check rate is in reasonable range (0 to max possible)
@@ -611,7 +611,7 @@ class TestUtilityFunctions:
     def test_firing_rate_torch(self):
         """Test firing rate with torch tensors."""
         spikes = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
-        fr = firing_rate(spikes, width=3, dt=0.5, axis=None)
+        fr = firing_rate(spikes, width=3, dt=0.5, batch_axis=None)
         assert fr.shape == spikes.shape
         assert fr.dtype == spikes.dtype
 

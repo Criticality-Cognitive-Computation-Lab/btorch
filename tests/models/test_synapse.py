@@ -509,3 +509,156 @@ def test_psc_multistep_conv_compile_parity(psc_cls, T=16, n_neuron=4, kernel_len
     loss_compiled.backward()
 
     torch.testing.assert_close(z_seq.grad, z_seq_compiled.grad, atol=1e-5, rtol=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Spike-timing convention
+#
+# For EVERY PSC type, a spike delivered to ``single_step_forward`` at step t
+# must already change the psc returned at step t (first response at the
+# delivery step, exactly like ExponentialPSC).  The tests below pin the
+# closed-form impulse responses so any extra-dt latency is caught.
+# ---------------------------------------------------------------------------
+
+
+def _impulse_response(psc, T: int = 12, weight: float = 1.0) -> torch.Tensor:
+    """Feed a single weighted spike at step 0 and return psc for T steps."""
+    n = psc.size
+    z = torch.zeros(T, n)
+    z[0] = weight
+    init_net_state(psc, dtype=torch.float32)
+    return torch.stack([psc.single_step_forward(z[t]) for t in range(T)])[:, 0]
+
+
+def _identity(n: int = 1) -> torch.nn.Linear:
+    linear = torch.nn.Linear(n, n, bias=False)
+    torch.nn.init.eye_(linear.weight)
+    return linear
+
+
+def _closed_form_impulse(psc_cls, T: int, tau: float, tau_rise: float = 2.0):
+    t = torch.arange(T, dtype=torch.float32)
+    if psc_cls is ExponentialPSC:
+        a = torch.exp(torch.tensor(-1.0 / tau))
+        return a**t
+    if psc_cls is AlphaPSC:
+        a = torch.exp(torch.tensor(-1.0 / tau))
+        return (t + 1) * (1 - a) * a**t
+    if psc_cls is AlphaPSCBilleh:
+        a = torch.exp(torch.tensor(-1.0 / tau))
+        return (t + 1) * (torch.e / tau) * a ** (t + 1)
+    if psc_cls is DualExponentialPSC:
+        tau_d, tau_r = torch.tensor(tau), torch.tensor(tau_rise)
+        A = tau_d / (tau_d - tau_r) * (tau_r / tau_d) ** (tau_r / (tau_r - tau_d))
+        coef = (tau_d - tau_r) / tau_r / tau_d * A
+        a_d, a_r = torch.exp(-1.0 / tau_d), torch.exp(-1.0 / tau_r)
+        return coef * (a_d ** (t + 1) - a_r ** (t + 1))
+    raise ValueError(psc_cls)
+
+
+@pytest.mark.parametrize("psc_cls", PSC_CLASSES)
+def test_psc_spike_acts_in_delivery_step(psc_cls):
+    """A spike at step 0 changes psc at step 0 and matches the closed form."""
+    tau = 5.0
+    with environ.context(dt=1.0):
+        psc = _make_psc(psc_cls, n_neuron=1, tau_syn=tau, tau_decay=tau, tau_rise=2.0)
+        psc.linear = _identity(1)
+        out = _impulse_response(psc)
+    assert out[0].item() > 0.0, f"{psc_cls.__name__}: no response in delivery step"
+    expected = _closed_form_impulse(psc_cls, out.shape[0], tau)
+    torch.testing.assert_close(out, expected, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("psc_cls", PSC_CLASSES)
+def test_psc_kernel_matches_single_step_impulse(psc_cls):
+    """get_kernel is exactly the single-step impulse response."""
+    tau = 5.0
+    with environ.context(dt=1.0):
+        psc = _make_psc(psc_cls, n_neuron=1, tau_syn=tau, tau_decay=tau, tau_rise=2.0)
+        psc.linear = _identity(1)
+        out = _impulse_response(psc, T=16)
+        kernel = psc.get_kernel(1.0, 16)
+    torch.testing.assert_close(kernel, out, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("psc_cls", PSC_CLASSES)
+@pytest.mark.parametrize("delay", [2, 4])
+def test_delayed_psc_shifts_base_response_by_exactly_delay(psc_cls, delay):
+    """DelayedPSC(d) response == base response shifted right by d steps."""
+    tau, T = 5.0, 14
+    with environ.context(dt=1.0):
+        base = _make_psc(psc_cls, n_neuron=1, tau_syn=tau, tau_decay=tau, tau_rise=2.0)
+        base.linear = _identity(1)
+        ref = _impulse_response(base, T=T)
+
+        inner = _make_psc(psc_cls, n_neuron=1, tau_syn=tau, tau_decay=tau, tau_rise=2.0)
+        inner.linear = _identity(1)
+        delayed = DelayedPSC(inner, max_delay_steps=delay)
+        init_net_state(delayed, dtype=torch.float32)
+        z = torch.zeros(T, 1)
+        z[0] = 1.0
+        out = torch.stack([delayed.single_step_forward(z[t]) for t in range(T)])[:, 0]
+
+    assert torch.all(out[:delay] == 0)
+    torch.testing.assert_close(out[delay:], ref[: T - delay], atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("psc_cls", PSC_CLASSES)
+def test_heter_synapse_psc_spike_acts_in_delivery_step(psc_cls):
+    """HeterSynapsePSC (no delay) inherits the same-step convention."""
+    import pandas as pd
+
+    tau = 5.0
+    kwargs = (
+        {"tau_decay": tau, "tau_rise": 2.0}
+        if psc_cls is DualExponentialPSC
+        else {"tau_syn": tau}
+    )
+    with environ.context(dt=1.0):
+        syn = HeterSynapsePSC(
+            n_neuron=1,
+            n_receptor=1,
+            receptor_type_index=pd.DataFrame(
+                {"receptor_type": ["r"], "receptor_index": [0]}
+            ),
+            linear=_identity(1),
+            base_psc=psc_cls,
+            **kwargs,
+        )
+        init_net_state(syn, dtype=torch.float32)
+        z = torch.zeros(10, 1)
+        z[0] = 1.0
+        out = torch.stack([syn.single_step_forward(z[t]) for t in range(10)])[:, 0]
+    assert out[0].item() > 0.0
+    torch.testing.assert_close(
+        out, _closed_form_impulse(psc_cls, 10, tau), atol=1e-6, rtol=1e-5
+    )
+
+
+def test_bilinear_mixing_synapse_inherits_same_step_timing():
+    """BilinearMixingSynapse wraps a PSC: a spike acts in its delivery step.
+
+    With the bilinear weight/bias zeroed the output is the plain sum over
+    receptors, i.e. the base PSC response itself.
+    """
+    from btorch.models.synapse import BilinearMixingSynapse
+
+    T = 10
+    with environ.context(dt=1.0):
+        for psc_cls in (ExponentialPSC, AlphaPSC):
+            base = psc_cls(n_neuron=1, tau_syn=3.0, linear=_identity(1))
+            syn = BilinearMixingSynapse(1, 1, base)
+            with torch.no_grad():
+                syn.bilinear.weight.zero_()
+                syn.bilinear.bias.zero_()
+            z = torch.zeros(T, 1, 1)
+            z[0] = 1.0
+            init_net_state(syn, dtype=torch.float32)
+            single = torch.stack([syn.single_step_forward(z[t]) for t in range(T)])
+            assert single[0].item() > 0.0
+            init_net_state(syn, dtype=torch.float32)
+            multi = syn.multi_step_forward(z, kernel_len=T)
+            # Single-step input is treated as (batch=1, receptors); compare values.
+            torch.testing.assert_close(
+                single.reshape(T, -1), multi.reshape(T, -1), atol=1e-6, rtol=1e-5
+            )

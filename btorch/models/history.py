@@ -112,7 +112,6 @@ class SpikeHistory(MemoryModule):
             persistent: Whether buffer should be persistent in stateDict.
             skip_mem_name: Names of memories to skip initialization.
         """
-        # Initialize memories, skip cursor if using circular buffer
         if self.use_circular_buffer:
             super().init_state(
                 batch_size, dtype, device, persistent, skip_mem_name + ("_cursor",)
@@ -139,7 +138,6 @@ class SpikeHistory(MemoryModule):
         """
         super().reset(batch_size, dtype, device, skip_mem_name)
         if self.use_circular_buffer:
-            # Reset cursor
             self._cursor = torch.tensor(0, dtype=torch.long, device=self._cursor.device)
 
     def _get_history_with_delay_first(self) -> Tensor:
@@ -204,7 +202,6 @@ class SpikeHistory(MemoryModule):
                 "Call init_state() before first update()."
             )
 
-        # Convert spike to history dtype
         if spike.dtype != self.history.dtype:
             spike = spike.to(self.history.dtype)
 
@@ -217,33 +214,25 @@ class SpikeHistory(MemoryModule):
 
     def _update_circular(self, spike: Tensor) -> None:
         """Update using circular buffer (efficient for simulation)."""
-        # Get history in delay-first format
         history = self._get_history_with_delay_first()
 
-        # Store spike at current cursor position
         history[self._cursor] = spike
 
-        # Advance cursor (circular)
         self._cursor.fill_((self._cursor + 1) % self.max_delay)
 
-        # Store back if we permuted
         if history is not self.history:
             self._set_history_with_delay_first(history)
 
     def _update_cat(self, spike: Tensor) -> None:
         """Update using torch.cat (torch.compile compatible for training)."""
-        # Get history in delay-first format
         history = self._get_history_with_delay_first()
 
-        # Convert spike to history dtype and add delay dimension
         # spike: (*batch, *n_neuron) -> (1, *batch, *n_neuron)
         spike = spike.unsqueeze(0)
 
-        # Update history using cat
         # Drop the oldest entry, prepend the new spike
         new_history = torch.cat([spike, history[:-1]], dim=0)
 
-        # Store back if we permuted
         if history is not self.history:
             self._set_history_with_delay_first(new_history)
         else:
@@ -267,7 +256,6 @@ class SpikeHistory(MemoryModule):
                 "Increase max_delay_steps or use smaller delays."
             )
 
-        # Get history in delay-first format
         history = self._get_history_with_delay_first()
 
         if self.use_circular_buffer:
@@ -323,21 +311,15 @@ class SpikeHistory(MemoryModule):
         if n_delays > self.max_delay:
             raise IndexError(f"n_delays ({n_delays}) > max_delay ({self.max_delay})")
 
-        # Gather recent n_delays steps: (n_delays, *batch, *n_neuron)
         delays = [self.get_delay(d) for d in range(n_delays)]
         stacked = torch.stack(delays, dim=0)
 
         # stacked shape: (n_delays, *batch, *n_neuron)
         # We want: (*batch, size * n_delays) where size = product of n_neuron dims
 
-        # First flatten the neuron dimensions within each delay
         delays_flat, _ = flatten_neuron(stacked, self.n_neuron, self.size)
 
         # Permute to move delay dimension to the end: (*batch, size, n_delays)
-        n_batch_dims = delays_flat.ndim - 2
-        if n_batch_dims < 0:
-            n_batch_dims = 0
-
         perm = list(range(1, delays_flat.ndim)) + [0]
         permuted = delays_flat.permute(*perm)
 

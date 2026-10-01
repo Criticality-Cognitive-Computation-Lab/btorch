@@ -10,11 +10,11 @@
 
 | 函数 | 描述 |
 |----------|-------------|
-| `cv_from_spikes` | 每个神经元的 ISI 变异系数 |
-| `fano_factor_from_spikes` | Fano 因子（脉冲计数的方差/均值） |
-| `kurtosis_from_spikes` | 脉冲计数分布的峰度 |
-| `local_variation_from_spikes` | 局部变异度 (LV) - 与速率无关的不规则性 |
-| `raster_plot` | 提取用于绘图的脉冲时间/神经元索引 |
+| `isi_cv` | 每个神经元的 ISI 变异系数 |
+| `fano` | Fano 因子（脉冲计数的方差/均值） |
+| `kurtosis` | 脉冲计数分布的峰度 |
+| `local_variation` | 局部变异度 (LV) - 与速率无关的不规则性 |
+| `compute_raster` | 提取用于绘图的脉冲时间/神经元索引 |
 | `firing_rate` | 将脉冲卷积为发放率 |
 | `compute_spectrum` | 通过 Welch 方法计算功率谱 |
 
@@ -26,49 +26,31 @@
 **示例：**
 
 ```python
-from btorch.analysis.spiking import cv_from_spikes, fano_factor_from_spikes
+from btorch.analysis import fano, fano_sweep, isi_cv, local_variation
 
-# NumPy 输入，跨 trial 进行批次聚合
-cv, isi_total, isi_stats = cv_from_spikes(
-    spikes,           # 形状: [T, B, N] 
+# NumPy input with batch aggregation across trials
+cv, info = isi_cv(
+    spikes,               # shape: [T, B, N]
     dt=1.0,
-    batch_axis=(1,),      # 跨批次维度聚合
-    percentile=(0.1, 0.5, 0.9)  # 计算第 10、50、90 百分位数
+    batch_axis=(1,),      # aggregate across batch dimension
+    percentiles=(10, 50, 90),  # percentile levels in [0, 100]
 )
-# cv 形状: [N] - 每个神经元的 CV 值
-# isi_stats['percentile']: {'levels': (0.1, 0.5, 0.9), 'values': [...]}
+# cv shape: [N] - per-neuron CV values
+# info["cv_levels"], info["cv_percentiles"]: requested levels and their values
 
-# Torch GPU 输入
+# Torch GPU input: returns GPU tensor, uses hybrid CPU/GPU for efficiency
 import torch
-cv_gpu, _, _ = cv_from_spikes(
-    torch.from_numpy(spikes).cuda(),
-    dt=1.0,
-    batch_axis=(1,)
-)
-# 返回 GPU 张量，使用 CPU/GPU 混合模式以提高效率
+cv_gpu, _ = isi_cv(torch.from_numpy(spikes).cuda(), dt=1.0, batch_axis=(1,))
 
-# 使用滑动窗口的 Fano 因子
-fano, info = fano_factor_from_spikes(
-    spikes,
-    window=100,       # 以时间步长为单位的窗口大小
-    overlap=50,       # 窗口之间的重叠
-    percentile=0.9    # 计算神经元的第 90 百分位数
-)
+# Fano factor with overlapping counting windows, aggregated to one number
+ff, info = fano(spikes, window=100, overlap=50, stat="mean")
 
-# 扫描模式 - 计算所有窗口大小
-fano_sweep = fano_factor_from_spikes(
-    spikes,
-    sweep_window=True  # 返回每个窗口大小下带有 FF 的 [T, ...]
-)
+# Sweep over counting-window sizes 1..50
+ff_sweep, info = fano_sweep(spikes, window=50)
 
-# 局部变异度 (LV) - 比 CV 对速率变化的敏感度更低
-lv, lv_stats = local_variation_from_spikes(
-    spikes,
-    dt=1.0,
-    percentile=(0.25, 0.75)
-)
+# Local Variation (LV) - less sensitive to rate changes than CV
+lv, info = local_variation(spikes, dt=1.0, percentiles=(25, 75))
 ```
-
 ---
 
 ### `statistics.py`
@@ -156,7 +138,8 @@ lv, lv_stats = local_variation_from_spikes(
 
 | 模块 | 描述 |
 |--------|-------------|
-| `micro_scale.py` | ISI CV、爆发检测、发放率分布 |
+| `micro_scale.py` | 发放率分布、SPIKE 距离（ISI CV 见 `analysis.spiking.isi_cv`） |
+| `fano.py` | 速率补偿的 Fano 因子（操作时间、均值匹配、模型法） |
 | `complexity.py` | PCIst、表征对齐、增益稳定性 |
 | `criticality.py` | 雪崩分析、幂律拟合、DFA |
 | `attractor_dynamics.py` | 相空间重构、Kaplan-Yorke 维数 |
@@ -206,14 +189,14 @@ metrics, info = compute_ei_balance_full(
 ## 使用示例
 
 ```python
-from btorch.analysis.spiking import firing_rate, fano_factor_from_spikes
+from btorch.analysis.spiking import firing_rate, fano
 from btorch.analysis.branching import MR_estimation
 
 # 计算发放率
 fr = firing_rate(spikes, width=10, dt=0.1)
 
 # 跨窗口的 Fano 因子
-fano = fano_factor_from_spikes(spikes, window=100)
+ff, info = fano(spikes, window=100)
 
 # 分支比估计
 result = MR_estimation(spike_counts)

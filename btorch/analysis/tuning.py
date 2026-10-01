@@ -14,7 +14,7 @@ def get_fi_vi_curve(
     duration=1000,
     dt=1.0,
     device="cpu",
-):
+) -> dict[str, torch.Tensor]:
     """Run sweeps to generate f-I and V-I curves.
 
     Args:

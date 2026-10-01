@@ -75,7 +75,6 @@ def def_model(neuron_params, device, dtype):
         grad_checkpoint=False,
     )
 
-    # scale_net(module)
     init_net_state(module)
     uniform_v_(module.neuron, set_reset_value=True)
     module = module.to(device=device, dtype=dtype)
@@ -89,12 +88,8 @@ def run_sim(module, device, dtype):
     x = torch.ones([T, *module.neuron.n_neuron]) * 2
     x = x.to(device=device, dtype=dtype)
 
-    # reset_net_state(module)
-
     with environ.context(dt=float(dt)):
-        # x = x / module.neuron.neuron_scale
         spikes, states = module(x)
-        # states = unscale_state(module, states)
 
     return spikes, states
 
@@ -108,35 +103,38 @@ def test_torch_save_load(tmp_path, neuron_params, device, dtype):
     _, states_before = run_sim(module, device, dtype)
 
     # Capture states
-    memories_rv_before = named_memory_reset_values(module)
+    memory_reset_values_before = named_memory_reset_values(module)
 
     # Save everything
     model_path = tmp_path / "model.pt"
     torch.save(
         {
             "model_state": module.state_dict(),
-            "memories_rv": memories_rv_before,
+            "memory_reset_values": memory_reset_values_before,
             "hidden_states": hidden_states_before,
         },
         model_path,
     )
 
     # Recreate and load
-    module_loaded = def_model({}, device, dtype)
+    # Same structure (tau_ref buffer present; GLIF3's default is now None =
+    # refractory disabled) but different values, which load_state_dict must
+    # overwrite.
+    module_loaded = def_model({"tau_ref": 0.0}, device, dtype)
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
 
     module_loaded.load_state_dict(checkpoint["model_state"])
-    set_memory_reset_values(module_loaded, checkpoint["memories_rv"])
+    set_memory_reset_values(module_loaded, checkpoint["memory_reset_values"])
     set_hidden_states(module_loaded, checkpoint["hidden_states"])
 
     # Validate internal state restoration
-    memories_rv_after = named_memory_reset_values(module_loaded)
+    memory_reset_values_after = named_memory_reset_values(module_loaded)
     hidden_states_after = named_hidden_states(module_loaded)
 
-    for k in memories_rv_before:
+    for k in memory_reset_values_before:
         assert torch.allclose(
-            torch.as_tensor(memories_rv_before[k].value, device=device),
-            torch.as_tensor(memories_rv_after[k].value, device=device),
+            torch.as_tensor(memory_reset_values_before[k].value, device=device),
+            torch.as_tensor(memory_reset_values_after[k].value, device=device),
         ), f"Memory reset value mismatch for {k}"
 
     for k in hidden_states_before:

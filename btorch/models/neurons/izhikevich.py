@@ -14,7 +14,6 @@ from ...types import TensorLike
 from .. import environ
 from ..base import BaseNode
 from ..ode import euler_step
-from ..surrogate import Sigmoid
 
 
 class Izhikevich(BaseNode):
@@ -40,8 +39,9 @@ class Izhikevich(BaseNode):
         a: Recovery timescale (ms^-1). Default: 0.03.
         b: Recovery coupling (nS). Default: -2.0.
         d: Recovery jump (pA). Default: 100.0.
-        trainable_param: Trainable parameters. Default: ().
-        surrogate_function: Surrogate for backprop. Default: Sigmoid().
+        trainable_param: Trainable parameters. Default: None (empty).
+        surrogate_function: Surrogate for backprop. Default: None, which builds
+            a fresh Sigmoid() per neuron.
         detach_reset: Detach reset signal. Default: False.
         hard_reset: Hard vs soft reset. Default: False.
         pre_spike: Store pre-spike values. Default: False.
@@ -94,8 +94,8 @@ class Izhikevich(BaseNode):
         a: float | Float[TensorLike, " n_neuron"] = 0.03,
         b: float | Float[TensorLike, " n_neuron"] = -2.0,
         d: float | Float[TensorLike, " n_neuron"] = 100.0,
-        trainable_param: set[str] = set(),
-        surrogate_function: Callable = Sigmoid(),
+        trainable_param: set[str] | None = None,
+        surrogate_function: Callable | None = None,
         detach_reset: bool = False,
         hard_reset: bool = False,
         pre_spike: bool = False,

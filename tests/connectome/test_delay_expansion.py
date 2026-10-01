@@ -159,8 +159,8 @@ class TestExpandConnForDelays:
         assert conn_d.nnz == n_conns
 
 
-class TestMakeDelayedHeteroConn:
-    """Test combined delay + heterosynapse connection creation."""
+class TestMakeDelayedHetersynapseConn:
+    """Test combined delay + hetersynapse connection creation."""
 
     def _create_test_data(self):
         """Create test neurons and connections DataFrames."""
@@ -192,13 +192,13 @@ class TestMakeDelayedHeteroConn:
         return neurons, connections
 
     def test_delays_only(self):
-        """Test creating connection with delays but no heterosynapse."""
+        """Test creating connection with delays but no hetersynapse."""
         neurons, connections = self._create_test_data()
 
         conn, idx = make_hetersynapse_conn(
             neurons,
             connections,
-            receptor_type_col=None,  # No heterosynapse
+            receptor_type_col=None,  # No hetersynapse
             delay_col="delay_steps",
             n_delay_bins=5,
         )
@@ -209,8 +209,8 @@ class TestMakeDelayedHeteroConn:
         # Verify index describes columns (one per neuron)
         assert len(idx) == 3  # One row per neuron
 
-    def test_combined_delay_and_hetero(self):
-        """Test creating connection with both delays and heterosynapse."""
+    def test_combined_delay_and_hetersynapse(self):
+        """Test creating connection with both delays and hetersynapse."""
         neurons, connections = self._create_test_data()
 
         conn, idx = make_hetersynapse_conn(
@@ -243,7 +243,7 @@ class TestMakeDelayedHeteroConn:
         dense = conn.toarray()
 
         # Connection 0(E)->1(E) with delay=1
-        # In hetero matrix: post 1, pre E, post E -> receptor index for E->E
+        # In hetersynapse matrix: post 1, pre E, post E -> receptor index for E->E
         # Column = 1 * 4 + 0 = 4 (assuming E->E is index 0)
         # Row = 0 * 5 + 1 = 1 (delay=1)
         assert dense[1, 4] == 1.0, "Expected connection 0(E)->1(E) at row 1, col 4"
@@ -266,14 +266,14 @@ class TestMakeDelayedHeteroConn:
         # Verify total non-zero count matches input connections
         assert conn.nnz == len(connections)
 
-    def test_column_index_matches_heterosynapse(self):
-        """Test that column structure matches heterosynapse pattern."""
+    def test_column_index_matches_hetersynapse(self):
+        """Test that column structure matches hetersynapse pattern."""
         neurons, connections = self._create_test_data()
 
-        # First create heterosynapse only
+        # First create hetersynapse only
         from btorch.connectome.connection import make_hetersynapse_conn
 
-        conn_hetero, idx_hetero = make_hetersynapse_conn(
+        conn_hetersynapse, idx_hetersynapse = make_hetersynapse_conn(
             neurons,
             connections,
             receptor_type_col="EI",
@@ -290,11 +290,11 @@ class TestMakeDelayedHeteroConn:
             n_delay_bins=5,
         )
 
-        # The column dimension should be the same (heterosynapse structure unchanged)
-        assert conn_delayed.shape[1] == conn_hetero.shape[1]
+        # The column dimension should be the same (hetersynapse structure unchanged)
+        assert conn_delayed.shape[1] == conn_hetersynapse.shape[1]
 
-        # Column index should match heterosynapse index exactly
-        pd.testing.assert_frame_equal(idx_delayed, idx_hetero)
+        # Column index should match hetersynapse index exactly
+        pd.testing.assert_frame_equal(idx_delayed, idx_hetersynapse)
 
     def test_invalid_delay_column(self):
         """Test error when delay column doesn't exist."""

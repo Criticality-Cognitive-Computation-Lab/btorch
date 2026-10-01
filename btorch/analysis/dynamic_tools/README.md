@@ -58,9 +58,38 @@ These provide the foundational statistics of the population activity.
     -   $CV \approx 1$: Poisson-like (irregular/noisy).
     -   $CV \ll 1$: Regular/Clock-like.
     -   $CV > 1$: Bursting.
-    -   **Usage**: `compute_cv_isi`.
+    -   **Usage**: `btorch.analysis.isi_cv` (the single ISI-CV implementation; returns NaN for neurons with fewer than three spikes).
 -   **Spike Distance**: Quantifies similarity between spike trains (e.g., VP-distance or van Rossum).
     -   **Usage**: `compute_spike_distance`.
+
+## 5. Rate-compensated Fano factor (`fano.py`)
+**"Is spike-count variability independent of the firing rate?"**
+
+Rate-independent Fano-factor estimators (operational time, mean matching,
+modulated Poisson and flexible-overdispersion models) plus the unified
+`fano_compensated` / `compare_fano_methods` entry points. The plain Fano factor
+(`fano`, `fano_temporal`, `fano_sweep`, `fano_population`) lives in
+`btorch.analysis.spiking`.
+
+---
+
+## Failure Return Convention
+
+Every function in this package follows one rule: **a failed or undefined
+estimate is reported as NaN (never a fake 0), together with a `warnings.warn`
+when the failure is unexpected.** The shape of the failure value mirrors the
+shape of a successful result:
+
+| Success return | Failure return |
+|----------------|----------------|
+| scalar `float` (e.g. `compute_dfa`, `compute_pcist`, `compute_spike_distance`) | `float("nan")` |
+| `(exponent, fit)` pairs (power-law / scaling fits) | `(np.nan, None)` |
+| arrays (e.g. per-neuron CV, per-gain Lyapunov values) | same shape, NaN in the failed entries |
+| dict of results (e.g. `compute_avalanche_statistics`) | same keys, NaN exponents and `None` fit objects |
+
+Invalid *arguments* (wrong shapes, non-square matrices, ...) raise
+`ValueError`; NaN is reserved for "the data does not allow an estimate". Each
+function docstring states its own failure return under `Returns`.
 
 ---
 

@@ -13,9 +13,6 @@ from . import simple_id_to_root_id
 from .augment import IdType
 
 
-# Defined here rather than imported from ``btorch.models`` to keep the connectome
-# package free of a dependency on the (heavier) models package. The values mirror
-# ``btorch.models.connection_conversion.ReceptorTypeMode``.
 ReceptorTypeMode = Literal["neuron", "connection"]
 ConstraintMode = Literal["full", "cell_only", "cell_and_receptor"]
 DropNaMode = Literal["error", "filter", "unknown"]
@@ -336,7 +333,7 @@ def make_hetersynapse_conn(
     delay_col: str | None = None,
     n_delay_bins: int = 5,
 ) -> tuple[scipy.sparse.sparray, pd.DataFrame] | tuple[OrderedDict, pd.DataFrame]:
-    """Transforms a connectivity matrix to represent heterosynaptic connections
+    """Transforms a connectivity matrix to represent hetersynaptic connections
     based on receptor types, with optional delay support.
 
     This function can handle two modes:
@@ -407,7 +404,7 @@ def make_hetersynapse_conn(
     if delay_col is not None and not isinstance(connections, pd.DataFrame):
         raise ValueError("delay_col can only be used with DataFrame connections")
 
-    # Handle delays-only case (no heterosynapse expansion)
+    # Handle delays-only case (no hetersynapse expansion)
     if receptor_type_col is None:
         if not isinstance(connections, pd.DataFrame):
             raise ValueError(
@@ -717,7 +714,7 @@ def make_hetersynapse_constraint(
         ignore_post_type: If True, constraints ignore post-receptor type.
 
     Returns:
-        scipy.sparse.sparray: Sparse array matching heterosynapse connection shape,
+        scipy.sparse.sparray: Sparse array matching hetersynapse connection shape,
             where each non-zero value is a group ID for that connection.
     """
     # First get the basic cell type constraint
@@ -789,22 +786,26 @@ def make_hetersynapse_constraint(
     tmp_conns["pre_cell_type"] = tmp_conns["pre_root_id"].map(root_id_to_cell_type)
     tmp_conns["post_cell_type"] = tmp_conns["post_root_id"].map(root_id_to_cell_type)
 
-    # Get heterosynapse connection matrix to know the expanded structure
+    # Get hetersynapse connection matrix to know the expanded structure
     conn_mat = conn_mat.tocoo()
 
-    hetero_conn_df = pd.DataFrame(
+    hetersynapse_conn_df = pd.DataFrame(
         {
             "pre": conn_mat.row,
-            "post_hetero": conn_mat.col,
+            "post_hetersynapse": conn_mat.col,
         }
     )
 
     # Map back to original post neuron and receptor index
     n_receptor_pairs = len(receptor_idx)
-    hetero_conn_df["post"] = hetero_conn_df["post_hetero"] // n_receptor_pairs
-    hetero_conn_df["receptor_idx"] = hetero_conn_df["post_hetero"] % n_receptor_pairs
+    hetersynapse_conn_df["post"] = (
+        hetersynapse_conn_df["post_hetersynapse"] // n_receptor_pairs
+    )
+    hetersynapse_conn_df["receptor_idx"] = (
+        hetersynapse_conn_df["post_hetersynapse"] % n_receptor_pairs
+    )
 
-    hetero_conn_df = hetero_conn_df.merge(
+    hetersynapse_conn_df = hetersynapse_conn_df.merge(
         receptor_idx, left_on="receptor_idx", right_on="receptor_index", how="left"
     )
 
@@ -812,7 +813,7 @@ def make_hetersynapse_constraint(
     original_conn_df = tmp_conns[
         ["pre_simple_id", "post_simple_id", "pre_cell_type", "post_cell_type"]
     ]
-    hetero_conn_df = hetero_conn_df.merge(
+    hetersynapse_conn_df = hetersynapse_conn_df.merge(
         original_conn_df,
         left_on=["pre", "post"],
         right_on=["pre_simple_id", "post_simple_id"],
@@ -823,11 +824,11 @@ def make_hetersynapse_constraint(
         # Each (pre_cell_type, post_cell_type, pre_receptor, post_receptor)
         # gets unique ID
         if ignore_post_type:
-            constraint_key = hetero_conn_df[
+            constraint_key = hetersynapse_conn_df[
                 ["pre_cell_type", "post_cell_type", "receptor_type"]
             ].agg(tuple, axis=1)
         elif receptor_type_mode == "neuron":
-            constraint_key = hetero_conn_df[
+            constraint_key = hetersynapse_conn_df[
                 [
                     "pre_cell_type",
                     "post_cell_type",
@@ -836,35 +837,38 @@ def make_hetersynapse_constraint(
                 ]
             ].agg(tuple, axis=1)
         else:
-            constraint_key = hetero_conn_df[
+            constraint_key = hetersynapse_conn_df[
                 ["pre_cell_type", "post_cell_type", "receptor_type"]
             ].agg(tuple, axis=1)
     else:  # "cell_and_receptor"
         # Group by cell type and receptor category (E-E, E-I, I-E, I-I)
         if ignore_post_type:
-            constraint_key = hetero_conn_df[
+            constraint_key = hetersynapse_conn_df[
                 ["pre_cell_type", "post_cell_type", "receptor_type"]
             ].agg(tuple, axis=1)
         elif receptor_type_mode == "neuron":
-            hetero_conn_df["receptor_category"] = (
-                hetero_conn_df["pre_receptor_type"].astype(str)
+            hetersynapse_conn_df["receptor_category"] = (
+                hetersynapse_conn_df["pre_receptor_type"].astype(str)
                 + "-"
-                + hetero_conn_df["post_receptor_type"].astype(str)
+                + hetersynapse_conn_df["post_receptor_type"].astype(str)
             )
-            constraint_key = hetero_conn_df[
+            constraint_key = hetersynapse_conn_df[
                 ["pre_cell_type", "post_cell_type", "receptor_category"]
             ].agg(tuple, axis=1)
         else:
-            constraint_key = hetero_conn_df[
+            constraint_key = hetersynapse_conn_df[
                 ["pre_cell_type", "post_cell_type", "receptor_type"]
             ].agg(tuple, axis=1)
 
-    hetero_conn_df["constraint_group_id"] = pd.factorize(constraint_key)[0] + 1
+    hetersynapse_conn_df["constraint_group_id"] = pd.factorize(constraint_key)[0] + 1
 
     return scipy.sparse.coo_array(
         (
-            hetero_conn_df["constraint_group_id"].values,
-            (hetero_conn_df["pre"].values, hetero_conn_df["post_hetero"].values),
+            hetersynapse_conn_df["constraint_group_id"].values,
+            (
+                hetersynapse_conn_df["pre"].values,
+                hetersynapse_conn_df["post_hetersynapse"].values,
+            ),
         ),
         shape=conn_mat.shape,
     )
@@ -881,7 +885,7 @@ def make_hetersynapse_constrained_conn(
     dropna: DropNaMode = "error",
     ignore_post_type: bool = False,
 ) -> tuple[scipy.sparse.sparray, scipy.sparse.sparray, pd.DataFrame]:
-    """Create both heterosynaptic connection and constraint matrices.
+    """Create both hetersynaptic connection and constraint matrices.
 
     This is a convenience function that combines make_hetersynapse_conn and
     make_hetersynapse_constraint to produce outputs ready for SparseConstrainedConn.

@@ -62,7 +62,9 @@ def do_bench(
 
     Supports both CPU wall-clock timing and GPU CUDA event timing.
     Warmup and repetition can be specified as iteration counts (int)
-    or durations in milliseconds (float).
+    or durations in milliseconds (float). In duration mode at least one
+    measurement is always taken, even if ``rep`` is shorter than a single
+    call.
 
     Args:
         fn: Function to benchmark (callable with no arguments).
@@ -185,7 +187,8 @@ def do_bench(
             if len(times) >= rep:
                 break
         else:
-            if (time.perf_counter() - rep_start) * 1000 >= rep:
+            # Always take at least one sample, even for a tiny ``rep`` budget.
+            if times and (time.perf_counter() - rep_start) * 1000 >= rep:
                 break
         if grad_to_none is not None:
             for x in grad_to_none:
@@ -205,4 +208,11 @@ def do_bench(
         if len(ret) == 1:
             ret = ret[0]
         return ret
+    if return_mode == "all":
+        return {
+            "min": times.min().item(),
+            "max": times.max().item(),
+            "mean": times.mean().item(),
+            "median": times.median().item(),
+        }
     return getattr(torch, return_mode)(times).item()

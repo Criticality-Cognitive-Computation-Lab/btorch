@@ -56,10 +56,8 @@ def _estimate_rate_numpy(
     else:
         window_bins = max(1, int(window_ms / dt))
 
-    # Simple moving average for rate estimation
     kernel = np.ones(window_bins) / (window_bins * dt / 1000.0)
 
-    # Convolve along time axis for each neuron independently
     rate = np.apply_along_axis(
         lambda x: np.convolve(x, kernel, mode="same"),
         axis=0,
@@ -86,7 +84,6 @@ def _estimate_rate_torch(
     # Pad with edge values to handle boundaries
     pad = window_bins // 2
 
-    # Handle different dimensions
     original_shape = spikes.shape
     if spikes.ndim == 1:
         spikes = spikes.unsqueeze(-1)  # [T, 1]
@@ -105,15 +102,12 @@ def _estimate_rate_torch(
     end_idx = start_idx + T
     moving_sum = moving_sum[start_idx:end_idx]
 
-    # Ensure correct shape
     if moving_sum.shape[0] < T:
-        # Pad if needed
         pad_right = T - moving_sum.shape[0]
         moving_sum = torch.nn.functional.pad(moving_sum, (0, 0, 0, pad_right))
 
     rate = moving_sum / (window_bins * dt / 1000.0)
 
-    # Restore original shape
     rate = rate.reshape(original_shape)
 
     return torch.clamp(rate, min=1e-6)
@@ -224,7 +218,6 @@ def _compute_operational_fano_numpy(
     mean_norm = np.mean(normalized_counts, axis=0)
     var_norm = np.var(normalized_counts, axis=0, ddof=1)
 
-    # Operational Fano factor
     fano_op = np.zeros(n_neurons)
     valid = (mean_norm > 0) & np.isfinite(var_norm)
     fano_op[valid] = var_norm[valid] / mean_norm[valid]
@@ -316,24 +309,20 @@ def _compute_operational_fano_torch(
     window_duration_s = window_bins * dt / 1000.0
     expected_counts = mean_rate * window_duration_s
 
-    # Normalized counts
     normalized_counts = counts / (expected_counts.unsqueeze(0) + 1e-12)
 
     mean_norm = torch.mean(normalized_counts, dim=0)
     var_norm = torch.var(normalized_counts, dim=0, unbiased=True)
 
-    # Operational Fano factor
     fano_op = torch.zeros(n_neurons, device=device)
     valid = (mean_norm > 0) & torch.isfinite(var_norm)
     fano_op[valid] = var_norm[valid] / mean_norm[valid]
 
-    # Reshape
     if rest_shape:
         fano_op = fano_op.reshape(rest_shape)
     elif n_neurons == 1:
         fano_op = fano_op[0]
 
-    # Batch aggregation
     if batch_axis is not None:
         fano_op = torch.mean(fano_op, dim=tuple(batch_axis))
 
@@ -459,7 +448,6 @@ def _compute_mean_matching_weights_numpy(
 
     bin_edges = np.linspace(mean_min, mean_max, n_bins + 1)
 
-    # Count per bin for each condition
     counts_per_condition = np.zeros((n_conditions, n_bins))
     for c in range(n_conditions):
         valid_means = means[c, ~np.isnan(means[c])]
@@ -576,7 +564,6 @@ def _compute_weighted_fano_numpy(
 
     weighted_mean = np.nansum(spike_counts * weights_normalized, axis=0)
 
-    # Weighted variance
     V1 = np.nansum(weights, axis=0)
     V2 = np.nansum(weights**2, axis=0)
 
@@ -588,7 +575,6 @@ def _compute_weighted_fano_numpy(
         / denom
     )
 
-    # Fano factor
     fano = np.full_like(weighted_mean, np.nan)
     valid = (weighted_mean > 0) & (weighted_var >= 0)
     fano[valid] = weighted_var[valid] / weighted_mean[valid]
@@ -603,16 +589,13 @@ def _compute_weighted_fano_torch(
     """Torch implementation of weighted Fano factor."""
     valid_mask = ~torch.isnan(spike_counts) & ~torch.isnan(weights)
 
-    # Normalize weights
     weight_sums = torch.sum(weights * valid_mask.float(), dim=0, keepdim=True)
     weights_normalized = torch.where(
         valid_mask, weights / (weight_sums + 1e-12), torch.zeros_like(weights)
     )
 
-    # Weighted mean
     weighted_mean = torch.sum(spike_counts * weights_normalized, dim=0)
 
-    # Weighted variance
     V1 = torch.sum(weights * valid_mask.float(), dim=0)
     V2 = torch.sum((weights**2) * valid_mask.float(), dim=0)
 
@@ -623,7 +606,6 @@ def _compute_weighted_fano_torch(
         / denom
     )
 
-    # Fano factor
     fano = torch.full_like(weighted_mean, float("nan"))
     valid = (weighted_mean > 0) & (weighted_var >= 0)
     fano[valid] = weighted_var[valid] / weighted_mean[valid]
@@ -696,7 +678,6 @@ def fano_mean_matching(
 
     n_conditions = spikes.shape[1]
 
-    # Flatten non-time, non-condition dimensions
     rest_shape = spikes.shape[2:]
     spike_flat = spikes.reshape(T, n_conditions, -1)
     n_neurons_flat = spike_flat.shape[2]
@@ -728,7 +709,6 @@ def fano_mean_matching(
         window_spikes = spike_flat[start:end]  # [window, n_conditions, n_neurons]
         counts[w] = window_spikes.sum(dim=0) if is_torch else window_spikes.sum(axis=0)
 
-    # Compute mean per condition (across windows)
     if is_torch:
         means = counts.mean(dim=0)  # [n_conditions, n_neurons]
     else:
@@ -750,7 +730,6 @@ def fano_mean_matching(
             weights.repeat(n_windows, axis=0),
         )
 
-    # Reshape to original non-time, non-condition dimensions
     fano_mm = fano_mm.reshape(rest_shape)
 
     if batch_axis is not None:
@@ -1000,7 +979,6 @@ def fano_model_based(
         empirical_mean = counts.mean(axis=0)
         empirical_var = counts.var(axis=0, ddof=1)
 
-    # Compute model-based prediction
     if model == "modulated_poisson":
         gain_mean = model_params.get("gain_mean", 1.0)
         gain_var = model_params.get("gain_var", 0.5)
@@ -1054,7 +1032,6 @@ def fano_model_based(
     else:
         raise ValueError(f"Unknown model: {model}")
 
-    # Reshape to original non-time dimensions
     rest_shape = spikes.shape[1:]
     fano_model = fano_model.reshape(rest_shape)
 
@@ -1164,7 +1141,6 @@ def compare_fano_methods(
     """
     results: dict[str, Any] = {}
 
-    # Standard Fano factor (no compensation)
     from btorch.analysis.spiking import fano as standard_fano
 
     results["standard"], _ = standard_fano(

@@ -39,8 +39,8 @@ class Conv1dSpatial(nn.Conv1d):
         n_neighbor: int,
         include_self: bool = True,
         bias: bool = False,
-        device=None,
-        dtype=None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
     ):
         self.include_self = include_self
         self.n_neighbor = n_neighbor
@@ -107,12 +107,10 @@ class Conv1dSpatial(nn.Conv1d):
             index=neighbor_indices_expanded,
         )  # Shape: (..., in_channels, n_neurons, kernel_size)
 
-        # Step 2: Apply matrix multiplication
         # self.weight shape: (out_channels, in_channels, kernel_size)
         # x_neighbors shape: (..., in_channels, n_neurons, kernel_size)
         # We want: (..., out_channels, n_neurons)
 
-        # Rearrange for matrix multiplication
         # Move kernel_size to the end and combine with in_channels
         x_reshaped = x_neighbors.permute(*range(len(leading_dims)), -2, -3, -1)
         # Shape: (..., n_neurons, in_channels, kernel_size)

@@ -23,19 +23,18 @@ import torch
 from matplotlib.figure import Figure
 
 from ..analysis.aggregation import agg_by_neuron, agg_by_neuropil
-from ..analysis.dynamic_tools.micro_scale import compute_cv_isi
-from ..analysis.spiking import fano
+from ..analysis.spiking import fano, isi_cv
+from ..utils.array import to_numpy
 
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
 
 
-def _to_numpy(data) -> np.ndarray:
-    """Convert torch.Tensor to numpy array."""
-    if isinstance(data, torch.Tensor):
-        return data.detach().cpu().numpy()
-    return np.asarray(data)
+def _isi_cv_stats(spikes: np.ndarray, dt: float) -> dict:
+    """Per-neuron ISI CV (NaN below three spikes) and its NaN-aware mean."""
+    cv_values, _ = isi_cv(spikes, dt=dt)
+    return {"cv_isi": cv_values, "mean": np.nanmean(cv_values)}
 
 
 @dataclass
@@ -196,7 +195,7 @@ def plot_multiscale_fano(
     if spikes is None:
         raise ValueError("spikes is required")
 
-    spikes = _to_numpy(spikes)
+    spikes = to_numpy(spikes)
     n_time, n_neurons = spikes.shape
 
     # Default windows: logarithmically spaced
@@ -440,7 +439,7 @@ def plot_dfa_analysis(
     if spikes is None:
         raise ValueError("spikes is required")
 
-    spikes = _to_numpy(spikes)
+    spikes = to_numpy(spikes)
 
     # Compute DFA
     from ..analysis.dynamic_tools.criticality import compute_dfa
@@ -537,10 +536,10 @@ def plot_isi_cv(
     if spikes is None:
         raise ValueError("spikes is required")
 
-    spikes = _to_numpy(spikes)
+    spikes = to_numpy(spikes)
 
     # Compute ISI CV
-    cv_results = compute_cv_isi(spikes, dt=dt)
+    cv_results = _isi_cv_stats(spikes, dt)
     cv_values = cv_results["cv_isi"]
 
     # Create figure based on mode
@@ -616,7 +615,7 @@ def plot_avalanche_analysis(
     """
     from ..analysis.dynamic_tools.criticality import compute_avalanche_statistics
 
-    spikes = _to_numpy(spikes)
+    spikes = to_numpy(spikes)
     results = compute_avalanche_statistics(spikes, bin_size=bin_size)
 
     fig = plt.figure(figsize=(15, 4))
@@ -661,7 +660,7 @@ def plot_avalanche_analysis(
 
         # Plot fit
         if not np.isnan(results["gamma"]):
-            if "gamma_stats" in results and "popt" in results["gamma_stats"]:
+            if results.get("gamma_stats") and "popt" in results["gamma_stats"]:
                 popt = results["gamma_stats"]["popt"]
                 a, gamma = popt
                 x_fit = np.logspace(
@@ -724,7 +723,7 @@ def plot_eigenvalue_spectrum(
         compute_structural_eigenvalue_outliers,
     )
 
-    W = _to_numpy(weight_matrix)
+    W = to_numpy(weight_matrix)
     results = compute_structural_eigenvalue_outliers(W)
 
     if ax is None:
@@ -796,7 +795,7 @@ def plot_lyapunov_spectrum(
         compute_kaplan_yorke_dimension,
     )
 
-    spec = _to_numpy(spectrum)
+    spec = to_numpy(spectrum)
     # Sort descending just in case, though standard is descending
     spec = np.sort(spec)[::-1]
 
@@ -848,7 +847,7 @@ def plot_firing_rate_distribution(
     """
     from ..analysis.dynamic_tools.micro_scale import compute_fr_distribution
 
-    spikes = _to_numpy(spikes)
+    spikes = to_numpy(spikes)
     stats = compute_fr_distribution(spikes, dt=dt)
 
     if ax is None:
@@ -879,7 +878,6 @@ def plot_firing_rate_distribution(
 def plot_micro_dynamics(
     spikes: np.ndarray | torch.Tensor,
     dt: float = 1.0,
-    ax: Axes | None = None,
 ) -> tuple[Figure, dict]:
     """Plot firing rate and ISI CV distributions side-by-side.
 
@@ -890,7 +888,6 @@ def plot_micro_dynamics(
     Args:
         spikes: Spike matrix with shape (time, neurons).
         dt: Timestep in milliseconds.
-        ax: Unused parameter (kept for API compatibility).
 
     Returns:
         Tuple of (figure, stats) where stats is a dict with keys:
@@ -901,8 +898,6 @@ def plot_micro_dynamics(
         >>> fig, stats = plot_micro_dynamics(spikes, dt=1.0)
         >>> print(f"Rate: {stats['fr']['mean']:.1f} Hz, CV: {stats['cv']['mean']:.2f}")
     """
-    from ..analysis.dynamic_tools.micro_scale import compute_cv_isi
-
     # Plot FR
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
@@ -910,8 +905,8 @@ def plot_micro_dynamics(
 
     # Plot CV (Re-implementing simplified version or using plot_isi_cv logic)
     # reusing logic from plot_isi_cv for consistency but without full overhead
-    spikes_np = _to_numpy(spikes)
-    cv_results = compute_cv_isi(spikes_np, dt=dt)
+    spikes_np = to_numpy(spikes)
+    cv_results = _isi_cv_stats(spikes_np, dt)
     cv_values = cv_results["cv_isi"]
     valid_cv = cv_values[~np.isnan(cv_values)]
 

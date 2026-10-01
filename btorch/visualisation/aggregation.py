@@ -9,7 +9,7 @@ import pandas as pd
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
-from ..analysis.aggregation import agg_by_neuropil, group_ecdf, group_values
+from ..analysis.aggregation import AggName, agg_by_neuropil, group_ecdf, group_values
 from ..types import TensorLike
 
 
@@ -177,7 +177,7 @@ def plot_neuropil_timeseries_overview(
     *,
     dt: float,
     mode: Literal["top_innervated", "all_innervated"] = "all_innervated",
-    agg: Literal["mean", "sum", "std"] = "mean",
+    agg: AggName = "mean",
     connections: pd.DataFrame | None = None,
     neurons: pd.DataFrame | None = None,
     kind: Literal["wave", "heatmap"] = "wave",
@@ -259,7 +259,7 @@ def plot_neuropil_timeseries_panels(
     *,
     dt: float,
     mode: Literal["top_innervated", "all_innervated"] = "all_innervated",
-    agg: Literal["mean", "sum", "std"] = "mean",
+    agg: AggName = "mean",
     connections: pd.DataFrame | None = None,
     neurons: pd.DataFrame | None = None,
     regions: Sequence[str] | None = None,
@@ -368,7 +368,7 @@ def _resolve_neuropil_traces(
     data: TensorLike | Mapping[str, TensorLike],
     *,
     mode: Literal["top_innervated", "all_innervated"],
-    agg: Literal["mean", "sum", "std"],
+    agg: AggName,
     connections: pd.DataFrame | None,
     neurons: pd.DataFrame | None,
     use_polars: bool,

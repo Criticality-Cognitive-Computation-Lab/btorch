@@ -91,9 +91,7 @@ class PlainRNN(LoopRNN):
     _multi_step_forward_impl = inspect.unwrap(
         RecurrentNNAbstract._multi_step_forward_impl
     )
-    _process_large_chunk_impl = inspect.unwrap(
-        RecurrentNNAbstract._process_large_chunk_impl
-    )
+    _run_chunk_steps = inspect.unwrap(RecurrentNNAbstract._run_chunk_steps)
 
 
 class RegionRNN(PlainRNN):

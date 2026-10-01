@@ -10,11 +10,15 @@ preserving.  Two complementary layers are used:
    signature of a figure is a JSON-friendly description of every axes (visibility,
    title, labels, limits, artist counts, checksums of line/scatter data and of
    scatter colours, legend entries, text strings).  Signatures are compared
-   against ``timeseries_characterization.golden`` which was recorded from
-   the unrefactored implementation.
+   against ``timeseries_characterization.json``.  The fixture records the
+   numpy and matplotlib versions it was generated with (key ``_meta``);
+   layout/colour checksums depend on them, so the golden comparison is
+   *skipped* when the installed versions differ.
 
-To regenerate the golden file after an *intentional* behaviour change run::
+To regenerate the golden file after an *intentional* behaviour change (or on
+a new numpy/matplotlib version) delete it and run::
 
+    rm tests/visualisation/timeseries_characterization.json
     BTORCH_UPDATE_GOLDEN=1 pytest \
         tests/visualisation/test_timeseries_characterization.py
 """
@@ -49,7 +53,12 @@ from btorch.visualisation.timeseries import (  # noqa: E402
 )
 
 
-GOLDEN_PATH = Path(__file__).with_name("timeseries_characterization.golden")
+GOLDEN_PATH = Path(__file__).with_name("timeseries_characterization.json")
+META_KEY = "_meta"
+
+
+def _versions() -> dict:
+    return {"numpy": np.__version__, "matplotlib": matplotlib.__version__}
 
 
 # --------------------------------------------------------------------------- #
@@ -350,16 +359,26 @@ def _raster_scenarios() -> dict:
             show_tracks=True,
             title="all",
         ),
-        # Pinned quirk: with a strip, per-neuron colour sequences are ignored
-        # (spikes are drawn later with strip colours).
+        # Fixed (was a pinned quirk): with a strip, an explicit per-neuron colour
+        # sequence now wins over the strip colours.
         "strip_with_color_sequence": s(
             neurons_df=df,
             group_key="group",
             show_group_strip=True,
             spike_color=["red", "blue"] * (N_N // 2),
         ),
-        # Pinned quirk: group_rate without group_key yields an empty rate panel.
-        "group_rate_without_group_key": s(group_rate=True),
+        # group_rate without group_key used to yield an empty rate panel; it now
+        # raises ValueError (see test_raster_group_rate_requires_group_key), so
+        # it no longer has a golden scenario.
+        "strip_all_zero_with_specs": lambda: _raster_result(
+            plot_raster(
+                np.zeros((N_T, N_N)),
+                neurons_df=df,
+                group_key="group",
+                show_group_strip=True,
+                neuron_specs=[NeuronSpec(marker="o"), NeuronSpec(marker="x")],
+            )
+        ),
         "torch_input": lambda: _raster_result(plot_raster(torch.tensor(sp))),
         "empty_spikes": lambda: _raster_result(plot_raster(np.zeros((N_T, N_N)))),
     }
@@ -513,7 +532,8 @@ def _traces_scenarios() -> dict:
                 format=TracePlotFormat(separate_figures=True, sample_size=2),
             )
         ),
-        # Pinned quirk: the separate-figures path ignores neuron_specs.
+        # Fixed (was a pinned quirk): the separate-figures path now honours
+        # neuron_specs (label, colour, linestyle, ...).
         "separate_with_specs": s(
             **full,
             neuron_indices=[0, 1],
@@ -562,13 +582,20 @@ def _load_golden() -> dict:
 def test_signature_matches_golden(name):
     """Every scenario reproduces the recorded structural signature."""
     sig = _run(name)
+    golden = _load_golden()
     if os.environ.get("BTORCH_UPDATE_GOLDEN"):
-        golden = _load_golden()
+        golden[META_KEY] = _versions()
         golden[name] = sig
         lines = [f"{json.dumps(k)}: {json.dumps(v)}" for k, v in sorted(golden.items())]
         GOLDEN_PATH.write_text("{\n" + ",\n".join(lines) + "\n}\n")
         return
-    golden = _load_golden()
+    recorded = golden.get(META_KEY)
+    if recorded != _versions():
+        pytest.skip(
+            f"golden recorded with {recorded}, installed {_versions()}; "
+            "checksums are version dependent. Regenerate with "
+            "BTORCH_UPDATE_GOLDEN=1 (see module docstring)."
+        )
     assert name in golden, f"no golden entry for {name}; regenerate golden file"
     assert sig == golden[name]
 
@@ -645,9 +672,9 @@ def test_raster_group_strip_adds_axes_and_legend():
     cax = fig.axes[1]
     assert len(cax.patches) == N_N
     assert cax.get_legend() is not None
-    # Pinned current behaviour (not necessarily intended): the default
-    # "top_sub" legend mode joins top/sub labels even without subgroups.
-    assert [t.get_text() for t in cax.get_legend().get_texts()] == ["A / A", "B / B"]
+    # Fixed (was pinned as "A / A"): the default "top_sub" legend mode only
+    # joins top/sub labels when real subgroups exist.
+    assert [t.get_text() for t in cax.get_legend().get_texts()] == ["A", "B"]
 
 
 def test_raster_mixed_markers_split_into_one_scatter_per_marker():
@@ -806,14 +833,95 @@ def test_traces_error_contracts():
         plot_neuron_traces(voltage=np.zeros(5))
 
 
-def test_traces_batched_psc_is_misdetected_as_multi_component():
-    """Pinned pre-existing bug: batched 3D psc is treated as (T, N, n_psc).
+def test_traces_batched_psc_with_3d_voltage():
+    """Fixed bug: batched 3D psc next to 3D voltage is a plain batched PSC.
 
-    With 3D voltage ``(time, batch, neurons)`` the neuron count is read from
-    ``voltage.shape[1]`` (the batch size), so a batched ``psc`` always matches
-    the "extra dimension" test and later fails indexing neurons.  This is not
-    fixed by the behaviour-preserving refactor.
+    It used to be misdetected as ``(time, neurons, n_psc)`` (the neuron count
+    was read from ``voltage.shape[1]``, the batch size) and raised IndexError.
     """
     d3 = _trace_data(batch=3)
-    with pytest.raises(IndexError):
-        plot_neuron_traces(voltage=d3["voltage"], psc=d3["psc"], batch_idx=2)
+    fig = plot_neuron_traces(
+        voltage=d3["voltage"], psc=d3["psc"], batch_idx=2, neuron_indices=[0, 1]
+    )
+    assert [a.get_title() for a in fig.axes[:2]] == [
+        "Voltage",
+        "Postsynaptic Current",
+    ]
+    psc_line = fig.axes[1].lines[0]
+    np.testing.assert_allclose(psc_line.get_ydata(), d3["psc"][:, 2, 0])
+
+
+def test_traces_4d_psc_is_multi_component():
+    """(time, batch, neurons, n_psc) psc plots one line per component."""
+    rng = np.random.default_rng(0)
+    volt = rng.normal(size=(40, 3, 6)).astype(np.float32)
+    psc = rng.normal(size=(40, 3, 6, 2)).astype(np.float32)
+    fig = plot_neuron_traces(
+        voltage=volt, psc=psc, batch_idx=1, neuron_indices=[0], psc_labels=["a", "b"]
+    )
+    assert len(fig.axes[1].lines) == 2
+    np.testing.assert_allclose(fig.axes[1].lines[1].get_ydata(), psc[:, 1, 0, 1])
+
+
+def test_raster_group_rate_requires_group_key():
+    """group_rate without group_key used to silently draw an empty panel."""
+    with pytest.raises(ValueError, match="group_rate requires group_key"):
+        plot_raster(_spikes(), group_rate=True)
+    with pytest.raises(ValueError, match="group_rate requires group_key"):
+        plot_raster(_spikes(), group_rate={"A": np.zeros(N_T)})
+
+
+def test_raster_strip_all_zero_spikes_with_specs():
+    """No spikes + strip + neuron_specs used to fail on ``marker_list[0]``."""
+    ax = plot_raster(
+        np.zeros((N_T, N_N)),
+        neurons_df=_neurons_df(),
+        group_key="group",
+        show_group_strip=True,
+        neuron_specs=[NeuronSpec(marker="o")],
+    )
+    assert ax.get_title().startswith("Spike raster Fired 0/")
+
+
+def test_raster_strip_honours_per_neuron_color_sequence():
+    """Explicit per-neuron colours are used on the raster even with a strip."""
+    colors = ["red", "blue"] * (N_N // 2)
+    ax = plot_raster(
+        _spikes(),
+        neurons_df=_neurons_df(),
+        group_key="group",
+        show_group_strip=True,
+        spike_color=colors,
+    )
+    used = {to_hex(c) for c in ax.collections[0].get_facecolor()}
+    assert used == {"#ff0000", "#0000ff"}
+
+
+def test_traces_separate_figures_honour_neuron_specs():
+    d = _trace_data()
+    figs = plot_neuron_traces(
+        voltage=d["voltage"],
+        neuron_indices=[0, 1],
+        separate_figures=True,
+        neuron_specs=[NeuronSpec(label="L0", color="red", linestyle="--")],
+    )
+    ax0, ax1 = figs["voltage"].axes
+    assert to_hex(ax0.lines[0].get_color()) == "#ff0000"
+    assert ax0.lines[0].get_linestyle() == "--"
+    assert [t.get_text() for t in ax0.texts] == ["L0"]
+    # Neuron without a spec keeps the defaults.
+    assert to_hex(ax1.lines[0].get_color()) == "#2e86ab"
+    assert len(ax1.texts) == 0
+
+
+def test_traces_explicit_dt_one_overrides_states_dt():
+    """An explicit dt=1.0 used to be mistaken for "not given"."""
+    d = _trace_data()
+    states = SimulationStates(voltage=d["voltage"], dt=2.0)
+    fig_states = plot_neuron_traces(states=states, neuron_indices=[0])
+    fig_explicit = plot_neuron_traces(states=states, dt=1.0, neuron_indices=[0])
+    assert fig_states.axes[0].lines[0].get_xdata()[1] == 2.0
+    assert fig_explicit.axes[0].lines[0].get_xdata()[1] == 1.0
+    # No states and no dt: default 1.0 ms.
+    fig_plain = plot_neuron_traces(voltage=d["voltage"], neuron_indices=[0])
+    assert fig_plain.axes[0].lines[0].get_xdata()[1] == 1.0

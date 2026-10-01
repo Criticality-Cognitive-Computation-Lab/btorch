@@ -404,6 +404,27 @@ def test_v_threshold_scalar_broadcast():
     assert (vt[n_glif:] == -48.0).all()
 
 
+def test_trainable_scalar_param_is_broadcast_per_neuron():
+    """A trainable *uniform* parameter is stored as a 0-dim ``nn.Parameter``.
+
+    ``_concat_attr`` must still return one value per neuron: the 0-dim value is
+    expanded to the sub-population size (the documented broadcast), mixed
+    freely with a group holding a per-neuron tensor.
+    """
+    glif = GLIF3(
+        n_neuron=4, step_mode="s", v_threshold=-50.0, trainable_param={"v_threshold"}
+    )
+    tc = TwoCompartmentGLIF(
+        n_neuron=3, step_mode="s", v_threshold=torch.tensor([-1.0, -2.0, -3.0])
+    )
+    mixed = MixedNeuronPopulation([(4, glif), (3, tc)], step_mode="s")
+
+    vt = mixed.v_threshold
+    assert vt.shape == (7,)
+    assert (vt[:4] == -50.0).all()
+    torch.testing.assert_close(vt[4:], torch.tensor([-1.0, -2.0, -3.0]))
+
+
 def test_v_threshold_per_neuron():
     # Per-neuron threshold passed as tensor
     n_glif, n_tc = 4, 3

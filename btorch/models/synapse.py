@@ -38,6 +38,13 @@ class BasePSC(MemoryModule):
     application and PSC state management. Delay handling is managed
     externally (e.g. via :class:`DelayedPSC`).
 
+    Timing convention: a spike delivered to :meth:`single_step_forward` at
+    step ``t`` already changes the returned PSC at step ``t`` for every
+    subclass (the first response is at the delivery step, delay 0). The
+    impulse response ``k[t]`` returned by ``get_kernel`` therefore starts at
+    ``t = 0`` with a non-zero value and :meth:`multi_step_forward` equals
+    stepping :meth:`single_step_forward` exactly.
+
     Args:
         n_neuron: Number of post-synaptic neurons.
         linear: Linear layer for weight application.
@@ -94,8 +101,14 @@ class BasePSC(MemoryModule):
         current = self.current_charge()
         return current
 
-    def multi_step_forward(self, z_seq: torch.Tensor, kernel_len: int = 64):
+    def multi_step_forward(
+        self, z_seq: torch.Tensor, kernel_len: int = 64
+    ) -> torch.Tensor:
         """Full-sequence forward via grouped 1D conv.
+
+        Extends :meth:`MemoryModule.multi_step_forward` (whose ``*args, **kwargs``
+        are subclass-defined) with the optional ``kernel_len`` truncation. The
+        sequence is the first positional argument, as in the base signature.
 
         Args:
             z_seq: (T, *batch, *n_neuron) spike sequence
@@ -208,7 +221,8 @@ class AlphaPSCBilleh(_Adaptive2VarPSC):
     ):
         """The Current-Based Alpha form of PSC, from [1], ensuring a post-
         synaptic current with synapse weight W = 1.0 has an amplitude of 1.0 pA
-        at the peak time point of t = tau_syn.
+        at its peak (``tau_syn`` steps after the spike, counting the delivery
+        step as the first). A spike acts in its delivery step.
 
         NOTE: this model assumes environ.get("dt") == 1.0
 
@@ -233,7 +247,10 @@ class AlphaPSCBilleh(_Adaptive2VarPSC):
         )
 
     def conductance_charge(self) -> Tensor:
-        self.psc = self.syn_decay * self.psc + self.syn_decay * self.h
+        # Only decay the rise variable here; the input is injected into ``h``
+        # (and ``psc`` advanced from the updated ``h``) in adaptation_charge so
+        # that a spike acts in its delivery step.
+        self.h = self.syn_decay * self.h
         return self.psc
 
     def adaptation_charge(self, z: torch.Tensor) -> None:
@@ -246,25 +263,25 @@ class AlphaPSCBilleh(_Adaptive2VarPSC):
         wz = self.linear(z_flat)
         if len(self.n_neuron) > 1 and z_flat is not z:
             wz = unflatten_neuron(wz, leading, self.n_neuron)
-        self.h = self.syn_decay * self.h + torch.e / self.tau_syn * wz
+        self.h = self.h + torch.e / self.tau_syn * wz
+        self.psc = self.syn_decay * self.psc + self.syn_decay * self.h
 
     def get_kernel(self, dt: float | Tensor, kernel_len: int) -> Tensor:
         """AlphaPSC Billeh variant kernel.
 
-        Kernel follows the exact single-step recurrence:
-        k[0] = 0,
-        k[t] = t * e/tau_syn * a^t for t >= 1,
-        where a = exp(-1/tau_syn).
+        Kernel follows the exact single-step recurrence
+        ``h_t = a h_{t-1} + c w z_t``, ``psc_t = a psc_{t-1} + a h_t`` with
+        ``c = e/tau_syn``, so a spike acts in its delivery step:
+        k[t] = (t + 1) * e/tau_syn * a^(t+1) for t >= 0,
+        where a = exp(-1/tau_syn). The peak (1.0 for unit weight) is reached
+        at kernel index ``tau_syn - 1`` (``tau_syn`` steps after the spike
+        counting the delivery step as the first).
 
         NOTE: dt is assumed to be 1.0 for this model (enforced in __init__).
         """
         a = self.syn_decay
         t = torch.arange(kernel_len, dtype=a.dtype, device=a.device)
-        kernel = torch.zeros_like(t, dtype=a.dtype)
-        if kernel_len > 1:
-            t_valid = t[1:]
-            kernel[1:] = t_valid * (torch.e / self.tau_syn) * (a**t_valid)
-        return kernel
+        return (t + 1) * (torch.e / self.tau_syn) * (a ** (t + 1))
 
 
 class AlphaPSC(_Adaptive2VarPSC):
@@ -298,7 +315,9 @@ class AlphaPSC(_Adaptive2VarPSC):
         return derivative, linear
 
     def conductance_charge(self) -> None:
-        self.psc = exp_euler_step(self.dg, self.psc, self.h, dt=environ.get("dt"))
+        # Only decay ``h`` here; ``psc`` is advanced from the input-updated
+        # ``h`` in adaptation_charge so a spike acts in its delivery step.
+        self.h = exp_euler_step(self.dh, self.h, dt=environ.get("dt"))
 
     def adaptation_charge(self, z: torch.Tensor) -> None:
         # Flatten only when input still carries multi-dimensional neuron dims
@@ -310,24 +329,23 @@ class AlphaPSC(_Adaptive2VarPSC):
         wz = self.g_max * self.linear(z_flat)
         if len(self.n_neuron) > 1 and z_flat is not z:
             wz = unflatten_neuron(wz, leading, self.n_neuron)
-        self.h = exp_euler_step(self.dh, self.h, dt=environ.get("dt")) + wz
+        self.h = self.h + wz
+        self.psc = exp_euler_step(self.dg, self.psc, self.h, dt=environ.get("dt"))
 
     def get_kernel(self, dt: float | Tensor, kernel_len: int) -> Tensor:
         """AlphaPSC (Brainpy variant) kernel.
 
-        Kernel follows the exact single-step recurrence:
-        k[0] = 0,
-        k[t] = t * (1 - a) * a^(t-1) for t >= 1,
+        Kernel follows the exact single-step recurrence
+        ``h_t = a h_{t-1} + g_max w z_t``,
+        ``psc_t = a psc_{t-1} + (1 - a) h_t`` so a spike acts in its
+        delivery step:
+        k[t] = g_max * (t + 1) * (1 - a) * a^t for t >= 0,
         where a = exp(-dt/tau_syn).
         """
         a = torch.exp(-dt / self.tau_syn)
         t = torch.arange(kernel_len, dtype=a.dtype, device=a.device)
-        kernel = torch.zeros_like(t, dtype=a.dtype)
-        if kernel_len > 1:
-            t_valid = t[1:]
-            kernel[1:] = t_valid * (1 - a) * (a ** (t_valid - 1))
-        kernel = self.g_max.to(kernel.dtype) * kernel
-        return kernel
+        kernel = (t + 1) * (1 - a) * (a**t)
+        return self.g_max.to(kernel.dtype) * kernel
 
 
 class DualExponentialPSC(BasePSC):
@@ -399,18 +417,26 @@ class DualExponentialPSC(BasePSC):
             wz = unflatten_neuron(wz, leading, self.n_neuron)
         self.g_rise = self.g_rise + wz
         self.g_decay = self.g_decay + wz
-        self.psc = self.a * (self.g_decay - self.g_rise)
+        # The analytic response a*(e^{-t/tau_d} - e^{-t/tau_r}) is zero at the
+        # injection instant, so psc is read out one dt after the input
+        # (``g`` advanced by one decay step) to make the spike act in its
+        # delivery step; the stored ``g`` stay at the injection instant.
+        dt = environ.get("dt")
+        a_r = torch.exp(-dt / self.tau_rise)
+        a_d = torch.exp(-dt / self.tau_decay)
+        self.psc = self.a * (a_d * self.g_decay - a_r * self.g_rise)
 
     def get_kernel(self, dt: float | Tensor, kernel_len: int) -> Tensor:
         """Dual-exponential (alpha-shaped) kernel.
 
-        Kernel: k[t] = a * (a_d^t - a_r^t) for t >= 0
-        where a = self.a, a_d = exp(-dt/tau_decay), a_r = exp(-dt/tau_rise).
+        Kernel: k[t] = a * (a_d^(t+1) - a_r^(t+1)) for t >= 0 so a spike acts
+        in its delivery step, where a = self.a, a_d = exp(-dt/tau_decay),
+        a_r = exp(-dt/tau_rise).
         """
         a_r = torch.exp(-dt / self.tau_rise)
         a_d = torch.exp(-dt / self.tau_decay)
         t = torch.arange(kernel_len, dtype=self.a.dtype, device=self.a.device)
-        return self.a * (a_d**t - a_r**t)
+        return self.a * (a_d ** (t + 1) - a_r ** (t + 1))
 
 
 class BilinearMixingSynapse(MemoryModule):
@@ -514,7 +540,11 @@ class BilinearMixingSynapse(MemoryModule):
         self._psc = (bilinear_term + linear_term).squeeze(-1)
         return self._psc
 
-    def multi_step_forward(self, z_seq: torch.Tensor, kernel_len: int | None = None):
+    def multi_step_forward(
+        self, z_seq: torch.Tensor, kernel_len: int | None = None
+    ) -> torch.Tensor:
+        """Multi-receptor forward; ``kernel_len`` defaults to
+        ``self.kernel_len``."""
         if kernel_len is None:
             kernel_len = self.kernel_len
         T, *batch_shape, n_neuron, n_receptor = z_seq.shape
@@ -605,7 +635,10 @@ class DelayedPSC(MemoryModule):
             z_delayed = z
         return self.psc_module.single_step_forward(z_delayed)
 
-    def multi_step_forward(self, z_seq: torch.Tensor, kernel_len: int = 64):
+    def multi_step_forward(
+        self, z_seq: torch.Tensor, kernel_len: int = 64
+    ) -> torch.Tensor:
+        """Step the delayed PSC over time; ``kernel_len`` is ignored here."""
         T = z_seq.shape[0]
         y_seq = []
         for t in range(T):
@@ -827,7 +860,14 @@ class HeterSynapsePSC(BasePSC):
 
         return result
 
-    def multi_step_forward(self, z_seq: torch.Tensor, kernel_len: int = 64):
+    def multi_step_forward(
+        self, z_seq: torch.Tensor, kernel_len: int = 64
+    ) -> torch.Tensor:
+        """Multi-receptor delayed forward.
+
+        ``kernel_len`` only applies on the history-free path (convolution);
+        with delays the PSC is stepped sequentially and it is ignored.
+        """
         if self.history is not None:
             _, _, has_receptor_axis = self._flatten_input(z_seq)
             self._validate_delayed_input(has_receptor_axis, z_seq.shape)
@@ -892,10 +932,8 @@ class GapJunction(nn.Module):
         self.n_neuron, self.size = normalize_n_neuron(n_neuron)
         self.step_mode = step_mode
 
-        # Register global scaling factor as buffer (non-trainable by default)
         self.register_buffer("g_gap", torch.as_tensor(g_gap))
 
-        # Linear layer for connection weights (models both connection and conductance)
         if linear is None:
             self.linear = torch.nn.Linear(self.size, self.size, bias=False)
             torch.nn.init.uniform_(self.linear.weight)
@@ -925,8 +963,6 @@ class GapJunction(nn.Module):
         v_pre_flat, leading = flatten_neuron(v_pre, self.n_neuron, self.size)
         v_post_flat, _ = flatten_neuron(v_post, self.n_neuron, self.size)
 
-        # Current is proportional to weighted voltage difference
-        # linear models both connection topology and conductance
         delta_v_flat = v_post_flat - v_pre_flat
         i_gap_flat = self.g_gap * self.linear(delta_v_flat)
 
@@ -1004,10 +1040,8 @@ class VoltageCoupling(nn.Module):
         self.n_neuron, self.size = normalize_n_neuron(n_neuron)
         self.step_mode = step_mode
 
-        # Register global scaling factor as buffer (non-trainable by default)
         self.register_buffer("g_couple", torch.as_tensor(g_couple))
 
-        # Linear layer for coupling weights
         if linear is None:
             self.linear = torch.nn.Linear(self.size, self.size, bias=False)
             torch.nn.init.uniform_(self.linear.weight)
@@ -1034,7 +1068,6 @@ class VoltageCoupling(nn.Module):
         """
         v_flat, leading = flatten_neuron(v, self.n_neuron, self.size)
 
-        # Current is proportional to weighted voltage
         i_couple_flat = self.g_couple * self.linear(v_flat)
 
         return unflatten_neuron(i_couple_flat, leading, self.n_neuron)

@@ -35,13 +35,13 @@ def save_dict_to_hdf5(
             compression (default: 1 MiB).
     """
 
-    def save_array(h5file, path_k, v):
+    def save_array(h5file: h5py.File, path_k: str, v: Any) -> None:
         if v.nbytes > compression_threshold:
             h5file.create_dataset(path_k, data=v, compression=compression)
         else:
             h5file.create_dataset(path_k, data=v)
 
-    def save_group(h5file, path, data):
+    def save_group(h5file: h5py.File, path: str, data: dict) -> None:
         for k, v in data.items():
             if v is None:
                 continue
@@ -78,7 +78,7 @@ def load_dict_from_hdf5(
         folder_or_file if filename is None else os.path.join(folder_or_file, filename)
     )
 
-    def load_group(h5file, path):
+    def load_group(h5file: h5py.File, path: str) -> dict:
         data = {}
         for k, v in h5file[path].items():
             if isinstance(v, h5py.Group):

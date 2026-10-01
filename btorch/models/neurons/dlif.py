@@ -15,10 +15,10 @@ from collections.abc import Sequence
 import torch
 from torch import Tensor, nn
 
-from .base import MemoryModule, normalize_n_neuron
-from .bilinear import SymmetricBilinear
-from .neurons.lif import LIF
-from .synapse import BasePSC, DualExponentialPSC
+from ..base import MemoryModule, normalize_n_neuron
+from ..bilinear import SymmetricBilinear
+from ..synapse import BasePSC, DualExponentialPSC
+from .lif import LIF
 
 
 class DendriticLIF(MemoryModule):

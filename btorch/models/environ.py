@@ -1,32 +1,39 @@
-import dataclasses
 import functools
 import threading
 from collections import defaultdict
+from collections.abc import Callable
 from typing import Any, Hashable
 
 
-# copied from brainstate
+# Adapted from brainstate.
+
+# Process-global defaults written by :func:`set` / :func:`unset`, visible from every
+# thread. The dict is treated as immutable (copy-on-write): writers build a new
+# dict under ``_SETTINGS_LOCK`` and rebind the name, so lock-free readers
+# (:func:`get`, :func:`all`) always see one consistent snapshot. Reads stay
+# lock-free so they remain cheap and ``torch.compile`` friendly.
+_DEFAULTS: dict[Hashable, Any] = {}
+_SETTINGS_LOCK = threading.Lock()
 
 
-@dataclasses.dataclass
-class DefaultContext(threading.local):
-    # default environment settings
-    settings: dict[Hashable, Any] = dataclasses.field(default_factory=dict)
-    # current environment settings
-    contexts: defaultdict[Hashable, Any] = dataclasses.field(
-        default_factory=lambda: defaultdict(list)
-    )
+class _ThreadContexts(threading.local):
+    """Thread-local override stacks pushed by :class:`context`."""
+
+    def __init__(self):
+        self.contexts: defaultdict[Hashable, list[Any]] = defaultdict(list)
 
 
-DEFAULT = DefaultContext()
+_LOCAL = _ThreadContexts()
 
 
 class context:
     """Context manager for temporary computation environment variables.
 
-    Values pushed via ``context`` are thread-local and automatically
-    popped on exit. Can be used as a decorator, context manager, or
-    directly around forward passes.
+    Values pushed via ``context`` are thread-local (other threads keep
+    seeing the global defaults from :func:`set`), take precedence over those
+    defaults inside the ``with`` block, and are automatically popped on exit.
+    Can be used as a decorator, context manager, or directly around forward
+    passes.
 
     Args:
         **kwargs: Key-value pairs to push onto the context stack.
@@ -40,25 +47,23 @@ class context:
         ...     return model(x)
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
 
     def __enter__(self):
         for k, v in self.kwargs.items():
-            if k not in DEFAULT.contexts:
-                DEFAULT.contexts[k] = []
-            DEFAULT.contexts[k].append(v)
+            _LOCAL.contexts[k].append(v)
         return all()
 
     def __exit__(self, exc_type, exc_value, traceback):
         for k, v in self.kwargs.items():
-            DEFAULT.contexts[k].pop()
+            _LOCAL.contexts[k].pop()
 
-    def __call__(self, func):
+    def __call__(self, func: Callable) -> Callable:
         return context_decorator(self, func)
 
 
-def context_decorator(context_instance, func):
+def context_decorator(context_instance: "context", func: Callable) -> Callable:
     @functools.wraps(func)
     def decorate_context(*args, **kwargs):
         with context_instance:
@@ -70,7 +75,8 @@ def context_decorator(context_instance, func):
 def get(key: str, desc: str | None = None) -> Any:
     """Get a value from the current computation environment.
 
-    Checks the context stack first, then global defaults.
+    Checks the calling thread's context stack first, then the process-global
+    defaults set by :func:`set`.
 
     Args:
         key: Environment variable name.
@@ -87,11 +93,12 @@ def get(key: str, desc: str | None = None) -> Any:
         >>> dt = environ.get("dt")
     """
 
-    if key in DEFAULT.contexts:
-        if len(DEFAULT.contexts[key]) > 0:
-            return DEFAULT.contexts[key][-1]
-    if key in DEFAULT.settings:
-        return DEFAULT.settings[key]
+    stack = _LOCAL.contexts.get(key)
+    if stack:
+        return stack[-1]
+    defaults = _DEFAULTS
+    if key in defaults:
+        return defaults[key]
 
     if desc is not None:
         raise KeyError(
@@ -112,23 +119,26 @@ def all() -> dict:
     """Get all current computation environment variables.
 
     Returns:
-        Dictionary of all active context and default settings.
+        Dictionary of this thread's active context values and the global
+        default settings (context values win).
     """
     r = dict()
-    for k, v in DEFAULT.contexts.items():
+    for k, v in _LOCAL.contexts.items():
         if v:
             r[k] = v[-1]
-    for k, v in DEFAULT.settings.items():
+    for k, v in _DEFAULTS.items():
         if k not in r:
             r[k] = v
     return r
 
 
-def set(**kwargs):
+def set(**kwargs: Any) -> None:
     """Set global default computation environment variables.
 
-    These values persist until changed and are used as fallbacks when
-    a key is not present in the active context stack.
+    The defaults are process-global: they persist until changed, are visible
+    from every thread, and are used as fallbacks when a key is not present in
+    the calling thread's active :class:`context` stack. Use :class:`context`
+    for thread-local, scoped overrides.
 
     Args:
         **kwargs: Key-value pairs to set as defaults.
@@ -136,4 +146,20 @@ def set(**kwargs):
     Example:
         >>> environ.set(dt=1.0)
     """
-    DEFAULT.settings.update(kwargs)
+    global _DEFAULTS
+    with _SETTINGS_LOCK:
+        _DEFAULTS = {**_DEFAULTS, **kwargs}
+
+
+def unset(*keys: Hashable) -> None:
+    """Remove global defaults previously set with :func:`set`.
+
+    Unknown keys are ignored. Thread-local :class:`context` overrides are not
+    affected.
+
+    Args:
+        *keys: Names of the defaults to remove.
+    """
+    global _DEFAULTS
+    with _SETTINGS_LOCK:
+        _DEFAULTS = {k: v for k, v in _DEFAULTS.items() if k not in keys}

@@ -27,7 +27,6 @@ from ...types import TensorLike
 from .. import environ
 from ..base import BaseNode
 from ..ode import exp_euler_step
-from ..shape import expand_trailing_dims
 from ..surrogate import Erf
 
 
@@ -83,10 +82,12 @@ class GLIF3(BaseNode):
             Default: [0.2].
         asc_amps: ASC amplitudes (pA) added at each spike.
             Default: [0.0].
-        tau_ref: Refractory period (ms). Default: 0.0.
+        tau_ref: Refractory period (ms). None disables refractory.
+            Default: None.
         trainable_param: Set of parameter names to make trainable.
         surrogate_function: Surrogate gradient function.
-            Default: ``Erf(alpha=4, damping_factor=0.5)``, matching the
+            Default: None, which builds a fresh ``Erf(alpha=4,
+            damping_factor=0.5)`` per neuron, matching the
             Gaussian surrogate used in Chen et al. (2022).
         detach_reset: If True, detach reset signal. Default: False.
         hard_reset: If True, use hard reset. Default: False.
@@ -99,7 +100,7 @@ class GLIF3(BaseNode):
     Attributes:
         v: Membrane potential, shape (*batch, n_neuron).
         Iasc: After-spike currents, shape (*batch, n_neuron, n_Iasc).
-        refractory: Refractory counter (if tau_ref > 0).
+        refractory: Refractory counter (if tau_ref is not None).
         c_m, tau, tau_ref: Neuron parameters.
         k: ASC decay rates, shape (n_neuron, n_Iasc) or (n_Iasc,).
         asc_amps: ASC amplitudes, shape (n_neuron, n_Iasc) or (n_Iasc,).
@@ -133,15 +134,17 @@ class GLIF3(BaseNode):
         v_rest: None | float | Float[TensorLike, " n_neuron"] = None,
         c_m: float | Float[TensorLike, " n_neuron"] = 0.05,  # 1/20 pfarad
         tau: float | Float[TensorLike, " n_neuron"] = 20.0,  # ms
-        k: float | Sequence[float] | Float[TensorLike, "n_neuron {self.n_Iasc}"] = [
-            0.2
-        ],  # ms^-1
+        k: float
+        | Sequence[float]
+        | Float[TensorLike, "n_neuron {self.n_Iasc}"]
+        | None = None,  # ms^-1, default [0.2]
         asc_amps: float
         | Sequence[float]
-        | Float[TensorLike, "n_neuron {self.n_Iasc}"] = [0.0],  # pA
-        tau_ref: float | Float[TensorLike, " n_neuron"] | None = 0.0,  # ms
-        trainable_param: set[str] = set(),
-        surrogate_function: Callable = Erf(alpha=4.0, damping_factor=0.5),
+        | Float[TensorLike, "n_neuron {self.n_Iasc}"]
+        | None = None,  # pA, default [0.0]
+        tau_ref: float | Float[TensorLike, " n_neuron"] | None = None,  # ms
+        trainable_param: set[str] | None = None,
+        surrogate_function: Callable | None = None,
         detach_reset: bool = False,
         hard_reset: bool = False,
         pre_spike_v: bool = False,
@@ -150,6 +153,13 @@ class GLIF3(BaseNode):
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ):
+        # Built per call so no mutable / Module default is shared across neurons.
+        if k is None:
+            k = [0.2]
+        if asc_amps is None:
+            asc_amps = [0.0]
+        if surrogate_function is None:
+            surrogate_function = Erf(alpha=4.0, damping_factor=0.5)
         super().__init__(
             n_neuron=n_neuron,
             v_threshold=v_threshold,
@@ -198,7 +208,6 @@ class GLIF3(BaseNode):
         else:
             self._v_rest = None
 
-        # Handle after-spike currents.
         if isinstance(asc_amps, Number):
             asc_amps = [asc_amps]
         if isinstance(k, Number):
@@ -306,7 +315,6 @@ class GLIF3(BaseNode):
         self.Iasc = exp_euler_step(self.dIasc, self.Iasc, dt=environ.get("dt"))
 
     def neuronal_fire(self):
-        # Check if voltage exceeds threshold and not in refractory period
         spike = self.surrogate_function(
             (self.v - self.v_threshold) / (self.v_threshold - self.v_reset)
         )
@@ -326,17 +334,13 @@ class GLIF3(BaseNode):
             self.v_pre_spike = self.v.clone()
 
         if self.hard_reset:
-            # hard reset
             self.v = self.v - (self.v - self.v_reset) * spike_d
         else:
-            # soft reset
             self.v = self.v - (self.v_threshold - self.v_reset) * spike_d
 
-        # Add after-spike currents
         self.Iasc = self.Iasc + self.asc_amps * spike_d[..., None]
 
         if self._use_refractory:
-            # Set refractory period
             self.refractory = torch.relu(
                 self.refractory + spike_d * self.tau_ref - environ.get("dt")
             )
@@ -367,75 +371,104 @@ class GLIF3(BaseNode):
 
     # TODO: headache to define precise input-output shapes
     # TODO: shape handling not torch.compile friendly
-    def _normalize_state_shapes(
-        self,
-        x: TensorLike | float,
-        v0: TensorLike | float,
-        Iasc0: TensorLike | float,
-        dt: TensorLike | float,
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        device = device or self.v_reset.device
-        dtype = dtype or self.v_reset.dtype
-        x, v0, Iasc0 = (
-            torch.as_tensor(x, device=device, dtype=dtype),
-            torch.as_tensor(v0, device=device, dtype=dtype),
-            torch.as_tensor(Iasc0, device=device, dtype=dtype),
-        )
-        if isinstance(dt, float):
-            dt = torch.tensor([dt], device=device, dtype=dtype)
-        else:
-            dt = torch.as_tensor(dt, device=device, dtype=dtype)
-
-        shapes = (x.shape, v0.shape, Iasc0.shape[:-1])
-        longest_shape = max(shapes, key=len)
-        if dt.shape[0] != longest_shape[0]:
-            dt = expand_trailing_dims(dt, longest_shape, broadcast_only=True)
-
-        return x, v0, Iasc0, dt
-
     def forward_exact_no_spike(
         self,
-        x: Float[Tensor, "*batch #neuron"] | Float[Tensor, "*batch"],
-        v0: Float[Tensor, "*batch neuron"] | None = None,
-        Iasc0: Float[Tensor, "*batch neuron {self.n_Iasc}"] | None = None,
-        dt: float
-        | Float[TensorLike, "#time *batch neuron"]
-        | Float[TensorLike, "#*batch neuron"]
-        | Float[TensorLike, "#time *batch"]
-        | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if dt is None:
-            dt = environ.get("dt")
+        x: Float[TensorLike, "*#state"] | float,
+        t: float | Float[TensorLike, " n_time"] | None = None,
+        v0: Float[Tensor, "*state"] | None = None,
+        Iasc0: Float[Tensor, "*state {self.n_Iasc}"] | None = None,
+        update_state: bool = False,
+    ) -> tuple[
+        Float[Tensor, " n_time *state"],
+        Float[Tensor, " n_time *state {self.n_Iasc}"],
+    ]:
+        r"""Evaluate the closed-form no-spike trajectory at the given times.
 
-        update = (v0 is None) and (Iasc0 is None)
-        if v0 is None:
-            v0 = self.v
-        if Iasc0 is None:
-            Iasc0 = self.Iasc
+        Between spikes the GLIF3 ODEs are linear, so for a constant input
+        :math:`x` they have an exact solution. This evaluates it directly at
+        every requested time (vectorised, not step by step):
 
-        x, v0, Iasc0, dt = self._normalize_state_shapes(x, v0, Iasc0, dt)
+        .. math::
+            I_{asc}(t) = I_{asc,0} e^{-k t}
+
+        and :math:`v(t)` is the leaky-integrator response to :math:`x` plus the
+        contribution of the decaying after-spike currents. Spikes and resets are
+        **not** modelled; use it for the sub-threshold regime.
+
+        Shape contract (``state`` is the neuron state shape, i.e.
+        ``(*batch, *n_neuron)``; every argument is broadcast against it from the
+        right, exactly like ordinary tensor arithmetic):
+
+        * ``v0``: ``(*state)``, defaults to the current ``self.v``.
+        * ``Iasc0``: ``(*state, n_Iasc)``, defaults to the current ``self.Iasc``.
+        * ``x``: constant input current, broadcastable to ``(*state)`` (a
+          python/0-dim scalar, ``(n_neuron,)``, or ``(*batch, n_neuron)``). A
+          per-batch scalar needs an explicit trailing axis, e.g. ``x[..., None]``.
+        * ``t``: elapsed time(s) since the initial state in the same unit as
+          ``dt``: a python float / 0-dim tensor (one time point) or a 1-D
+          tensor ``(time,)``. Defaults to a single step ``environ.get("dt")``.
+
+        Args:
+            x: Constant input current.
+            t: Elapsed time(s) since ``v0`` / ``Iasc0``.
+            v0: Initial membrane potential.
+            Iasc0: Initial after-spike currents.
+            update_state: If True, store the state at the **last** requested
+                time in ``self.v`` / ``self.Iasc`` (the state has no time axis).
+                The module state is never touched otherwise.
+
+        Returns:
+            ``(v, Iasc)`` with shapes ``(time, *state)`` and
+            ``(time, *state, n_Iasc)``, where the leading axis indexes ``t``.
+
+        Raises:
+            ValueError: If ``t`` is not a scalar or a 1-D tensor.
+        """
+        dtype, device = self.v_reset.dtype, self.v_reset.device
+        if t is None:
+            t = environ.get("dt")
+        t = torch.as_tensor(t, dtype=dtype, device=device)
+        if t.ndim == 0:
+            t = t.reshape(1)
+        if t.ndim != 1:
+            raise ValueError(
+                "t must be a scalar or a 1-D tensor of shape (time,), "
+                f"got shape {tuple(t.shape)}"
+            )
+
+        x = torch.as_tensor(x, dtype=dtype, device=device)
+        v0 = torch.as_tensor(self.v if v0 is None else v0, dtype=dtype, device=device)
+        Iasc0 = torch.as_tensor(
+            self.Iasc if Iasc0 is None else Iasc0, dtype=dtype, device=device
+        )
+        # Fail early (with a readable message) if the shapes cannot broadcast.
+        state_shape = torch.broadcast_shapes(x.shape, v0.shape, Iasc0.shape[:-1])
+
+        # (time, 1, ..., 1): one singleton axis per state axis.
+        t_b = t.reshape(-1, *([1] * len(state_shape)))
+        exp_m = torch.exp(-t_b / self.tau)  # (time, *state)
+        exp_asc = torch.exp(-t_b[..., None] * self.k)  # (time, *state, n_Iasc)
 
         v_inf = self.v_reset + x * self.tau / self.c_m
-
-        exp_m = torch.exp(-dt / self.tau)
-        # (time, batch, neuron, n_Iasc)
-        exp_asc = torch.exp(-dt[..., None] * self.k)
-
         Iasc = Iasc0 * exp_asc
 
-        # degenerate case if tau=tau_asc=1/k
+        # Contribution of Iasc to v. When tau == 1 / k the generic formula is
+        # 0 / 0, so that branch uses its limit; the denominator is replaced by
+        # 1 there so the unused branch stays finite (no NaN gradients).
+        inv_tau = 1.0 / self.tau[..., None]
+        gap = inv_tau - self.k
+        degenerate = torch.abs(gap) <= 1e-12
+        safe_gap = torch.where(degenerate, torch.ones_like(gap), gap)
+        Iasc_c_m = Iasc0 / self.c_m[..., None]
+        exp_m_asc = exp_m[..., None]
         Iasc_contrib = torch.where(
-            torch.abs(self.k - 1 / self.tau[..., None]) > 1e-12,
-            (Iasc0 / self.c_m[..., None])
-            * (exp_asc - exp_m[..., None])
-            / (1.0 / self.tau[..., None] - self.k),
-            (Iasc0 / self.c_m[..., None]) * (dt * exp_m)[..., None],
+            degenerate,
+            Iasc_c_m * (t_b[..., None] * exp_m_asc),
+            Iasc_c_m * (exp_asc - exp_m_asc) / safe_gap,
         )
         v = v_inf + (v0 - v_inf) * exp_m + Iasc_contrib.sum(dim=-1)
 
-        if update:
-            self.v = v
-            self.Iasc = Iasc
+        if update_state:
+            self.v = v[-1]
+            self.Iasc = Iasc[-1]
         return v, Iasc

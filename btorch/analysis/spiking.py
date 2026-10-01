@@ -420,8 +420,7 @@ def isi_cv(
     dt: float = 1.0,
     batch_axis: int | tuple[int, ...] | None = None,
     dtype: np.dtype | torch.dtype | None = None,
-    **kwargs: Any,
-) -> tuple:
+) -> tuple[Any, ...]:
     """Calculate coefficient of variation of ISIs per neuron.
 
     Supports both NumPy and PyTorch inputs. For GPU tensors, uses a hybrid
@@ -429,8 +428,8 @@ def isi_cv(
     returns to GPU.
 
     This function is decorated with `@use_stats` and `@use_percentiles`.
-    See [`use_stats()`](btorch/analysis/statistics.py:483) and
-    [`use_percentiles()`](btorch/analysis/statistics.py:777) for detailed usage.
+    See :func:`~btorch.analysis.statistics.use_stats` and
+    :func:`~btorch.analysis.statistics.use_percentiles` for detailed usage.
 
     Args:
         spikes: Spike train array of shape [T, ...]. First dimension is time.
@@ -443,17 +442,17 @@ def isi_cv(
     Keyword Args:
         stat (str | None): Aggregation statistic to return instead of per-neuron values.
             Options: "mean", "median", "max", "min", "std", "var", "argmax",
-            "argmin", "cv". See [`use_stats()`](btorch/analysis/statistics.py:483).
+            "argmin", "cv". See :func:`~btorch.analysis.statistics.use_stats`.
         stat_info (str | list[str] | None): Additional statistics to compute
             and store in info dict.
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         nan_policy (str | None): How to handle NaN values ("skip", "warn", "assert").
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         inf_policy (str | None): How to handle Inf values ("propagate", "skip", "warn",
-            "assert"). See [`use_stats()`](btorch/analysis/statistics.py:483).
+            "assert"). See :func:`~btorch.analysis.statistics.use_stats`.
         percentiles (float | tuple[float, ...] | None): Percentile level(s) in
             [0, 100] to compute.
-            See [`use_percentiles()`](btorch/analysis/statistics.py:777).
+            See :func:`~btorch.analysis.statistics.use_percentiles`.
 
     Returns:
         cv_values: CV values reshaped to match input without time dimension.
@@ -475,15 +474,14 @@ def fano(
     overlap: int = 0,
     batch_axis: int | tuple[int, ...] | None = None,
     dtype: np.dtype | torch.dtype | None = None,
-    **kwargs: Any,
-) -> tuple:
+) -> tuple[Any, ...]:
     """Compute Fano factor for spike trains using optimized cumulative sums.
 
     Supports both NumPy and PyTorch inputs. GPU-friendly operation.
 
     This function is decorated with `@use_stats` and `@use_percentiles`.
-    See [`use_stats()`](btorch/analysis/statistics.py:483) and
-    [`use_percentiles()`](btorch/analysis/statistics.py:777) for detailed usage.
+    See :func:`~btorch.analysis.statistics.use_stats` and
+    :func:`~btorch.analysis.statistics.use_percentiles` for detailed usage.
 
     Args:
         spikes: Spike train of shape [T, ...]. First dimension is time.
@@ -497,17 +495,17 @@ def fano(
     Keyword Args:
         stat (str | None): Aggregation statistic to return instead of per-neuron values.
             Options: "mean", "median", "max", "min", "std", "var", "argmax",
-            "argmin", "cv". See [`use_stats()`](btorch/analysis/statistics.py:483).
+            "argmin", "cv". See :func:`~btorch.analysis.statistics.use_stats`.
         stat_info (str | list[str] | None): Additional statistics to compute
             and store in info dict.
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         nan_policy (str | None): How to handle NaN values ("skip", "warn", "assert").
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         inf_policy (str | None): How to handle Inf values ("propagate", "skip", "warn",
-            "assert"). See [`use_stats()`](btorch/analysis/statistics.py:483).
+            "assert"). See :func:`~btorch.analysis.statistics.use_stats`.
         percentiles (float | tuple[float, ...] | None): Percentile level(s) in
             [0, 100] to compute.
-            See [`use_percentiles()`](btorch/analysis/statistics.py:777).
+            See :func:`~btorch.analysis.statistics.use_percentiles`.
 
     Returns:
         fano: Fano factor values with shape [...]
@@ -535,15 +533,14 @@ def kurtosis(
     overlap: int = 0,
     fisher: bool = True,
     batch_axis: int | tuple[int, ...] | None = None,
-    **kwargs: Any,
-) -> tuple:
+) -> tuple[Any, ...]:
     """Compute kurtosis of spike counts using optimized cumulative sums.
 
     Supports both NumPy and PyTorch inputs. GPU-friendly operation.
 
     This function is decorated with `@use_stats` and `@use_percentiles`.
-    See [`use_stats()`](btorch/analysis/statistics.py:483) and
-    [`use_percentiles()`](btorch/analysis/statistics.py:777) for detailed usage.
+    See :func:`~btorch.analysis.statistics.use_stats` and
+    :func:`~btorch.analysis.statistics.use_percentiles` for detailed usage.
 
     Args:
         spikes: Spike train of shape [T, ...]. First dimension is time.
@@ -556,17 +553,17 @@ def kurtosis(
     Keyword Args:
         stat (str | None): Aggregation statistic to return instead of per-neuron values.
             Options: "mean", "median", "max", "min", "std", "var", "argmax",
-            "argmin", "cv". See [`use_stats()`](btorch/analysis/statistics.py:483).
+            "argmin", "cv". See :func:`~btorch.analysis.statistics.use_stats`.
         stat_info (str | list[str] | None): Additional statistics to compute
             and store in info dict.
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         nan_policy (str | None): How to handle NaN values ("skip", "warn", "assert").
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         inf_policy (str | None): How to handle Inf values ("propagate", "skip", "warn",
-            "assert"). See [`use_stats()`](btorch/analysis/statistics.py:483).
+            "assert"). See :func:`~btorch.analysis.statistics.use_stats`.
         percentiles (float | tuple[float, ...] | None): Percentile level(s) in
             [0, 100] to compute.
-            See [`use_percentiles()`](btorch/analysis/statistics.py:777).
+            See :func:`~btorch.analysis.statistics.use_percentiles`.
 
     Returns:
         kurt: Kurtosis values with shape [...]
@@ -633,15 +630,14 @@ def _isis_population_torch(spikes: torch.Tensor, dt: float):
 def isi_cv_population(
     spikes: np.ndarray | torch.Tensor,
     dt: float = 1.0,
-    **kwargs: Any,
-) -> tuple:
+) -> tuple[Any, ...]:
     """Calculate coefficient of variation of ISIs pooled across all neurons.
 
     This computes CV from the pooled ISI distribution across the entire
     population, giving a single population-level metric.
 
     This function is decorated with `@use_stats`.
-    See [`use_stats()`](btorch/analysis/statistics.py:483) for detailed usage.
+    See :func:`~btorch.analysis.statistics.use_stats` for detailed usage.
 
     Args:
         spikes: Spike train array of shape [T, ...]. First dimension is time.
@@ -650,14 +646,14 @@ def isi_cv_population(
     Keyword Args:
         stat (str | None): Aggregation statistic to return. Default is "cv".
             Options: "mean", "median", "max", "min", "std", "var", "argmax",
-            "argmin", "cv". See [`use_stats()`](btorch/analysis/statistics.py:483).
+            "argmin", "cv". See :func:`~btorch.analysis.statistics.use_stats`.
         stat_info (str | list[str] | None): Additional statistics to compute
             and store in info dict.
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         nan_policy (str | None): How to handle NaN values ("skip", "warn", "assert").
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         inf_policy (str | None): How to handle Inf values ("propagate", "skip", "warn",
-            "assert"). See [`use_stats()`](btorch/analysis/statistics.py:483).
+            "assert"). See :func:`~btorch.analysis.statistics.use_stats`.
 
     Returns:
         cv_pop: Single scalar CV value for the population, or aggregated
@@ -899,15 +895,14 @@ def cv_temporal(
     step: int = 1,
     batch_axis: int | tuple[int, ...] | None = None,
     dtype: np.dtype | torch.dtype | None = None,
-    **kwargs: Any,
-) -> tuple:
+) -> tuple[Any, ...]:
     """Compute CV in sliding temporal windows.
 
     Calculates the coefficient of variation of ISIs within sliding windows
     over time, giving a time-resolved measure of spike train irregularity.
 
     This function is decorated with `@use_stats`.
-    See [`use_stats()`](btorch/analysis/statistics.py:483) for detailed usage.
+    See :func:`~btorch.analysis.statistics.use_stats` for detailed usage.
 
     Args:
         spikes: Spike train array of shape [T, ...]. First dimension is time.
@@ -920,13 +915,13 @@ def cv_temporal(
 
     Keyword Args:
         stat (str | None): Aggregation statistic to return instead of per-window values.
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         stat_info (str | list[str] | None): Additional statistics to compute.
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         nan_policy (str | None): How to handle NaN values ("skip", "warn", "assert").
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         inf_policy (str | None): How to handle Inf values.
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
 
     Returns:
         cv_temporal: CV values for each window. Shape: [n_windows, ...]
@@ -981,15 +976,14 @@ def fano_temporal(
     window: int = 100,
     step: int = 1,
     batch_axis: int | tuple[int, ...] | None = None,
-    **kwargs: Any,
-) -> tuple:
+) -> tuple[Any, ...]:
     """Compute Fano factor in sliding temporal windows.
 
     Calculates the Fano factor within sliding windows over time,
     giving a time-resolved measure of spike count variability.
 
     This function is decorated with `@use_stats`.
-    See [`use_stats()`](btorch/analysis/statistics.py:483) for detailed usage.
+    See :func:`~btorch.analysis.statistics.use_stats` for detailed usage.
 
     Args:
         spikes: Spike train of shape [T, ...]. First dimension is time.
@@ -999,13 +993,13 @@ def fano_temporal(
 
     Keyword Args:
         stat (str | None): Aggregation statistic to return instead of per-window values.
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         stat_info (str | list[str] | None): Additional statistics to compute.
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         nan_policy (str | None): How to handle NaN values ("skip", "warn", "assert").
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         inf_policy (str | None): How to handle Inf values.
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
 
     Returns:
         fano_temporal: Fano factor values for each window. Shape: [n_windows, ...]
@@ -1118,7 +1112,7 @@ def fano_sweep(
     if start < 1:
         raise ValueError("start must be >= 1")
     if stop > T + 1:
-        raise ValueError(f"stop must be <= T+1 ({T+1})")
+        raise ValueError(f"stop must be <= T+1 ({T + 1})")
 
     window_sizes = np.arange(start, stop, step)
     n_windows = len(window_sizes)
@@ -1296,8 +1290,7 @@ def local_variation(
     spikes: np.ndarray | torch.Tensor,
     dt: float = 1.0,
     batch_axis: int | tuple[int, ...] | None = None,
-    **kwargs: Any,
-) -> tuple:
+) -> tuple[Any, ...]:
     """Calculate Local Variation (LV) of ISIs per neuron.
 
     LV is a measure of spike train irregularity that is less sensitive to
@@ -1314,16 +1307,16 @@ def local_variation(
 
     Keyword Args:
         stat (str | None): Aggregation statistic to return instead of per-neuron values.
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         stat_info (str | list[str] | None): Additional statistics to compute.
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         nan_policy (str | None): How to handle NaN values ("skip", "warn", "assert").
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         inf_policy (str | None): How to handle Inf values.
-            See [`use_stats()`](btorch/analysis/statistics.py:483).
+            See :func:`~btorch.analysis.statistics.use_stats`.
         percentiles (float | tuple[float, ...] | None): Percentile level(s) in
             [0, 100] to compute.
-            See [`use_percentiles()`](btorch/analysis/statistics.py:777).
+            See :func:`~btorch.analysis.statistics.use_percentiles`.
 
     Returns:
         lv_values: LV values reshaped to match input without time dimension.
@@ -1358,34 +1351,36 @@ def firing_rate(
     spikes: np.ndarray | torch.Tensor,
     width: int | float | None = 4,
     dt: int | float | None = None,
-    axis: int | Sequence[int] | None = None,
+    batch_axis: int | Sequence[int] | None = None,
 ) -> np.ndarray | torch.Tensor:
     """Smooth spikes into firing rates.
 
     Supports input shapes like [T, ...].
-    If axis is not None, averages over the specified dimensions before smoothing.
+    If batch_axis is not None, averages over the specified dimensions before
+    smoothing.
 
     Args:
         spikes: Spike train array of shape [T, ...].
         width: Smoothing window width. If None or 0, no smoothing is applied.
         dt: Time step in milliseconds. If None, defaults to 1.0.
-        axis: Axes to average over before smoothing. Can be int or tuple of ints.
+        batch_axis: Axes to average over before smoothing (e.g., neurons or
+            trials). Can be int or tuple of ints.
 
     Returns:
         firing_rates: Smoothed firing rates with same shape as input (minus
-            averaged axes if axis is specified).
+            averaged axes if batch_axis is specified).
     """
     if dt is None:
         dt = 1.0
 
-    if axis is not None:
-        # Normalize axis to tuple for consistent handling
-        if isinstance(axis, int):
-            axis = (axis,)
+    if batch_axis is not None:
+        # Normalize to a tuple for consistent handling
+        if isinstance(batch_axis, int):
+            batch_axis = (batch_axis,)
         if isinstance(spikes, np.ndarray):
-            spikes = spikes.mean(axis=axis)
+            spikes = spikes.mean(axis=tuple(batch_axis))
         else:
-            spikes = spikes.mean(dim=axis)
+            spikes = spikes.mean(dim=tuple(batch_axis))
 
     if width is None or width == 0:
         return spikes / dt

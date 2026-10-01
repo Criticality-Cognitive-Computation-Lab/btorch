@@ -1,3 +1,4 @@
+from abc import abstractmethod
 from collections.abc import Callable, Sequence
 from functools import partial
 from typing import Any, overload
@@ -93,8 +94,15 @@ class RecurrentNNAbstract(base.MemoryModule):
         self.cudagraph = cudagraph
         self._cudagraph_runner = CudaGraphRunner(warmup=cudagraph_warmup)
 
-    def _detect_loop_args(self, *args):
-        """Heuristic: use first arg's shape to detect loop args"""
+    def _detect_loop_args(self, *args: Any) -> tuple[int, tuple[int, ...]]:
+        """Infer ``(T, loop_args)`` from the first positional argument.
+
+        Every positional tensor whose leading dim equals that of the first
+        argument is treated as a time-major input to be sliced per step.
+
+        Raises:
+            ValueError: If the first argument is not a tensor with a time dim.
+        """
 
         if len(args) == 1:
             return args[0].shape[0], (0,)
@@ -102,13 +110,25 @@ class RecurrentNNAbstract(base.MemoryModule):
             a.shape[0] if torch.is_tensor(a) and a.ndim > 0 else None for a in args
         ]
         T = shapes[0]
-        assert T is not None
+        if T is None:
+            raise ValueError(
+                "cannot infer the time dimension: the first positional argument "
+                "must be a tensor with at least one dimension (time first), or "
+                "pass `loop_args` explicitly."
+            )
         loop_args = tuple(i for i, s in enumerate(shapes) if s == T)
         return T, loop_args
 
+    @abstractmethod
     def single_step_forward(
-        *args, **kwargs
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]: ...
+        self, *args: Any, **kwargs: Any
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Advance one timestep; return ``(output, states)``.
+
+        Narrows :meth:`base.MemoryModule.single_step_forward` (which returns
+        ``Any``) to the ``(output, states)`` pair the time loop accumulates.
+        """
+        raise NotImplementedError
 
     def _init_grad_hist(self, state_names: Sequence[str], T: int) -> None:
         self._grad_history = {name: [None] * T for name in state_names}
@@ -132,7 +152,9 @@ class RecurrentNNAbstract(base.MemoryModule):
         if tensor.requires_grad:
             tensor.register_hook(grad_hook)
 
-    def _process_small_chunk(self, *args, loop_args=(0,), **kwargs):
+    def _run_unroll_block(
+        self, *args: Any, loop_args: Sequence[int] = (0,), **kwargs: Any
+    ) -> tuple[list[Tensor], dict[str, list[Tensor]]]:
         """Inner loop for processing a small chunk.
 
         Returns:
@@ -158,9 +180,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         return z_seq, states_seq
 
     @partial(torch.compiler.disable, recursive=False)
-    def _process_large_chunk_impl(
-        self, *chunk_args, loop_args=(0,), unroll_size=1, **kwargs
-    ):
+    def _run_chunk_steps(self, *chunk_args, loop_args=(0,), unroll_size=1, **kwargs):
         """Process a large chunk by splitting it into small unroll blocks.
 
         This function is NOT checkpointed itself, but is the body of the
@@ -171,7 +191,7 @@ class RecurrentNNAbstract(base.MemoryModule):
 
         for sub_args in _split_loop_args(chunk_args, loop_args, unroll_size):
             # Process small chunk
-            z_sub, states_sub = self._process_small_chunk(
+            z_sub, states_sub = self._run_unroll_block(
                 *sub_args,
                 loop_args=loop_args,
                 **kwargs,
@@ -188,15 +208,15 @@ class RecurrentNNAbstract(base.MemoryModule):
         *chunk_args,
         loop_args=(0,),
         unroll_size=1,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         memories = named_hidden_states(self)
         env = environ.all()
 
         def _pure(env, memories, *inner_args):
             set_hidden_states(self, memories)
             with environ.context(**env):
-                return self._process_large_chunk_impl(
+                return self._run_chunk_steps(
                     *inner_args,
                     loop_args=loop_args,
                     unroll_size=unroll_size,
@@ -214,7 +234,9 @@ class RecurrentNNAbstract(base.MemoryModule):
             return self._cudagraph_multi_step(*args, loop_args=loop_args, **kwargs)
         return self._multi_step_forward_impl(*args, loop_args=loop_args, **kwargs)
 
-    def _chunk_plan(self, *args, loop_args=None):
+    def _chunk_plan(
+        self, *args: Any, loop_args: Sequence[int] | None = None
+    ) -> tuple[int, Sequence[int], int, int]:
         """Resolve T, the loop args, and the two block sizes the time loop
         uses."""
         # Detect loop args and time length T
@@ -241,7 +263,9 @@ class RecurrentNNAbstract(base.MemoryModule):
 
         return T, loop_args, unroll_size, large_chunk_size
 
-    def _iter_large_chunks(self, args, loop_args, chunk_size):
+    def _iter_large_chunks(
+        self, args: Sequence, loop_args: Sequence[int], chunk_size: int
+    ):
         """Yield each large chunk's positional args.
 
         Only the loop args are split along time (``torch.split`` returns zero-copy
@@ -254,7 +278,9 @@ class RecurrentNNAbstract(base.MemoryModule):
     # is what makes compile time constant in T. Without it dynamo inlines all T
     # steps into one graph (T=1000 -> ~335s to compile).
     @partial(torch.compiler.disable, recursive=False)
-    def _multi_step_forward_impl(self, *args, loop_args=None, **kwargs):
+    def _multi_step_forward_impl(
+        self, *args: Any, loop_args: Sequence[int] | None = None, **kwargs: Any
+    ) -> tuple[Tensor, dict[str, Tensor]]:
         """Unified implementation for chunked unrolling and CPU offloading."""
         # Reset gradient history
         if self.save_grad_history:
@@ -281,7 +307,7 @@ class RecurrentNNAbstract(base.MemoryModule):
             process = (
                 self._checkpointed_large_chunk
                 if use_checkpoint
-                else self._process_large_chunk_impl
+                else self._run_chunk_steps
             )
             z_chunk, states_chunk = process(
                 *chunk_args,
@@ -326,7 +352,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         than one per timestep -- which would put O(T) eager work back into the
         loop and undo what capturing bought.
         """
-        z_chunk, states_chunk = self._process_large_chunk_impl(
+        z_chunk, states_chunk = self._run_chunk_steps(
             *chunk_args, loop_args=loop_args, unroll_size=unroll_size, **kwargs
         )
         return (
@@ -335,7 +361,9 @@ class RecurrentNNAbstract(base.MemoryModule):
         )
 
     @partial(torch.compiler.disable, recursive=False)
-    def _cudagraph_multi_step(self, *args, loop_args=None, **kwargs):
+    def _cudagraph_multi_step(
+        self, *args: Any, loop_args: Sequence[int] | None = None, **kwargs: Any
+    ) -> tuple[Tensor, dict[str, Tensor]]:
         """Chunked time loop whose per-chunk device work is a replayed CUDA
         graph.
 
@@ -410,20 +438,20 @@ class RecurrentNNAbstract(base.MemoryModule):
 
 @overload
 def make_rnn(
-    obj: type[base.MemoryModule], allow_buffer=False, **rnn_kwargs
+    obj: type[base.MemoryModule], allow_buffer: bool = False, **rnn_kwargs
 ) -> type[RecurrentNNAbstract]: ...
 @overload
 def make_rnn(
-    obj: base.MemoryModule, allow_buffer=False, **rnn_kwargs
+    obj: base.MemoryModule, allow_buffer: bool = False, **rnn_kwargs
 ) -> RecurrentNNAbstract: ...
 @overload
 def make_rnn(
-    obj: None = None, allow_buffer=False, **rnn_kwargs
+    obj: None = None, allow_buffer: bool = False, **rnn_kwargs
 ) -> Callable[[type[base.MemoryModule]], type[RecurrentNNAbstract]]: ...
 def make_rnn(
-    obj=None,
-    allow_buffer=False,
-    **rnn_kwargs,
+    obj: type[base.MemoryModule] | base.MemoryModule | None = None,
+    allow_buffer: bool = False,
+    **rnn_kwargs: Any,
 ) -> (
     type[RecurrentNNAbstract]
     | RecurrentNNAbstract
@@ -435,14 +463,16 @@ def make_rnn(
         neuron_cls: type[base.MemoryModule] | base.MemoryModule,
     ) -> type[RecurrentNNAbstract]:
         class RNNWrapped(RecurrentNNAbstract):
-            def __init__(self, *args, **kwargs):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
                 super().__init__(**rnn_kwargs)
                 if isinstance(neuron_cls, type):
                     self.rnn_cell = neuron_cls(*args, **kwargs)
                 else:
                     self.rnn_cell = neuron_cls
 
-            def single_step_forward(self, *args, **kwargs):
+            def single_step_forward(
+                self, *args: Any, **kwargs: Any
+            ) -> tuple[Any, dict[str, Tensor]]:
                 out = self.rnn_cell(*args, **kwargs)
                 states = filter_hidden_states(
                     self.rnn_cell, self.update_state_names, allow_buffer=allow_buffer
@@ -485,9 +515,9 @@ class RecurrentNN(RecurrentNNAbstract):
         chunk_size: int | None = None,
         cpu_offload: bool = False,
         grad_checkpoint: bool = False,
-        allow_buffer=False,
-        **kwargs,
-    ):
+        allow_buffer: bool = False,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(
             update_state_names=update_state_names,
             unroll=unroll,
@@ -572,9 +602,9 @@ class ApicalRecurrentNN(RecurrentNN):
         chunk_size: int | None = None,
         cpu_offload: bool = False,
         grad_checkpoint: bool = False,
-        allow_buffer=False,
-        **kwargs,
-    ):
+        allow_buffer: bool = False,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(
             neuron=neuron,
             synapse=synapse,
@@ -678,8 +708,8 @@ class SomaApicalRecurrentNN(ApicalRecurrentNN):
         neuron_inp_module: nn.Module | None = None,
         *,
         update_state_names: Sequence[str] | None = None,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         super().__init__(
             neuron=neuron,
             synapse=synapse_soma,

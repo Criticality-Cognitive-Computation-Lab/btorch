@@ -32,7 +32,6 @@ def compute_ra(spike_initial: torch.Tensor, spike_final: torch.Tensor) -> float:
                Low RA -> Rich Regime (Radical restructuring)
                High RA -> Lazy Regime (Little change in internal structure)
     """
-    # Ensure inputs are float tensors
     if not isinstance(spike_initial, torch.Tensor):
         spike_initial = torch.tensor(spike_initial, dtype=torch.float32)
     if not isinstance(spike_final, torch.Tensor):
@@ -58,12 +57,10 @@ def compute_ra(spike_initial: torch.Tensor, spike_final: torch.Tensor) -> float:
     product = torch.matmul(g_final, g_initial)
     numerator = torch.trace(product)
 
-    # 3. Calculate norms ||G||
     # Assuming Frobenius norm as is standard for matrix alignment
     norm_initial = torch.norm(g_initial, p="fro")
     norm_final = torch.norm(g_final, p="fro")
 
-    # 4. Calculate RA
     if norm_initial == 0 or norm_final == 0:
         return 0.0  # Avoid division by zero
 
@@ -101,7 +98,6 @@ def compute_pcist(
         float: The PCIst score, or NaN (with a warning) if the SVD of the
             response fails to converge.
     """
-    # Ensure inputs are float tensors
     if not isinstance(response, torch.Tensor):
         response = torch.tensor(response, dtype=torch.float32)
     if not isinstance(baseline, torch.Tensor):
@@ -117,12 +113,10 @@ def compute_pcist(
         batch_size = response.shape[0]
         pcist_values = []
         for i in range(batch_size):
-            # Handle corresponding baseline
             b_sample = baseline[i] if baseline.ndim == 3 else baseline
             pcist_values.append(compute_pcist(response[i], b_sample, threshold_factor))
         return sum(pcist_values) / len(pcist_values)
 
-    # 1. Center data based on baseline mean
     mean_base = baseline.mean(dim=0)
     response_centered = response - mean_base
     baseline_centered = baseline - mean_base
@@ -147,7 +141,6 @@ def compute_pcist(
     scores_response = torch.matmul(response_centered, V)
     scores_baseline = torch.matmul(baseline_centered, V)
 
-    # 3. Calculate SNR for each component
     # SNR = Variance(Response) / Variance(Baseline)
     # Add epsilon to avoid division by zero
     var_response = scores_response.var(dim=0)
@@ -156,14 +149,12 @@ def compute_pcist(
     epsilon = 1e-9
     snr = var_response / (var_baseline + epsilon)
 
-    # 4. Calculate State Transitions
     # A state transition is defined as crossing a threshold defined by baseline noise.
     # Threshold for component k: threshold_factor * std(baseline_k)
 
     std_baseline = scores_baseline.std(dim=0)
     thresholds = threshold_factor * std_baseline  # (K,)
 
-    # Binarize response: 1 if |score| > threshold, else 0
     # We are looking for "significant excursions"
     # Shape: (T, K)
     active_states = (torch.abs(scores_response) > thresholds.unsqueeze(0)).float()
@@ -172,7 +163,6 @@ def compute_pcist(
     # diff along time dimension
     transitions = torch.abs(active_states[1:] - active_states[:-1])
 
-    # Sum transitions for each component
     num_transitions = transitions.sum(dim=0)  # (K,)
 
     # 5. Weighted Sum "Sum significant state transitions weighted by the
@@ -197,7 +187,6 @@ def compute_lyapunov_exponent(spike_train: torch.Tensor, dt: float = 0.1) -> flo
     Returns:
         float: The maximum Lyapunov exponent.
     """
-    # Ensure spike_train is a 2D tensor
     if spike_train.ndim != 2:
         raise ValueError(
             "spike_train must be a 2D tensor with shape (time_steps, num_neurons)"
@@ -210,9 +199,11 @@ def compute_lyapunov_exponent(spike_train: torch.Tensor, dt: float = 0.1) -> flo
     bandwidth = 5.0  # in ms, this may need adjustment
     continuous_rate = get_continuous_spiking_rate(spike_train, dt, bandwidth)
 
-    # 2. Calculate the Lyapunov exponent using the continuous rate
-    # We use the largest Lyapunov exponent as the measure of chaos/complexity.
-    lyapunov_exponent = compute_max_lyapunov_exponent(continuous_rate, dt)
+    # 2. Calculate the Lyapunov exponent of the mean population rate (nolds
+    # needs a 1D series). The largest Lyapunov exponent is the measure of
+    # chaos/complexity. Embedding parameters keep their defaults.
+    mean_rate = continuous_rate.mean(axis=1)
+    lyapunov_exponent = compute_max_lyapunov_exponent(mean_rate)
 
     return lyapunov_exponent
 
@@ -288,14 +279,11 @@ def compute_gain_stability_sensitivity(
     lambda_values = []
     try:
         for g in g_values:
-            # Scale weights
             linear_layer.magnitude.data = original_magnitude * g
 
-            # Reset state
             functional.reset_net(model, batch_size=1, device=device)
             init.uniform_v_(model.brain.neuron, set_reset_value=True)
 
-            # Run
             with torch.no_grad():
                 _, brain_out = model(input_sample)
                 spikes = brain_out["neuron"]["spike"]  # (Time, Batch, Neurons)
@@ -303,7 +291,6 @@ def compute_gain_stability_sensitivity(
             # spikes: (Time, 1, Neurons) -> (Time, Neurons)
             spikes_sq = spikes.squeeze(1)
 
-            # Continuous rate
             rates = get_continuous_spiking_rate(spikes_sq, dt=dt)
 
             # Mean population rate for LE calculation

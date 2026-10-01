@@ -7,7 +7,12 @@ from ...utils._optional import require
 
 
 def _fit_distribution(data):
-    """Helper to fit power law distribution using powerlaw package."""
+    """Fit a discrete power law with the ``powerlaw`` package.
+
+    Returns:
+        ``(alpha, fit)``; ``(np.nan, None)`` when there are fewer than 10
+        samples or the fit fails (a warning is emitted for failures).
+    """
     if len(data) < 10:
         return np.nan, None
     powerlaw = require("powerlaw", "analysis", "power-law fitting")
@@ -25,7 +30,13 @@ def _power_law_func(x, a, gamma):
 
 
 def _fit_scaling(x, y):
-    """Helper to fit power law scaling y = a * x^gamma using curve_fit."""
+    """Fit the power law scaling y = a * x^gamma using curve_fit.
+
+    Returns:
+        ``(gamma, stats)`` with ``stats`` a dict (``r_squared``, ``popt``,
+        ``pcov``); ``(np.nan, None)`` when there are fewer than 3 points or
+        the fit fails (a warning is emitted for failures).
+    """
     if len(x) < 3:
         return np.nan, None
 
@@ -72,11 +83,19 @@ def compute_avalanche_statistics(spike_train: np.ndarray, bin_size: int = 1) -> 
               gamma_pred| / gamma
             - 'sizes': List of avalanche sizes
             - 'durations': List of avalanche durations
-            - 'avg_size_by_duration': Tuple (unique_durations, mean_sizes)
-            - 'fit_S': powerlaw.Fit object for sizes
-            - 'fit_T': powerlaw.Fit object for durations
+            - 'avg_size_by_duration': Tuple (unique_durations, mean_sizes);
+              empty arrays when no avalanche was found
+            - 'gamma_stats': Dict with 'r_squared', 'popt', 'pcov' of the
+              scaling fit, or None
+            - 'fit_S': powerlaw.Fit object for sizes, or None
+            - 'fit_T': powerlaw.Fit object for durations, or None
+
+    Notes:
+        The result always has the same keys. When a quantity cannot be
+        estimated (fewer than 10 avalanches, failed fit) its exponent is
+        ``np.nan`` and the associated fit object / stats are ``None``; a
+        :class:`UserWarning` is emitted.
     """
-    # Ensure input is numpy array
     spike_train = np.array(spike_train)
 
     # Check dimensions. We expect (Time, Neurons).
@@ -86,12 +105,10 @@ def compute_avalanche_statistics(spike_train: np.ndarray, bin_size: int = 1) -> 
     # 1. Calculate population activity (sum spikes across neurons)
     population_activity = np.sum(spike_train, axis=1)  # Shape: (T,)
 
-    # 2. Binning
     if bin_size > 1:
         n_bins = len(population_activity) // bin_size
         # Truncate to multiple of bin_size
         population_activity = population_activity[: n_bins * bin_size]
-        # Reshape and sum
         population_activity = population_activity.reshape(-1, bin_size).sum(axis=1)
 
     # 3. Identify avalanches
@@ -125,6 +142,18 @@ def compute_avalanche_statistics(spike_train: np.ndarray, bin_size: int = 1) -> 
     sizes = np.array(sizes)
     durations = np.array(durations)
 
+    # Average size per duration (<S>(T)); grouped with bincount over the
+    # integer durations. Empty arrays when there is no avalanche.
+    if len(durations) > 0:
+        counts = np.bincount(durations)
+        sum_sizes = np.bincount(durations, weights=sizes)
+        mask = counts > 0
+        unique_durations = np.arange(len(counts))[mask]
+        mean_sizes = sum_sizes[mask] / counts[mask]
+    else:
+        unique_durations = np.array([], dtype=int)
+        mean_sizes = np.array([], dtype=float)
+
     results = {
         "sizes": sizes,
         "durations": durations,
@@ -133,6 +162,8 @@ def compute_avalanche_statistics(spike_train: np.ndarray, bin_size: int = 1) -> 
         "gamma": np.nan,
         "fit_S": None,
         "fit_T": None,
+        "avg_size_by_duration": (unique_durations, mean_sizes),
+        "gamma_stats": None,
     }
 
     if len(sizes) < 10:
@@ -147,19 +178,7 @@ def compute_avalanche_statistics(spike_train: np.ndarray, bin_size: int = 1) -> 
     results["tau"], results["fit_S"] = _fit_distribution(sizes)
     results["alpha"], results["fit_T"] = _fit_distribution(durations)
 
-    # 5. Average Size vs. Duration Scaling (<S>(T) ~ T^gamma)
-    # (at least 10 avalanches exist here, so durations is non-empty)
-    # Use bincount for fast grouping by integer duration
-    counts = np.bincount(durations)
-    sum_sizes = np.bincount(durations, weights=sizes)
-
-    # Filter out durations that didn't occur
-    mask = counts > 0
-    unique_durations = np.arange(len(counts))[mask]
-    mean_sizes = sum_sizes[mask] / counts[mask]
-
-    results["avg_size_by_duration"] = (unique_durations, mean_sizes)
-
+    # 5. Average Size vs. Duration Scaling (<S>(T) ~ T^gamma), computed above.
     # Fit scaling relation using curve_fit (non-linear least squares)
     results["gamma"], results["gamma_stats"] = _fit_scaling(
         unique_durations, mean_sizes
@@ -195,11 +214,11 @@ def compute_dfa(spike_train: np.ndarray, bin_size: int = 1) -> float:
         bin_size (int): Width of time bin in number of time steps.
 
     Returns:
-        float: The DFA exponent alpha.
+        float: The DFA exponent alpha, or ``np.nan`` (with a warning) when
+        the computation fails.
     """
     nolds = require("nolds", "analysis", "DFA analysis")
 
-    # Ensure input is numpy array
     spike_train = np.array(spike_train)
 
     # 1. Calculate population activity (sum spikes across neurons)
@@ -208,7 +227,6 @@ def compute_dfa(spike_train: np.ndarray, bin_size: int = 1) -> float:
     else:
         population_activity = spike_train
 
-    # 2. Binning
     if bin_size > 1:
         n_bins = len(population_activity) // bin_size
         population_activity = population_activity[: n_bins * bin_size]

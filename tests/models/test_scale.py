@@ -142,17 +142,6 @@ def test_scale_state_does_not_track_gradients():
     assert not st["v"].requires_grad
 
 
-def test_scale_state_helpers_handle_none_states():
-    """``functional.scale_state``/``unscale_state`` return ``None`` for
-    ``None``."""
-    import torch.nn as nn
-
-    from btorch.models.functional import scale_state, unscale_state
-
-    assert scale_state(nn.Module(), None) is None
-    assert unscale_state(nn.Module(), None) is None
-
-
 def test_scale_state_asc_amps_rejects_scalar():
     with pytest.raises(TypeError, match="asc_amps"):
         scale_state_({"asc_amps": 1.0, "v": torch.ones(2)}, scale=2.0, zeropoint=0.0)

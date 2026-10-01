@@ -114,7 +114,7 @@ def save_checkpoint(model, optimizer, epoch, path):
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "epoch": epoch,
-        "memories_rv": functional.named_memory_reset_values(model),
+        "memory_reset_values": functional.named_memory_reset_values(model),
     }, path)
 
 def load_checkpoint(model, optimizer, path):
@@ -125,8 +125,8 @@ def load_checkpoint(model, optimizer, path):
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
 
     # 恢复记忆重置值
-    if "memories_rv" in ckpt:
-        functional.set_memory_reset_values(model, ckpt["memories_rv"])
+    if "memory_reset_values" in ckpt:
+        functional.set_memory_reset_values(model, ckpt["memory_reset_values"])
     if "hidden_states" in ckpt:
         functional.set_hidden_states(model, ckpt["hidden_states"])
 
@@ -155,7 +155,7 @@ for t in range(0, T, chunk_size):
 
 1. **始终重置状态** — 在每个新批次前使用 `functional.reset_net`。
 2. **始终包装前向传递** — 在 `environ.context(dt=...)` 中运行。
-3. **保存 `memories_rv`** — 保存检查点时一并保存；`state_dict()` 不包含动态状态。
+3. **保存 `memory_reset_values`** — 保存检查点时一并保存；`state_dict()` 不包含动态状态。
 4. **使用 `detach_net`** — 用于长序列的截断时间反向传播。
 
 有关常见错误和故障排除，请参阅 [FAQ](../faq.md)。

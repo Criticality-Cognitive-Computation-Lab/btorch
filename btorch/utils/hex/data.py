@@ -431,7 +431,7 @@ class HexGrid:
         return self._data.values
 
     @values.setter
-    def values(self, v: np.ndarray):
+    def values(self, v: np.ndarray) -> None:
         self._data.values = v
 
     @property

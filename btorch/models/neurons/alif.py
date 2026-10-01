@@ -24,7 +24,6 @@ from ...types import TensorLike
 from .. import environ
 from ..base import BaseNode
 from ..ode import exp_euler_step
-from ..surrogate import Sigmoid
 
 
 class ALIF(BaseNode):
@@ -54,7 +53,8 @@ class ALIF(BaseNode):
         tau_ref: Refractory period (ms). None disables refractory.
             Default: None.
         trainable_param: Set of parameter names to make trainable.
-        surrogate_function: Surrogate gradient function. Default: Sigmoid().
+        surrogate_function: Surrogate gradient function. Default: None, which builds
+            a fresh Sigmoid() per neuron.
         detach_reset: If True, detach reset signal. Default: False.
         hard_reset: If True, use hard reset. Default: False.
         pre_spike_v: If True, store pre-spike voltage. Default: False.
@@ -96,8 +96,8 @@ class ALIF(BaseNode):
         tau_adapt: float | Float[TensorLike, " n_neuron"] = 20.0,
         dg_k: float | Float[TensorLike, " n_neuron"] = 0.0,
         tau_ref: float | Float[TensorLike, " n_neuron"] | None = None,
-        trainable_param: set[str] = set(),
-        surrogate_function: Callable = Sigmoid(),
+        trainable_param: set[str] | None = None,
+        surrogate_function: Callable | None = None,
         detach_reset: bool = False,
         hard_reset: bool = False,
         pre_spike_v: bool = False,
@@ -247,7 +247,7 @@ class ALIF(BaseNode):
             )
 
     def extra_repr(self) -> str:
-        g_k_init = self._memories_rv["g_k"].value
+        g_k_init = self._memory_reset_values["g_k"].value
         parts = [
             f"c_m={self._format_repr_value(self.c_m)}",
             f"g_leak={self._format_repr_value(self.g_leak)}",
@@ -293,11 +293,13 @@ class ELIF(ALIF):
         g_k_init: Initial adaptation conductance (nS). Default: 0.0.
         tau_adapt: Adaptation time constant (ms). Default: 20.0.
         dg_k: Adaptation increment per spike (nS). Default: 0.0.
-        tau_ref: Refractory period (ms). Default: 0.0.
+        tau_ref: Refractory period (ms). None disables refractory.
+            Default: None.
         delta_T: Slope factor for exponential term (mV). Default: 1.0.
         v_T: Soft threshold potential (mV). Default: 0.0.
         trainable_param: Set of parameter names to make trainable.
-        surrogate_function: Surrogate gradient function. Default: Sigmoid().
+        surrogate_function: Surrogate gradient function. Default: None, which builds
+            a fresh Sigmoid() per neuron.
         detach_reset: If True, detach reset signal. Default: False.
         hard_reset: If True, use hard reset. Default: False.
         pre_spike_v: If True, store pre-spike voltage. Default: False.
@@ -326,11 +328,11 @@ class ELIF(ALIF):
         g_k_init: float | Float[TensorLike, " n_neuron"] = 0.0,
         tau_adapt: float | Float[TensorLike, " n_neuron"] = 20.0,
         dg_k: float | Float[TensorLike, " n_neuron"] = 0.0,
-        tau_ref: float | Float[TensorLike, " n_neuron"] | None = 0.0,
+        tau_ref: float | Float[TensorLike, " n_neuron"] | None = None,
         delta_T: float | Float[TensorLike, " n_neuron"] = 1.0,
         v_T: float | Float[TensorLike, " n_neuron"] = 0.0,
-        trainable_param: set[str] = set(),
-        surrogate_function: Callable = Sigmoid(),
+        trainable_param: set[str] | None = None,
+        surrogate_function: Callable | None = None,
         detach_reset: bool = False,
         hard_reset: bool = False,
         pre_spike_v: bool = False,

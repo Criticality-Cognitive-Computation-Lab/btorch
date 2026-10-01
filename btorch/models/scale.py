@@ -1,30 +1,11 @@
 from collections.abc import Sequence
 from numbers import Number
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
 import torch
 
 from ..types import TensorLike
-from .base import MemoryModule
-
-
-# DEPRECATED (kept for now): this was designed to scale/unscale the network weight
-#   automatically. Scaling makes param values compatible with gradient learning
-#   rate. However, through practice, it seems easier to pass scaled param
-#   directly to the model.
-#   TODO: revisit for a better design.
-#   NOTE: not dead code -- ``SupportScaleState`` is still referenced by
-#   ``btorch.models.functional`` (isinstance checks), so do not remove it
-#   without updating that module.
-
-# TODO: needs rework. use scale_state_ for now.
-#   - how does it fit in states dict and memory?
-#   - how to handle weight and input scaling?
-#   - how to scale buffer and parameters in the same way?
-#   - must be explicit and optional. once enabled, must be automatic later
-#   - consider torch parametrise or brevitas QuantTensor (not perferable,
-#     because scaling couples with model)?
 
 
 @torch.no_grad()
@@ -35,8 +16,14 @@ def scale_state_(
     zeropoint: TensorLike | None = None,
     unscale: bool = False,
     store: bool = False,
-):
+) -> tuple[TensorLike, TensorLike]:
     """Scale or unscale a state dictionary in-place.
+
+    Maps ``v``, ``v_threshold`` and ``v_reset`` to ``(x - zeropoint) / scale``
+    and ``Iasc``, ``psc`` and ``asc_amps`` to ``x / scale`` (inverted when
+    ``unscale=True``). Scaling makes parameter magnitudes comparable with the
+    learning rate; it is applied explicitly to a states dict, not hooked into
+    modules.
 
     Args:
         states: Dictionary of state tensors to scale.
@@ -127,189 +114,3 @@ def scale_state_(
             states["scaled"] = True
 
     return scale, zeropoint
-
-
-# Behavior when (un)scaling a module that is already (un)scaled:
-#   "ignore":   no-op; value-returning helpers return their input unchanged.
-#   "assert":   raise ``RuntimeError``.
-#   "repeated": apply the transform again regardless of the current state.
-_ENFORCE_MODE = Literal["ignore", "assert", "repeated"]
-
-
-class SupportScaleState(MemoryModule):
-    """Mixin providing automatic state scaling for neuron parameters.
-
-    Still experimental; see module notes for limitations.
-    You are suggested to use :func:`scale_state_` directly for now.
-    """
-
-    scaled: torch.Tensor
-    neuron_scale: torch.Tensor
-    neuron_zeropoint: torch.Tensor
-
-    def _init_scale_state(self):
-        self.register_buffer("scaled", torch.tensor(False), persistent=True)
-
-    def _scale_state(self, states: dict | None = None) -> None:
-        self.scaled |= True
-
-    def _unscale_state(self, states: dict | None = None) -> None:
-        self.scaled &= False
-
-    def init_scale_state(self):
-        self._init_scale_state()
-        self.register_buffer(
-            "neuron_scale", self.v_threshold - self.v_rest, persistent=True
-        )
-        self.register_buffer("neuron_zeropoint", self.v_rest, persistent=True)
-
-    def scale_func(self, v, zero=True, enforce: _ENFORCE_MODE = "assert"):
-        """Scale ``v`` into normalized units and return the result.
-
-        With ``enforce="ignore"`` on an already scaled module, ``v`` is returned
-        unchanged; ``"assert"`` raises ``RuntimeError``; ``"repeated"`` scales again.
-        """
-        if not hasattr(self, "scaled"):
-            self.init_scale_state()
-        if self.scaled:
-            if enforce == "assert":
-                raise RuntimeError(f"{self} already scaled")
-            elif enforce == "ignore":
-                return v
-        if zero:
-            return (v - self.neuron_zeropoint) / self.neuron_scale
-        else:
-            return v / self.neuron_scale
-
-    def unscale_func(self, v, zero=True, enforce: _ENFORCE_MODE = "ignore"):
-        """Map normalized ``v`` back to physical units and return the result.
-
-        With ``enforce="ignore"`` on an already unscaled module, ``v`` is returned
-        unchanged; ``"assert"`` raises ``RuntimeError``; ``"repeated"`` unscales
-        again.
-        """
-        if not self.scaled:
-            if enforce == "assert":
-                raise RuntimeError(f"{self} already unscaled")
-            elif enforce == "ignore":
-                return v
-
-        if zero:
-            return v * self.neuron_scale + self.neuron_zeropoint
-        else:
-            return v * self.neuron_scale
-
-    # TODO: complicated, how does this play with memories and memories_rv?
-    # TODO: should I scale memories already inited by init_state?
-    @torch.no_grad()
-    def scale_state(
-        self,
-        states: dict | None = None,
-        enforce: _ENFORCE_MODE = "assert",
-        force_memories_rv: bool = True,
-    ) -> None:
-        """Scale neuron parameters and optionally memory reset values.
-
-        Args:
-            states: Optional state dictionary to scale in-place. If None,
-                scales the module's own parameters and reset values.
-            enforce: Behavior when already scaled (``ignore``, ``assert``,
-                or ``repeated`` to apply the scaling again).
-            force_memories_rv: If True, also scale memory reset values.
-        """
-        if not hasattr(self, "scaled"):
-            self.init_scale_state()
-        if self.scaled:
-            if enforce == "assert":
-                raise RuntimeError(f"{self} already scaled")
-            elif enforce == "ignore":
-                return
-
-        if states is not None:
-            scale_state_(
-                states,
-                scale=self.neuron_scale,
-                zeropoint=self.neuron_zeropoint,
-            )
-            return
-
-        states = {
-            "v_threshold": self.v_threshold,
-            "v_reset": self.v_rest,
-            "asc_amps": self.asc_amps,
-        }
-        if force_memories_rv:
-            states.update(
-                {
-                    "v": self._memories_rv["v"].value,
-                    "Iasc": self._memories_rv["Iasc"].value,
-                }
-            )
-        scale_state_(states, scale=self.neuron_scale, zeropoint=self.neuron_zeropoint)
-        self.v_threshold = states["v_threshold"]
-        self.v_reset = states["v_reset"]
-        self.v_rest = states["v_reset"]
-        self.asc_amps = states["asc_amps"]
-        if force_memories_rv:
-            self.set_reset_value("v", states["v"])
-            self.set_reset_value("Iasc", states["Iasc"])
-
-        self._scale_state(states)
-
-    @torch.no_grad()
-    def unscale_state(
-        self,
-        states: dict | None = None,
-        enforce: _ENFORCE_MODE = "ignore",
-        force_memories_rv: bool = True,
-    ) -> None:
-        """Unscale neuron parameters and optionally memory reset values.
-
-        Args:
-            states: Optional state dictionary to unscale in-place. If None,
-                unscales the module's own parameters and reset values.
-            enforce: Behavior when already unscaled (``ignore``, ``assert``,
-                or ``repeated`` to apply the unscaling again).
-            force_memories_rv: If True, also unscale memory reset values.
-        """
-        if not self.scaled:
-            if enforce == "assert":
-                raise RuntimeError(f"{self} already unscaled")
-            elif enforce == "ignore":
-                return
-
-        if states is not None:
-            scale_state_(
-                states,
-                scale=self.neuron_scale,
-                zeropoint=self.neuron_zeropoint,
-                unscale=True,
-            )
-            return
-
-        states = {
-            "v_threshold": self.v_threshold,
-            "v_reset": self.v_rest,
-            "asc_amps": self.asc_amps,
-        }
-        if force_memories_rv:
-            states.update(
-                {
-                    "v": self._memories_rv["v"].value,
-                    "Iasc": self._memories_rv["Iasc"].value,
-                }
-            )
-        scale_state_(
-            states,
-            scale=self.neuron_scale,
-            zeropoint=self.neuron_zeropoint,
-            unscale=True,
-        )
-        self.v_threshold = states["v_threshold"]
-        self.v_reset = states["v_reset"]
-        self.v_rest = states["v_reset"]
-        self.asc_amps = states["asc_amps"]
-        if force_memories_rv:
-            self.set_reset_value("v", states["v"])
-            self.set_reset_value("Iasc", states["Iasc"])
-        self._unscale_state(states)

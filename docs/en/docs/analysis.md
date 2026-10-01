@@ -10,11 +10,11 @@ Spike train analysis utilities with dual NumPy/PyTorch backend support.
 
 | Function | Description |
 |----------|-------------|
-| `cv_from_spikes` | Coefficient of variation of ISIs per neuron |
-| `fano_factor_from_spikes` | Fano factor (variance/mean of spike counts) |
-| `kurtosis_from_spikes` | Kurtosis of spike count distribution |
-| `local_variation_from_spikes` | Local Variation (LV) - rate-independent irregularity |
-| `raster_plot` | Extract spike times/neuron indices for plotting |
+| `isi_cv` | Coefficient of variation of ISIs per neuron |
+| `fano` | Fano factor (variance/mean of spike counts) |
+| `kurtosis` | Kurtosis of spike count distribution |
+| `local_variation` | Local Variation (LV) - rate-independent irregularity |
+| `compute_raster` | Extract spike times/neuron indices for plotting |
 | `firing_rate` | Convolve spikes to firing rates |
 | `compute_spectrum` | Power spectrum via Welch method |
 
@@ -26,49 +26,31 @@ Spike train analysis utilities with dual NumPy/PyTorch backend support.
 **Examples:**
 
 ```python
-from btorch.analysis.spiking import cv_from_spikes, fano_factor_from_spikes
+from btorch.analysis import fano, fano_sweep, isi_cv, local_variation
 
 # NumPy input with batch aggregation across trials
-cv, isi_total, isi_stats = cv_from_spikes(
-    spikes,           # shape: [T, B, N] 
+cv, info = isi_cv(
+    spikes,               # shape: [T, B, N]
     dt=1.0,
     batch_axis=(1,),      # aggregate across batch dimension
-    percentile=(0.1, 0.5, 0.9)  # compute 10th, 50th, 90th percentiles
+    percentiles=(10, 50, 90),  # percentile levels in [0, 100]
 )
 # cv shape: [N] - per-neuron CV values
-# isi_stats['percentile']: {'levels': (0.1, 0.5, 0.9), 'values': [...]}
+# info["cv_levels"], info["cv_percentiles"]: requested levels and their values
 
-# Torch GPU input
+# Torch GPU input: returns GPU tensor, uses hybrid CPU/GPU for efficiency
 import torch
-cv_gpu, _, _ = cv_from_spikes(
-    torch.from_numpy(spikes).cuda(),
-    dt=1.0,
-    batch_axis=(1,)
-)
-# Returns GPU tensor, uses hybrid CPU/GPU for efficiency
+cv_gpu, _ = isi_cv(torch.from_numpy(spikes).cuda(), dt=1.0, batch_axis=(1,))
 
-# Fano factor with sliding windows
-fano, info = fano_factor_from_spikes(
-    spikes,
-    window=100,       # window size in time steps
-    overlap=50,       # overlap between windows
-    percentile=0.9    # compute 90th percentile across neurons
-)
+# Fano factor with overlapping counting windows, aggregated to one number
+ff, info = fano(spikes, window=100, overlap=50, stat="mean")
 
-# Sweep mode - compute for all window sizes
-fano_sweep = fano_factor_from_spikes(
-    spikes,
-    sweep_window=True  # returns [T, ...] with FF for each window size
-)
+# Sweep over counting-window sizes 1..50
+ff_sweep, info = fano_sweep(spikes, window=50)
 
 # Local Variation (LV) - less sensitive to rate changes than CV
-lv, lv_stats = local_variation_from_spikes(
-    spikes,
-    dt=1.0,
-    percentile=(0.25, 0.75)
-)
+lv, info = local_variation(spikes, dt=1.0, percentiles=(25, 75))
 ```
-
 ---
 
 ### `statistics.py`
@@ -150,13 +132,34 @@ Selection and masking utilities.
 
 ---
 
+### `two_compartment_fit.py`
+
+Fitting and evaluation helpers for `TwoCompartmentGLIF` against Allen Cell Types
+sweeps. All loss settings are carried by a single `FitLossConfig` dataclass that
+is passed as `loss=` to `two_compartment_loss`, `evaluate_two_compartment_fit`,
+`evaluate_fit_across_sweeps` and `fit_two_compartment_model` (`None` selects the
+defaults).
+
+```python
+from btorch.analysis import (
+    FitLossConfig,
+    evaluate_fit_across_sweeps,
+    fit_two_compartment_model,
+)
+
+loss = FitLossConfig(spike_count_weight=5.0, spike_match_window_ms=5.0)
+history = fit_two_compartment_model(model, sweeps, method="hybrid", loss=loss)
+evaluations, aggregate = evaluate_fit_across_sweeps(model, sweeps, loss=loss)
+```
+
 ## `dynamic_tools/` Subpackage
 
 Advanced dynamical systems analysis tools.
 
 | Module | Description |
 |--------|-------------|
-| `micro_scale.py` | ISI CV, burst detection, firing rate distribution |
+| `micro_scale.py` | Firing rate distribution, SPIKE distance (ISI CV lives in `analysis.spiking.isi_cv`) |
+| `fano.py` | Rate-compensated Fano factors (operational time, mean matching, model based) |
 | `complexity.py` | PCIst, representation alignment, gain-stability |
 | `criticality.py` | Avalanche analysis, power-law fitting, DFA |
 | `attractor_dynamics.py` | Phase space reconstruction, Kaplan-Yorke dimension |
@@ -206,14 +209,14 @@ metrics, info = compute_ei_balance_full(
 ## Usage Examples
 
 ```python
-from btorch.analysis.spiking import firing_rate, fano_factor_from_spikes
+from btorch.analysis.spiking import firing_rate, fano
 from btorch.analysis.branching import MR_estimation
 
 # Compute firing rates
 fr = firing_rate(spikes, width=10, dt=0.1)
 
 # Fano factor across windows
-fano = fano_factor_from_spikes(spikes, window=100)
+ff, info = fano(spikes, window=100)
 
 # Branching ratio estimation
 result = MR_estimation(spike_counts)

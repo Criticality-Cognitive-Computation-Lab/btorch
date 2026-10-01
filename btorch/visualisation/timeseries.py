@@ -31,12 +31,7 @@ from matplotlib.ticker import MaxNLocator
 
 from ..analysis.spiking import compute_raster, compute_spectrum, firing_rate
 from ..analysis.statistics import compute_log_hist
-
-
-def _to_numpy(data: Any) -> np.ndarray:
-    if isinstance(data, torch.Tensor):
-        return data.detach().cpu().numpy()
-    return np.asarray(data)
+from ..utils.array import to_numpy
 
 
 def _resolve_per_neuron_values(
@@ -53,7 +48,7 @@ def _resolve_per_neuron_values(
     if np.isscalar(value):
         return [float(value)] * n_plot
 
-    arr = _to_numpy(value)
+    arr = to_numpy(value)
     if arr.ndim == 0:
         return [float(arr)] * n_plot
     if arr.ndim != 1:
@@ -85,7 +80,7 @@ def _get_time_axis(
             raise ValueError(
                 f"Length of times ({len(times)}) must match length of data ({length})."
             )
-        return _to_numpy(times)
+        return to_numpy(times)
 
     if dt is None:
         dt = 1.0
@@ -224,6 +219,9 @@ class _SpikeStyle:
     size_list: np.ndarray | None = None
     color_list: list | None = None
     multi_marker: bool = False
+    # True when the caller supplied explicit per-neuron colours (sequence or
+    # neuron-/group-keyed dict) that must also win over strip colours.
+    per_neuron_colors: bool = False
 
 
 @dataclass
@@ -442,7 +440,12 @@ def _resolve_spike_style(
         color_by_neuron = np.array(spike_color, dtype=object)
 
     if color_by_neuron is not None:
-        return _SpikeStyle(color_by_neuron[orig_neuron_indices], marker, marker_size)
+        return _SpikeStyle(
+            color_by_neuron[orig_neuron_indices],
+            marker,
+            marker_size,
+            per_neuron_colors=True,
+        )
     if neuron_specs is None:
         return _SpikeStyle(c_array, marker, marker_size)
 
@@ -672,7 +675,8 @@ def _add_strip_legend(
 ) -> None:
     base_colors = colors.base_colors
     subgroup_colors = colors.subgroup_colors
-    if label_mode == "top":
+    # Without subgroups top and sub labels coincide; avoid "A / A".
+    if label_mode == "top" or not colors.use_subgroups:
         legend_elements = [
             mpatches.Patch(color=base_colors[tg], label=str(tg))
             for tg in top_groups_order
@@ -815,19 +819,23 @@ def _draw_strip_spikes(
     marker_size: float,
 ) -> None:
     """Draw spikes coloured by the group strip colours (strip mode)."""
-    top_vals = groups.group_labels[orig_neuron_indices]
-    sub_vals = groups.subgroup_labels[orig_neuron_indices]
-    spike_colors = []
-    for top, sub in zip(top_vals, sub_vals):
-        if colors.use_subgroups:
-            spike_colors.append(
-                colors.subgroup_colors.get(
-                    (top, sub), colors.base_colors.get(top, "black")
+    if style.per_neuron_colors:
+        # Explicit per-neuron colours from the caller override the strip colours.
+        spike_colors = np.asarray(style.c_array, dtype=object)
+    else:
+        top_vals = groups.group_labels[orig_neuron_indices]
+        sub_vals = groups.subgroup_labels[orig_neuron_indices]
+        spike_colors = []
+        for top, sub in zip(top_vals, sub_vals):
+            if colors.use_subgroups:
+                spike_colors.append(
+                    colors.subgroup_colors.get(
+                        (top, sub), colors.base_colors.get(top, "black")
+                    )
                 )
-            )
-        else:
-            spike_colors.append(colors.base_colors.get(sub, "black"))
-    spike_colors = np.array(spike_colors, dtype=object)
+            else:
+                spike_colors.append(colors.base_colors.get(sub, "black"))
+        spike_colors = np.array(spike_colors, dtype=object)
 
     sizes = style.size_list if style.size_list is not None else marker_size
     marker_list = style.marker_list
@@ -842,7 +850,12 @@ def _draw_strip_spikes(
             sorted(set(marker_list)),
         )
     else:
-        marker_use = marker_list[0] if marker_list is not None else style.marker
+        # marker_list is empty when there are no spikes at all.
+        marker_use = (
+            marker_list[0]
+            if marker_list is not None and len(marker_list) > 0
+            else style.marker
+        )
         _scatter_spikes(
             ax, spike_times, plot_neuron_indices, sizes, spike_colors, marker_use
         )
@@ -858,7 +871,7 @@ def _resolve_total_rate(
     """Return the population rate trace (given array or computed) or None."""
     n_time = spikes_np.shape[0]
     if isinstance(rate, (np.ndarray, torch.Tensor)):
-        fr = _to_numpy(rate)
+        fr = to_numpy(rate)
         if fr.ndim == 2 and fr.shape[1] == 1:
             fr = fr[:, 0]
         if fr.ndim != 1:
@@ -869,7 +882,7 @@ def _resolve_total_rate(
     if rate is True:
         eff_dt = _effective_dt(dt, t)
         return firing_rate(
-            spikes_np, width=rate_window_ms / eff_dt, dt=eff_dt * 1e-3, axis=-1
+            spikes_np, width=rate_window_ms / eff_dt, dt=eff_dt * 1e-3, batch_axis=-1
         )
     return None
 
@@ -907,7 +920,7 @@ def _plot_group_rates(
         )
 
     if isinstance(group_rate, dict):
-        group_rates = {k: _to_numpy(v) for k, v in group_rate.items()}
+        group_rates = {k: to_numpy(v) for k, v in group_rate.items()}
         for g in groups.groups:
             if g not in group_rates:
                 continue
@@ -918,7 +931,7 @@ def _plot_group_rates(
                 raise ValueError("group_rate values must be 1D and match time axis.")
             plot_line(g, g_rate)
     elif isinstance(group_rate, (np.ndarray, torch.Tensor)):
-        group_rate_arr = _to_numpy(group_rate)
+        group_rate_arr = to_numpy(group_rate)
         if group_rate_arr.ndim != 2 or group_rate_arr.shape[0] != n_time:
             raise ValueError("group_rate array must have shape (T, G).")
         if group_rate_arr.shape[1] != len(groups.groups):
@@ -937,7 +950,7 @@ def _plot_group_rates(
                     spikes_np[:, g_indices],
                     width=rate_window_ms / eff_dt,
                     dt=eff_dt * 1e-3,
-                    axis=-1,
+                    batch_axis=-1,
                 ),
             )
 
@@ -961,7 +974,7 @@ def _draw_rate_panel(
     """Fill the rate axes and move the x label from the raster to it."""
     fr = _resolve_total_rate(rate, spikes_np, t, dt, rate_window_ms)
 
-    if show_group_rate and group_key is not None:
+    if show_group_rate:
         _plot_group_rates(
             ax_rate,
             t,
@@ -1091,7 +1104,7 @@ def plot_raster(
     ax or (ax_raster, ax_rate)
         The axis object(s).
     """
-    spikes_np = _to_numpy(spikes)
+    spikes_np = to_numpy(spikes)
     if spikes_np.ndim != 2:
         raise ValueError("spikes must be 2D (time, neurons)")
 
@@ -1104,6 +1117,11 @@ def plot_raster(
         group_rate
     )
     with_rate_panel = show_rate or show_group_rate
+    if show_group_rate and group_key is None:
+        raise ValueError(
+            "group_rate requires group_key (and neurons_df) so per-group "
+            "rates can be computed."
+        )
 
     ax_raster, ax_rate = _create_raster_axes(ax, n_neurons, with_rate_panel)
     groups = _resolve_raster_groups(
@@ -1262,7 +1280,7 @@ def plot_traces(
     -------
     Axes
     """
-    data_np = _to_numpy(data)
+    data_np = to_numpy(data)
     t = _get_time_axis(data_np.shape[0], dt, times)
 
     if data_np.ndim == 2:
@@ -1372,7 +1390,7 @@ def plot_spectrum(
     Example:
         >>> freqs, power, ax = plot_spectrum(spikes, dt=1.0, mode="loglog")
     """
-    data_np = _to_numpy(data)
+    data_np = to_numpy(data)
     if dt is None:
         dt = 1.0
 
@@ -1438,7 +1456,7 @@ def plot_grouped_spectrum(
         separate_figures: Return dict of figs
         colors: Dict of {group_label: color}
     """
-    data_np = _to_numpy(data)
+    data_np = to_numpy(data)
     if groups is None:
         if neurons_df is None or group_by is None:
             # No grouping, treat as one group "All"
@@ -1557,7 +1575,7 @@ def plot_log_hist(
     Example:
         >>> ax = plot_log_hist(synapse_weights, title="Weight Distribution")
     """
-    vals = _to_numpy(values)
+    vals = to_numpy(values)
     hist, bin_centers = compute_log_hist(vals)
 
     if ax is None:
@@ -1686,7 +1704,7 @@ def _extract_batch_dim(
     if data is None:
         return None
 
-    arr = _to_numpy(data)
+    arr = to_numpy(data)
     if arr.ndim == 2:
         # No batch dimension: (time, neurons)
         return arr
@@ -1738,7 +1756,7 @@ class _TraceConfig:
     dataclasses."""
 
     voltage: Any
-    dt: float
+    dt: float | None
     asc: Any
     psc: Any
     epsc: Any
@@ -1785,11 +1803,12 @@ def _merge_trace_config(
 ) -> _TraceConfig:
     """Fill unset arguments from ``states`` and override from ``format``.
 
-    The sentinels (``dt == 1.0``, ``seed == 42``) mean "not explicitly given".
+    ``dt=None`` means "not given" (taken from ``states``, else 1.0 ms); the
+    sentinel ``seed == 42`` still means "not explicitly given".
     """
     if states is not None:
         cfg.voltage = states.voltage if cfg.voltage is None else cfg.voltage
-        cfg.dt = states.dt if cfg.dt == 1.0 else cfg.dt
+        cfg.dt = states.dt if cfg.dt is None else cfg.dt
         cfg.asc = states.asc if cfg.asc is None else cfg.asc
         cfg.psc = states.psc if cfg.psc is None else cfg.psc
         cfg.epsc = states.epsc if cfg.epsc is None else cfg.epsc
@@ -1820,6 +1839,8 @@ def _merge_trace_config(
             cfg.neurons_per_row = format.neurons_per_row
         if cfg.batch_idx is None:
             cfg.batch_idx = format.batch_idx
+    if cfg.dt is None:
+        cfg.dt = 1.0
     return cfg
 
 
@@ -1828,14 +1849,22 @@ def _prepare_trace_data(cfg: _TraceConfig) -> _TraceData:
     batch_idx = 0 if cfg.batch_idx is None else cfg.batch_idx
     psc_labels = cfg.psc_labels
 
-    # A 3D PSC matching the neuron count is (time, neurons, n_psc). This must be
-    # decided before batch extraction, which would read it as (time, batch, neurons).
+    # Multi-component PSC layouts: (time, neurons, n_psc) next to 2D voltage
+    # (no batch dimension), or (time, batch, neurons, n_psc) (4D).  A 3D PSC
+    # next to 3D voltage is a plain batched PSC (time, batch, neurons).
     psc_has_extra_dim = False
-    psc_raw = _to_numpy(cfg.psc) if cfg.psc is not None else None
-    if psc_raw is not None and psc_raw.ndim == 3:
-        n_neurons_from_v = _to_numpy(cfg.voltage).shape[1]
-        if psc_raw.shape[1] == n_neurons_from_v:
+    psc_raw = to_numpy(cfg.psc) if cfg.psc is not None else None
+    if psc_raw is not None:
+        voltage_shape = to_numpy(cfg.voltage).shape
+        if psc_raw.ndim == 4:
             psc_has_extra_dim = True
+        elif (
+            psc_raw.ndim == 3
+            and len(voltage_shape) == 2
+            and psc_raw.shape[1] == voltage_shape[1]
+        ):
+            psc_has_extra_dim = True
+        if psc_has_extra_dim:
             for name, value in (
                 ("epsc", cfg.epsc),
                 ("ipsc", cfg.ipsc),
@@ -1847,12 +1876,12 @@ def _prepare_trace_data(cfg: _TraceConfig) -> _TraceData:
                         "(n_psc > 1)"
                     )
             if psc_labels is None:
-                psc_labels = [f"PSC_{i}" for i in range(psc_raw.shape[2])]
+                psc_labels = [f"PSC_{i}" for i in range(psc_raw.shape[-1])]
 
     voltage = _extract_batch_dim(cfg.voltage, batch_idx)
     spikes = _extract_batch_dim(cfg.spikes, batch_idx)
     asc = _extract_batch_dim(cfg.asc, batch_idx)
-    if psc_has_extra_dim:
+    if psc_has_extra_dim and psc_raw.ndim == 3:
         psc = psc_raw
     else:
         psc = _extract_batch_dim(cfg.psc, batch_idx)
@@ -1860,7 +1889,7 @@ def _prepare_trace_data(cfg: _TraceConfig) -> _TraceData:
     ipsc = _extract_batch_dim(cfg.ipsc, batch_idx)
     input_current = _extract_batch_dim(cfg.input, batch_idx)
     return _TraceData(
-        voltage=_to_numpy(voltage),
+        voltage=to_numpy(voltage),
         spikes=spikes,
         asc=asc,
         psc=psc,
@@ -2050,6 +2079,7 @@ def _plot_separate_trace_figures(
     resolve_label: Callable[[int, int], str | None],
     label_position: str,
     figsize: tuple[float, float],
+    neuron_specs: list[NeuronSpec | dict] | NeuronSpec | dict | None = None,
 ) -> dict[str, Figure]:
     """Create one figure per trace type with one row per neuron."""
     n_plot = len(neuron_indices)
@@ -2058,21 +2088,28 @@ def _plot_separate_trace_figures(
         fig, axes = plt.subplots(n_plot, 1, figsize=figsize, squeeze=False)
         for i, neuron_idx in enumerate(neuron_indices):
             ax = axes[i, 0]
+            spec = _resolve_neuron_spec(neuron_specs, i)
             _draw_trace_panel(
                 ax,
                 kind,
                 data,
                 neuron_idx,
                 times,
-                colors,
+                _colors_for_spec(colors, spec),
                 format,
                 v_thresholds[i],
                 v_resets[i],
-                {},
+                {
+                    "linestyle": spec.linestyle,
+                    "linewidth": spec.linewidth,
+                    "alpha": spec.alpha,
+                },
                 _SEPARATE_TITLES[kind] if i == 0 else None,
             )
             _finish_trace_axis(ax, i == n_plot - 1)
-            label = resolve_label(i, neuron_idx)
+            label = (
+                spec.label if spec.label is not None else resolve_label(i, neuron_idx)
+            )
             if label is None:
                 continue
             if label_position == "top":
@@ -2281,7 +2318,7 @@ def plot_neuron_traces(
     format: TracePlotFormat | None = None,
     # Plain args interface
     voltage: np.ndarray | torch.Tensor | None = None,
-    dt: float = 1.0,
+    dt: float | None = None,
     asc: np.ndarray | torch.Tensor | None = None,
     psc: np.ndarray | torch.Tensor | None = None,
     epsc: np.ndarray | torch.Tensor | None = None,
@@ -2315,7 +2352,8 @@ def plot_neuron_traces(
         states: SimulationStates dataclass with all state data
         format: TracePlotFormat dataclass with formatting options
         voltage: Voltage traces (time, neurons) or (time, batch, neurons)
-        dt: Timestep in ms
+        dt: Timestep in ms. If None, ``states.dt`` is used when ``states`` is
+            given, otherwise 1.0. An explicit value always wins.
         asc: Afterspike current traces (time, neurons), (time, batch, neurons),
             or (time, batch, neurons, n_asc) for multiple ASC components
         psc: Postsynaptic current traces (time, neurons), (time, batch, neurons),
@@ -2430,6 +2468,7 @@ def plot_neuron_traces(
             resolve_label,
             cfg.neuron_label_position,
             (base_width, height_per_row * n_plot),
+            cfg.neuron_specs,
         )
 
     if not kinds:

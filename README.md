@@ -36,7 +36,7 @@ We thank the developers of both libraries for the inspirations.
 
 **Enhancement from spikingjelly**:
 
-- heterogenous parameters
+- heterogeneous parameters
 - enhanced check of shape and dtype of register_memory
 - torch.compile compatibility
 - gradient checkpoint and truncated BPTT

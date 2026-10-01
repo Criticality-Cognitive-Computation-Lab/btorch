@@ -29,8 +29,6 @@ hide:
     Sparse connectivity matrices, delay expansion, and
     Flywire-compatible data handling.
 
-    [:octicons-arrow-right-24: Connection Conversion](connection_conversion.md)
-
 -   :material-chart-line:{ .lg .middle } __Analysis & Visualisation__
 
     ---
@@ -64,7 +62,7 @@ pip install -e . --config-settings editable_mode=strict
 ## Key Features
 
 - **Stateful Modules**: Built-in memory management for spiking neurons
-- **Shape Safety**: Enhanced dtype and dimension handling for scala and hetergenous parameters
+- **Shape Safety**: Enhanced dtype and dimension handling for scala and heterogeneous parameters
 - **`torch.compile` Ready**: Compatible with PyTorch 2.x compilation
 - **Sparse Connectivity**: First-class support for large sparse matrices
 - **Truncated BPTT**: Easy gradient truncation for long sequences

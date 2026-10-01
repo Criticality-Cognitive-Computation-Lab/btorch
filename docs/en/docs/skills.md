@@ -13,7 +13,7 @@ This page summarizes what each skill covers and links to the relevant source fil
 - **Stateful modules** — `MemoryModule`, `init_net_state`, `reset_net`, checkpointing
 - **The `dt` environment** — `environ.context(dt=...)` usage
 - **Training loops** — plain PyTorch and Lightning integration
-- **Checkpointing** — saving/loading `memories_rv` with `state_dict()`
+- **Checkpointing** — saving/loading `memory_reset_values` with `state_dict()`
 - **Truncated BPTT** — `detach_net` for long sequences
 - **Common pitfalls** — forgetting `dt`, wrong state names, missing resets
 

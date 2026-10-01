@@ -1,4 +1,6 @@
+from collections.abc import Callable
 from functools import partial
+from typing import Any
 
 import torch
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -22,9 +24,9 @@ class CheckpointWrapper(ActivationWrapper):
     def __init__(
         self,
         mod: torch.nn.Module,
-        checkpoint_fn=None,
-        **checkpoint_fn_kwargs,
-    ):
+        checkpoint_fn: Callable[..., Any] | None = None,
+        **checkpoint_fn_kwargs: Any,
+    ) -> None:
         super().__init__(mod)
         if checkpoint_fn is None:
             # use torch.utils.checkpoint
@@ -40,7 +42,7 @@ class CheckpointWrapper(ActivationWrapper):
                 **checkpoint_fn_kwargs,
             )
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
         mem_states = named_hidden_states(self._checkpoint_wrapped_module)
         env = environ.all()
 
@@ -56,9 +58,24 @@ class CheckpointWrapper(ActivationWrapper):
 
 def checkpoint_wrapper(
     module: torch.nn.Module,
-    checkpoint_fn=None,
-    **checkpoint_fn_kwargs,
+    checkpoint_fn: Callable[..., Any] | None = None,
+    **checkpoint_fn_kwargs: Any,
 ) -> torch.nn.Module:
+    """Wrap ``module`` so its forward is activation-checkpointed.
+
+    Hidden states of MemoryModules and the active :mod:`environ` settings are
+    passed through the checkpoint explicitly so the recompute is faithful.
+
+    Args:
+        module: Module to wrap.
+        checkpoint_fn: Checkpoint function; defaults to
+            :func:`torch.utils.checkpoint.checkpoint` with
+            ``use_reentrant=False``.
+        **checkpoint_fn_kwargs: Passed to the checkpoint function.
+
+    Returns:
+        A :class:`CheckpointWrapper` around ``module``.
+    """
     return CheckpointWrapper(
         module,
         checkpoint_fn,

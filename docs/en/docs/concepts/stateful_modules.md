@@ -8,7 +8,7 @@ At the heart of btorch's state management is [`MemoryModule`][btorch.models.base
 
 - **`register_memory`**: Declares a time-varying buffer (e.g., membrane voltage `v`).
 - **`_memories`**: A dictionary of current state values.
-- **`_memories_rv`**: Reset values used to restore state at the start of a new batch or trial.
+- **`_memory_reset_values`**: Reset values used to restore state at the start of a new batch or trial.
 
 When you call `functional.init_net_state(model, batch_size=4)`, btorch walks the module tree and initializes every `MemoryModule` buffer to the requested shape.
 
@@ -69,7 +69,7 @@ Optionally, also save if needed:
 ```python
 checkpoint = {
     "model_state_dict": model.state_dict(),
-    "memories_rv": functional.named_memory_reset_values(model),  # if reset values are randomized
+    "memory_reset_values": functional.named_memory_reset_values(model),  # if reset values are randomized
     "hidden_states": functional.named_hidden_states(model),      # if you need neuron state
 }
 ```

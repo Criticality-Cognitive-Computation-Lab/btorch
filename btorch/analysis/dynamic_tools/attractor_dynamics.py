@@ -17,7 +17,6 @@ def compute_kaplan_yorke_dimension(lyapunov_spectrum: np.ndarray) -> float:
             (all lambda < 0). Returns the number of exponents if the sum of all
             is positive (unbounded/hyperchaos).
     """
-    # Ensure sorted descending
     ls = np.sort(lyapunov_spectrum)[::-1]
 
     n = len(ls)
@@ -84,7 +83,6 @@ def compute_structural_eigenvalue_outliers(
             - 'outlier_count': Number of outliers.
             - 'spectral_radius': The radius used for thresholding.
     """
-    # Ensure numpy array
     W = np.array(weight_matrix)
     N = W.shape[0]
 
@@ -103,14 +101,12 @@ def compute_structural_eigenvalue_outliers(
         sigma = np.std(W)
         spectral_radius = sigma * np.sqrt(N)
 
-    # Identify outliers
     magnitudes = np.abs(eigenvalues)
     outlier_indices = np.where(magnitudes > spectral_radius)[0]
     outliers = eigenvalues[outlier_indices]
 
     return {
         "eigenvalues": eigenvalues,
-        # True Spectral Radius
         "max_eigenvalue": np.max(magnitudes) if len(magnitudes) > 0 else 0.0,
         "outliers": outliers,
         "outlier_count": len(outliers),

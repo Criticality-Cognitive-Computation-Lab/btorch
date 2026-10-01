@@ -10,7 +10,7 @@ import torch
 import yaml
 
 from btorch.analysis.branching import branching_ratio
-from btorch.analysis.dynamic_tools import complexity, spiking as dyn_spiking
+from btorch.analysis.dynamic_tools import complexity, fano as dyn_fano
 from btorch.analysis.statistics import describe_array
 from btorch.utils.yaml_utils import load_yaml, save_yaml
 
@@ -29,9 +29,9 @@ def test_compare_fano_methods_failure_is_nan_not_string(monkeypatch):
     def boom(*args, **kwargs):
         raise ValueError("not enough data")
 
-    monkeypatch.setattr(dyn_spiking, "fano_mean_matching", boom)
+    monkeypatch.setattr(dyn_fano, "fano_mean_matching", boom)
     with pytest.warns(UserWarning, match="mean_matching"):
-        results = dyn_spiking.compare_fano_methods(_spikes(), dt=1.0)
+        results = dyn_fano.compare_fano_methods(_spikes(), dt=1.0)
 
     assert np.isnan(results["mean_matching"])
     # No value in the result dict may be a string.
@@ -44,17 +44,17 @@ def test_compare_fano_methods_programming_errors_propagate(monkeypatch):
     def bug(*args, **kwargs):
         raise TypeError("bad argument")
 
-    monkeypatch.setattr(dyn_spiking, "fano_mean_matching", bug)
+    monkeypatch.setattr(dyn_fano, "fano_mean_matching", bug)
     with pytest.raises(TypeError):
-        dyn_spiking.compare_fano_methods(_spikes(), dt=1.0)
+        dyn_fano.compare_fano_methods(_spikes(), dt=1.0)
 
 
 def test_fano_operational_time_rejects_overlap():
     """``overlap`` used to be silently ignored; now it raises."""
     with pytest.raises(ValueError, match="overlap"):
-        dyn_spiking.fano_operational_time(_spikes(), overlap=0.5)
+        dyn_fano.fano_operational_time(_spikes(), overlap=0.5)
     # overlap=0 / None (no overlap) stays accepted.
-    dyn_spiking.fano_operational_time(_spikes(), overlap=0)
+    dyn_fano.fano_operational_time(_spikes(), overlap=0)
 
 
 def test_branching_ratio_no_maxslopes():
@@ -181,7 +181,7 @@ def test_fano_mean_matching_too_few_windows_warns_and_returns_nan():
     'error'."""
     spikes = _spikes(T=12, N=3)
     with pytest.warns(UserWarning, match="windows"):
-        result, info = dyn_spiking.fano_mean_matching(spikes, window=10)
+        result, info = dyn_fano.fano_mean_matching(spikes, window=10)
     assert np.all(np.isnan(result))
     assert "error" not in info
 
@@ -193,3 +193,23 @@ def test_spiking_window_args_raise_value_error(window, overlap):
 
     with pytest.raises(ValueError, match="window|overlap"):
         fano(_spikes(T=100, N=2), window=window, overlap=overlap)
+
+
+def test_compute_lyapunov_exponent_runs_on_spike_train():
+    """``compute_lyapunov_exponent`` works on a ``(time, neurons)`` spike
+    train.
+
+    Regression test: it used to hand the 2D smoothed rate to nolds (which needs
+    a 1D series) and pass ``dt`` in the ``emb_dim`` slot, so every call raised
+    ``ValueError``. It now reduces to the mean population rate first.
+    """
+    pytest.importorskip("nolds")
+
+    gen = torch.Generator().manual_seed(0)
+    spikes = (torch.rand(2000, 20, generator=gen) < 0.05).float()
+
+    value = complexity.compute_lyapunov_exponent(spikes, dt=0.1)
+
+    # A finite scalar: the exact value depends on nolds, so only check type.
+    assert isinstance(value, float)
+    assert np.isfinite(value)

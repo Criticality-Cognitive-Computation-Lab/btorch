@@ -1,3 +1,5 @@
+from typing import Any
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -17,8 +19,8 @@ class SymmetricBilinear(nn.Bilinear, HasConstraint):
         bias: bool = True,
         mask: float | Tensor | None = None,
         enforce_dale: bool = False,
-        device=None,
-        dtype=None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
     ):
         """Symmetric Bilinear layer where both inputs are the same. Supports
         weight masking and Dale's Law enforcement.
@@ -59,7 +61,7 @@ class SymmetricBilinear(nn.Bilinear, HasConstraint):
     def forward(self, input: Tensor) -> Tensor:
         return super().forward(input, input)
 
-    def constrain(self, *args, **kwargs):
+    def constrain(self, *args: Any, **kwargs: Any) -> None:
         """Apply the weight mask and Dale's Law constraints to the weight
         matrix."""
         if self.mask is not None:

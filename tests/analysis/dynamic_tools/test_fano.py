@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 import torch
 
-from btorch.analysis.dynamic_tools.spiking import (
+from btorch.analysis.dynamic_tools.fano import (
     compare_fano_methods,
     fano_compensated,
     fano_mean_matching,

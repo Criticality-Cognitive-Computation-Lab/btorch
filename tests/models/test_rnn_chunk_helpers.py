@@ -42,6 +42,34 @@ def test_iter_large_chunks_splits_only_loop_args():
     assert torch.equal(torch.cat([c[0] for c in chunks]), x)
 
 
+def test_detect_loop_args_shape_heuristic_documented():
+    """Pin the loop-arg heuristic (documentation of current behaviour).
+
+    ``_detect_loop_args`` guesses which positional args are time sequences:
+    every tensor whose leading dim equals the FIRST arg's leading dim (``T``)
+    is a loop arg; non-tensors and scalar tensors never are.  Consequence: a
+    static tensor whose first dim happens to equal ``T`` is silently treated
+    as a time sequence, so pass such tensors as keyword args or reshape them.
+    """
+    rnn = make_rnn(LIF, chunk_size=None)(n_neuron=2)
+    x = torch.zeros(5, 3, 2)
+
+    # Single arg: always the loop arg.
+    assert rnn._detect_loop_args(x) == (5, (0,))
+
+    # Same leading dim -> loop arg; different leading dim / scalar / non-tensor
+    # -> passed through unchanged.
+    T, loop = rnn._detect_loop_args(x, torch.zeros(5, 2), torch.zeros(4, 2), 7)
+    assert (T, loop) == (5, (0, 1))
+    T, loop = rnn._detect_loop_args(x, torch.tensor(1.0), torch.zeros(2, 2))
+    assert (T, loop) == (5, (0,))
+
+    # The pitfall: a static (n_neuron=5)-shaped tensor is mistaken for a
+    # sequence when n_neuron == T.
+    _, loop = rnn._detect_loop_args(x, torch.zeros(5))
+    assert loop == (0, 1)
+
+
 def test_cudagraph_incompatibilities_reports_enabled_options():
     rnn = make_rnn(LIF, grad_checkpoint=True)(n_neuron=2)
     assert list(rnn._cudagraph_incompatibilities()) == ["grad_checkpoint"]
@@ -70,3 +98,49 @@ def test_set_hidden_states_and_reset_values_roundtrip():
     assert m.v.data_ptr() == addr and m.v.abs().sum() == 0
     rv = functional.named_memory_reset_values(m)
     functional.set_memory_reset_values(m, rv)
+
+
+def test_detect_loop_args_rejects_non_tensor_first_arg():
+    """No time dimension can be inferred from a non-tensor / 0-dim first arg.
+
+    This used to be a bare ``assert`` (stripped under ``python -O``); it is now
+    a ``ValueError`` that tells the caller to pass ``loop_args`` explicitly.
+    """
+    rnn = make_rnn(LIF, chunk_size=None)(n_neuron=2)
+    with pytest.raises(ValueError, match="loop_args"):
+        rnn._detect_loop_args(7, torch.zeros(5, 2))
+    with pytest.raises(ValueError, match="loop_args"):
+        rnn._detect_loop_args(torch.tensor(1.0), torch.zeros(5, 2))
+
+
+def test_abstract_single_step_forward_is_a_bound_method_stub():
+    """``RecurrentNNAbstract.single_step_forward`` takes ``self`` like the
+    base.
+
+    It used to be declared without ``self``. A subclass that forgets to
+    override it must now fail with a clear ``NotImplementedError`` rather than a
+    confusing argument-binding error or a silent ``None``.
+    """
+    from btorch.models.rnn import RecurrentNNAbstract
+
+    stub = RecurrentNNAbstract()
+    with pytest.raises(NotImplementedError):
+        stub.single_step_forward(torch.zeros(2))
+
+
+def test_chunk_step_helpers_match_a_manual_loop():
+    """``_run_chunk_steps`` (unroll blocks of ``_run_unroll_block``) equals a
+    plain per-step loop, whatever the unroll size, including a remainder."""
+    torch.manual_seed(0)
+    cell = make_rnn(LIF)(n_neuron=3, step_mode="s")
+    functional.init_net_state(cell, batch_size=2)
+    x = torch.rand(7, 2, 3) * 3
+    start = functional.named_hidden_states(cell, clone=True)
+
+    from btorch.models import environ
+
+    with environ.context(dt=1.0):
+        z_ref, _ = cell._run_unroll_block(x, loop_args=(0,))
+        functional.set_hidden_states(cell, start)
+        z_chunked, _ = cell._run_chunk_steps(x, loop_args=(0,), unroll_size=3)
+    torch.testing.assert_close(torch.stack(z_chunked), torch.stack(z_ref))

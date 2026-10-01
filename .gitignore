@@ -31,6 +31,8 @@ coverage.xml
 
 *.png
 *.json
+# Test fixtures that must be tracked despite the blanket *.json rule.
+!tests/visualisation/*.json
 *.nwb
 *.log
 *.swp

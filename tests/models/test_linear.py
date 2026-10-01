@@ -496,3 +496,49 @@ def test_get_sparse_matrix_non_square(backend: str):
     loss = sp_mat.values().sum()
     loss.backward()
     assert model.magnitude.grad is not None
+
+
+@pytest.mark.parametrize("backend", available_sparse_backends())
+def test_sparse_conn_state_dict_roundtrip_loads_new_pattern(backend: str):
+    """``load_state_dict`` fully determines the layer's forward behaviour.
+
+    ``BaseSparseConn`` once cached a native ``sparse_tensor`` at construction
+    (indices frozen into a plain attribute, outside the state dict). Loading a
+    checkpoint whose connectivity *pattern* differs (but with the same number of
+    non-zeros, so the tensor shapes match) updated the ``indices`` buffer while
+    the cached tensor kept the old pattern, so a native-backend forward silently
+    used the wrong wiring. The forward must derive everything from the
+    registered ``indices`` buffer and parameters only.
+    """
+    torch.manual_seed(0)
+    # Two 4x3 matrices with 4 non-zeros each but different wiring.
+    w_a = torch.tensor(
+        [[1.0, 0, 0], [0, 2.0, 0], [0, 0, 3.0], [4.0, 0, 0]],
+    )
+    w_b = torch.tensor(
+        [[0, 1.0, 0], [0, 0, 2.0], [3.0, 0, 0], [0, 4.0, 0]],
+    )
+    saved = SparseConn(
+        scipy.sparse.coo_array(w_b.numpy()),
+        enforce_dale=False,
+        sparse_backend=backend,
+    )
+    fresh = SparseConn(
+        scipy.sparse.coo_array(w_a.numpy()),
+        enforce_dale=False,
+        sparse_backend=backend,
+    )
+    # A device/dtype move before loading re-creates the module's tensors, which
+    # is when a cached sparse tensor stops aliasing the ``indices`` buffer.
+    fresh = fresh.to(torch.float64)
+    saved = saved.to(torch.float64)
+    x = torch.randn(5, 4, dtype=torch.float64)
+    # Sanity: the two layers really differ before loading.
+    assert not torch.allclose(saved(x), fresh(x))
+
+    fresh.load_state_dict(saved.state_dict())
+
+    # After loading, the fresh layer reproduces the saved layer exactly and
+    # matches the dense reference for the checkpointed matrix.
+    torch.testing.assert_close(fresh(x), saved(x))
+    torch.testing.assert_close(fresh(x), x @ w_b.double())

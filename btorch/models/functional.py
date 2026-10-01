@@ -5,9 +5,7 @@ from typing import Any, Literal
 import torch
 from torch import nn
 
-from ..utils.dict_utils import flatten_dict
 from . import base
-from .scale import SupportScaleState
 
 
 def _call_on_modules(
@@ -92,7 +90,7 @@ def _strip_self(d: set[str]) -> set[str]:
 
 def _collect_memory_vars(
     mod: nn.Module,
-    target_attr: Literal["_memories", "_memories_rv"],
+    target_attr: Literal["_memories", "_memory_reset_values"],
     names: Sequence[str] | None = None,
     allow_buffer: bool = False,
     clone: bool = False,
@@ -119,7 +117,7 @@ def _collect_memory_vars(
 
 def _walk_memory_targets(
     mod: nn.Module,
-    target_attr: Literal["_memories", "_memories_rv"],
+    target_attr: Literal["_memories", "_memory_reset_values"],
     hidden_states: dict[str, Any] | None,
     allow_buffer: bool = False,
 ):
@@ -138,8 +136,9 @@ def _walk_memory_targets(
     if hidden_states is None:
         return
 
-    # TODO: ensure no state is set twice. The following case should not happen
-    #       {"a.mem": v0, "a.mem.V": v1}
+    # Entries are not checked for overlap: addressing one memory twice, e.g.
+    # ``{"a": {"mem": v0}, "a.mem": v1}``, applies both writes in dict order, so
+    # the later one wins.
 
     for name, hidden_state in hidden_states.items():
         if hidden_state is None:
@@ -156,9 +155,9 @@ def _walk_memory_targets(
             continue
         for p in path[:-1]:
             m = getattr(m, p)
-        if target_attr == "_memories_rv":
+        if target_attr == "_memory_reset_values":
             # reset values are not attributes; look them up in the registry
-            m_leaf = m._memories_rv[path[-1]]
+            m_leaf = m._memory_reset_values[path[-1]]
         else:
             m_leaf = getattr(m, path[-1])
         if isinstance(m_leaf, nn.Module):
@@ -217,12 +216,13 @@ def _set_memories(
 def _set_reset_values(
     mod: nn.Module, hidden_states: dict[str, Any] | None, strict: bool
 ):
-    """Write ``_memories_rv`` entries through the MemoryModule setters."""
+    """Write ``_memory_reset_values`` entries through the MemoryModule
+    setters."""
     for kind, m, key, v in _walk_memory_targets(
-        mod, "_memories_rv", hidden_states, allow_buffer=False
+        mod, "_memory_reset_values", hidden_states, allow_buffer=False
     ):
         if kind == "whole":
-            m.set_memories_rv(v, strict=strict)
+            m.set_memory_reset_values(v, strict=strict)
         else:
             m.set_reset_value(key, v, strict=strict)
 
@@ -265,7 +265,7 @@ def set_hidden_states(
     hidden_states: dict[str, Any],
     allow_buffer: bool = False,
     inplace: bool = False,
-):
+) -> None:
     """Set hidden states (_memories) in a network from a dotted dict.
 
     Args:
@@ -288,13 +288,12 @@ def set_hidden_states(
 set_memory_values = set_hidden_states
 
 
-# TODO: support both dotted flattened dict and non-dotted nested dict
-#       probably, nested dict is more efficient
-# mainly for serialisation, e.g. with torch.save
+# Reset values are exchanged as a dotted flattened dict (same layout as
+# ``named_hidden_states``), mainly for serialisation, e.g. with torch.save.
 def named_memory_reset_values(
     mod: nn.Module, names: Sequence[str] | None = None
 ) -> dict[str, Any]:
-    """Collect memory reset values (_memories_rv) from a network.
+    """Collect memory reset values (_memory_reset_values) from a network.
 
     Args:
         mod: Network module to collect from.
@@ -306,18 +305,19 @@ def named_memory_reset_values(
     Example:
         >>> rv = functional.named_memory_reset_values(model)
     """
-    return _collect_memory_vars(mod, "_memories_rv", names, allow_buffer=False)
+    return _collect_memory_vars(mod, "_memory_reset_values", names, allow_buffer=False)
 
 
 def set_memory_reset_values(
     mod: nn.Module, hidden_states: dict[str, Any], strict: bool = True
-):
-    """Set memory reset values (_memories_rv) in a network from a dotted dict.
+) -> None:
+    """Set memory reset values (_memory_reset_values) in a network from a
+    dotted dict.
 
     Args:
         mod: Network module to update.
         hidden_states: Dotted dictionary of reset values.
-        strict: Passed through to ``set_memories_rv()``.
+        strict: Passed through to ``set_memory_reset_values()``.
 
     Example:
         >>> functional.set_memory_reset_values(model, rv_dict)
@@ -326,134 +326,7 @@ def set_memory_reset_values(
     _set_reset_values(mod, hidden_states, strict=strict)
 
 
-def _unflatten_leaf(d: dict) -> dict:
-    ret = {}
-    for k, v in d.items():
-        ks = k.split(".")
-        k, k_unflatten = ks[:-1], ks[-1:]
-        k, k_unflatten = ".".join(k), ".".join(k_unflatten)
-        ret.setdefault(k, {})[k_unflatten] = v
-    return ret
-
-
-def _scale_state(
-    mod: nn.Module,
-    hidden_states: dict[str, Any] | None,
-    scale: Literal["scale_state", "unscale_state"],
-    enforce: Literal["ignore", "assert", "repeated"] = "repeated",
-) -> dict[str, Any] | None:
-    if hidden_states is None:
-        return None
-
-    hidden_states = _unflatten_leaf(hidden_states)
-
-    for name, m in mod.named_modules():
-        if isinstance(m, SupportScaleState):
-            if name in hidden_states:
-                getattr(m, scale)(hidden_states[name], enforce=enforce)
-
-    hidden_states = flatten_dict(hidden_states, dot=True)
-
-    return hidden_states
-
-
-def scale_state(
-    mod: nn.Module,
-    hidden_states: dict | None,
-    enforce: Literal["ignore", "assert", "repeated"] = "repeated",
-) -> dict | None:
-    """Scale hidden states for modules that support state scaling.
-
-    Expects a proper dotted dict flattened up to items of _memories*,
-    e.g. ``{"brain.neuron.v": v_array, "brain.neuron.Iasc": i_array}``.
-
-    Args:
-        mod: Network containing SupportScaleState modules.
-        hidden_states: Dotted dictionary of states to scale.
-        enforce: Behavior when already scaled (``ignore``, ``assert``,
-            or ``repeated``).
-
-    Returns:
-        Scaled hidden states as a dotted dictionary, or ``None`` if
-        ``hidden_states`` is ``None``.
-    """
-    return _scale_state(mod, hidden_states, "scale_state", enforce=enforce)
-
-
-def unscale_state(
-    mod: nn.Module,
-    hidden_states: dict | None,
-    enforce: Literal["ignore", "assert", "repeated"] = "repeated",
-) -> dict | None:
-    """Unscale hidden states for modules that support state scaling.
-
-    Expects a proper dotted dict flattened up to items of _memories*,
-    e.g. ``{"brain.neuron.v": v_array, "brain.neuron.Iasc": i_array}``.
-
-    Args:
-        mod: Network containing SupportScaleState modules.
-        hidden_states: Dotted dictionary of states to unscale.
-        enforce: Behavior when already unscaled (``ignore``, ``assert``,
-            or ``repeated``).
-
-    Returns:
-        Unscaled hidden states as a dotted dictionary, or ``None`` if
-        ``hidden_states`` is ``None``.
-    """
-    return _scale_state(
-        mod,
-        hidden_states,
-        "unscale_state",
-        enforce=enforce,
-    )
-
-
-def scale_net(
-    mod: nn.Module,
-    enforce: Literal["ignore", "assert", "repeated"] = "assert",
-    force_memories_rv=True,
-):
-    """Scale all SupportScaleState modules in a network in-place.
-
-    Args:
-        mod: Network to scale.
-        enforce: Behavior on repeated scale calls.
-        force_memories_rv: If True, also scale memory reset values.
-    """
-
-    def scale_net_fn(mod: nn.Module):
-        if isinstance(mod, SupportScaleState):
-            mod.scale_state(
-                enforce=enforce,
-                force_memories_rv=force_memories_rv,
-            )
-
-    for m in mod.modules():
-        scale_net_fn(m)
-
-
-def unscale_net(
-    mod: nn.Module,
-    enforce: Literal["ignore", "assert", "repeated"] = "assert",
-    force_memories_rv=False,
-):
-    """Unscale all SupportScaleState modules in a network in-place.
-
-    Args:
-        mod: Network to unscale.
-        enforce: Behavior on repeated unscale calls.
-        force_memories_rv: If True, also unscale memory reset values.
-    """
-
-    def unscale_net_fn(mod: nn.Module):
-        if isinstance(mod, SupportScaleState):
-            mod.unscale_state(enforce=enforce, force_memories_rv=force_memories_rv)
-
-    for m in mod.modules():
-        unscale_net_fn(m)
-
-
-def detach_net(net: nn.Module):
+def detach_net(net: nn.Module) -> None:
     """Detach the computation graph of the whole network from previous time
     steps.
 
