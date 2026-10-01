@@ -6,8 +6,8 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.utils.checkpoint import checkpoint as torch_utils_checkpoint
 
-from ...models import environ
-from ...models.functional import named_hidden_states, set_hidden_states
+from . import environ
+from .functional import named_hidden_states, set_hidden_states
 
 
 class CheckpointWrapper(ActivationWrapper):

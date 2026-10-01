@@ -6,7 +6,8 @@ summarization.
 """
 
 import time
-from typing import Callable, Dict, List, Literal, Optional, Union
+import warnings
+from typing import Callable, Literal
 
 import torch
 
@@ -51,12 +52,12 @@ def do_bench(
     fn: Callable,
     warmup: int | float = 25,
     rep: int | float = 100,
-    grad_to_none: Optional[torch.Tensor] = None,
-    quantiles: Optional[List[float]] = None,
+    grad_to_none: torch.Tensor | None = None,
+    quantiles: list[float] | None = None,
     return_mode: Literal["min", "max", "mean", "median", "all"] = "mean",
     timing_method: Literal["gpu", "cpu"] = "cpu",
     sync_cuda: bool = True,
-) -> Union[float, Dict[str, float]]:
+) -> float | dict[str, float]:
     """Benchmark function runtime with warmup and statistics.
 
     Supports both CPU wall-clock timing and GPU CUDA event timing.
@@ -96,9 +97,10 @@ def do_bench(
         raise ValueError("timing_method must be either 'gpu' or 'cpu'")
 
     if timing_method == "gpu" and not torch.cuda.is_available():
-        print(
-            "Warning: GPU timing requested but CUDA is not available. "
-            "Falling back to cpu timing."
+        warnings.warn(
+            "GPU timing requested but CUDA is not available. "
+            "Falling back to cpu timing.",
+            stacklevel=2,
         )
         timing_method = "cpu"
 
@@ -134,7 +136,8 @@ def do_bench(
                 fn()
             end_event.record()
             di.synchronize()
-            estimate_ms = start_event.elapsed_time(end_event) / 5
+            # Clamp so a sub-resolution (0 ms) measurement cannot divide by zero.
+            estimate_ms = max(start_event.elapsed_time(end_event) / 5, 1e-6)
             n_warmup = max(1, int(warmup / estimate_ms))
             n_repeat = max(1, int(rep / estimate_ms))
 

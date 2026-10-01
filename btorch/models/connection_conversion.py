@@ -17,7 +17,7 @@ through sparse conversion.
 
 from __future__ import annotations
 
-from typing import Any, Literal, get_args
+from typing import Any, Literal, cast, get_args
 
 import numpy as np
 import pandas as pd
@@ -65,7 +65,9 @@ def _normalize_receptor_type_mode(mode: str) -> ReceptorTypeMode:
             "receptor_type_mode must be one of "
             f"{get_args(ReceptorTypeMode)}, got {mode!r}"
         )
-    return mode  # type: ignore[return-value]
+    # Validated against ``get_args(ReceptorTypeMode)`` above; ``str`` is not
+    # narrowed to the ``Literal`` by the membership check, hence the cast.
+    return cast(ReceptorTypeMode, mode)
 
 
 def _edge_df_from_sparse_conn(conn: scipy.sparse.coo_array) -> pd.DataFrame:
@@ -570,9 +572,13 @@ def _convert_dense_layer(
     vals: np.ndarray
 
     if allow_weight_split:
+        if edge_receptor_weight is None:
+            raise ValueError(
+                "edge_receptor_weight is required when allow_weight_split=True."
+            )
         rows, cols, vals = _expand_edges_with_split(
             edge_df=edge_df,
-            edge_receptor_weight=edge_receptor_weight,  # type: ignore[arg-type]
+            edge_receptor_weight=edge_receptor_weight,
             n_receptor=n_receptor,
         )
     else:
@@ -685,9 +691,13 @@ def _convert_sparse_layer(
 
     edge_df = _edge_df_from_sparse_conn(src_conn)
     if allow_weight_split:
+        if edge_receptor_weight is None:
+            raise ValueError(
+                "edge_receptor_weight is required when allow_weight_split=True."
+            )
         rows, cols, vals = _expand_edges_with_split(
             edge_df=edge_df,
-            edge_receptor_weight=edge_receptor_weight,  # type: ignore[arg-type]
+            edge_receptor_weight=edge_receptor_weight,
             n_receptor=n_receptor,
         )
     else:
@@ -811,7 +821,7 @@ def convert_connection_layer(
     Raises:
         ValueError: If required metadata is missing or inconsistent.
     """
-    target_layout = target_layout.lower()  # type: ignore[assignment]
+    target_layout = cast(TargetLayout, target_layout.lower())
     if target_layout not in get_args(TargetLayout):
         raise ValueError(
             "target_layout must be one of "
@@ -894,7 +904,11 @@ def convert_connection_layer(
         allow_weight_split=allow_weight_split,
         edge_receptor_weight=edge_receptor_weight,
         group_policy=group_policy,
-        target_class=resolved_target_class,  # type: ignore[arg-type]
+        # ``_validate_target_class`` guarantees a sparse class for sparse layers;
+        # the return annotation is the union over all layer families.
+        target_class=cast(
+            "type[SparseConn] | type[SparseConstrainedConn]", resolved_target_class
+        ),
         enforce_dale=resolved_enforce_dale,
         sparse_backend=resolved_sparse_backend,
         device=device,
@@ -1171,7 +1185,7 @@ def _build_sparse_constrained_source_layer_from_checkpoint(
             pre.max(initial=0) >= shape[0] or post.max(initial=0) >= shape[1]
         ):
             raise ValueError(
-                "state_dict indices are out of bounds for constraint shape " f"{shape}."
+                f"state_dict indices are out of bounds for constraint shape {shape}."
             )
         conn = scipy.sparse.coo_array((values, (pre, post)), shape=shape)
         conn.sum_duplicates()

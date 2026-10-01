@@ -39,39 +39,51 @@ import torch
 StatChoice = Literal[
     "mean", "median", "max", "min", "std", "var", "argmax", "argmin", "cv"
 ]
+NanPolicy = Literal["skip", "warn", "assert"]
+InfPolicy = Literal["propagate", "skip", "warn", "assert"]
 
 
-def describe_array(array: np.ndarray):
-    """Print descriptive statistics for a 1D array.
+def describe_array(array: np.ndarray, verbose: bool = True) -> dict[str, float]:
+    """Compute descriptive statistics for an array.
 
-    Displays mean, median, std, min, max, and quartiles.
+    Computes mean, median, std, min, max, and quartiles, optionally printing
+    them.
 
     Args:
-        array: 1D NumPy array to describe.
+        array: NumPy array to describe (statistics are over all elements).
+        verbose: If True (default), also print the statistics.
+
+    Returns:
+        Dictionary with keys ``mean``, ``median``, ``std``, ``min``, ``max``,
+        ``q25``, ``q50`` and ``q75``.
 
     Example:
-        >>> describe_array(np.random.randn(100))
-        Mean: 0.05
-        Median: 0.12
-        ...
+        >>> stats = describe_array(np.random.randn(100), verbose=False)
+        >>> sorted(stats)
+        ['max', 'mean', 'median', 'min', 'q25', 'q50', 'q75', 'std']
     """
-    mean = np.mean(array)
-    median = np.median(array)
-    std_dev = np.std(array)
-    min_val = np.min(array)
-    max_val = np.max(array)
-    q25 = np.percentile(array, 25)
-    q50 = np.percentile(array, 50)  # This is the same as the median
-    q75 = np.percentile(array, 75)
+    q25, q50, q75 = np.percentile(array, [25, 50, 75])  # q50 equals the median
+    stats = {
+        "mean": float(np.mean(array)),
+        "median": float(np.median(array)),
+        "std": float(np.std(array)),
+        "min": float(np.min(array)),
+        "max": float(np.max(array)),
+        "q25": float(q25),
+        "q50": float(q50),
+        "q75": float(q75),
+    }
 
-    print(f"Mean: {mean}")
-    print(f"Median: {median}")
-    print(f"Standard Deviation: {std_dev}")
-    print(f"Min: {min_val}")
-    print(f"Max: {max_val}")
-    print(f"25th Percentile (Q1): {q25}")
-    print(f"50th Percentile (Q2/Median): {q50}")
-    print(f"75th Percentile (Q3): {q75}")
+    if verbose:
+        print(f"Mean: {stats['mean']}")
+        print(f"Median: {stats['median']}")
+        print(f"Standard Deviation: {stats['std']}")
+        print(f"Min: {stats['min']}")
+        print(f"Max: {stats['max']}")
+        print(f"25th Percentile (Q1): {stats['q25']}")
+        print(f"50th Percentile (Q2/Median): {stats['q50']}")
+        print(f"75th Percentile (Q3): {stats['q75']}")
+    return stats
 
 
 def compute_log_hist(
@@ -131,7 +143,6 @@ def compute_percentiles(
         if not 0 <= p <= 100:
             raise ValueError(f"Percentile must be in [0, 100], got {p}")
 
-    # Compute percentiles using native functions
     if isinstance(values, torch.Tensor):
         # Use torch.quantile for tensor inputs (preserves device/dtype)
         values_flat = values.flatten()
@@ -157,8 +168,8 @@ def compute_stat(
     values: np.ndarray | torch.Tensor,
     stat: StatChoice,
     *,
-    nan_policy: Literal["skip", "warn", "assert"] = "skip",
-    inf_policy: Literal["propagate", "skip", "warn", "assert"] = "propagate",
+    nan_policy: NanPolicy = "skip",
+    inf_policy: InfPolicy = "propagate",
     dim: int | tuple[int, ...] | None = None,
 ) -> Any:
     """Compute a single statistic on an array or tensor.
@@ -194,8 +205,8 @@ def compute_stat(
 def _compute_stat(
     values: np.ndarray | torch.Tensor,
     stat: str,
-    nan_policy: str,
-    inf_policy: str,
+    nan_policy: NanPolicy,
+    inf_policy: InfPolicy,
     dim: int | tuple[int, ...] | None,
 ) -> Any:
     """Internal implementation of compute_stat."""
@@ -204,7 +215,6 @@ def _compute_stat(
 
     is_tensor = isinstance(values, torch.Tensor)
 
-    # Handle NaN values
     if nan_policy != "propagate":
         has_nan = (
             torch.isnan(values).any().item() if is_tensor else np.isnan(values).any()
@@ -220,7 +230,6 @@ def _compute_stat(
             else:
                 values = values[~np.isnan(values)]
 
-    # Handle Inf values
     if inf_policy != "propagate":
         has_inf = (
             torch.isinf(values).any().item() if is_tensor else np.isinf(values).any()
@@ -236,7 +245,6 @@ def _compute_stat(
             else:
                 values = values[~np.isinf(values)]
 
-    # Flatten if dim is None
     if dim is None:
         if is_tensor:
             values = values.flatten()
@@ -325,8 +333,8 @@ def _compute_stat(
 def _compute_stats_batch(
     values: np.ndarray | torch.Tensor,
     stats: list[str],
-    nan_policy: str,
-    inf_policy: str,
+    nan_policy: NanPolicy,
+    inf_policy: InfPolicy,
     dim: int | tuple[int, ...] | None,
 ) -> dict[str, Any]:
     """Compute multiple stats efficiently, reusing mean/std for cv.
@@ -338,7 +346,6 @@ def _compute_stats_batch(
 
     is_tensor = isinstance(values, torch.Tensor)
 
-    # Handle NaN values
     if nan_policy != "propagate":
         has_nan = (
             torch.isnan(values).any().item() if is_tensor else np.isnan(values).any()
@@ -353,7 +360,6 @@ def _compute_stats_batch(
             else:
                 values = values[~np.isnan(values)]
 
-    # Handle Inf values
     if inf_policy != "propagate":
         has_inf = (
             torch.isinf(values).any().item() if is_tensor else np.isinf(values).any()
@@ -368,7 +374,6 @@ def _compute_stats_batch(
             else:
                 values = values[~np.isinf(values)]
 
-    # Flatten if dim is None
     if dim is None:
         if is_tensor:
             values = values.flatten()
@@ -394,7 +399,6 @@ def _compute_stats_batch(
         else:
             std_val = values.std(axis=dim)
 
-    # Compute each stat
     for stat in stats:
         if stat == "mean":
             if is_tensor:
@@ -469,8 +473,8 @@ def compute_stats_batch(
     values: np.ndarray | torch.Tensor,
     stats: list[StatChoice],
     *,
-    nan_policy: Literal["skip", "warn", "assert"] = "skip",
-    inf_policy: Literal["propagate", "skip", "warn", "assert"] = "propagate",
+    nan_policy: NanPolicy = "skip",
+    inf_policy: InfPolicy = "propagate",
     dim: int | tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     """Compute multiple statistics efficiently on an array or tensor.
@@ -553,8 +557,8 @@ def use_stats(
         | dict[int, StatChoice | Iterable[StatChoice]]
         | None
     ) = None,
-    default_nan_policy: Literal["skip", "warn", "assert"] = "skip",
-    default_inf_policy: Literal["propagate", "skip", "warn", "assert"] = "propagate",
+    default_nan_policy: NanPolicy = "skip",
+    default_inf_policy: InfPolicy = "propagate",
 ) -> Callable:
     """Decorator to add stat and stat_info args for aggregation.
 
@@ -652,8 +656,8 @@ def use_stats(
             | Iterable[StatChoice]
             | dict[int, StatChoice | Iterable[StatChoice]]
             | None = default_stat_info,
-            nan_policy: Literal["skip", "warn", "assert"] | None = None,
-            inf_policy: Literal["propagate", "skip", "warn", "assert"] | None = None,
+            nan_policy: NanPolicy | None = None,
+            inf_policy: InfPolicy | None = None,
             **kwargs,
         ) -> tuple[Any, ...]:
             # Use effective policies (passed value > decorator default > "skip")
@@ -722,7 +726,7 @@ def use_stats(
                             stat_choice,
                             effective_nan_policy,
                             effective_inf_policy,
-                            effective_dim,  # type: ignore
+                            effective_dim,
                         )
                         results.append(stat_value)
                         updated_info[key_name] = values
@@ -738,7 +742,7 @@ def use_stats(
                         stat,
                         effective_nan_policy,
                         effective_inf_policy,
-                        effective_dim,  # type: ignore
+                        effective_dim,
                     )
                     updated_info[key_name] = values
                     updated_info[f"{key_name}_{stat}"] = stat_value
@@ -777,7 +781,7 @@ def use_stats(
                                 stats_list[0],
                                 effective_nan_policy,
                                 effective_inf_policy,
-                                effective_dim,  # type: ignore
+                                effective_dim,
                             )
                             updated_info[f"{key_name}_{stats_list[0]}"] = stat_value
                 else:
@@ -809,7 +813,7 @@ def use_stats(
                             stat_info_list[0],
                             effective_nan_policy,
                             effective_inf_policy,
-                            effective_dim,  # type: ignore
+                            effective_dim,
                         )
                         updated_info[f"{key_name}_{stat_info_list[0]}"] = stat_value
 
@@ -917,7 +921,6 @@ def use_percentiles(
                     )
                 return values_tuple[pos]
 
-            # Compute percentiles only if requested
             if isinstance(percentiles, dict):
                 # Dict format: {position: percentile_value(s)}
                 # Allows different percentiles for different return values
@@ -929,7 +932,6 @@ def use_percentiles(
                     updated_info[f"{key_name}_levels"] = perc_result["levels"]
             elif isinstance(value_key, dict):
                 # Dict value_key with single percentiles value:
-                # Apply same percentiles to all positions in value_key
                 for pos, label in value_key.items():
                     values = _get_values(pos)
                     perc_result = compute_percentiles(values, percentiles)

@@ -52,28 +52,6 @@ def _sync_shared(language: str) -> None:
         print(f"Synced {name}: {src} -> {dest}")
 
 
-def _get_en_nav_paths() -> list[str]:
-    """Extract relative doc paths from English mkdocs.yml nav."""
-    en_yml = DOCS_DIR / "en" / "mkdocs.yml"
-    data = yaml.safe_load(en_yml.read_text(encoding="utf-8"))
-    nav = data.get("nav", [])
-    paths: list[str] = []
-
-    def _walk(items):
-        for item in items:
-            if isinstance(item, str):
-                paths.append(item)
-            elif isinstance(item, dict):
-                for v in item.values():
-                    if isinstance(v, str):
-                        paths.append(v)
-                    elif isinstance(v, list):
-                        _walk(v)
-
-    _walk(nav)
-    return paths
-
-
 def build_lang(cfg: DocsConf) -> None:
     """Build a single language into the unified site directory."""
     language = cfg.language

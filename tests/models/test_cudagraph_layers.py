@@ -1,3 +1,7 @@
+"""Raw torch CUDA-graph capture of connection layers and neurons (manual
+warmup/capture/replay); the RNN ``cudagraph=True`` runner is tested in
+``tests/models/rnn/test_cudagraph.py``."""
+
 import pytest
 import scipy.sparse
 import torch

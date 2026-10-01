@@ -25,6 +25,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state in a captured inference graph); `clone` snapshots state decoupled from the
   live buffers (e.g. a start state to restore each step).
 
+### Changed
+
+- **Surrogate autograd functions are `torch.func`-compatible** — `_SurrogateAutograd`
+  and the Poisson random spike function use `setup_context`/`jvp`/
+  `generate_vmap_rule`, so `torch.func.jvp/vjp/vmap` work through them.
+- **Analysis failures no longer return error strings or fake zeros** —
+  `compare_fano_methods` and `calculate_gain_stability_sensitivity` return NaN and
+  log a warning; `save_yaml` fails explicitly; `fano_operational_time` rejects a
+  non-zero `overlap` instead of ignoring it.
+- `FiringRateLoss` now defaults to a valid `loss_type` (`"huber_pinball"`).
+
+### Fixed
+
+- `is_broadcastable` now checks "first broadcasts to second" on shapes only.
+- `MemoryModule.init_state`/`reset` no longer leak one memory's dtype/persistent/
+  batch-size override into later memories; explicit `persistent=False` is honored.
+- `load_config` now actually loads the config file found via `search_path` (it
+  resolved the path and then loaded the original relative one), and raises
+  `FileNotFoundError`/`ValueError` instead of a bare `assert`.
+- `exp_euler_step` no longer returns NaN when the linear term is exactly zero.
+- `init_net_state`/`reset_net` no longer raise `AttributeError` for plain (non-
+  compiled) modules; they warn as intended.
+- `SupportScaleState` guards now actually raise (`enforce="assert"` used to assert a
+  non-empty string), and `scale_state` marks the module as scaled.
+- `calculate_pcist` returns NaN with a warning (not a fake `0.0`) when the SVD fails.
+- Argument validation in `btorch.analysis` and `connectome.augment` raises
+  `ValueError` instead of a bare `assert` (which `python -O` strips).
+- `make_hetersynapse_conn` docstring default for `n_delay_bins` matches the signature.
+- `scale_state_` returns `(scale, zeropoint)` on its early-return paths too.
+- `btorch.config` no longer imports `distutils` (removed in Python 3.12).
+- `calculate_gain_stability_sensitivity` imported a nonexistent `model` package.
+- Declared `h5py`, `pyyaml` and `fastdtw`; dropped unused `spikingjelly` and
+  `typing-extensions`; aligned the pandas minimum across manifests.
+
+### Removed
+
+- `btorch.config.SPARSE_BACKEND` (no consumers).
+- `btorch.io.dict_to_xarray`, `xarray_to_dict`, `save_dict_to_xarray`,
+  `load_dict_from_xarray` (unused aliases of the `memories_*` functions).
+- `btorch.models.parametrize` (unused; superseded by `constrain`).
+- `maxslopes` argument of `branching_ratio`.
+- `stateful` argument of `PoissonNoiseLayer` (it was accepted but ignored).
+
+- Validation of user input in `btorch.models` (`MemoryModule`, regularizers, scale,
+  linear), `PoissonNoiseLayer` and `connectome.connection` raises `ValueError`/
+  `KeyError`/`TypeError` instead of a bare `assert`; `memories_to_xarray` rejects a
+  `partial_map` entry with no neuron dimensions instead of ignoring it.
+- `SupportScaleState` supports `enforce="repeated"`; `scale_func`/`unscale_func`
+  return their input under `enforce="ignore"`.
+
+### Internal
+
+- `plot_raster`/`plot_neuron_traces` are split into private helpers (public
+  signatures unchanged) and pinned by characterization tests; the two-compartment
+  fit routines share one `FitLossConfig` and a `_prepare_sweep` helper, and the
+  plotting function lives in `btorch/analysis/_two_compartment_plots.py`
+  (re-exported from `two_compartment_fit`).
+
+- `RecurrentNN` eager and CUDA-graph multi-step paths share chunking/offload
+  helpers; the CUDA-graph compatibility rule lives in
+  `RecurrentNNAbstract._cudagraph_incompatibilities()`; the hidden-state setters
+  in `btorch.models.functional` no longer use callback parameters.
+- Library `print()` calls became `warnings.warn`; broad `except Exception`
+  blocks in analysis were narrowed to the expected exceptions.
+
 ## [0.1.0]
 
 ### Added

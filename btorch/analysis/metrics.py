@@ -10,7 +10,8 @@ def indices_to_mask(indices: np.ndarray, shape=None, array=None) -> np.ndarray:
     flattened indices. Provide a tuple of index arrays for per-axis
     indexing.
     """
-    assert not (shape is None and array is None)
+    if shape is None and array is None:
+        raise ValueError("Either `shape` or `array` must be provided")
     mask = (
         np.zeros(shape, dtype=bool)
         if shape is not None
@@ -32,7 +33,8 @@ def select_on_metric(
 ):
     """Select neurons based on a metric array."""
     if mode == "topk":
-        assert num is not None
+        if num is None:
+            raise ValueError("`num` must be provided when mode is 'topk'")
         ret = np.argpartition(metrics, -num)[-num:]
     elif mode == "any":
         ret = metrics.nonzero()[0]

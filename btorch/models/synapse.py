@@ -53,8 +53,8 @@ class BasePSC(MemoryModule):
         self,
         n_neuron: int | Sequence[int],
         linear: torch.nn.Module,
-        step_mode="s",
-        backend="torch",
+        step_mode: str = "s",
+        backend: str = "torch",
     ):
         super().__init__()
 
@@ -65,28 +65,20 @@ class BasePSC(MemoryModule):
 
         self.register_memory("psc", 0.0, self.n_neuron)
 
-    def extra_repr(self):
+    def extra_repr(self) -> str:
         return f"step_mode={self.step_mode}, backend={self.backend}"
 
-    def _flatten_neuron(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
-        return flatten_neuron(x, self.n_neuron, self.size)
-
-    def _unflatten_neuron(
-        self, x: torch.Tensor, leading_shape: tuple[int, ...]
-    ) -> torch.Tensor:
-        return unflatten_neuron(x, leading_shape, self.n_neuron)
-
-    def conductance_charge(self):
+    def conductance_charge(self) -> None:
         raise NotImplementedError()
 
-    def adaptation_charge(self, z: torch.Tensor):
+    def adaptation_charge(self, z: torch.Tensor) -> None:
         # Flatten only when input still carries multi-dimensional neuron dims
         z_flat, leading = flatten_neuron(z, self.n_neuron, self.size)
         wz = self.linear(z_flat)
         wz = unflatten_neuron(wz, leading, self.n_neuron)
         self.psc = self.psc + wz
 
-    def current_charge(self, v=None):
+    def current_charge(self, v: Tensor | None = None) -> Tensor:
         if v is not None:
             raise NotImplementedError(
                 "Only current-based PSC is supported."
@@ -115,7 +107,7 @@ class BasePSC(MemoryModule):
         """
         dt = environ.get("dt")
 
-        z_flat, leading = self._flatten_neuron(z_seq)
+        z_flat, leading = flatten_neuron(z_seq, self.n_neuron, self.size)
         wz_seq = self.linear(z_flat)
 
         kernel = self.get_kernel(dt, kernel_len)
@@ -132,7 +124,7 @@ class BasePSC(MemoryModule):
         out_flat = out_flat.squeeze(0).transpose(0, 1)
 
         out = out_flat.reshape(*leading, self.size)
-        return self._unflatten_neuron(out, leading)
+        return unflatten_neuron(out, leading, self.n_neuron)
 
 
 class ExponentialPSC(BasePSC):
@@ -156,8 +148,8 @@ class ExponentialPSC(BasePSC):
         n_neuron: int | Sequence[int],
         tau_syn: float | TensorLike,
         linear,
-        step_mode="s",
-        backend="torch",
+        step_mode: str = "s",
+        backend: str = "torch",
     ):
         super().__init__(
             n_neuron,
@@ -168,16 +160,16 @@ class ExponentialPSC(BasePSC):
 
         self.register_buffer("tau_syn", torch.as_tensor(tau_syn), persistent=False)
 
-    def dpsc(self, psc):
+    def dpsc(self, psc: Tensor) -> tuple[Tensor, Tensor]:
         derivative = -psc / self.tau_syn
         linear = -1.0 / self.tau_syn
         return derivative, linear
 
-    def conductance_charge(self):
+    def conductance_charge(self) -> Tensor:
         self.psc = exp_euler_step(self.dpsc, self.psc, dt=environ.get("dt"))
         return self.psc
 
-    def get_kernel(self, dt, kernel_len):
+    def get_kernel(self, dt: float | Tensor, kernel_len: int) -> Tensor:
         """Exponential decay kernel.
 
         k[t] = a^t for t >= 0 where a = exp(-dt/tau_syn).
@@ -191,7 +183,11 @@ class _Adaptive2VarPSC(BasePSC):
     h: torch.Tensor
 
     def __init__(
-        self, n_neuron: int | Sequence[int], linear, step_mode="s", backend="torch"
+        self,
+        n_neuron: int | Sequence[int],
+        linear,
+        step_mode: str = "s",
+        backend: str = "torch",
     ):
         super().__init__(n_neuron, linear, step_mode=step_mode, backend=backend)
 
@@ -207,8 +203,8 @@ class AlphaPSCBilleh(_Adaptive2VarPSC):
         n_neuron: int | Sequence[int],
         tau_syn: float | TensorLike,
         linear: torch.nn.Module,
-        step_mode="s",
-        backend="torch",
+        step_mode: str = "s",
+        backend: str = "torch",
     ):
         """The Current-Based Alpha form of PSC, from [1], ensuring a post-
         synaptic current with synapse weight W = 1.0 has an amplitude of 1.0 pA
@@ -236,11 +232,11 @@ class AlphaPSCBilleh(_Adaptive2VarPSC):
             "syn_decay", torch.exp(-1.0 / self.tau_syn), persistent=False
         )
 
-    def conductance_charge(self):
+    def conductance_charge(self) -> Tensor:
         self.psc = self.syn_decay * self.psc + self.syn_decay * self.h
         return self.psc
 
-    def adaptation_charge(self, z: torch.Tensor):
+    def adaptation_charge(self, z: torch.Tensor) -> None:
         # Flatten only when input still carries multi-dimensional neuron dims
         if len(self.n_neuron) > 1 and z.shape[-len(self.n_neuron) :] == self.n_neuron:
             z_flat, leading = flatten_neuron(z, self.n_neuron, self.size)
@@ -252,7 +248,7 @@ class AlphaPSCBilleh(_Adaptive2VarPSC):
             wz = unflatten_neuron(wz, leading, self.n_neuron)
         self.h = self.syn_decay * self.h + torch.e / self.tau_syn * wz
 
-    def get_kernel(self, dt, kernel_len):
+    def get_kernel(self, dt: float | Tensor, kernel_len: int) -> Tensor:
         """AlphaPSC Billeh variant kernel.
 
         Kernel follows the exact single-step recurrence:
@@ -281,8 +277,8 @@ class AlphaPSC(_Adaptive2VarPSC):
         tau_syn: float | TensorLike,
         linear: torch.nn.Module,
         g_max=1.0,
-        step_mode="s",
-        backend="torch",
+        step_mode: str = "s",
+        backend: str = "torch",
     ):
         """The Alpha form (current-based) of PSC, from Brainpy/BrainState."""
 
@@ -291,20 +287,20 @@ class AlphaPSC(_Adaptive2VarPSC):
         self.register_buffer("tau_syn", torch.as_tensor(tau_syn), persistent=False)
         self.register_buffer("g_max", torch.as_tensor(g_max), persistent=False)
 
-    def dg(self, psc, h):
+    def dg(self, psc: Tensor, h: Tensor) -> tuple[Tensor, Tensor]:
         derivative = -psc / self.tau_syn + h / self.tau_syn
         linear = -1.0 / self.tau_syn
         return derivative, linear
 
-    def dh(self, h):
+    def dh(self, h: Tensor) -> tuple[Tensor, Tensor]:
         derivative = -h / self.tau_syn
         linear = -1.0 / self.tau_syn
         return derivative, linear
 
-    def conductance_charge(self):
+    def conductance_charge(self) -> None:
         self.psc = exp_euler_step(self.dg, self.psc, self.h, dt=environ.get("dt"))
 
-    def adaptation_charge(self, z: torch.Tensor):
+    def adaptation_charge(self, z: torch.Tensor) -> None:
         # Flatten only when input still carries multi-dimensional neuron dims
         if len(self.n_neuron) > 1 and z.shape[-len(self.n_neuron) :] == self.n_neuron:
             z_flat, leading = flatten_neuron(z, self.n_neuron, self.size)
@@ -316,7 +312,7 @@ class AlphaPSC(_Adaptive2VarPSC):
             wz = unflatten_neuron(wz, leading, self.n_neuron)
         self.h = exp_euler_step(self.dh, self.h, dt=environ.get("dt")) + wz
 
-    def get_kernel(self, dt, kernel_len):
+    def get_kernel(self, dt: float | Tensor, kernel_len: int) -> Tensor:
         """AlphaPSC (Brainpy variant) kernel.
 
         Kernel follows the exact single-step recurrence:
@@ -348,8 +344,8 @@ class DualExponentialPSC(BasePSC):
         tau_rise: float | TensorLike,
         linear: torch.nn.Module,
         A: float | TensorLike | None = None,
-        step_mode="s",
-        backend="torch",
+        step_mode: str = "s",
+        backend: str = "torch",
     ):
         """The Double Exponential form of PSC, from Brainpy/BrainState."""
 
@@ -377,21 +373,21 @@ class DualExponentialPSC(BasePSC):
         self.register_memory("g_rise", 0.0, self.n_neuron)
         self.register_memory("g_decay", 0.0, self.n_neuron)
 
-    def dg_rise(self, g_rise):
+    def dg_rise(self, g_rise: Tensor) -> tuple[Tensor, Tensor]:
         derivative = -g_rise / self.tau_rise
         linear = -1.0 / self.tau_rise
         return derivative, linear
 
-    def dg_decay(self, g_decay):
+    def dg_decay(self, g_decay: Tensor) -> tuple[Tensor, Tensor]:
         derivative = -g_decay / self.tau_decay
         linear = -1.0 / self.tau_decay
         return derivative, linear
 
-    def conductance_charge(self):
+    def conductance_charge(self) -> None:
         self.g_rise = exp_euler_step(self.dg_rise, self.g_rise, dt=environ.get("dt"))
         self.g_decay = exp_euler_step(self.dg_decay, self.g_decay, dt=environ.get("dt"))
 
-    def adaptation_charge(self, z: torch.Tensor):
+    def adaptation_charge(self, z: torch.Tensor) -> None:
         # Flatten only when input still carries multi-dimensional neuron dims
         if len(self.n_neuron) > 1 and z.shape[-len(self.n_neuron) :] == self.n_neuron:
             z_flat, leading = flatten_neuron(z, self.n_neuron, self.size)
@@ -405,7 +401,7 @@ class DualExponentialPSC(BasePSC):
         self.g_decay = self.g_decay + wz
         self.psc = self.a * (self.g_decay - self.g_rise)
 
-    def get_kernel(self, dt, kernel_len):
+    def get_kernel(self, dt: float | Tensor, kernel_len: int) -> Tensor:
         """Dual-exponential (alpha-shaped) kernel.
 
         Kernel: k[t] = a * (a_d^t - a_r^t) for t >= 0
@@ -466,12 +462,12 @@ class BilinearMixingSynapse(MemoryModule):
 
     def init_state(
         self,
-        batch_size=None,
-        dtype=None,
-        device=None,
-        persistent=True,
+        batch_size: int | None = None,
+        dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
+        persistent: bool = True,
         skip_mem_name: Iterable[str] = (),
-    ):
+    ) -> None:
         self.base_psc.init_state(
             batch_size,
             dtype,
@@ -488,11 +484,11 @@ class BilinearMixingSynapse(MemoryModule):
 
     def reset(
         self,
-        batch_size=None,
-        dtype=None,
-        device=None,
+        batch_size: int | None = None,
+        dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
         skip_mem_name: Iterable[str] = (),
-    ):
+    ) -> None:
         self.base_psc.reset(
             batch_size,
             dtype,
@@ -538,7 +534,8 @@ class DelayedPSC(MemoryModule):
     """Wrapper that adds delay buffering to any BasePSC subclass.
 
     Delays are managed orthogonally to synaptic dynamics via SpikeHistory.
-    This replaces the legacy ``latency=`` parameter on BasePSC subclasses.
+    Delay is configured here via ``max_delay_steps``; BasePSC subclasses no
+    longer take a delay/latency argument themselves.
 
     Args:
         psc: BasePSC subclass instance (e.g. ExponentialPSC, AlphaPSC).
@@ -653,8 +650,8 @@ class HeterSynapsePSC(BasePSC):
         base_psc: type[BasePSC] = AlphaPSC,
         max_delay_steps: int = 1,
         use_circular_buffer: bool = False,
-        step_mode="s",
-        backend="torch",
+        step_mode: str = "s",
+        backend: str = "torch",
         **kwargs,
     ):
         super().__init__(n_neuron, linear, step_mode=step_mode, backend=backend)
@@ -683,12 +680,12 @@ class HeterSynapsePSC(BasePSC):
 
     def init_state(
         self,
-        batch_size=None,
-        dtype=None,
-        device=None,
-        persistent=True,
+        batch_size: int | tuple[int, ...] | None = None,
+        dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
+        persistent: bool = True,
         skip_mem_name: Iterable[str] = (),
-    ):
+    ) -> None:
         super().init_state(
             batch_size,
             dtype,
@@ -701,11 +698,11 @@ class HeterSynapsePSC(BasePSC):
 
     def reset(
         self,
-        batch_size=None,
-        dtype=None,
-        device=None,
+        batch_size: int | tuple[int, ...] | None = None,
+        dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
         skip_mem_name: Iterable[str] = (),
-    ):
+    ) -> None:
         super().reset(
             batch_size,
             dtype,
@@ -935,13 +932,7 @@ class GapJunction(nn.Module):
 
         return unflatten_neuron(i_gap_flat, leading, self.n_neuron)
 
-    def single_step_forward(
-        self,
-        v_pre: Float[Tensor, "*batch n_neuron"],
-        v_post: Float[Tensor, "*batch n_neuron"],
-    ) -> Float[Tensor, "*batch n_neuron"]:
-        """Single step forward (alias for forward)."""
-        return self.forward(v_pre, v_post)
+    single_step_forward = forward
 
     def multi_step_forward(
         self,
@@ -1048,12 +1039,7 @@ class VoltageCoupling(nn.Module):
 
         return unflatten_neuron(i_couple_flat, leading, self.n_neuron)
 
-    def single_step_forward(
-        self,
-        v: Float[Tensor, "*batch n_neuron"],
-    ) -> Float[Tensor, "*batch n_neuron"]:
-        """Single step forward (alias for forward)."""
-        return self.forward(v)
+    single_step_forward = forward
 
     def multi_step_forward(
         self,

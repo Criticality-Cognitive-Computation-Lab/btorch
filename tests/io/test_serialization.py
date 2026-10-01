@@ -6,6 +6,7 @@ import xarray as xr
 
 from btorch.io.serialization import (
     load_memories_from_xarray,
+    memories_to_xarray,
     save_memories_to_xarray,
 )
 
@@ -220,3 +221,20 @@ def test_neuron_indices(tmp_path):
     ds = xr.open_zarr(save_path)
     assert "root_id" in ds.coords
     assert ds["root_id"].shape == n_shape
+
+
+def test_partial_map_without_neuron_dims_raises():
+    """A ``partial_map`` entry cannot be expanded when no neuron dims exist.
+
+    With ``dim_counts=(1, 1, 0)`` the neuron group is empty, so there is nothing
+    to expand the partial variable into. This must raise ``ValueError`` (like the
+    sibling "full neuron dimensions unknown" case) instead of being ignored.
+    """
+    data = {"v": np.zeros((4, 2), dtype=np.float32)}
+    with pytest.raises(ValueError, match="no neuron dimensions"):
+        memories_to_xarray(
+            data,
+            dim_counts=(1, 1, 0),
+            dim_names=("time", "batch", "neuron"),
+            partial_map={"v": np.array([0])},
+        )

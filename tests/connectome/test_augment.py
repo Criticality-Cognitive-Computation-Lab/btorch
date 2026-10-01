@@ -102,3 +102,14 @@ def test_sample_neuron_representative_validates_required_columns():
         match="sample_neuron_representative requires columns",
     ):
         sample_neuron_representative(bad, k=1, j=1)
+
+
+def test_mask_neurons_in_conn_mat_root_id_requires_neurons():
+    """root_id masking without a neurons table raises ValueError."""
+    import scipy.sparse
+
+    from btorch.connectome.augment import mask_neurons_in_conn_mat
+
+    conn = scipy.sparse.eye(3, format="csr")
+    with pytest.raises(ValueError, match="neurons"):
+        mask_neurons_in_conn_mat(conn, [1], id_type="root_id")

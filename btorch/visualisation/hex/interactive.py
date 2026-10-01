@@ -464,7 +464,9 @@ def heatmap(
                 fig.add_trace(_build_scatter(series, colorbar))
                 fig.layout.shapes = _build_shapes(series)
 
-        fig.layout.sliders[0].steps = slider_steps  # type: ignore
+        # plotly's layout typing does not expose ``sliders`` element attributes,
+        # although the slider is created earlier in this function.
+        fig.layout.sliders[0].steps = slider_steps  # type: ignore[attr-defined]
         fig.frames = frames
 
     if title:

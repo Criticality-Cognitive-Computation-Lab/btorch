@@ -55,7 +55,6 @@ class HexEye(nn.Module):
         self.ppo = ppo
         self.mode = mode
 
-        # Validate mode
         valid_modes = (None, "point", "mean", "sum", "max", "min")
         if mode not in valid_modes:
             raise ValueError(f"mode must be one of {valid_modes}, got {mode}")
@@ -77,11 +76,9 @@ class HexEye(nn.Module):
                 f"Closest valid: {expected}"
             )
 
-        # Set default dimensions if not provided
         self.height_px = height_px or ppo * (2 * self.radius + 1)
         self.width_px = width_px or ppo * (2 * self.radius + 1)
 
-        # Generate receptor center coordinates
         self._generate_receptor_centers()
 
     def _generate_receptor_centers(self) -> None:
@@ -89,10 +86,8 @@ class HexEye(nn.Module):
         from ...utils.hex.coords import disk
         from ...utils.hex.transform import to_pixel
 
-        # Get hex coordinates
         q, r = disk(self.radius)
 
-        # Convert to pixel coordinates
         x, y = to_pixel(q, r, size=self.ppo)
 
         # Calculate hex grid bounds to properly fit within image
@@ -115,15 +110,12 @@ class HexEye(nn.Module):
         else:
             scale = 1.0
 
-        # Apply scaling and center
         x = (x * scale) + self.width_px // 2
         y = (y * scale) + self.height_px // 2
 
-        # Round to integer pixel coordinates
         x = np.rint(x).astype(np.int64)
         y = np.rint(y).astype(np.int64)
 
-        # Register as buffer (non-trainable)
         self.register_buffer(
             "receptor_x", torch.tensor(x, dtype=torch.long), persistent=False
         )
@@ -159,11 +151,9 @@ class HexEye(nn.Module):
 
         original_shape = stim.shape
 
-        # Handle flattened input
         if stim.dim() == 2:
             stim = stim.view(*original_shape[:-1], self.height_px, self.width_px)
 
-        # Resize if needed
         if stim.shape[-2] != self.height_px or stim.shape[-1] != self.width_px:
             stim = F.interpolate(
                 stim.view(-1, 1, stim.shape[-2], stim.shape[-1]),
@@ -172,12 +162,10 @@ class HexEye(nn.Module):
                 align_corners=False,
             ).view(*original_shape[:-2], self.height_px, self.width_px)
 
-        # Flatten batch dimensions
         batch_shape = stim.shape[:-2]
         stim_flat = stim.view(-1, self.height_px, self.width_px)
         n_batch = stim_flat.shape[0]
 
-        # Sample at receptor locations
         if self.mode == "point":
             # Fast path: simple indexing at receptor centers
             results = []
@@ -190,7 +178,6 @@ class HexEye(nn.Module):
             # Aggregation modes: extract neighborhoods and aggregate
             output = self._aggregate_receptor_regions(stim_flat)
 
-        # Reshape back
         return output.view(*batch_shape, self.n_ommatidia)
 
     def _aggregate_receptor_regions(self, images: torch.Tensor) -> torch.Tensor:
@@ -206,10 +193,8 @@ class HexEye(nn.Module):
         k = self.kernel_size
         pad = k // 2
 
-        # Pad images to handle edges
         padded = F.pad(images, (pad, pad, pad, pad), mode="reflect")
 
-        # Extract receptor positions (ensure within valid range)
         rx = self.receptor_x.clamp(pad, w + pad - 1)
         ry = self.receptor_y.clamp(pad, h + pad - 1)
 
@@ -217,10 +202,8 @@ class HexEye(nn.Module):
         # Use unfold to get sliding windows, then index
         unfolded = padded.unfold(1, k, 1).unfold(2, k, 1)  # (batch, h, w, k, k)
 
-        # Gather neighborhoods for all receptors at once
         neighborhoods = []
         for i in range(n_batch):
-            # Get neighborhoods at receptor positions
             # Shift by pad to account for padding
             ny = ry  # y in padded coords
             nx = rx  # x in padded coords
@@ -229,7 +212,6 @@ class HexEye(nn.Module):
 
         neighborhoods = torch.stack(neighborhoods)  # (batch, n_ommatidia, k, k)
 
-        # Apply aggregation
         if self.mode == "mean":
             return neighborhoods.mean(dim=(-2, -1))
         elif self.mode == "sum":
@@ -280,7 +262,6 @@ class BoxEye(nn.Module):
         self.ppo = ppo
         self.mode = mode
 
-        # Calculate extent
         self.radius = int((-3 + np.sqrt(12 * n_ommatidia - 3)) / 6)
 
         expected = disk_count(self.radius)
@@ -293,11 +274,9 @@ class BoxEye(nn.Module):
         self.height_px = height_px or ppo * (2 * self.radius + 1)
         self.width_px = width_px or ppo * (2 * self.radius + 1)
 
-        # Create box filter convolution
         self.kernel_size = ppo
         self._setup_conv()
 
-        # Generate receptor centers
         from ...utils.hex.coords import disk
         from ...utils.hex.transform import to_pixel
 
@@ -317,7 +296,6 @@ class BoxEye(nn.Module):
 
     def _setup_conv(self) -> None:
         """Set up the box filter convolution."""
-        # Create average pooling layer
         self.pool = nn.AvgPool2d(
             kernel_size=self.kernel_size,
             stride=self.kernel_size,
@@ -346,11 +324,9 @@ class BoxEye(nn.Module):
 
         original_shape = stim.shape
 
-        # Handle flattened input
         if stim.dim() == 2:
             stim = stim.view(*original_shape[:-1], self.height_px, self.width_px)
 
-        # Resize if needed
         if stim.shape[-2] != self.height_px or stim.shape[-1] != self.width_px:
             stim = F.interpolate(
                 stim.view(-1, 1, stim.shape[-2], stim.shape[-1]),
@@ -359,11 +335,9 @@ class BoxEye(nn.Module):
                 align_corners=False,
             ).view(*original_shape[:-2], self.height_px, self.width_px)
 
-        # Flatten batch dimensions
         batch_shape = stim.shape[:-2]
         stim_flat = stim.view(-1, 1, self.height_px, self.width_px)
 
-        # Apply box filter
         filtered = self.pool(stim_flat)
 
         # Sample at hex positions (simplified - just flatten for now)

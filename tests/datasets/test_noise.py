@@ -213,3 +213,24 @@ def test_pink_noise_functional_and_layer():
     y_s = torch.stack(y_s)
     assert y_s.shape == (8, 2, 3)
     assert torch.allclose(layer.noise, y_s[-1])
+
+
+@pytest.mark.parametrize("layer_cls", [OUNoiseLayer, PinkNoiseLayer])
+def test_single_step_forward_requires_stateful(layer_cls):
+    """Calling ``single_step_forward`` on a non-stateful layer is a usage
+    error.
+
+    The constructor already rejects ``stateful=False`` in single-step mode, so the
+    flag is flipped afterwards. It must raise ``RuntimeError`` (an explicit
+    exception, not a bare ``assert`` that is stripped under ``python -O``).
+    """
+    kwargs = {"n_neuron": 3, "step_mode": "s", "stateful": True}
+    if layer_cls is OUNoiseLayer:
+        kwargs.update(sigma=0.5, tau=10.0)
+    else:
+        kwargs.update(fir_order=8)
+    layer = layer_cls(**kwargs)
+    layer.stateful = False
+    with environ.context(dt=1.0):
+        with pytest.raises(RuntimeError, match="stateful=True"):
+            layer.single_step_forward()

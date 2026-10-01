@@ -6,7 +6,7 @@ Supports multiple coordinate formats: axial (q,r), zigzag (x,y), pixel (px,py).
 Code adapted from flyvis (MIT License).
 """
 
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -42,10 +42,10 @@ class HexScatter:
         layout: str | None = None,
         figsize: tuple[float, float] = (6, 6),
         cmap: str = "viridis",
-        vmin: Optional[float] = None,
-        vmax: Optional[float] = None,
+        vmin: float | None = None,
+        vmax: float | None = None,
         interval: int = 200,
-        ax: Optional[Axes] = None,
+        ax: Axes | None = None,
     ):
         self.values = values
         self.c1 = c1
@@ -145,7 +145,7 @@ class HexQuiver:
         cmap: str = "hsv",
         cwheel: bool = True,
         interval: int = 200,
-        ax: Optional[Axes] = None,
+        ax: Axes | None = None,
     ):
         self.flow = flow
         self.c1 = c1

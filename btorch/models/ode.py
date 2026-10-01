@@ -17,7 +17,12 @@ def _derivative_only(out):
     return out[0] if isinstance(out, tuple) else out
 
 
-def exp_euler_step(f: Callable, *args, dt=1.0, linear: Tensor | None = None):
+def exp_euler_step(
+    f: Callable,
+    *args: Tensor,
+    dt: float | Tensor = 1.0,
+    linear: Tensor | None = None,
+) -> Tensor:
     """One integration step applying the exponential Euler method.
 
     .. math::
@@ -47,9 +52,16 @@ def exp_euler_step(f: Callable, *args, dt=1.0, linear: Tensor | None = None):
             _f = lambda x: _derivative_only(f(x))
         derivative, linear_f = vjp(_f, args[0])
         linear = linear_f(torch.ones_like(derivative))[0]
-    return args[0] + torch.expm1(dt * linear) / linear * derivative
+    # (e^{dt A} - 1) / A -> dt as A -> 0; the safe denominator keeps the
+    # unused branch (and its gradient) finite.
+    is_zero = linear == 0
+    safe_linear = torch.where(is_zero, torch.ones_like(linear), linear)
+    phi = torch.where(
+        is_zero, torch.full_like(linear, dt), torch.expm1(dt * linear) / safe_linear
+    )
+    return args[0] + phi * derivative
 
 
-def euler_step(f: Callable, *args, dt=1.0):
+def euler_step(f: Callable, *args: Tensor, dt: float | Tensor = 1.0) -> Tensor:
     derivative = _derivative_only(f(*args))
     return args[0] + dt * derivative

@@ -43,7 +43,8 @@ def agg_by_neuropil(
             use_polars = False
 
     if mode == "top_innervated":
-        assert neurons is not None, "neurons must be provided for top_innervated mode"
+        if neurons is None:
+            raise ValueError("neurons must be provided for top_innervated mode")
         tmp = neurons[["group", "simple_id"]].copy()
         tmp = tmp[tmp["simple_id"] < y.shape[-1]]
         pre_ret: dict = {}
@@ -76,9 +77,8 @@ def agg_by_neuropil(
                 post_ret[post] = agg_func(y[..., group.simple_id], -1)
         return pre_ret, post_ret
     if mode == "all_innervated":
-        assert (
-            connections is not None
-        ), "connections must be provided for all_innervated mode"
+        if connections is None:
+            raise ValueError("connections must be provided for all_innervated mode")
         tmp = connections[["pre_simple_id", "post_simple_id", "neuropil"]]
         tmp = tmp[
             (tmp["pre_simple_id"] < y.shape[-1]) & (tmp["post_simple_id"] < y.shape[-1])
@@ -137,7 +137,8 @@ def agg_conn(
     if mode == "neuropil":
         return conn.groupby("neuropil")["weight"].agg(agg)
     if mode == "neuron":
-        assert neurons is not None, "neurons must be provided for neuron mode"
+        if neurons is None:
+            raise ValueError("neurons must be provided for neuron mode")
         conn = conn.merge(
             neurons[["simple_id", neuron_type_column]].rename(
                 columns={
@@ -211,7 +212,7 @@ def build_group_frame(
         simple_ids = pd.to_numeric(metadata[simple_id_col], errors="raise").to_numpy(
             dtype=np.int64
         )
-    except Exception as exc:
+    except (ValueError, TypeError, OverflowError) as exc:
         raise ValueError(f"`{simple_id_col}` must be numeric.") from exc
 
     n_neurons = y.shape[-1]

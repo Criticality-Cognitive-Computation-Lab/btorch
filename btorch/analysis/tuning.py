@@ -35,36 +35,24 @@ def get_fi_vi_curve(
     """
     currents = torch.linspace(current_start, current_end, steps, device=device)
 
-    # Instantiate neuron with original population size
     params = neuron_params.copy()
     n_neuron = params.pop("n_neuron", 1)
     params["device"] = device
 
-    # Instantiate the neuron model
     neuron = neuron_cls(n_neuron=n_neuron, **params)
-    # Initialize state with batch_size = steps for parallel sweep
     init_net_state(neuron, batch_size=steps, device=device)
 
-    # Wrap with RecurrentNN for time-stepping
     rnn_model = make_rnn(neuron, update_state_names=["v"])
 
-    # Create input tensor: (Time, Batch, Neurons)
     time_steps = int(duration / dt)
-    # expand currents (steps,) -> (time_steps, steps, n_neuron)
-    # currents[None, :, None] gives (1, steps, 1)
     input_current = currents[None, :, None].expand(time_steps, steps, n_neuron)
 
     with torch.no_grad():
         with environ.context(dt=dt):
             spikes, states = rnn_model(input_current)
 
-            # spikes: (Time, steps, n_neuron)
-            # states['v']: (Time, steps, n_neuron)
-
     voltages = states["v"]
 
-    # Calculate firing rates
-    # Sum spikes over time, divide by duration (in seconds)
     spike_counts = spikes.sum(dim=0)  # (steps, n_neuron)
     frequencies = spike_counts / (duration / 1000.0)
 

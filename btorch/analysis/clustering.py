@@ -1,17 +1,19 @@
+from collections.abc import Sequence
+
 import numpy as np
 from fastdtw import fastdtw
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import euclidean as _scipy_euclidean, squareform
 
 
-def _euclidean(u, v):
+def _euclidean(u: np.ndarray | float, v: np.ndarray | float) -> float:
     """Euclidean distance that tolerates scalar input (for fastdtw)."""
     u = np.atleast_1d(np.asarray(u))
     v = np.atleast_1d(np.asarray(v))
     return _scipy_euclidean(u, v)
 
 
-def suggest_threshold(linkage_matrix):
+def suggest_threshold(linkage_matrix: np.ndarray) -> float:
     """Suggest a sensible threshold for hierarchical clustering."""
     sorted_distances = sorted(linkage_matrix[:, 2], reverse=True)
     diffs = np.abs(np.diff(sorted_distances))
@@ -26,7 +28,11 @@ def suggest_threshold(linkage_matrix):
     return suggested_threshold
 
 
-def cluster_traces(traces, threshold=10, linkage_method="average"):
+def cluster_traces(
+    traces: Sequence[np.ndarray],
+    threshold: float = 10,
+    linkage_method: str = "average",
+) -> tuple[dict[int, list[int]], np.ndarray, np.ndarray, np.ndarray]:
     """Cluster traces of voltages or currents using hierarchical agglomerative
     clustering with DTW distance."""
     num_traces = len(traces)

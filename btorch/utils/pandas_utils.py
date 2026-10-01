@@ -4,14 +4,14 @@ Helpers for common DataFrame operations used in connectome analysis and
 data aggregation workflows.
 """
 
-from typing import Any, Optional, Sequence
+from typing import Any, Sequence
 
 import pandas as pd
 
 
 def groupby_to_dict(
     df: pd.DataFrame,
-    column_select: Optional[Sequence[str]] = None,
+    column_select: Sequence[str] | None = None,
     **groupby_args: Any,
 ) -> dict[Any, pd.DataFrame]:
     """Group DataFrame and return as dictionary mapping keys to subframes.

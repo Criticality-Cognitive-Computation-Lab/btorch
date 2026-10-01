@@ -5,7 +5,6 @@ dependencies:
   - python=3.14.6
   - pytorch-gpu
   - torchvision
-  - spikingjelly
   - pytorch_sparse  # optional: btorch falls back to native torch.sparse if unavailable
   - pip
   - pip:
@@ -14,14 +13,16 @@ dependencies:
     # dynamic tools
     - nolds
     - powerlaw
+    - fastdtw
     - btorch
   - tqdm
   - matplotlib
   - scipy
   - xarray
   - h5py
+  - pyyaml
   - hdf5plugin
-  - pandas>=3.0.3 # assume CoW
+  - pandas>=2
   - numba
   - seaborn
   # dev

@@ -4,6 +4,7 @@ Helpers for resolving figure output paths based on caller location
 within the repository structure.
 """
 
+import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,9 @@ from pathlib import Path
 import matplotlib.figure
 
 from btorch.utils import conf
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -63,8 +67,9 @@ def caller_file(stack_level: int = 2) -> str:
             import os
 
             return str(Path(os.getcwd()) / "__notebook__.ipynb")
-    except Exception:
-        pass
+    except (ImportError, AttributeError, KeyError, OSError):
+        # Not in IPython or notebook lookup failed; use the call stack instead.
+        logger.debug("Notebook path lookup failed", exc_info=True)
     return sys._getframe(stack_level).f_code.co_filename
 
 

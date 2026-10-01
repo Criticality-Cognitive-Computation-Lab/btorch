@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import torch
 
@@ -96,7 +98,8 @@ def calculate_pcist(
             significant state excursion. Default 3.0.
 
     Returns:
-        float: The PCIst score.
+        float: The PCIst score, or NaN (with a warning) if the SVD of the
+            response fails to converge.
     """
     # Ensure inputs are float tensors
     if not isinstance(response, torch.Tensor):
@@ -132,9 +135,14 @@ def calculate_pcist(
     try:
         # full_matrices=False ensures we get min(T, N) components
         U, S, Vh = torch.linalg.svd(response_centered, full_matrices=False)
-    except RuntimeError:
-        # Fallback for singular matrices or convergence issues
-        return 0.0
+    except RuntimeError as e:
+        # SVD did not converge (e.g. non-finite input). Report NaN rather than
+        # a fake score of 0.0, which would be indistinguishable from "no
+        # complexity".
+        warnings.warn(
+            f"SVD failed in calculate_pcist, returning NaN: {e}", stacklevel=2
+        )
+        return float("nan")
 
     V = Vh.T  # (N, K)
 
@@ -219,11 +227,15 @@ def calculate_gain_stability_sensitivity(
     g_values: np.ndarray | None = None,
     dt: float = 1.0,
     device: str = "cuda",
-) -> tuple:
+) -> tuple[float, float, np.ndarray, np.ndarray]:
     """Calculate the Gain-Stability Sensitivity (Susceptibility) slope.
 
     Definition: The slope of the curve of the Maximum Lyapunov Exponent (lambda_max)
     as a function of global synaptic gain scaling (g).
+
+    The model must expose ``model.brain.synapse.linear.magnitude`` (the weight
+    magnitude being scaled) and ``model.brain.neuron``. The model weights are
+    always restored, even if the sweep raises.
 
     Args:
         model: The Brain model.
@@ -234,38 +246,41 @@ def calculate_gain_stability_sensitivity(
 
     Returns:
         tuple: (slope, intercept, g_values, lambda_values)
-            - slope: The slope of lambda_max vs g.
-            - intercept: The intercept of the fit.
+            - slope: The slope of lambda_max vs g (NaN if fewer than two
+              finite lambda values were obtained).
+            - intercept: The intercept of the fit (NaN as above).
             - g_values: The gain values used.
-            - lambda_values: The computed max Lyapunov exponents.
+            - lambda_values: The computed max Lyapunov exponents; NaN for gains
+              where the estimate failed.
+
+    Raises:
+        AttributeError: If the model lacks ``brain.synapse.linear.magnitude``.
+        ValueError: If the dataloader is empty.
     """
-    from model import functional, init
+    # Local import: btorch.models is heavy and only needed for this routine.
+    from btorch.models import functional, init
 
     if g_values is None:
         g_values = np.linspace(0.5, 5.0, 10)
+    g_values = np.asarray(g_values, dtype=float)
 
-    # Access linear layer
     # Assuming model is Brain, model.brain is RecurrentNN, model.brain.synapse
-    # is Synapse model.brain.synapse.linear is the layer
+    # is Synapse and model.brain.synapse.linear is the layer.
     try:
         linear_layer = model.brain.synapse.linear
-    except AttributeError:
-        print("Could not find linear layer at model.brain.synapse.linear")
-        return 0.0
-
-    original_magnitude = linear_layer.magnitude.data.clone()
-
-    lambda_values = []
+        original_magnitude = linear_layer.magnitude.data.clone()
+    except AttributeError as e:
+        raise AttributeError(
+            "model must expose model.brain.synapse.linear.magnitude"
+        ) from e
 
     model.eval()
     model.to(device)
 
-    # Get one batch of input
     try:
         batch = next(iter(dataloader))
     except StopIteration:
-        print("Dataloader is empty.")
-        return 0.0
+        raise ValueError("dataloader is empty") from None
 
     inputs = batch["input"]
     # inputs: (Batch, Time, ...) -> (Time, Batch, ...)
@@ -274,51 +289,53 @@ def calculate_gain_stability_sensitivity(
     # We can use the first sample in the batch.
     input_sample = inputs[:, 0:1, ...]  # Keep batch dim 1
 
-    for g in g_values:
-        # Scale weights
-        linear_layer.magnitude.data = original_magnitude * g
+    lambda_values = []
+    try:
+        for g in g_values:
+            # Scale weights
+            linear_layer.magnitude.data = original_magnitude * g
 
-        # Reset state
-        functional.reset_net(model, device=device)
-        init.uniform_v_(model.brain.neuron, set_reset_value=True, batch_size=1)
+            # Reset state
+            functional.reset_net(model, batch_size=1, device=device)
+            init.uniform_v_(model.brain.neuron, set_reset_value=True)
 
-        # Run
-        with torch.no_grad():
-            _, brain_out = model(input_sample)
-            spikes = brain_out["neuron"]["spike"]  # (Time, Batch, Neurons)
+            # Run
+            with torch.no_grad():
+                _, brain_out = model(input_sample)
+                spikes = brain_out["neuron"]["spike"]  # (Time, Batch, Neurons)
 
-        # Convert to rate
-        # spikes: (Time, 1, Neurons) -> (Time, Neurons)
-        spikes_sq = spikes.squeeze(1)
+            # spikes: (Time, 1, Neurons) -> (Time, Neurons)
+            spikes_sq = spikes.squeeze(1)
 
-        # Continuous rate
-        rates = get_continuous_spiking_rate(spikes_sq, dt=dt)
+            # Continuous rate
+            rates = get_continuous_spiking_rate(spikes_sq, dt=dt)
 
-        # Mean population rate for LE calculation
-        mean_rate = rates.mean(axis=1)
+            # Mean population rate for LE calculation
+            mean_rate = rates.mean(axis=1)
 
-        # Compute LE
-        try:
-            le = compute_max_lyapunov_exponent(mean_rate)
-        except Exception as e:
-            print(f"Error computing LE for g={g}: {e}")
-            le = 0.0  # Or NaN?
+            # Compute LE; nolds raises ValueError/RuntimeError on degenerate
+            # series (e.g. too short or constant). Record NaN, not a fake 0.
+            try:
+                le = compute_max_lyapunov_exponent(mean_rate)
+            except (ValueError, RuntimeError, ArithmeticError) as e:
+                warnings.warn(f"Lyapunov exponent failed for g={g}: {e}", stacklevel=2)
+                le = float("nan")
 
-        lambda_values.append(le)
+            lambda_values.append(le)
+    finally:
+        # Restore weights even if the sweep raised
+        linear_layer.magnitude.data = original_magnitude
 
-    # Restore weights
-    linear_layer.magnitude.data = original_magnitude
+    lambda_arr = np.asarray(lambda_values, dtype=float)
 
-    # Calculate slope
-    # Fit line: lambda = slope * g + intercept
-    # Handle potential NaNs or Infs
-    valid_indices = np.isfinite(lambda_values)
-    if np.sum(valid_indices) < 2:
-        return 0.0
+    # Fit line: lambda = slope * g + intercept, ignoring NaN/Inf entries
+    valid = np.isfinite(lambda_arr)
+    if np.sum(valid) < 2:
+        warnings.warn(
+            "Fewer than two finite Lyapunov exponents; slope is NaN", stacklevel=2
+        )
+        return float("nan"), float("nan"), g_values, lambda_arr
 
-    g_valid = g_values[valid_indices]
-    lambda_valid = np.array(lambda_values)[valid_indices]
+    slope, intercept = np.polyfit(g_values[valid], lambda_arr[valid], 1)
 
-    slope, intercept = np.polyfit(g_valid, lambda_valid, 1)
-
-    return slope, intercept, g_values, np.array(lambda_values)
+    return float(slope), float(intercept), g_values, lambda_arr

@@ -127,7 +127,7 @@ class CudaGraphRunner:
         )
 
     @staticmethod
-    def _check_supported(module, args):
+    def _check_supported(module, args, incompatible=None):
         if not torch.cuda.is_available():
             raise RuntimeError("cudagraph=True requires CUDA to be available.")
         devices = {a.device for a in args if torch.is_tensor(a)}
@@ -152,17 +152,10 @@ class CudaGraphRunner:
                 'training, use torch.compile(model, mode="reduce-overhead") instead '
                 "-- its cudagraph trees do capture forward and backward."
             )
-        for attr, why in (
-            # Not merely unsupported: the capture path never routes through
-            # _checkpointed_large_chunk, so this would be silently ignored -- no
-            # recompute, no memory saved -- on top of being backward-only.
-            ("grad_checkpoint", "the capture path would silently ignore it"),
-            ("save_grad_history", "its hooks only fire in the backward pass"),
-        ):
-            if getattr(module, attr, False):
-                raise RuntimeError(
-                    f"cudagraph=True is incompatible with {attr}=True ({why})."
-                )
+        for attr, why in (incompatible or {}).items():
+            raise RuntimeError(
+                f"cudagraph=True is incompatible with {attr}=True ({why})."
+            )
 
     def _capture(self, module, fn, args, kwargs):
         # Snapshot the entry state *by value*. Warmup and capture both advance the
@@ -206,15 +199,21 @@ class CudaGraphRunner:
         set_hidden_states(module, snapshot)
         return _Entry(graph, static_args, static_state_in, state_out, outputs)
 
-    def __call__(self, module, fn, args, kwargs=None, clone_outputs=True):
+    def __call__(
+        self, module, fn, args, kwargs=None, clone_outputs=True, incompatible=None
+    ):
         """Replay ``fn(*args, **kwargs)``, capturing it first if needed.
 
         Set ``clone_outputs=False`` only if the caller copies the results out of
         the pool itself before the next replay (``.cpu()`` counts); otherwise they
         are live only until then.
+
+        ``incompatible`` maps option names the caller has enabled but capture
+        cannot honour to the reason; any entry is refused. The runner knows
+        nothing about the module's own options.
         """
         kwargs = kwargs or {}
-        self._check_supported(module, args)
+        self._check_supported(module, args, incompatible)
 
         key = self._key(args, kwargs)
         entry = self.entries.get(key)

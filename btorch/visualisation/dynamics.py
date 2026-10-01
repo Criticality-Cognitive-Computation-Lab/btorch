@@ -585,9 +585,6 @@ def plot_isi_cv(
     return fig
 
 
-# --- Ported from legacy dynamics.py ---
-
-
 def plot_avalanche_analysis(
     spikes: np.ndarray | torch.Tensor,
     bin_size: int = 1,

@@ -53,6 +53,50 @@ def test_range_intersection():
             ), f"Hex ({q[i]},{r[i]}) is not within range of ({cq},{cr})"
 
 
+def test_range_intersection_known_geometry():
+    """Disks (0,0,r=2) and (3,0,r=2) share exactly 4 hexes.
+
+    Hexes within 2 of both centres satisfy the six-neighbour geometry;
+    for centres 3 apart along q the overlap is
+    {(1,0),(1,1),(2,-1),(2,0)}.
+    """
+    q, r = range_intersection([(0, 0), (3, 0)], [2, 2])
+    assert set(zip(q.tolist(), r.tolist())) == {(1, 0), (1, 1), (2, -1), (2, 0)}
+
+
+def test_range_intersection_disjoint_is_empty():
+    """Disks that do not touch have an empty intersection."""
+    q, r = range_intersection([(0, 0), (10, 0)], [2, 2])
+    assert len(q) == 0 and len(r) == 0
+
+
+def test_range_intersection_single_range_is_disk():
+    """Intersecting one range returns the disk itself (3r(r+1)+1 hexes)."""
+    q, r = range_intersection([(0, 0)], [3])
+    assert len(q) == 3 * 3 * 4 + 1
+    dq, dr = disk(3, 0, 0)
+    assert set(zip(q.tolist(), r.tolist())) == set(zip(dq.tolist(), dr.tolist()))
+
+
+def test_range_union_exact_count_for_disjoint_disks():
+    """Union of two non-overlapping radius-2 disks has 19 + 19 = 38 hexes."""
+    q, r = range_union([(0, 0), (5, 0)], [2, 2])
+    assert len(q) == 38
+    # a union is a superset of each member
+    union = set(zip(q.tolist(), r.tolist()))
+    for cq, cr in [(0, 0), (5, 0)]:
+        dq, dr = disk(2, cq, cr)
+        assert set(zip(dq.tolist(), dr.tolist())) <= union
+
+
+def test_range_union_overlapping_inclusion_exclusion():
+    """|A union B| = |A| + |B| - |A intersect B| for overlapping disks."""
+    centers, radii = [(0, 0), (3, 0)], [2, 2]
+    qu, _ = range_union(centers, radii)
+    qi, _ = range_intersection(centers, radii)
+    assert len(qu) == 19 + 19 - len(qi)
+
+
 def test_range_union():
     """Test range union - hexes within ANY range."""
     centers = [(0, 0), (5, 0)]
@@ -114,6 +158,13 @@ def test_range_intersection_visualization():
     ax.set_aspect("equal")
     ax.axis("off")
 
+    # two disk panels (radius 3 => 37 hexes each) plus the intersection panel
+    # background + full disk + centre marker scatter per disk panel
+    assert len(axes[0].collections) == 3 and len(axes[1].collections) == 3
+    assert len(disk(3, 0, 0)[0]) == 37
+    assert len(q_int) > 0
+    assert axes[2].get_title() == f"Intersection\n({len(q_int)} hexes)"
+
     plt.suptitle("Range Intersection (Hexes in ALL ranges)", fontsize=14)
     plt.tight_layout()
     save_fig(fig, "range_intersection", suffix="png")
@@ -167,6 +218,11 @@ def test_range_union_visualization():
     ax.set_aspect("equal")
     ax.axis("off")
 
+    # disks (0,0) and (6,0) with radius 3 touch in exactly one hex, (3,0):
+    # 37 + 37 - 1 = 73
+    assert len(q_union) == 73
+    assert axes[2].get_title() == "Union\n(73 hexes)"
+
     plt.suptitle("Range Union (Hexes in ANY range)", fontsize=14)
     plt.tight_layout()
     save_fig(fig, "range_union", suffix="png")
@@ -180,6 +236,14 @@ def test_multiple_range_intersection():
     radii = [3, 3, 3]
 
     q, r = range_intersection(centers, radii)
+
+    # the 3-way intersection is non-empty and lies in every disk
+    assert len(q) > 0
+    from btorch.utils.hex import distance as hex_distance
+
+    for (cq, cr), rad in zip(centers, radii):
+        d = hex_distance(q, r, np.full_like(q, cq), np.full_like(r, cr))
+        assert np.all(d <= rad)
 
     # Visualize
     fig, ax = plt.subplots(figsize=(8, 8))

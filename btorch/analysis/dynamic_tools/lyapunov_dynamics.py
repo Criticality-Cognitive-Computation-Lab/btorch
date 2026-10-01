@@ -1,7 +1,18 @@
-import nolds
 import numpy as np
 import torch
 from scipy.ndimage import gaussian_filter1d
+
+
+def _import_nolds():
+    """Import nolds lazily, with an install hint if it is missing."""
+    try:
+        import nolds
+    except ImportError as e:
+        raise ImportError(
+            "nolds package is required for this function. "
+            "Install with: pip install nolds"
+        ) from e
+    return nolds
 
 
 def get_continuous_spiking_rate(
@@ -23,7 +34,7 @@ def get_continuous_spiking_rate(
     if isinstance(spikes, torch.Tensor):
         spikes = spikes.detach().cpu().numpy()
 
-    # Convert sigma from ms to bins
+    # sigma is in ms, dt in ms: convert to bins
     sigma_bins = sigma / dt
 
     # Apply Gaussian filter along the time axis (axis 0)
@@ -50,6 +61,7 @@ def compute_max_lyapunov_exponent(
     Returns:
         The estimated largest Lyapunov exponent.
     """
+    nolds = _import_nolds()
     lyapunov_exponent = nolds.lyap_r(time_series, emb_dim=emb_dim, lag=lag, tau=tau)
     return lyapunov_exponent
 
@@ -72,7 +84,7 @@ def compute_lyapunov_exponent_spectrum(
     Returns:
         A list of estimated Lyapunov exponents.
     """
-    lyapunov_spectrum = nolds.lyap_e(
+    lyapunov_spectrum = _import_nolds().lyap_e(
         time_series, emb_dim=emb_dim, matrix_dim=matrix_dim, tau=tau
     )
     return lyapunov_spectrum
@@ -92,7 +104,7 @@ def compute_ks_entropy(
     Returns:
         The estimated KS entropy.
     """
-    ks_entropy = nolds.sampen(time_series, emb_dim=emb_dim, lag=lag)
+    ks_entropy = _import_nolds().sampen(time_series, emb_dim=emb_dim, lag=lag)
     return ks_entropy
 
 

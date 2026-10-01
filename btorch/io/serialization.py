@@ -238,22 +238,11 @@ def _infer_dim_counts(
     # If val is (T_d, B_d, N_d)
     ndim = val.ndim
 
-    # n_rank = neuron_ids.ndim if neuron_ids is not None else 1
-
     if partial:
         # Partial arrays might strictly be (T, B, N_partial)
         pass
 
-    # Default strategy if completely unknown: (ndim-2, 1, 1) or similar?
-    # Current xarray_utils behavior was: infer names by iterating backwards
-    # from known map.
-    # Here we want to establish the GLOBAL map.
-
-    # Let's assume simplest case if not specified: all dimensions are mapped
-    # 1:1 to names if they fit?
-    # No, that's dangerous.
-    # Safest default: (1, 1, 1) for rank 3, (1, 0, 1) for rank 2?
-
+    # Unspecified counts: fall back to conservative defaults by rank.
     if ndim == 3:
         return (1, 1, 1)
     elif ndim == 2:
@@ -333,11 +322,9 @@ def memories_to_xarray(
     dim_counts: Sequence[int] | None = None,
     dim_names: Sequence[str] = ("time", "batch", "neuron"),
     neuron_ids: Any | None = None,
-    # New args
     hint_field: str | None = None,
     partial_map: dict[str, Any] | None = None,
     strict_dims: bool = True,
-    # Legacy/Existing args
     spike_suffix: str = "spike",
     spike_dtype: Any = bool,
     sparse_threshold: float = 0.05,
@@ -416,61 +403,27 @@ def memories_to_xarray(
         if partial_map and var_name in partial_map:
             indices = _to_numpy(partial_map[var_name])
 
-            # We need to reshape indices to match neuron_group_dims rank?
-            # Usually indices are 1D valid indices into the flattened neuron
-            # dimension OR they match the rank of neuron dims.
-            # COMPLEXITY: If neuron dims are (2, 5), indices might be
-            # (N_partial, 2)?
-            # For simplicity, let's assume partial recording targets the
-            # flattened neuron population if indices are 1D, or specific coords
-            # if multi-D.
-            # But wait, `val` itself must match `indices` in size.
-
-            # Strategy: Construct a full-size array of NaNs (or appropriate
-            # empty). We need the full shape of this variable if it were NOT
-            # partial. We rely on other dimensions (Time, Batch) being same as
-            # `val` currently has, but Neuron dimension must be expanded.
-
-            # How do we know the full size of Neuron dim?
-            # Must be in dim_registry (from hint or root_id).
-            # If not in registry, we can't expand without knowing target size.
-
-            non_neuron_shape = val.shape[
-                : -len(neuron_group_dims) if neuron_group_dims else 0
-            ]
-            # Wait, if neuron_group_dims is empty, partial map doesn't make
-            # sense?
-
+            # Contract: ``val`` holds only the recorded neurons along its trailing
+            # neuron dims, and ``indices`` locates them in the full neuron
+            # population. 1D indices address the flattened neuron dims. The
+            # leading (time/batch) shape is kept from ``val``; the neuron dims are
+            # expanded to their full size (known from ``hint_field`` or
+            # ``neuron_ids``) and unrecorded entries are filled with NaN (0 for
+            # non-float dtypes).
             if not neuron_group_dims:
-                # Warn or skip expansion
-                pass
-            elif all(d in dim_registry for d in neuron_group_dims):
-                # We know the full neuron shape
+                raise ValueError(
+                    f"Cannot expand partial variable '{var_name}': no neuron "
+                    "dimensions are defined. Provide 'hint_field' or 'neuron_ids'."
+                )
+
+            non_neuron_shape = val.shape[: -len(neuron_group_dims)]
+
+            if all(d in dim_registry for d in neuron_group_dims):
                 full_neuron_shape = tuple(dim_registry[d] for d in neuron_group_dims)
                 full_shape = non_neuron_shape + full_neuron_shape
 
-                # Check compatibility
-                # val should be (..., N_partial)
-                # indices should be (N_partial,) typically
-
-                # For Multi-dim neuron (e.g. H, W), indices might be tuple of
-                # arrays? User said: "user can supply field name and neuron
-                # index pairs if some fields are only recorded for subset of
-                # neurons"
-
-                # We'll assume simple indexing for now:
-                # Create empty
-                # We need a dtype.
                 fill_val = np.nan if np.issubdtype(val.dtype, np.floating) else 0
                 expanded = np.full(full_shape, fill_val, dtype=val.dtype)
-
-                # Assign
-                # We need to construct the slicing tuple
-                # [..., indices]
-                # If indices is 1D array of ints, it works for 1D neuron dim.
-                # If neuron dim is multi-D, indices must be handled carefully.
-                # Assuming flattened indexing if 1D indices provided for
-                # multi-D shape?
 
                 if len(neuron_group_dims) > 1 and indices.ndim == 1:
                     # Flatten last K dims of expanded to assign, then reshape
@@ -494,10 +447,8 @@ def memories_to_xarray(
 
                 val = expanded
             else:
-                # Cannot expand, missing size info.
-                # Bail out or just store as is (will likely mismatch dimensions
-                # later). We raise error to be safe as requested
-                # "bail out if mismatch"
+                # The full neuron size is unknown, so the variable cannot be
+                # expanded; storing it as-is would mismatch dims later.
                 raise ValueError(
                     f"Cannot expand partial variable '{var_name}': Full neuron "
                     f"dimensions unknown. Provide 'hint_field' or 'neuron_ids'."
@@ -506,21 +457,11 @@ def memories_to_xarray(
         # Determine dimensions for this variable
         n_dims = val.ndim
 
-        # Alignment logic: alignment defaults to Right-to-Left matching against
-        # all_mapped_dims?
-        # BUT user says "T, B, N are uniform across endpoint arrays".
-        # So we should match Left-to-Right for T, B?
-        # Actually standard for xarray/numpy broadcasting is Right-to-Left,
-        # but in neuro-sims often (T, B, N) structure is fixed.
-        # If we have resolved_counts and all_mapped_dims, we expect `val` to
-        # match `all_mapped_dims` plus maybe extra dims.
+        # Alignment contract: core dims (e.g. T, B, N) are a fixed prefix of every
+        # array; extra trailing dims (e.g. a synapse state of shape (T, B, N, 2))
+        # get private names. Lower-rank arrays are right-aligned to the core dims.
+        n_dims = val.ndim
 
-        # If val.ndim > len(all_mapped_dims), extra dims are appended or
-        # prepended? Standard: (T, B, N) + (Extra). Or (T, B, N, Extra)?
-        # If T, B, N are core, usually Extra is LAST.
-        # Example: Input current (T, B, N), Synapse state (T, B, N, 2).
-
-        # So we take `all_mapped_dims` as the prefix.
         if n_dims >= len(all_mapped_dims):
             current_dims = list(all_mapped_dims)
             extra_count = n_dims - len(all_mapped_dims)
@@ -528,15 +469,7 @@ def memories_to_xarray(
                 # private extra dim
                 current_dims.append(f"{var_name}_dim_{len(all_mapped_dims) + i}")
         else:
-            # Rank deficiency.
-            # Maybe (T, N) only (B=0)?
-            # Or (N,) only?
-            # We try to match suffixes?
-            # Heuristic: Match suffix of all_mapped_dims.
-            # e.g. if (T, B, N) and var is (N,), it matches N.
-            # if var is (T, N), it matches T and N? (Skipping B).
-            # This is dangerous without named axes.
-            # Use Right-Alignment:
+            # Rank deficiency: right-align against the core dims.
             current_dims = all_mapped_dims[len(all_mapped_dims) - n_dims :]
 
         # Validation against dim_registry
@@ -544,14 +477,9 @@ def memories_to_xarray(
         for i, (d_name, size) in enumerate(zip(current_dims, val.shape)):
             if d_name in dim_registry:
                 if dim_registry[d_name] != size:
-                    # Conflict.
-                    # If this is a core dimension (in all_mapped_dims), this is
-                    # likely an error based on "uniform across endpoint
-                    # arrays". But unless we want to be very strict, we rename
-                    # it to private. User said: "bail out if there are size
-                    # mismatch and user has not supplied the field name"
-                    # Implies: if hint supplied, strict check?
-
+                    # Size conflict: with a hint field the core dims must agree
+                    # across variables (error); otherwise the mismatching axis
+                    # falls back to a private per-variable dim.
                     if hint_field and d_name in all_mapped_dims:
                         raise ValueError(
                             f"Dimension mismatch for '{var_name}' on dim "
@@ -563,27 +491,20 @@ def memories_to_xarray(
                     new_name = f"{var_name}_d{i}"
                     final_dims.append(new_name)
                 else:
-                    # Conflict or Broadcasting check
-                    pass
-
                     final_dims.append(d_name)
             else:
                 dim_registry[d_name] = size
                 final_dims.append(d_name)
 
         # Validation of Rank/Suffix if Strict
-        if strict_dims:
-            # Check if we skipped any core dimensions
-            # `current_dims` are the dims we assigned.
-            if len(unique_val_dims(final_dims)) < len(unique_val_dims(all_mapped_dims)):
-                if len(final_dims) < len(all_mapped_dims):
-                    # This is a parameter or lower-rank array.
-                    # Bail out as requested.
-                    raise ValueError(
-                        f"Strict dimensions required: Variable '{var_name}' has "
-                        f"rank {len(final_dims)} but global dims are "
-                        f"{len(all_mapped_dims)} {all_mapped_dims}."
-                    )
+        if strict_dims and len(final_dims) < len(all_mapped_dims):
+            # Lower-rank arrays (e.g. parameters) cannot be aligned to the
+            # global dims.
+            raise ValueError(
+                f"Strict dimensions required: Variable '{var_name}' has "
+                f"rank {len(final_dims)} but global dims are "
+                f"{len(all_mapped_dims)} {all_mapped_dims}."
+            )
 
         var_dims = final_dims
 
@@ -605,19 +526,8 @@ def memories_to_xarray(
                 )
 
         if should_sparse:
-            # If it's a "spike" array (via suffix) AND it was dense, we might
-            # want to cast it to spike_dtype??
-            # But user wants generic sparse support.
-            # If the user passed a float sparse matrix, we should preserve float
-            # If the user passed a dense boolean spike array, we preserve bool
-            # We simply call to_sparse_repr which preserves INPUT dtype.
-            # If one wants to force spike_dtype, one should cast before calling
-            # or handle here.
-            # Legacy behavior: `to_spike_sparse` DID cast to `spike_dtype`.
-            # To maintain back-compat for dense boolean spikes that might come
-            # in as float or something?
-            # If var matches spike_suffix, maybe we cast to spike_dtype if
-            # provided?
+            # to_sparse_repr preserves the input dtype; only dense arrays
+            # identified as spikes are cast to ``spike_dtype``.
             if is_spike and spike_dtype is not None and not sp.issparse(val):
                 # Only cast dense arrays that we identified as "spikes"
                 val = val.astype(spike_dtype)
@@ -806,13 +716,3 @@ def load_memories_from_xarray(
     """
     ds = xr.open_zarr(path, consolidated=True, chunks="auto" if dask else None)
     return xarray_to_memories(ds, return_sparse_2d=return_sparse_2d)
-
-
-# Legacy aliases for backward compatibility if needed, although mostly handled
-# by package move
-dict_to_xarray = memories_to_xarray
-# to_spike_sparse = to_sparse_repr # Signature changed slightly, but safe to
-# alias if needed? No.
-xarray_to_dict = xarray_to_memories
-save_dict_to_xarray = save_memories_to_xarray
-load_dict_from_xarray = load_memories_from_xarray

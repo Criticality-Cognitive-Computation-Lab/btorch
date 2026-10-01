@@ -83,15 +83,14 @@ class QuantileDistributionLoss(nn.Module):
         sorted: bool = False,
     ):
         super().__init__()
-        assert loss_type in (
-            "pinball",
-            "huber_pinball",
-        ), "loss_type must be 'pinball' or 'huber_pinball'"
-        assert reduction in (
-            "mean",
-            "sum",
-            "none",
-        ), "reduction must be 'mean', 'sum', or 'none'"
+        if loss_type not in ("pinball", "huber_pinball"):
+            raise ValueError(
+                f"loss_type must be 'pinball' or 'huber_pinball', got {loss_type!r}"
+            )
+        if reduction not in ("mean", "sum", "none"):
+            raise ValueError(
+                f"reduction must be 'mean', 'sum', or 'none', got {reduction!r}"
+            )
         self.loss_type = loss_type
         self.kappa = kappa
         self.reduction = reduction
@@ -107,8 +106,13 @@ class QuantileDistributionLoss(nn.Module):
         Returns:
             Scalar if ``reduction != 'none'``, else shape ``(...)``.
         """
-        assert pred.shape == target.shape, "pred and target must have the same shape"
-        assert pred.dim() >= 1, "Input must have at least one dimension"
+        if pred.shape != target.shape:
+            raise ValueError(
+                "pred and target must have the same shape, got "
+                f"{tuple(pred.shape)} and {tuple(target.shape)}"
+            )
+        if pred.dim() < 1:
+            raise ValueError("Input must have at least one dimension")
 
         *batch_dims, N = pred.shape
 
@@ -161,7 +165,8 @@ class FiringRateLoss(nn.Module):
         target: Target firing rate distribution.
         input_type: ``'spike'`` or ``'firing_rate'``.
         n_neuron: Optional output neuron count for interpolation.
-        loss_type: ``'pinball'`` or ``'huber'``.
+        loss_type: ``'pinball'`` or ``'huber_pinball'`` (forwarded to
+            :class:`QuantileDistributionLoss`).
         kappa: Smoothing parameter for huber loss.
         reduction: ``'sum'`` or ``'mean'``.
         rng: Seed for any random operations.
@@ -180,7 +185,7 @@ class FiringRateLoss(nn.Module):
         target: Float[TensorLike, "... M"],
         input_type: Literal["spike", "firing_rate"] = "spike",
         n_neuron: int | None = None,
-        loss_type="huber",
+        loss_type: Literal["pinball", "huber_pinball"] = "huber_pinball",
         kappa=0.002,
         reduction: Literal["sum", "mean"] = "mean",
         rng: torch.Generator | int | None = None,
@@ -216,6 +221,10 @@ class FiringRateLoss(nn.Module):
         if self.input_type == "spike":
             x = x.mean(0)
 
-        assert x.shape[-1] == 1 or (x.shape[-1] == self.n_neuron)
+        if x.shape[-1] != 1 and x.shape[-1] != self.n_neuron:
+            raise ValueError(
+                f"Last dimension of input must be 1 or n_neuron={self.n_neuron}, "
+                f"got {x.shape[-1]}"
+            )
 
         return self.loss(x, self.target)

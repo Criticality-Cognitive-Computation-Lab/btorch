@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from btorch.analysis.metrics import indices_to_mask, select_on_metric
 
@@ -26,3 +27,11 @@ def test_select_on_metric_topk_and_any_modes():
     )
     assert any_mask.sum() == 1
     assert any_indices.shape == (1,)
+
+
+def test_metrics_argument_validation_raises_value_error():
+    """Missing required arguments raise ValueError, not AssertionError."""
+    with pytest.raises(ValueError, match="shape"):
+        indices_to_mask(np.array([0]))
+    with pytest.raises(ValueError, match="num"):
+        select_on_metric(np.arange(5.0), num=None, mode="topk")

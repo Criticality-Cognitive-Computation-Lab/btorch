@@ -36,6 +36,9 @@ import scipy.sparse
 from . import simple_id_to_root_id
 
 
+IdType = Literal["root_id", "simple_id"]
+
+
 def slice_neurons_connections(
     simple_id: int | list[int] | np.ndarray | None = None,
     root_id: int | list[int] | np.ndarray | None = None,
@@ -276,13 +279,14 @@ def sample_neuron_representative(
 def mask_neurons_in_conn_mat(
     conn_mat: scipy.sparse.sparray,
     ids: int | Sequence[int],
-    id_type: Literal["root_id", "simple_id"],
+    id_type: IdType,
     neurons: pd.DataFrame | None = None,
 ) -> scipy.sparse.sparray:
     if isinstance(ids, int):
         ids = [ids]
     if id_type == "root_id":
-        assert neurons is not None
+        if neurons is None:
+            raise ValueError("`neurons` must be provided when id_type is 'root_id'")
         to_root_id = simple_id_to_root_id(neurons, reverse=True)
         ids = [to_root_id[i] for i in ids]
     conn_mat_lil = conn_mat.tolil()
@@ -321,7 +325,9 @@ def drop_no_conn(neurons: pd.DataFrame, connections: pd.DataFrame) -> pd.DataFra
     return neurons[neurons.root_id.isin(unique_series)]
 
 
-def find_neuron_inout_degree(neurons: pd.DataFrame, connections: pd.DataFrame):
+def find_neuron_inout_degree(
+    neurons: pd.DataFrame, connections: pd.DataFrame
+) -> pd.DataFrame:
     degrees = neurons["root_id"]
     degrees = pd.merge(
         degrees,
@@ -376,7 +382,9 @@ def downsample_neurons(
     return neurons, connections
 
 
-def make_ei_conn_mat(conn_mats: dict[str, scipy.sparse.sparray], g: float = 0.5):
+def make_ei_conn_mat(
+    conn_mats: dict[str, scipy.sparse.sparray], g: float = 0.5
+) -> scipy.sparse.sparray:
     return conn_mats["E"] - g * conn_mats["I"]
 
 

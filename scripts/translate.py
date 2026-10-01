@@ -124,7 +124,7 @@ def _get_client() -> OpenAI:
         api_key = os.environ.get("OPENAI_API_KEY")
         base_url = os.environ.get("OPENAI_BASE_URL")
         if not api_key and not base_url:
-            print("OPENAI_API_KEY not set", file=sys.stderr)
+            print("Set OPENAI_API_KEY or OPENAI_BASE_URL", file=sys.stderr)
             raise SystemExit(1)
         kwargs: dict[str, str] = {}
         if base_url:
@@ -348,6 +348,7 @@ def update_outdated(cfg: TranslateConf) -> None:
                 out = subprocess.check_output(
                     ["git", "log", "-1", "--format=%ct", str(path)],
                     text=True,
+                    timeout=60,
                 ).strip()
                 return int(out) if out else 0
             except Exception:
@@ -413,6 +414,7 @@ def translate_changed(cfg: TranslateConf) -> None:
                 str(en_docs),
             ],
             text=True,
+            timeout=60,
         ).strip()
     except subprocess.CalledProcessError:
         print("Failed to get changed files from git", file=sys.stderr)

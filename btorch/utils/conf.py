@@ -96,12 +96,20 @@ def load_config(
     else:
         cli_cfg_ = cli_cfg = OmegaConf.from_cli(argv_arglist)
     if use_config_file and "config_path" in cli_cfg:
-        assert "config_path" not in Param.__dataclass_fields__
+        if "config_path" in Param.__dataclass_fields__:
+            raise ValueError(
+                "'config_path' is reserved for the config-file option and cannot "
+                "be a field of the config schema"
+            )
         config_path = Path(cli_cfg.config_path)
         if not config_path.is_file():
             config_path = search_path / config_path
-            assert config_path.is_file()
-        cfg_cli_file = OmegaConf.load(cli_cfg.config_path)
+            if not config_path.is_file():
+                raise FileNotFoundError(
+                    f"config file {cli_cfg.config_path!r} not found (also tried "
+                    f"under {search_path})"
+                )
+        cfg_cli_file = OmegaConf.load(config_path)
         if return_cli:
             cli_cfg_ = cli_cfg.copy()
         cli_cfg.pop("config_path")
@@ -215,12 +223,8 @@ def to_dotlist(
             # For DictConfig, key is a string. For ListConfig, key is an int index.
             new_path = f"{path}.{key}" if path else str(key)
 
-            # Recursively flatten nested configs
-            if isinstance(value, (DictConfig, ListConfig)):
-                flatten_conf(value, new_path)
-            else:
-                # Handle the final value
-                flatten_conf(value, new_path)
+            # Containers recurse; scalar leaves are emitted by the base case.
+            flatten_conf(value, new_path)
 
     if subfield:
         try:

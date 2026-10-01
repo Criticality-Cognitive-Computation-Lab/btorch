@@ -18,7 +18,7 @@ class DefaultContext(threading.local):
     )
 
 
-DFAULT = DefaultContext()
+DEFAULT = DefaultContext()
 
 
 class context:
@@ -45,14 +45,14 @@ class context:
 
     def __enter__(self):
         for k, v in self.kwargs.items():
-            if k not in DFAULT.contexts:
-                DFAULT.contexts[k] = []
-            DFAULT.contexts[k].append(v)
+            if k not in DEFAULT.contexts:
+                DEFAULT.contexts[k] = []
+            DEFAULT.contexts[k].append(v)
         return all()
 
     def __exit__(self, exc_type, exc_value, traceback):
         for k, v in self.kwargs.items():
-            DFAULT.contexts[k].pop()
+            DEFAULT.contexts[k].pop()
 
     def __call__(self, func):
         return context_decorator(self, func)
@@ -67,7 +67,7 @@ def context_decorator(context_instance, func):
     return decorate_context
 
 
-def get(key: str, desc: str | None = None):
+def get(key: str, desc: str | None = None) -> Any:
     """Get a value from the current computation environment.
 
     Checks the context stack first, then global defaults.
@@ -87,11 +87,11 @@ def get(key: str, desc: str | None = None):
         >>> dt = environ.get("dt")
     """
 
-    if key in DFAULT.contexts:
-        if len(DFAULT.contexts[key]) > 0:
-            return DFAULT.contexts[key][-1]
-    if key in DFAULT.settings:
-        return DFAULT.settings[key]
+    if key in DEFAULT.contexts:
+        if len(DEFAULT.contexts[key]) > 0:
+            return DEFAULT.contexts[key][-1]
+    if key in DEFAULT.settings:
+        return DEFAULT.settings[key]
 
     if desc is not None:
         raise KeyError(
@@ -115,10 +115,10 @@ def all() -> dict:
         Dictionary of all active context and default settings.
     """
     r = dict()
-    for k, v in DFAULT.contexts.items():
+    for k, v in DEFAULT.contexts.items():
         if v:
             r[k] = v[-1]
-    for k, v in DFAULT.settings.items():
+    for k, v in DEFAULT.settings.items():
         if k not in r:
             r[k] = v
     return r
@@ -136,4 +136,4 @@ def set(**kwargs):
     Example:
         >>> environ.set(dt=1.0)
     """
-    DFAULT.settings.update(kwargs)
+    DEFAULT.settings.update(kwargs)

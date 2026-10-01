@@ -120,7 +120,6 @@ def _compute_eci(
         I_e_eff = I_e
         I_i_eff = I_i
 
-    # Compute recurrent current
     I_rec = I_e_eff + I_i_eff
 
     # Determine axes/dims for aggregation
@@ -231,7 +230,8 @@ def _compute_lag_correlation(
     use_fft: bool = True,
     dtype: torch.dtype | np.dtype | None = None,
 ):
-    assert max_lag_ms >= dt
+    if max_lag_ms < dt:
+        raise ValueError(f"max_lag_ms ({max_lag_ms}) must be >= dt ({dt})")
     if isinstance(x, torch.Tensor):
         y = torch.as_tensor(y, dtype=x.dtype, device=x.device)
     else:
@@ -339,7 +339,6 @@ def _cross_correlation_fft(
         x_std = x.std(dim=0, keepdim=True) + torch.finfo(x.dtype).eps
         y_std = y.std(dim=0, keepdim=True) + torch.finfo(y.dtype).eps
         corr_norm = corr_full / (x_std * y_std * T)
-        # Extract valid lags
         max_lag_actual = min(max_lag, T - 1)
         neg_lags = corr_norm[-max_lag_actual:, :]
         pos_lags = corr_norm[: max_lag_actual + 1, :]
@@ -363,7 +362,6 @@ def _cross_correlation_fft(
         corr_norm = corr_full / (x_std * y_std * T)
         if compute_dtype is not None:
             corr_norm = corr_norm.astype(compute_dtype, copy=False)
-        # Extract valid lags
         neg_lags = corr_norm[-max_lag:, :]
         pos_lags = corr_norm[: max_lag + 1, :]
         return np.concatenate([neg_lags, pos_lags], axis=0)
@@ -392,7 +390,6 @@ def _cross_correlation_direct(
         y_std = y.std(dim=0, keepdim=True) + torch.finfo(y.dtype).eps
         x_norm = (x - x_mean) / x_std
         y_norm = (y - y_mean) / y_std
-        # Compute correlations for each lag
         max_lag_actual = min(max_lag, T - 1)
         n_lags = 2 * max_lag_actual + 1
         corr = torch.zeros(n_lags, N, device=device, dtype=x.dtype)
@@ -417,7 +414,6 @@ def _cross_correlation_direct(
         y_norm = (y - y.mean(axis=0, dtype=compute_dtype)) / (
             y.std(axis=0, dtype=compute_dtype) + np.finfo(y.dtype).eps
         )
-        # Compute correlations for each lag
         n_lags = 2 * max_lag + 1
         corr = []
         for i, lag in enumerate(range(-max_lag, max_lag + 1)):
@@ -485,7 +481,6 @@ def compute_ei_balance(
         best_lag_ms: Best lag in ms (positive = I lags E)
         info: Dictionary with detailed analysis results
     """
-    # Compute ECI
     eci, eci_info = compute_eci(
         I_e,
         I_i,
@@ -495,7 +490,6 @@ def compute_ei_balance(
         stat=None,
     )
 
-    # Compute lag correlation between E and I
     peak_corr, best_lag_ms, lag_info = compute_lag_correlation(
         I_e,
         -I_i,

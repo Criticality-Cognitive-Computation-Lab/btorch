@@ -1,4 +1,4 @@
-from typing import Literal, get_args
+from typing import Literal, cast, get_args
 
 import numpy as np
 import pandas as pd
@@ -22,7 +22,7 @@ SparseBackend = Literal["native", "torch_sparse"]
 
 def _resolve_sparse_backend(backend: str | None) -> SparseBackend:
     if backend is None:
-        return "torch_sparse" if spmm is not None else "native"  # type: ignore[return-value]
+        return "torch_sparse" if spmm is not None else "native"
 
     backend = backend.lower()
     if backend not in get_args(SparseBackend):
@@ -37,7 +37,9 @@ def _resolve_sparse_backend(backend: str | None) -> SparseBackend:
             stacklevel=3,
         )
         backend = "native"
-    return backend  # type: ignore[return-value]
+    # ``backend`` was validated against ``get_args(SparseBackend)`` above, but
+    # a ``str`` cannot be narrowed to a ``Literal`` by ``in`` checks.
+    return cast(SparseBackend, backend)
 
 
 def available_sparse_backends() -> list[SparseBackend]:
@@ -278,8 +280,6 @@ class BaseSparseConn(nn.Module):
                 is_coalesced=True,
             )
             self.sparse_tensor = native_sparse
-        else:
-            self.sparse_tensor = None
         self.bias = nn.Parameter(bias) if bias is not None else None
         self._init_weights(value)
 
@@ -527,9 +527,8 @@ class SparseConstrainedConn(BaseSparseConn, HasConstraint):
             }
         )
         merged = coo_df.merge(constraint_df, how="left", on=["row", "col"])
-        assert (
-            merged["group_id"].notnull().all()
-        ), "Constraint missing for some connections."
+        if not merged["group_id"].notnull().all():
+            raise ValueError("Constraint missing for some connections.")
         # Convert group ID from 1-based to 0-based indexing
         return merged["group_id"].values - 1
 

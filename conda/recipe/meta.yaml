@@ -15,12 +15,23 @@ requirements:
     - pip
   run:
     - python >=3.10
-    - torch >=2.1
+    - pytorch
     - numpy >=1.24
-    - pandas >=1.5
+    - pandas >=2
     - scipy >=1.10
     - jaxtyping >=0.2.20
-    - typing-extensions >=4.5
+    - h5py
+    - hdf5plugin
+    - pyyaml
+    - fastdtw
+    - omegaconf
+    - plotly
+    - nolds !=0.6.3
+    - powerlaw
+    - matplotlib-base >=3.7
+    - xarray
+    - zarr
+    - numcodecs
 
 test:
   requires:

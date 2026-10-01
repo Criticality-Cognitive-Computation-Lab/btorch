@@ -21,8 +21,8 @@ def _fit_distribution(data):
         # discrete=True because sizes/durations are counts (integers)
         fit = powerlaw.Fit(data, discrete=True, verbose=False)
         return fit.alpha, fit
-    except Exception as e:
-        warnings.warn(f"Failed to fit power law distribution: {e}")
+    except (ValueError, RuntimeError, FloatingPointError, ZeroDivisionError) as e:
+        warnings.warn(f"Failed to fit power law distribution: {e}", stacklevel=2)
         return np.nan, None
 
 
@@ -36,21 +36,21 @@ def _fit_scaling(x, y):
         return np.nan, None
 
     try:
-        # Initial guess: a=1, gamma=1.5
+        # Initial guess: a=1, gamma=1.5. curve_fit raises RuntimeError when it
+        # fails to converge and ValueError on invalid/NaN input.
         popt, pcov = curve_fit(_power_law_func, x, y, p0=[1, 1.5], maxfev=2000)
-        gamma = popt[1]
-
-        # Calculate R^2
-        residuals = y - _power_law_func(x, *popt)
-        ss_res = np.sum(residuals**2)
-        ss_tot = np.sum((y - np.mean(y)) ** 2)
-        r_squared = 1 - (ss_res / ss_tot)
-
-        stats = {"r_squared": r_squared, "popt": popt, "pcov": pcov}
-        return gamma, stats
-    except Exception as e:
-        warnings.warn(f"Failed to fit scaling relation: {e}")
+    except (RuntimeError, ValueError) as e:
+        warnings.warn(f"Failed to fit scaling relation: {e}", stacklevel=2)
         return np.nan, None
+
+    gamma = popt[1]
+    residuals = y - _power_law_func(x, *popt)
+    ss_res = np.sum(residuals**2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    r_squared = 1 - (ss_res / ss_tot)
+
+    stats = {"r_squared": r_squared, "popt": popt, "pcov": pcov}
+    return gamma, stats
 
 
 def compute_avalanche_statistics(spike_train: np.ndarray, bin_size: int = 1) -> dict:
@@ -137,16 +137,16 @@ def compute_avalanche_statistics(spike_train: np.ndarray, bin_size: int = 1) -> 
         "tau": np.nan,
         "alpha": np.nan,
         "gamma": np.nan,
-        "gamma_pred": np.nan,
-        "CCC": np.nan,
         "fit_S": None,
         "fit_T": None,
     }
 
     if len(sizes) < 10:
         warnings.warn(
-            f"Not enough avalanches to fit power law. Found {len(sizes)} avalanches."
+            f"Not enough avalanches to fit power law. Found {len(sizes)} avalanches.",
+            stacklevel=2,
         )
+        results.update(gamma_pred=np.nan, CCC=np.nan)
         return results
 
     # 4. Fit power laws using MLE (powerlaw package)
@@ -154,41 +154,35 @@ def compute_avalanche_statistics(spike_train: np.ndarray, bin_size: int = 1) -> 
     results["alpha"], results["fit_T"] = _fit_distribution(durations)
 
     # 5. Average Size vs. Duration Scaling (<S>(T) ~ T^gamma)
-    if len(durations) > 0:
-        # Use bincount for fast grouping by integer duration
-        counts = np.bincount(durations)
-        sum_sizes = np.bincount(durations, weights=sizes)
+    # (at least 10 avalanches exist here, so durations is non-empty)
+    # Use bincount for fast grouping by integer duration
+    counts = np.bincount(durations)
+    sum_sizes = np.bincount(durations, weights=sizes)
 
-        # Filter out durations that didn't occur
-        mask = counts > 0
-        unique_durations = np.arange(len(counts))[mask]
-        mean_sizes = sum_sizes[mask] / counts[mask]
+    # Filter out durations that didn't occur
+    mask = counts > 0
+    unique_durations = np.arange(len(counts))[mask]
+    mean_sizes = sum_sizes[mask] / counts[mask]
 
-        results["avg_size_by_duration"] = (unique_durations, mean_sizes)
+    results["avg_size_by_duration"] = (unique_durations, mean_sizes)
 
-        # Fit scaling relation using curve_fit (non-linear least squares)
-        results["gamma"], results["gamma_stats"] = _fit_scaling(
-            unique_durations, mean_sizes
-        )
+    # Fit scaling relation using curve_fit (non-linear least squares)
+    results["gamma"], results["gamma_stats"] = _fit_scaling(
+        unique_durations, mean_sizes
+    )
 
     # 6. Calculate Criticality Consistency Coefficient (CCC)
     # gamma_pred = (alpha - 1) / (tau - 1)
     # CCC = 1 - |gamma_obs - gamma_pred| / gamma_obs
-    if (
-        not np.isnan(results["tau"])
-        and not np.isnan(results["alpha"])
-        and not np.isnan(results["gamma"])
-    ):
-        try:
-            if results["tau"] != 1:
-                gamma_pred = (results["alpha"] - 1) / (results["tau"] - 1)
-                results["gamma_pred"] = gamma_pred
-
-                if results["gamma"] != 0:
-                    ccc = 1 - abs(results["gamma"] - gamma_pred) / results["gamma"]
-                    results["CCC"] = ccc
-        except Exception as e:
-            warnings.warn(f"Failed to calculate CCC: {e}")
+    gamma_pred = np.nan
+    ccc = np.nan
+    tau, alpha, gamma = results["tau"], results["alpha"], results["gamma"]
+    if not (np.isnan(tau) or np.isnan(alpha) or np.isnan(gamma)):
+        if tau != 1:
+            gamma_pred = (alpha - 1) / (tau - 1)
+            if gamma != 0:
+                ccc = 1 - abs(gamma - gamma_pred) / gamma
+    results.update(gamma_pred=gamma_pred, CCC=ccc)
 
     return results
 
@@ -235,6 +229,6 @@ def calculate_dfa(spike_train: np.ndarray, bin_size: int = 1) -> float:
     try:
         alpha = nolds.dfa(population_activity)
         return alpha
-    except Exception as e:
-        warnings.warn(f"Failed to calculate DFA: {e}")
+    except (ValueError, RuntimeError, AssertionError, FloatingPointError) as e:
+        warnings.warn(f"Failed to calculate DFA: {e}", stacklevel=2)
         return np.nan

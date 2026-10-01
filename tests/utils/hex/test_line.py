@@ -45,6 +45,52 @@ def test_line_n_length():
     assert len(q) == 4
 
 
+@pytest.mark.parametrize(
+    "dq,dr",
+    [(4, 0), (0, 4), (-4, 4), (-4, 0), (0, -4), (4, -4)],
+    ids=["E", "SE", "SW", "W", "NW", "NE"],
+)
+def test_line_along_axis_is_exact(dq, dr):
+    """A line along one of the 6 hex axes visits every lattice step exactly.
+
+    Along an axis there is no rounding ambiguity: the k-th hex is (k*dq/4,
+    k*dr/4), so the exact coordinates (not just the count) are known.
+    """
+    q, r = line(np.array([0]), np.array([0]), np.array([dq]), np.array([dr]))
+    steps = np.arange(5)
+    np.testing.assert_array_equal(q, steps * dq // 4)
+    np.testing.assert_array_equal(r, steps * dr // 4)
+
+
+def test_line_consecutive_hexes_are_neighbours():
+    """Each step of a line moves to an adjacent hex (distance exactly 1)."""
+    q, r = line(np.array([-2]), np.array([3]), np.array([5]), np.array([-4]))
+    steps = distance(q[:-1], r[:-1], q[1:], r[1:])
+    assert np.all(steps == 1)
+    # endpoints are preserved in order
+    assert (q[0], r[0]) == (-2, 3) and (q[-1], r[-1]) == (5, -4)
+
+
+def test_line_reversed_has_same_hexes():
+    """Reversing the endpoints yields the same number of hexes and
+    endpoints."""
+    qa, ra = line(np.array([0]), np.array([0]), np.array([3]), np.array([2]))
+    qb, rb = line(np.array([3]), np.array([2]), np.array([0]), np.array([0]))
+    assert len(qa) == len(qb)
+    assert (qb[0], rb[0]) == (3, 2) and (qb[-1], rb[-1]) == (0, 0)
+
+
+def test_line_n_exact_interpolation():
+    """line_n with n steps returns n+1 evenly spaced hexes including ends."""
+    q, r = line_n(np.array([0]), np.array([0]), np.array([3]), np.array([0]), 3)
+    np.testing.assert_array_equal(q, [0, 1, 2, 3])
+    np.testing.assert_array_equal(r, [0, 0, 0, 0])
+    # endpoints stay fixed for any n, even when n differs from the hex distance
+    q, r = line_n(np.array([0]), np.array([0]), np.array([5]), np.array([3]), n=2)
+    assert len(q) == 3
+    assert (q[0], r[0]) == (0, 0) and (q[-1], r[-1]) == (5, 3)
+
+
 def test_line_visualization():
     """Visualize lines between various points in a hex grid.
 
@@ -99,6 +145,11 @@ def test_line_visualization():
         ax.set_aspect("equal")
         ax.axis("off")
 
+    # one panel per direction; all lines have the same 5-hex length
+    assert len(axes) == 6
+    assert all(len(ax.collections) >= 2 for ax in axes)
+    assert all(ax.get_title().endswith("(5 hexes)") for ax in axes)
+
     plt.suptitle("Hex Grid Line Drawing (Cube Lerp + Round)", fontsize=14)
     plt.tight_layout()
     save_fig(fig, "line_drawing_examples", suffix="png")
@@ -135,6 +186,10 @@ def test_line_n_visualization():
         ax.set_title(f"n={n_steps} steps ({len(q_line)} points)")
         ax.set_aspect("equal")
         ax.axis("off")
+
+    # n steps produce n+1 points for n = 1..6 (titles carry the point count)
+    for n, ax in enumerate(axes, start=1):
+        assert ax.get_title() == f"n={n} steps ({n + 1} points)"
 
     plt.suptitle("Line Drawing with Fixed Step Count", fontsize=14)
     plt.tight_layout()

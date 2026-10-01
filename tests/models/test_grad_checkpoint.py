@@ -6,8 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 """Test checkpoint with variable buffers."""
 
-from typing import Optional
-
+import pytest
 import torch
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as torch_checkpoint_wrapper,  # noqa: F401
@@ -15,27 +14,26 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from torch.nn import Linear, Sequential
 from torch.optim import SGD
 
-from ...models import environ
-from ...models.base import MemoryModule
-from ...models.functional import init_net_state
-from .checkpoint import checkpoint_wrapper
+from btorch.models import environ
+from btorch.models.base import MemoryModule
+from btorch.models.functional import init_net_state
+from btorch.models.grad_checkpoint import checkpoint_wrapper
 
 
-class TestModule(MemoryModule):
+class _AccumulatorModule(MemoryModule):
     def __init__(self, sizes):
         super().__init__()
         self.register_memory("v", 0, sizes)
 
     # @environ.context(**environ.all())
     def forward(self, x):
-        # breakpoint()
         self.v = self.v + x * environ.get("dt")
         return self.v
 
 
 def get_model(checkpointed, sizes):
     assert checkpointed in [True, False], checkpointed
-    model = Sequential(TestModule(sizes), Linear(3, 2))
+    model = Sequential(_AccumulatorModule(sizes), Linear(3, 2))
     init_net_state(model)
 
     if checkpointed:
@@ -52,9 +50,9 @@ def objects_are_equal(
     a,
     b,
     raise_exception: bool = False,
-    dict_key: Optional[str] = None,
-    rtol: Optional[float] = None,
-    atol: Optional[float] = None,
+    dict_key: str | None = None,
+    rtol: float | None = None,
+    atol: float | None = None,
 ) -> bool:
     """Test that two objects are equal.
 
@@ -111,7 +109,25 @@ def objects_are_equal(
         return a == b
 
 
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA not available"
+            ),
+        ),
+    ],
+)
 def test_checkpointed_variable_buffer(device):
+    """A checkpointed model must match the reference after one SGD step.
+
+    The model holds a memory buffer (``v``) that is updated in forward; the
+    checkpoint wrapper recomputes forward during backward and must not corrupt
+    that state.
+    """
     # Get input, ref, checkpoint models and make them equal.
     sizes = (2, 2, 3, 3)
     in_data = torch.rand(*sizes).to(device)
@@ -138,6 +154,3 @@ def test_checkpointed_variable_buffer(device):
         optim.step()
 
     assert objects_are_equal(m_ref.state_dict(), m_cpt.state_dict())
-
-
-test_checkpointed_variable_buffer("cuda")

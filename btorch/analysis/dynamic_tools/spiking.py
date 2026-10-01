@@ -19,6 +19,8 @@ All methods support both NumPy and PyTorch inputs following the btorch
 conventions, with GPU acceleration where applicable.
 """
 
+import warnings
+from collections.abc import Callable
 from typing import Any, Literal
 
 import numpy as np
@@ -81,7 +83,6 @@ def _estimate_rate_torch(
     else:
         window_bins = max(1, int(window_ms / dt_ms))
 
-    # Compute moving average using cumsum approach
     # Pad with edge values to handle boundaries
     pad = window_bins // 2
 
@@ -99,11 +100,9 @@ def _estimate_rate_torch(
         spike_padded[:pad] = spike_data[0]
         spike_padded[-pad:] = spike_data[-1]
 
-    # Compute moving sum using cumsum
     cumsum = torch.cumsum(spike_padded, dim=0)
     moving_sum = cumsum[window_bins:] - cumsum[:-window_bins]
 
-    # Extract center portion matching original size
     start_idx = window_bins // 2
     end_idx = start_idx + T
     moving_sum = moving_sum[start_idx:end_idx]
@@ -114,7 +113,6 @@ def _estimate_rate_torch(
         pad_right = T - moving_sum.shape[0]
         moving_sum = torch.nn.functional.pad(moving_sum, (0, 0, 0, pad_right))
 
-    # Convert to Hz
     rate = moving_sum / (window_bins * dt_ms / 1000.0)
 
     # Restore original shape
@@ -155,7 +153,6 @@ def _compute_operational_fano_numpy(
     rest_shape = spike_data.shape[1:]
     n_elements = np.prod(rest_shape) if rest_shape else 1
 
-    # Flatten for processing
     flat_spikes = (
         spike_data.reshape(T, -1) if n_elements > 0 else spike_data.reshape(T, 1)
     )
@@ -167,7 +164,6 @@ def _compute_operational_fano_numpy(
 
     n_neurons = flat_spikes.shape[1]
 
-    # Compute operational time window in original time bins
     # w = λ * t, so for window W in operational time:
     # number of original bins ≈ W / (λ * dt)
     # Use median rate for window calculation
@@ -197,11 +193,15 @@ def _compute_operational_fano_numpy(
 
     if n_windows < 2:
         # Not enough windows, return NaN
+        warnings.warn(
+            f"Insufficient data for operational-time Fano ({n_windows} "
+            "windows < 2); returning NaN",
+            stacklevel=2,
+        )
         return np.full(rest_shape if rest_shape else (1,), np.nan), {
-            "error": "insufficient data"
+            "n_windows": n_windows
         }
 
-    # Compute counts per window for each neuron
     counts = np.zeros((n_windows, n_neurons))
     for w in range(n_windows):
         start = w * step
@@ -225,7 +225,6 @@ def _compute_operational_fano_numpy(
     # and variance = window_duration, giving Fano = 1
     normalized_counts = counts / (expected_counts[None, :] + 1e-12)
 
-    # Compute mean and variance of normalized counts
     mean_norm = np.mean(normalized_counts, axis=0)
     var_norm = np.var(normalized_counts, axis=0, ddof=1)
 
@@ -240,7 +239,6 @@ def _compute_operational_fano_numpy(
     else:
         fano_op = fano_op[0] if n_neurons == 1 else fano_op
 
-    # Apply batch axis aggregation if requested
     if batch_axis is not None:
         fano_op = np.mean(fano_op, axis=tuple(batch_axis))
 
@@ -268,7 +266,6 @@ def _compute_operational_fano_torch(
     rest_shape = spike_data.shape[1:]
     n_elements = int(np.prod(rest_shape)) if rest_shape else 1
 
-    # Flatten for processing
     flat_spikes = (
         spike_data.reshape(T, -1) if n_elements > 0 else spike_data.reshape(T, 1)
     )
@@ -280,7 +277,6 @@ def _compute_operational_fano_torch(
 
     n_neurons = flat_spikes.shape[1]
 
-    # Compute median rate
     if isinstance(flat_rate, torch.Tensor) and flat_rate.ndim > 1:
         median_rate = torch.median(flat_rate, dim=0).values
     else:
@@ -289,7 +285,6 @@ def _compute_operational_fano_torch(
         )
         median_rate = torch.full((n_neurons,), scalar_rate, device=device)
 
-    # Compute window size
     median_rate_val = torch.median(median_rate).item()
     window_bins = max(5, int(window_op / median_rate_val / (dt_ms / 1000.0)))
     window_bins = min(window_bins, T // 3)
@@ -301,18 +296,21 @@ def _compute_operational_fano_torch(
     n_windows = (T - window_bins) // step + 1
 
     if n_windows < 2:
+        warnings.warn(
+            f"Insufficient data for operational-time Fano ({n_windows} "
+            "windows < 2); returning NaN",
+            stacklevel=2,
+        )
         return torch.full(
             rest_shape if rest_shape else (1,), float("nan"), device=device
-        ), {"error": "insufficient data"}
+        ), {"n_windows": n_windows}
 
-    # Compute counts per window
     counts = torch.zeros((n_windows, n_neurons), device=device)
     for w in range(n_windows):
         start = w * step
         end = start + window_bins
         counts[w] = flat_spikes[start:end].sum(dim=0)
 
-    # Compute expected counts
     if isinstance(flat_rate, torch.Tensor) and flat_rate.ndim > 1:
         mean_rate = torch.mean(flat_rate, dim=0)
     else:
@@ -327,7 +325,6 @@ def _compute_operational_fano_torch(
     # Normalized counts
     normalized_counts = counts / (expected_counts.unsqueeze(0) + 1e-12)
 
-    # Compute statistics
     mean_norm = torch.mean(normalized_counts, dim=0)
     var_norm = torch.var(normalized_counts, dim=0, unbiased=True)
 
@@ -385,7 +382,8 @@ def fano_operational_time(
                 Values are binary (0/1) or spike counts.
             window: Window size in operational time units (default: 1.0).
                 This is the expected count at rate=1 (i.e., 1 spike expected).
-            overlap: Not used (kept for API compatibility).
+            overlap: Unsupported. Operational-time windows are disjoint; any
+                value other than ``None`` or ``0`` raises ``ValueError``.
             rate_hz: Firing rate in Hz. Can be:
                 - Scalar: homogeneous rate
                 - Array [T, ...]: time-varying rate
@@ -405,6 +403,11 @@ def fano_operational_time(
             >>> ff_high, _ = fano_operational_time(spikes_high_rate)
             >>> # Both should be ≈ 1 regardless of rate difference
     """
+    if overlap:
+        raise ValueError(
+            "fano_operational_time does not support overlapping windows; "
+            f"got overlap={overlap!r}."
+        )
     if window is None:
         window = 1.0  # Unit operational time window
 
@@ -417,7 +420,6 @@ def fano_operational_time(
         else:
             rate_hz = _estimate_rate_numpy(spike_data, dt_ms)
 
-    # Compute operational time Fano factor
     if is_torch:
         return _compute_operational_fano_torch(
             spike_data, rate_hz, window, dt_ms, batch_axis
@@ -452,7 +454,6 @@ def _compute_mean_matching_weights_numpy(
     """
     n_conditions, n_neurons = means.shape
 
-    # Compute histogram for each condition
     mean_min, mean_max = np.nanmin(means), np.nanmax(means)
     if mean_min == mean_max:
         # All means are the same
@@ -475,7 +476,6 @@ def _compute_mean_matching_weights_numpy(
     # Find minimum count per bin (greatest common distribution)
     min_counts_per_bin = np.min(counts_per_condition, axis=0)
 
-    # Compute weights for each data point
     weights = np.ones_like(means)
 
     for c in range(n_conditions):
@@ -527,7 +527,6 @@ def _compute_mean_matching_weights_torch(
         mean_min.item(), mean_max.item(), n_bins + 1, device=device
     )
 
-    # Compute histogram counts
     counts_per_condition = torch.zeros((n_conditions, n_bins), device=device)
     for c in range(n_conditions):
         for b in range(n_bins):
@@ -538,7 +537,6 @@ def _compute_mean_matching_weights_torch(
 
     min_counts_per_bin = torch.min(counts_per_condition, dim=0).values
 
-    # Compute weights
     weights = torch.ones_like(means)
     for c in range(n_conditions):
         for b in range(n_bins):
@@ -577,10 +575,8 @@ def _compute_weighted_fano_numpy(
     Returns:
         Weighted Fano factor per neuron
     """
-    # Handle NaN values
     valid_mask = ~np.isnan(spike_counts) & ~np.isnan(weights)
 
-    # Compute weighted mean
     weights_normalized = np.where(
         valid_mask, weights / (np.nansum(weights, axis=0, keepdims=True) + 1e-12), 0
     )
@@ -690,7 +686,11 @@ def fano_mean_matching(
         window = max(1, T // 10)
 
     step = window - overlap
-    assert step > 0, "window must be greater than overlap"
+    if step <= 0:
+        raise ValueError(
+            f"window must be greater than overlap, got window={window}, "
+            f"overlap={overlap}"
+        )
 
     # Move condition axis to position 1 for processing
     if condition_axis != 1:
@@ -707,7 +707,6 @@ def fano_mean_matching(
     spike_flat = spike_data.reshape(T, n_conditions, -1)
     n_neurons_flat = spike_flat.shape[2]
 
-    # Compute counts per window
     n_windows = (T - window) // step + 1
     if n_windows < 2:
         if is_torch:
@@ -716,8 +715,12 @@ def fano_mean_matching(
             )
         else:
             result = np.full((n_neurons_flat,), np.nan)
+        warnings.warn(
+            f"Too few windows ({n_windows} < 2) for mean-matching Fano; returning NaN",
+            stacklevel=2,
+        )
         return result.reshape(rest_shape) if rest_shape else result, {
-            "error": "insufficient windows"
+            "n_windows": n_windows
         }
 
     if is_torch:
@@ -739,12 +742,10 @@ def fano_mean_matching(
     else:
         means = counts.mean(axis=0)  # [n_conditions, n_neurons]
 
-    # Compute mean matching weights
     if is_torch:
         match_info = _compute_mean_matching_weights_torch(means, n_bins)
         weights = match_info["weights"]
 
-        # Apply weighted Fano computation
         fano_mm = _compute_weighted_fano_torch(
             counts.reshape(-1, n_neurons_flat), weights.repeat(n_windows, 1)
         )
@@ -752,7 +753,6 @@ def fano_mean_matching(
         match_info = _compute_mean_matching_weights_numpy(means, n_bins)
         weights = match_info["weights"]
 
-        # Compute weighted Fano factor
         fano_mm = _compute_weighted_fano_numpy(
             counts.reshape(-1, n_neurons_flat),
             weights.repeat(n_windows, axis=0),
@@ -761,7 +761,6 @@ def fano_mean_matching(
     # Reshape to original non-time, non-condition dimensions
     fano_mm = fano_mm.reshape(rest_shape)
 
-    # Apply batch axis aggregation if requested
     if batch_axis is not None:
         if is_torch:
             fano_mm = torch.mean(fano_mm, dim=tuple(batch_axis))
@@ -968,7 +967,6 @@ def fano_model_based(
 
     model_params = model_params or {}
 
-    # Compute empirical mean and variance
     flat_spike = spike_data.reshape(T, -1)
     n_flat = flat_spike.shape[1]
 
@@ -981,7 +979,11 @@ def fano_model_based(
         else:
             result = np.full((n_flat,), np.nan)
         rest_shape = spike_data.shape[1:]
-        return result.reshape(rest_shape), {"error": "insufficient windows"}
+        warnings.warn(
+            f"Too few windows ({n_windows} < 2) for model-based Fano; returning NaN",
+            stacklevel=2,
+        )
+        return result.reshape(rest_shape), {"n_windows": n_windows}
 
     if is_torch:
         counts = torch.zeros((n_windows, n_flat), device=spike_data.device)
@@ -996,7 +998,6 @@ def fano_model_based(
         else:
             counts[w] = flat_spike[start:end].sum(axis=0)
 
-    # Compute empirical statistics
     if is_torch:
         empirical_mean = counts.mean(dim=0)
         empirical_var = counts.var(dim=0, unbiased=True)
@@ -1062,7 +1063,6 @@ def fano_model_based(
     rest_shape = spike_data.shape[1:]
     fano_model = fano_model.reshape(rest_shape)
 
-    # Apply batch axis aggregation if requested
     if batch_axis is not None:
         if is_torch:
             fano_model = torch.mean(fano_model, dim=tuple(batch_axis))
@@ -1159,9 +1159,15 @@ def compare_fano_methods(
         **kwargs: Additional arguments passed to methods.
 
     Returns:
-        Dictionary with results from each method.
+        Dictionary mapping method name (``"standard"``, ``"operational_time"``,
+        ``"mean_matching"``, ``"modulated_poisson"``) to its Fano factor
+        result. Values are always numeric. If a compensation method fails for
+        data-dependent reasons (``ValueError``, ``RuntimeError``,
+        ``ArithmeticError``, ``LinAlgError``), its entry is ``float("nan")``
+        and a :class:`UserWarning` is emitted. Other exceptions (e.g.
+        ``TypeError`` from bad arguments) are programming errors and propagate.
     """
-    results = {}
+    results: dict[str, Any] = {}
 
     # Standard Fano factor (no compensation)
     from btorch.analysis.spiking import fano as standard_fano
@@ -1171,9 +1177,26 @@ def compare_fano_methods(
         **{k: v for k, v in kwargs.items() if k in ["window", "overlap", "batch_axis"]},
     )
 
-    # Operational time
-    try:
-        results["operational_time"], _ = fano_operational_time(
+    def _run(name: str, func: Callable[[], Any]) -> None:
+        # Only data/numerical failures (ValueError, RuntimeError, LinAlgError,
+        # FloatingPointError, ArithmeticError) are converted to NaN. Programming
+        # errors such as TypeError or AttributeError propagate to the caller.
+        try:
+            results[name], _ = func()
+        except (
+            ValueError,
+            RuntimeError,
+            ArithmeticError,
+            np.linalg.LinAlgError,
+        ) as e:
+            warnings.warn(
+                f"Fano method {name!r} failed, returning NaN: {e}", stacklevel=3
+            )
+            results[name] = float("nan")
+
+    _run(
+        "operational_time",
+        lambda: fano_operational_time(
             spike_data,
             dt_ms=dt_ms,
             **{
@@ -1181,26 +1204,21 @@ def compare_fano_methods(
                 for k, v in kwargs.items()
                 if k not in ["window", "overlap", "batch_axis"]
             },
-        )
-    except Exception as e:
-        results["operational_time"] = f"Error: {e}"
-
-    # Mean matching
-    try:
-        results["mean_matching"], _ = fano_mean_matching(
+        ),
+    )
+    _run(
+        "mean_matching",
+        lambda: fano_mean_matching(
             spike_data, **{k: v for k, v in kwargs.items() if k not in ["dt_ms"]}
-        )
-    except Exception as e:
-        results["mean_matching"] = f"Error: {e}"
-
-    # Model-based
-    try:
-        results["modulated_poisson"], _ = fano_model_based(
+        ),
+    )
+    _run(
+        "modulated_poisson",
+        lambda: fano_model_based(
             spike_data,
             model="modulated_poisson",
             **{k: v for k, v in kwargs.items() if k not in ["dt_ms"]},
-        )
-    except Exception as e:
-        results["modulated_poisson"] = f"Error: {e}"
+        ),
+    )
 
     return results

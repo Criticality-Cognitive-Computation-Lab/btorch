@@ -23,8 +23,8 @@ The `HopDistanceModel` class provides efficient hop distance computation
 using either sparse matrix or edge list representations.
 """
 
+import warnings
 from collections import deque
-from typing import Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -36,12 +36,13 @@ def compute_ie_ratio(
     excitatory_mat: sparray,
     inhibitory_mat: sparray,
     excitatory_neuron_only: bool = True,
-    neurons: Optional[pd.DataFrame] = None,
+    neurons: pd.DataFrame | None = None,
     warn_strict: bool = True,
 ) -> tuple[float, np.ndarray]:
     """Compute inhibitory/excitatory ratio per neuron and whole-brain mean."""
     if excitatory_neuron_only:
-        assert neurons is not None
+        if neurons is None:
+            raise ValueError("`neurons` must be provided when excitatory_neuron_only")
 
     sum_inhibitory = inhibitory_mat.sum(axis=0).astype(float)
     sum_excitatory = excitatory_mat.sum(axis=0).astype(float)
@@ -59,11 +60,17 @@ def compute_ie_ratio(
     if warn_strict:
         nan_indices = (np.isnan(ie_ratios) & ~input_indices).nonzero()[0]
         if nan_indices.size > 0:
-            print(f"Warning: IE ratio contains NaN values at indices {nan_indices}")
+            warnings.warn(
+                f"IE ratio contains NaN values at indices {nan_indices}",
+                stacklevel=2,
+            )
 
         inf_indices = np.isinf(ie_ratios).nonzero()[0]
         if inf_indices.size > 0:
-            print(f"Warning: IE ratio contains Inf values at indices {inf_indices}")
+            warnings.warn(
+                f"IE ratio contains Inf values at indices {inf_indices}",
+                stacklevel=2,
+            )
 
     ie_ratios = np.where(np.isinf(ie_ratios), np.nan, ie_ratios)
     ie_ratio_whole_brain: float = np.nanmean(ie_ratios[ie_ratios != 0])
@@ -76,9 +83,9 @@ class HopDistanceModel:
 
     def __init__(
         self,
-        edges: Optional[pd.DataFrame] = None,
-        adjacency: Optional[sparse.sparray] = None,
-        node_mapping: Optional[Dict] = None,
+        edges: pd.DataFrame | None = None,
+        adjacency: sparse.sparray | None = None,
+        node_mapping: dict | None = None,
         source: str = "source",
         target: str = "target",
     ):
@@ -101,8 +108,9 @@ class HopDistanceModel:
             self.target = target
             self.use_sparse = False
 
-            assert source in edges.columns, f'edges must contain "{source}" column'
-            assert target in edges.columns, f'edges must contain "{target}" column'
+            for col in (source, target):
+                if col not in edges.columns:
+                    raise ValueError(f'edges must contain "{col}" column')
 
             all_nodes = np.unique(
                 np.concatenate([edges[source].values, edges[target].values])
@@ -130,14 +138,14 @@ class HopDistanceModel:
             self.adj_dict[node] = np.array(self.adj_dict[node], dtype=np.int32)
 
     def compute_distances(
-        self, seeds: List[Union[int, str]], max_hops: Optional[int] = None
+        self, seeds: list[int | str], max_hops: int | None = None
     ) -> pd.DataFrame:
         """Compute hop distances from seeds to all reachable nodes using
         BFS."""
         seed_indices = [self.node_mapping.get(seed, None) for seed in seeds]
         missing = [s for s in seeds if s not in self.node_mapping]
         if len(missing) != 0:
-            print(f"Seeds not found in network: {missing}")
+            warnings.warn(f"Seeds not found in network: {missing}", stacklevel=2)
             seed_indices = [s for s in seed_indices if s is not None]
 
         distances = np.full(self.n_nodes, -1, dtype=np.int32)
@@ -186,7 +194,7 @@ class HopDistanceModel:
         )
 
     def hop_statistics(
-        self, seeds: List[Union[int, str]], max_hops: Optional[int] = None
+        self, seeds: list[int | str], max_hops: int | None = None
     ) -> pd.DataFrame:
         """Compute statistics about network reachability by hop distance."""
         distances_df = self.compute_distances(seeds, max_hops)
@@ -224,10 +232,10 @@ class HopDistanceModel:
 
     def reconstruct_path(
         self,
-        source_node: Union[int, str],
-        target_node: Union[int, str],
-        distances_df: Optional[pd.DataFrame] = None,
-    ) -> List[Union[int, str]]:
+        source_node: int | str,
+        target_node: int | str,
+        distances_df: pd.DataFrame | None = None,
+    ) -> list[int | str]:
         """Reconstruct shortest path from source to target using predecessor
         info."""
         if distances_df is None:

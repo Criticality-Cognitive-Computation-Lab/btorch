@@ -1,10 +1,10 @@
-from typing import Literal, Optional
+from typing import Literal
 
 import numpy as np
 import torch
 
 
-def suggest_skip_timestep(data: np.ndarray) -> float:
+def suggest_skip_timestep(data: np.ndarray | torch.Tensor) -> int:
     """Suggest a burn-in period based on trace length."""
     skip_timestep = data.shape[0] // 8
     if skip_timestep < 100:
@@ -15,11 +15,11 @@ def suggest_skip_timestep(data: np.ndarray) -> float:
 
 
 def voltage_overshoot(
-    V,
+    V: np.ndarray | torch.Tensor,
     mode: Literal["std", "mse_threshold", "threshold_resting"] = "threshold_resting",
-    skip_timestep: Optional[int] = None,
-    **params,
-):
+    skip_timestep: int | None = None,
+    **params: float,
+) -> np.ndarray | torch.Tensor:
     """Quantify voltage stability/overshoot in different ways."""
     is_numpy = isinstance(V, np.ndarray)
     V = V.astype(np.float32) if is_numpy else V.to(torch.float32)
@@ -50,7 +50,7 @@ def voltage_overshoot(
         lower = V_reset - n_scale * scale
 
         mask = (V_slice > upper) | (V_slice < lower)
-        return mask.mean(0)
+        return mask.astype(np.float32).mean(0) if is_numpy else mask.float().mean(0)
 
     else:
         raise ValueError(f"Unsupported mode: {mode}")

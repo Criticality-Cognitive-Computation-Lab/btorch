@@ -490,3 +490,35 @@ def test_diff_conf_supports_union_values_for_structured_and_primitives():
     prim_a = OmegaConf.structured(PrimitiveUnionConf(item=1))
     prim_b = OmegaConf.structured(PrimitiveUnionConf(item="1"))
     assert OmegaConf.to_container(diff_conf(prim_a, prim_b)) == {"item": "1"}
+
+
+def test_load_config_uses_search_path_fallback(tmp_path):
+    """A relative ``config_path`` missing from the cwd is resolved via
+    search_path.
+
+    Regression test: the resolved path used to be computed and then ignored (the
+    original relative path was loaded instead), so the fallback never worked.
+    """
+    cfg_dir = tmp_path / "configs"
+    cfg_dir.mkdir()
+    (cfg_dir / "run.yaml").write_text("id: 42\n")
+
+    # "run.yaml" does not exist relative to the cwd; it only exists under cfg_dir.
+    cfg = load_config(
+        CommonConf,
+        search_path=cfg_dir,
+        argv_arglist=["config_path=run.yaml", "overwrite=true"],
+    )
+    assert cfg.id == 42  # value comes from the file found via search_path
+    assert cfg.overwrite is True  # CLI still overrides / merges on top
+
+
+def test_load_config_missing_file_raises(tmp_path):
+    """A config file that cannot be found raises FileNotFoundError (not
+    assert)."""
+    with pytest.raises(FileNotFoundError, match="nope.yaml"):
+        load_config(
+            CommonConf,
+            search_path=tmp_path,
+            argv_arglist=["config_path=nope.yaml"],
+        )

@@ -750,7 +750,8 @@ class OUNoiseLayer(_BaseNoiseLayer):
         Returns:
             Updated noise tensor with same shape as ``self.noise``.
         """
-        assert self.stateful, "single_step_forward requires stateful=True"
+        if not self.stateful:
+            raise RuntimeError("single_step_forward requires stateful=True")
 
         sigma, tau = self.sigma, self.tau
         dt: float = dt if dt is not None else environ.get("dt")
@@ -853,8 +854,6 @@ class PoissonNoiseLayer(_BaseNoiseLayer):
         trainable_shape: Shape policy for trainable values:
             - ``"scalar"`` (default): Store as scalar, broadcast to neurons
             - ``"full"``: Store as full per-neuron tensor
-        stateful: Kept for API compatibility but ignored (Poisson is
-            memoryless).
         scale: Initial multiplicative scaling.
         bias: Initial additive offset.
 
@@ -872,10 +871,10 @@ class PoissonNoiseLayer(_BaseNoiseLayer):
         trainable_param: bool | set[str] = False,
         *,
         trainable_shape: str = "scalar",
-        stateful: bool = False,
         scale: float | Tensor = 1.0,
         bias: float | Tensor = 0.0,
     ):
+        # Poisson sampling is memoryless, so the layer is always stateless.
         super().__init__(
             n_neuron,
             scale=scale,
@@ -883,9 +882,8 @@ class PoissonNoiseLayer(_BaseNoiseLayer):
             trainable_param=trainable_param,
             trainable_shape=trainable_shape,
             step_mode=step_mode,
-            stateful=stateful,
+            stateful=False,
         )
-        # stateful is a no-op for Poisson (memoryless), kept for compatibility.
 
         self.def_param(
             "rate",
@@ -1070,7 +1068,8 @@ class PinkNoiseLayer(_BaseNoiseLayer):
         Returns:
             Single noise sample with shape ``(*n_neuron)``.
         """
-        assert self.stateful, "single_step_forward requires stateful=True"
+        if not self.stateful:
+            raise RuntimeError("single_step_forward requires stateful=True")
         out, new_hist = pink_noise(
             T=1,
             fir_order=self.fir_order,

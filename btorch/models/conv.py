@@ -46,12 +46,10 @@ class Conv1dSpatial(nn.Conv1d):
         self.n_neighbor = n_neighbor
         self.n_neuron = len(neurons)
 
-        # Calculate kernel size before calling super().__init__
         kernel_size = (
             n_neighbor + 1 if include_self else n_neighbor
         )  # +1 for self connection
 
-        # Call parent constructor to initialize weight and bias parameters
         super().__init__(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -61,7 +59,6 @@ class Conv1dSpatial(nn.Conv1d):
             dtype=dtype,
         )
 
-        # Create connection matrix
         # interprete row as post-neuron, and col as pre-neuron
         # coo doesn't support slicing??, have to use csr
         from ..connectome.connection import make_spatial_localised_conn
@@ -84,21 +81,17 @@ class Conv1dSpatial(nn.Conv1d):
         1. Gather neighbors for each neuron: (..., in_channels, n_neurons, kernel_size)
         2. Apply matrix multiplication with shared weights
         """
-        # Handle arbitrary leading dimensions (..., in_channels, n_neurons)
         *leading_dims, in_channels, n_neurons = x.shape
 
         kernel_size = self.kernel_size[0]  # (n,) -> n
 
-        # Step 1: Gather neighbor values for each neuron
         # Reshape indices to (n_neurons, kernel_size)
         neighbor_indices = self.indices.view(n_neurons, kernel_size)
 
-        # Gather neighbor values
         # x shape: (..., in_channels, n_neurons)
         # neighbor_indices shape: (n_neurons, kernel_size)
         # We want: (..., in_channels, n_neurons, kernel_size)
 
-        # Expand neighbor indices for all leading dimensions and channels
         expanded_shape = x.shape + (
             kernel_size,
         )  # (..., in_channels, n_neurons, kernel_size)
@@ -106,10 +99,8 @@ class Conv1dSpatial(nn.Conv1d):
             *([1] * len(leading_dims)), 1, n_neurons, kernel_size
         ).expand(*leading_dims, in_channels, -1, -1)
 
-        # Expand x for gathering
         x_expanded = x.unsqueeze(-1).expand(*expanded_shape)
 
-        # Gather along the neuron dimension (index -2)
         x_neighbors = torch.gather(
             x_expanded,
             dim=-2,  # gather along neuron dimension
@@ -126,26 +117,19 @@ class Conv1dSpatial(nn.Conv1d):
         x_reshaped = x_neighbors.permute(*range(len(leading_dims)), -2, -3, -1)
         # Shape: (..., n_neurons, in_channels, kernel_size)
 
-        # Flatten last two dimensions for matrix multiplication
         *batch_dims, n_neurons_dim, in_ch_dim, kernel_dim = x_reshaped.shape
         x_flat = x_reshaped.reshape(*batch_dims, n_neurons_dim, in_ch_dim * kernel_dim)
 
-        # Flatten weight for matrix multiplication
         weight_flat = self.weight.view(
             self.out_channels, self.in_channels * kernel_size
         )
 
-        # Matrix multiplication: (..., n_neurons, in_channels * kernel_size) @
-        # (out_channels, in_channels * kernel_size).T
         output = torch.matmul(x_flat.contiguous(), weight_flat.T)
         # Shape: (..., n_neurons, out_channels)
 
-        # Transpose to get (..., out_channels, n_neurons)
         output = output.transpose(-2, -1)
 
-        # Add bias if present
         if self.bias is not None:
-            # bias shape: (out_channels,)
             output = output + self.bias.view(
                 *([1] * len(leading_dims)), self.out_channels, 1
             )

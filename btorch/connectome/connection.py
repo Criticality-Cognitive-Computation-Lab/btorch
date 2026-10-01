@@ -1,7 +1,7 @@
 import itertools
 import warnings
 from collections import OrderedDict
-from typing import Literal, Optional, Sequence
+from typing import Literal, Sequence
 
 import numpy as np
 import pandas as pd
@@ -10,6 +10,15 @@ import scipy.spatial
 
 from ..utils.pandas_utils import groupby_to_dict
 from . import simple_id_to_root_id
+from .augment import IdType
+
+
+# Defined here rather than imported from ``btorch.models`` to keep the connectome
+# package free of a dependency on the (heavier) models package. The values mirror
+# ``btorch.models.connection_conversion.ReceptorTypeMode``.
+ReceptorTypeMode = Literal["neuron", "connection"]
+ConstraintMode = Literal["full", "cell_only", "cell_and_receptor"]
+DropNaMode = Literal["error", "filter", "unknown"]
 
 
 def make_sparse_mat(
@@ -41,22 +50,54 @@ def make_sparse_mat(
 
 def neuron_subset_to_conn_mat(
     subset: Sequence[int] | pd.Series | pd.DataFrame,
-    id_type: Literal["root_id", "simple_id"],
+    id_type: IdType,
     size: int,
-    neurons: Optional[pd.DataFrame] = None,
+    neurons: pd.DataFrame | None = None,
     remove_nan: bool = False,
     return_mode: Literal["sparray", "scatter"] = "scatter",
 ) -> scipy.sparse.sparray | np.ndarray:
+    """Convert a neuron subset to simple ids or a selection matrix.
+
+    Args:
+        subset: Neuron ids (sequence or Series), or a DataFrame with a
+            ``root_id`` column (and optionally ``simple_id``).
+        id_type: Kind of ids in ``subset`` when it is a sequence or Series.
+        size: Total number of neurons (columns of the selection matrix).
+        neurons: Neuron table with ``root_id`` and ``simple_id`` columns.
+            Required whenever ``root_id`` values must be mapped to ``simple_id``.
+        remove_nan: Drop (with a warning) ids that cannot be mapped instead of
+            raising.
+        return_mode: ``"scatter"`` returns the simple ids as an array;
+            ``"sparray"`` returns a ``(len(subset), size)`` selection matrix.
+
+    Returns:
+        Array of simple ids, or a sparse selection matrix.
+
+    Raises:
+        ValueError: If ``subset`` has an invalid type or lacks ``root_id``, if
+            ``neurons`` is needed but missing, or if ids are unmappable and
+            ``remove_nan`` is False.
+    """
+    needs_mapping = (
+        isinstance(subset, pd.DataFrame)
+        and "simple_id" not in subset.columns
+        or not isinstance(subset, pd.DataFrame)
+        and id_type == "root_id"
+    )
+    if needs_mapping and neurons is None:
+        raise ValueError(
+            "`neurons` is required to map root_id to simple_id for this subset."
+        )
     if isinstance(subset, (Sequence, pd.Series)):
         df = pd.DataFrame(subset, columns=[id_type])
-        # convert to root_id
         if id_type == "root_id":
             df["simple_id"] = df.root_id.map(
                 simple_id_to_root_id(neurons, reverse=True).get
             )
     elif isinstance(subset, pd.DataFrame):
-        assert hasattr(subset, "root_id")
-        if not hasattr(subset, "simple_id"):
+        if "root_id" not in subset.columns:
+            raise ValueError("Neuron subset DataFrame must have a 'root_id' column.")
+        if "simple_id" not in subset.columns:
             df = subset.copy()
             df["simple_id"] = df.root_id.map(
                 simple_id_to_root_id(neurons, reverse=True).get
@@ -75,11 +116,12 @@ def neuron_subset_to_conn_mat(
         )
         df = df.dropna(subset="simple_id")
     else:
-        assert unmapped.empty, (
-            f"Found unknown root_id, {unmapped['root_id'].to_list()}.\n"
-            "Either the current Flywire version doesn't contain these neurons,\n"
-            "or they don't have neurotransmitter prediction"
-        )
+        if not unmapped.empty:
+            raise ValueError(
+                f"Found unknown root_id, {unmapped['root_id'].to_list()}.\n"
+                "Either the current Flywire version doesn't contain these neurons,\n"
+                "or they don't have neurotransmitter prediction"
+            )
 
     simple_id_subset = df["simple_id"].to_numpy().flatten()
     if return_mode == "scatter":
@@ -108,7 +150,6 @@ def make_constraint_by_neuron_type(
             'pre_simple_id', and 'post_simple_id'.
         nan_in_same_group (bool): If True, missing cell types are grouped together.
             If False, missing values are assigned unique dummy types.
-        format (Literal["coo", "csr"]): Return format for the sparse matrix.
 
     Returns:
         scipy.sparse.sparray: Sparse array with shape (num_neurons, num_neurons),
@@ -124,7 +165,6 @@ def make_constraint_by_neuron_type(
             f"__none_{i}__" for i in range(none_mask.sum())
         ]
 
-    # Build mapping from root_id to resolved cell_type
     root_id_to_cell_type = dict(
         tmp_neurons[["root_id", "cell_type"]].itertuples(index=False, name=None)
     )
@@ -134,7 +174,6 @@ def make_constraint_by_neuron_type(
         subset=["pre_simple_id", "post_simple_id"]
     ).copy()
 
-    # Map root IDs to cell types
     tmp_conns["pre_cell_type"] = tmp_conns["pre_root_id"].map(root_id_to_cell_type)
     tmp_conns["post_cell_type"] = tmp_conns["post_root_id"].map(root_id_to_cell_type)
 
@@ -146,7 +185,6 @@ def make_constraint_by_neuron_type(
         + 1
     )
 
-    # Construct sparse array with group IDs as values
     constraint_group = scipy.sparse.coo_array(
         (
             tmp_conns["cell_type_pair_id"].to_numpy(dtype=int).flatten(),
@@ -158,10 +196,6 @@ def make_constraint_by_neuron_type(
     return constraint_group
 
 
-# prompt:
-# 1. forgot :-b
-# 2. support the include_self flag for both num and radius modes.
-# 3. avoid using for loop, try numpy
 def make_spatial_localised_conn(
     neurons: pd.DataFrame,
     mode: Literal["num", "radius"] = "num",
@@ -195,7 +229,6 @@ def make_spatial_localised_conn(
         _, indices = tree.query_radius(
             positions, r=int(radius), return_distance=False, sort_results=False
         )
-        # Flatten indices
         row_indices = np.repeat(np.arange(n_neurons), [len(ids) for ids in indices])
         col_indices = np.concatenate(indices)
 
@@ -219,9 +252,9 @@ def make_hetersynapse_conn(
     neurons: pd.DataFrame,
     connections: scipy.sparse.sparray | pd.DataFrame,
     receptor_type_col="EI",
-    receptor_type_mode: Literal["neuron", "connection"] = "neuron",
+    receptor_type_mode: ReceptorTypeMode = "neuron",
     return_dict: bool = False,
-    dropna: Literal["error", "filter", "unknown"] = "error",
+    dropna: DropNaMode = "error",
     ignore_post_type: bool = False,
     delay_col: str | None = None,
     n_delay_bins: int = 5,
@@ -270,7 +303,8 @@ def make_hetersynapse_conn(
             delay values (in dt steps). If provided, expands matrix rows for
             delays. Only works with DataFrame connections.
         n_delay_bins: Number of delay bins when delay_col is provided
-            (default: 1, meaning no delay expansion).
+            (default: 5; a value of 1 means no delay
+            expansion).
 
     Returns:
         A tuple containing:
@@ -293,7 +327,6 @@ def make_hetersynapse_conn(
         When dropna='filter', only connections are removed, not neurons.
         When dropna='unknown', NaN becomes a valid receptor type.
     """
-    # Validate delay_col can only be used with DataFrame connections
     if delay_col is not None and not isinstance(connections, pd.DataFrame):
         raise ValueError("delay_col can only be used with DataFrame connections")
 
@@ -307,24 +340,19 @@ def make_hetersynapse_conn(
             raise ValueError(
                 "Must provide either receptor_type_col or delay_col (or both)"
             )
-        # Just do delay expansion without heterosynapse
         shape = (len(neurons), len(neurons))
         conn_sparse = make_sparse_mat(connections, shape)
-        # Extract and aggregate delay values
         tmp_conn = connections.groupby(
             ["pre_simple_id", "post_simple_id"], as_index=False
         ).agg({"syn_count": "sum", delay_col: "mean"})
         delay_vals = tmp_conn[delay_col].values.astype(int)
-        # Create simple index
         index_df = pd.DataFrame({"simple_id": range(len(neurons))})
         if n_delay_bins > 1:
             conn_sparse = expand_conn_for_delays(conn_sparse, delay_vals, n_delay_bins)
-            # Add delay index
             index_df["delay_index"] = 0
         return conn_sparse, index_df
 
     if isinstance(connections, pd.DataFrame):
-        # Extract delay values early if delay_col is provided
         delay_vals = None
         if delay_col is not None:
             if delay_col not in connections.columns:
@@ -355,7 +383,6 @@ def make_hetersynapse_conn(
                 dropna=dropna,
                 ignore_post_type=ignore_post_type,
             )
-            # Apply delay expansion if needed
             if delay_vals is not None and n_delay_bins > 1:
                 result = expand_conn_for_delays(result, delay_vals, n_delay_bins)
             return result, index_df
@@ -377,7 +404,6 @@ def make_hetersynapse_conn(
         if return_dict:
             result = conn_receptor_type_groups
             if delay_vals is not None and n_delay_bins > 1:
-                # Apply delay expansion to each matrix in the dict
                 result = OrderedDict(
                     {
                         k: expand_conn_for_delays(v, delay_vals, n_delay_bins)
@@ -406,18 +432,17 @@ def make_hetersynapse_conn(
             ),
             shape=new_shape,
         )
-        # Apply delay expansion if needed
         if delay_vals is not None and n_delay_bins > 1:
             result = expand_conn_for_delays(result, delay_vals, n_delay_bins)
         return result, receptor_type_index
 
     elif isinstance(connections, scipy.sparse.sparray):
-        assert receptor_type_mode == "neuron"
+        if receptor_type_mode != "neuron":
+            raise ValueError(
+                "Sparse-array input only supports receptor_type_mode='neuron', "
+                f"got {receptor_type_mode!r}"
+            )
 
-        if ignore_post_type and receptor_type_mode != "neuron":
-            raise ValueError("ignore_post_type only valid for 'neuron' mode")
-
-        # Validate no NaN in connection data
         connections = connections.tocoo()
         if np.isnan(connections.data).any():
             raise ValueError("NaN values detected in connection matrix data")
@@ -427,7 +452,6 @@ def make_hetersynapse_conn(
         )
         shape = connections.shape
 
-        # Check for NaN receptor types in neurons
         nan_mask = neurons[receptor_type_col].isna()
         if nan_mask.any():
             if dropna == "error":
@@ -464,7 +488,6 @@ def make_hetersynapse_conn(
                     f"dropna must be 'error', 'filter', or 'unknown', got {dropna}"
                 )
 
-        # Group neurons by receptor type
         receptor_type_groups = OrderedDict(
             groupby_to_dict(
                 neurons,
@@ -496,7 +519,6 @@ def make_hetersynapse_conn(
         new_shape = (shape[0], shape[1] * n_receptor_type)
 
         if return_dict:
-            # Return dict mapping keys -> sparse matrix
             result_dict = OrderedDict()
             if ignore_post_type:
                 for i, (pre_type, pre_group) in receptor_type_index_groups:
@@ -537,7 +559,6 @@ def make_hetersynapse_conn(
                     ],
                 )
 
-        # Default: return stacked matrix
         new_row = []
         new_col = []
         new_val = []
@@ -592,8 +613,8 @@ def make_hetersynapse_constraint(
     connections: pd.DataFrame,
     cell_type_col: str = "cell_type",
     receptor_type_col: str = "EI",
-    receptor_type_mode: Literal["neuron", "connection"] = "neuron",
-    constraint_mode: Literal["full", "cell_only", "cell_and_receptor"] = "full",
+    receptor_type_mode: ReceptorTypeMode = "neuron",
+    constraint_mode: ConstraintMode = "full",
     nan_in_same_group: bool = True,
     ignore_post_type: bool = False,
 ) -> scipy.sparse.sparray:
@@ -640,7 +661,6 @@ def make_hetersynapse_constraint(
         )
         n_receptor_pairs = len(receptor_idx)
 
-        # Replicate constraint for each receptor pair
         cell_constraint = cell_constraint.tocoo()
         new_row = []
         new_col = []
@@ -695,7 +715,6 @@ def make_hetersynapse_constraint(
     # Get heterosynapse connection matrix to know the expanded structure
     conn_mat = conn_mat.tocoo()
 
-    # Create DataFrame of connections in hetersynapse space
     hetero_conn_df = pd.DataFrame(
         {
             "pre": conn_mat.row,
@@ -708,7 +727,6 @@ def make_hetersynapse_constraint(
     hetero_conn_df["post"] = hetero_conn_df["post_hetero"] // n_receptor_pairs
     hetero_conn_df["receptor_idx"] = hetero_conn_df["post_hetero"] % n_receptor_pairs
 
-    # Merge with receptor type info
     hetero_conn_df = hetero_conn_df.merge(
         receptor_idx, left_on="receptor_idx", right_on="receptor_index", how="left"
     )
@@ -780,10 +798,10 @@ def make_hetersynapse_constrained_conn(
     connections: pd.DataFrame,
     cell_type_col: str = "cell_type",
     receptor_type_col: str = "EI",
-    receptor_type_mode: Literal["neuron", "connection"] = "neuron",
-    constraint_mode: Literal["full", "cell_only", "cell_and_receptor"] = "full",
+    receptor_type_mode: ReceptorTypeMode = "neuron",
+    constraint_mode: ConstraintMode = "full",
     nan_in_same_group: bool = True,
-    dropna: Literal["error", "filter", "unknown"] = "error",
+    dropna: DropNaMode = "error",
     ignore_post_type: bool = False,
 ) -> tuple[scipy.sparse.sparray, scipy.sparse.sparray, pd.DataFrame]:
     """Create both heterosynaptic connection and constraint matrices.
@@ -917,17 +935,14 @@ def stack_hetersynapse(
         idx_df = pd.DataFrame([(0, "all")], columns=["receptor_index", "receptor_type"])
         return summed.tocoo(), idx_df
 
-    # Collapsing behavior
     if ignore_receptor_type in {"pre", "post", "all"}:
         # Connection mode: 'pre'/'post' behave like 'all'
         if connection_mode:
             return _collapse_all(conn_dict)
 
-        # Neuron mode collapse
         if ignore_receptor_type == "all":
             return _collapse_all(conn_dict)
 
-        # Collapse over the specified dimension (pre or post) in neuron mode
         collapsed = OrderedDict()
         if ignore_receptor_type == "post":
             for (pre, _post), mat in conn_dict.items():
@@ -1016,7 +1031,6 @@ def expand_conn_for_delays(
     conn_coo = conn.tocoo()
     n_pre, n_post = conn.shape
 
-    # Clip delays to valid range and convert to integers
     delay_bins = np.clip(delays, 0, n_delay_bins - 1).astype(int)
 
     # Expand rows: each pre neuron gets n_delay_bins slots

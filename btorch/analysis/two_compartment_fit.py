@@ -2,11 +2,10 @@
 
 import json
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -15,6 +14,8 @@ from scipy.optimize import linear_sum_assignment
 from torch import Tensor
 
 from btorch.models import environ, functional
+
+from ._two_compartment_plots import plot_two_compartment_fit
 
 
 @dataclass
@@ -53,13 +54,37 @@ class FitEvaluation:
     traces: dict[str, np.ndarray]
 
 
+SweepKind = Literal["all", "silent", "lowrate", "spiking", "countcal"]
+
+
+@dataclass(frozen=True)
+class FitLossConfig:
+    """Loss weights and spike-matching settings shared by the fitting helpers.
+
+    Mirrors the keyword arguments of :func:`two_compartment_loss`; private
+    helpers pass one instance instead of forwarding each field.
+    """
+
+    voltage_weight: float = 1.0
+    spike_weight: float = 1.0
+    spike_count_weight: float = 0.0
+    spike_timing_weight: float = 0.0
+    spike_count_over_weight: float = 1.0
+    spike_count_under_weight: float = 1.0
+    sparsity_weight: float = 1e-4
+    spike_tau_ms: float = 10.0
+    post_spike_mask_ms: float = 3.0
+    spike_match_window_ms: float = 10.0
+    spike_miss_penalty_ms: float | None = None
+
+
 @dataclass(frozen=True)
 class TwoCompartmentFitStage:
     """Configuration for one stage of staged parameter fitting."""
 
     name: str
     trainable_params: frozenset[str]
-    sweep_kind: Literal["all", "silent", "lowrate", "spiking", "countcal"]
+    sweep_kind: SweepKind
     voltage_weight: float
     spike_weight: float
     spike_count_weight: float
@@ -581,7 +606,43 @@ def two_compartment_loss(
     spike_miss_penalty_ms: float | None = None,
 ) -> dict[str, Tensor]:
     """Compute a composite fitting loss for the two-compartment model."""
-    refractory_bins = int(round(post_spike_mask_ms / dt_ms))
+    config = FitLossConfig(
+        voltage_weight=voltage_weight,
+        spike_weight=spike_weight,
+        spike_count_weight=spike_count_weight,
+        spike_timing_weight=spike_timing_weight,
+        spike_count_over_weight=spike_count_over_weight,
+        spike_count_under_weight=spike_count_under_weight,
+        sparsity_weight=sparsity_weight,
+        spike_tau_ms=spike_tau_ms,
+        post_spike_mask_ms=post_spike_mask_ms,
+        spike_match_window_ms=spike_match_window_ms,
+        spike_miss_penalty_ms=spike_miss_penalty_ms,
+    )
+    return _loss_from_config(
+        v_pred=v_pred,
+        spike_pred=spike_pred,
+        v_true=v_true,
+        spike_true=spike_true,
+        dt_ms=dt_ms,
+        w_Ca=w_Ca,
+        config=config,
+    )
+
+
+def _loss_from_config(
+    *,
+    v_pred: Tensor,
+    spike_pred: Tensor,
+    v_true: Tensor,
+    spike_true: Tensor,
+    dt_ms: float,
+    w_Ca: Tensor | None,
+    config: FitLossConfig,
+) -> dict[str, Tensor]:
+    """Config-taking implementation of :func:`two_compartment_loss`."""
+    c = config
+    refractory_bins = int(round(c.post_spike_mask_ms / dt_ms))
     mask = mask_post_spike_voltage_samples(
         spike_true,
         refractory_bins=refractory_bins,
@@ -594,31 +655,31 @@ def two_compartment_loss(
 
     spike_pred_smooth = exponential_filter_spike_train(
         spike_pred,
-        tau_ms=spike_tau_ms,
+        tau_ms=c.spike_tau_ms,
         dt_ms=dt_ms,
     )
     spike_true_smooth = exponential_filter_spike_train(
         spike_true,
-        tau_ms=spike_tau_ms,
+        tau_ms=c.spike_tau_ms,
         dt_ms=dt_ms,
     )
     spike_loss = F.smooth_l1_loss(spike_pred_smooth, spike_true_smooth)
     spike_count_pred = (spike_pred > 0.5).to(spike_pred.dtype).sum(dim=0)
     spike_count_true = spike_true.sum(dim=0)
-    if spike_count_over_weight <= 0.0 or spike_count_under_weight <= 0.0:
+    if c.spike_count_over_weight <= 0.0 or c.spike_count_under_weight <= 0.0:
         raise ValueError("Spike-count over/under weights must be positive.")
     spike_count_over = torch.relu(spike_count_pred - spike_count_true)
     spike_count_under = torch.relu(spike_count_true - spike_count_pred)
     spike_count_loss = (
-        spike_count_over_weight * spike_count_over.square()
-        + spike_count_under_weight * spike_count_under.square()
+        c.spike_count_over_weight * spike_count_over.square()
+        + c.spike_count_under_weight * spike_count_under.square()
     ).mean()
     spike_timing_event_loss = spike_timing_loss(
         spike_true,
         spike_pred,
         dt_ms=dt_ms,
-        match_window_ms=spike_match_window_ms,
-        miss_penalty_ms=spike_miss_penalty_ms,
+        match_window_ms=c.spike_match_window_ms,
+        miss_penalty_ms=c.spike_miss_penalty_ms,
     )
 
     if w_Ca is None:
@@ -627,11 +688,11 @@ def two_compartment_loss(
         sparsity_loss = w_Ca.abs().mean()
 
     total = (
-        voltage_weight * voltage_loss
-        + spike_weight * spike_loss
-        + spike_count_weight * spike_count_loss
-        + spike_timing_weight * spike_timing_event_loss
-        + sparsity_weight * sparsity_loss
+        c.voltage_weight * voltage_loss
+        + c.spike_weight * spike_loss
+        + c.spike_count_weight * spike_count_loss
+        + c.spike_timing_weight * spike_timing_event_loss
+        + c.sparsity_weight * sparsity_loss
     )
     return {
         "total": total,
@@ -690,6 +751,43 @@ def _f1_score_from_binary_traces(
     return 2.0 * precision * recall / (precision + recall)
 
 
+def _prepare_sweep(
+    model,
+    sweep: AllenSweepBatch,
+    *,
+    device: str | torch.device | None,
+    dtype: torch.dtype,
+    init_state: bool = True,
+) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+    """Move a sweep to ``device``/``dtype`` and reset the model for it.
+
+    Args:
+        model: Model whose state is (re)initialised for the sweep batch size.
+        sweep: Sweep to convert.
+        device: Target device.
+        dtype: Target dtype.
+        init_state: Also call ``init_net_state`` (skip after the first sweep
+            when the state buffers already exist).
+
+    Returns:
+        ``(i_soma, v_true, spike_true, i_apical)`` on the target device.
+    """
+    i_soma = sweep.i_soma.to(device=device, dtype=dtype)
+    v_true = sweep.v_true.to(device=device, dtype=dtype)
+    spike_true = sweep.spike_true.to(device=device, dtype=dtype)
+    i_apical = None
+    if sweep.i_apical is not None:
+        i_apical = sweep.i_apical.to(device=device, dtype=dtype)
+
+    batch_size = i_soma.shape[1]
+    if init_state:
+        functional.init_net_state(
+            model, batch_size=batch_size, device=device, dtype=dtype
+        )
+    functional.reset_net(model, batch_size=batch_size, device=device, dtype=dtype)
+    return i_soma, v_true, spike_true, i_apical
+
+
 def evaluate_two_compartment_fit(
     model,
     sweep: AllenSweepBatch,
@@ -706,24 +804,8 @@ def evaluate_two_compartment_fit(
     spike_miss_penalty_ms: float | None = None,
 ) -> FitEvaluation:
     """Evaluate a fitted model on a single sweep and collect metrics."""
-    i_soma = sweep.i_soma.to(device=device, dtype=dtype)
-    v_true = sweep.v_true.to(device=device, dtype=dtype)
-    spike_true = sweep.spike_true.to(device=device, dtype=dtype)
-    i_apical = None
-    if sweep.i_apical is not None:
-        i_apical = sweep.i_apical.to(device=device, dtype=dtype)
-
-    functional.init_net_state(
-        model,
-        batch_size=i_soma.shape[1],
-        device=device,
-        dtype=dtype,
-    )
-    functional.reset_net(
-        model,
-        batch_size=i_soma.shape[1],
-        device=device,
-        dtype=dtype,
+    i_soma, v_true, spike_true, i_apical = _prepare_sweep(
+        model, sweep, device=device, dtype=dtype
     )
 
     with torch.no_grad():
@@ -886,78 +968,6 @@ def evaluate_fit_across_sweeps(
     return evaluations, aggregate
 
 
-def plot_two_compartment_fit(
-    evaluation: FitEvaluation,
-    history: Sequence[dict[str, float | str]] | None = None,
-    *,
-    output_path: str | Path,
-) -> Path:
-    """Create a compact fit-quality figure with traces and loss history."""
-    output = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-
-    fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=False)
-    time_ms = evaluation.traces["time_ms"]
-
-    axes[0].plot(time_ms, evaluation.traces["i_soma"], color="tab:blue", lw=1.2)
-    axes[0].set_ylabel("I soma")
-    axes[0].set_title(
-        f"Specimen {evaluation.specimen_id}, sweep {evaluation.sweep_number}"
-    )
-
-    axes[1].plot(time_ms, evaluation.traces["v_true"], label="Recorded", lw=1.5)
-    axes[1].plot(time_ms, evaluation.traces["v_pred"], label="Predicted", lw=1.2)
-    axes[1].set_ylabel("Voltage")
-    axes[1].legend(loc="best")
-
-    spike_true_t = evaluation.traces["spike_true"]
-    spike_pred_t = evaluation.traces["spike_pred"]
-    axes[2].eventplot(
-        [time_ms[spike_true_t > 0.5], time_ms[spike_pred_t > 0.5]],
-        lineoffsets=[1, 0],
-        linelengths=0.8,
-        colors=["tab:green", "tab:red"],
-    )
-    axes[2].set_yticks([0, 1], ["Pred", "True"])
-    axes[2].set_ylabel("Spikes")
-
-    if history:
-        x = np.arange(len(history))
-        axes[3].plot(x, [float(row["total_loss"]) for row in history], label="Total")
-        axes[3].plot(
-            x,
-            [float(row["voltage_loss"]) for row in history],
-            label="Voltage",
-        )
-        axes[3].plot(
-            x,
-            [float(row["spike_loss"]) for row in history],
-            label="Spike",
-        )
-        axes[3].legend(loc="best")
-        axes[3].set_xlabel("Optimization step")
-    else:
-        axes[3].axis("off")
-
-    axes[3].set_ylabel("Loss")
-    metrics_text = "\n".join(
-        f"{name}: {value:.4f}" for name, value in evaluation.metrics.items()
-    )
-    fig.text(
-        0.99,
-        0.5,
-        metrics_text,
-        va="center",
-        ha="right",
-        fontsize=9,
-        family="monospace",
-    )
-    fig.tight_layout(rect=(0.0, 0.0, 0.9, 1.0))
-    fig.savefig(output, dpi=160)
-    plt.close(fig)
-    return output
-
-
 def save_fit_report(
     model,
     evaluations: Sequence[FitEvaluation],
@@ -1034,17 +1044,7 @@ def _fit_sweeps_once(
     *,
     device: str | torch.device | None = None,
     dtype: torch.dtype = torch.float32,
-    voltage_weight: float = 1.0,
-    spike_weight: float = 1.0,
-    spike_count_weight: float = 0.0,
-    spike_timing_weight: float = 0.0,
-    spike_count_over_weight: float = 1.0,
-    spike_count_under_weight: float = 1.0,
-    sparsity_weight: float = 1e-4,
-    spike_tau_ms: float = 10.0,
-    post_spike_mask_ms: float = 3.0,
-    spike_match_window_ms: float = 10.0,
-    spike_miss_penalty_ms: float | None = None,
+    loss: FitLossConfig,
 ) -> dict[str, float]:
     """Evaluate the current model parameters on one or more sweeps."""
     total_loss = 0.0
@@ -1057,46 +1057,20 @@ def _fit_sweeps_once(
 
     with torch.no_grad():
         for sweep in sweeps:
-            i_soma = sweep.i_soma.to(device=device, dtype=dtype)
-            v_true = sweep.v_true.to(device=device, dtype=dtype)
-            spike_true = sweep.spike_true.to(device=device, dtype=dtype)
-            i_apical = None
-            if sweep.i_apical is not None:
-                i_apical = sweep.i_apical.to(device=device, dtype=dtype)
-
-            functional.init_net_state(
-                model,
-                batch_size=i_soma.shape[1],
-                device=device,
-                dtype=dtype,
-            )
-            functional.reset_net(
-                model,
-                batch_size=i_soma.shape[1],
-                device=device,
-                dtype=dtype,
+            i_soma, v_true, spike_true, i_apical = _prepare_sweep(
+                model, sweep, device=device, dtype=dtype
             )
 
             with environ.context(dt=float(sweep.dt_ms)):
                 rollout = rollout_two_compartment(model, i_soma, i_apical)
-                losses = two_compartment_loss(
+                losses = _loss_from_config(
                     v_pred=rollout["v"],
                     spike_pred=rollout["spike"],
                     v_true=v_true,
                     spike_true=spike_true,
                     dt_ms=sweep.dt_ms,
                     w_Ca=getattr(model, "w_Ca", None),
-                    voltage_weight=voltage_weight,
-                    spike_weight=spike_weight,
-                    spike_count_weight=spike_count_weight,
-                    spike_timing_weight=spike_timing_weight,
-                    spike_count_over_weight=spike_count_over_weight,
-                    spike_count_under_weight=spike_count_under_weight,
-                    sparsity_weight=sparsity_weight,
-                    spike_tau_ms=spike_tau_ms,
-                    post_spike_mask_ms=post_spike_mask_ms,
-                    spike_match_window_ms=spike_match_window_ms,
-                    spike_miss_penalty_ms=spike_miss_penalty_ms,
+                    config=loss,
                 )
 
             total_loss += float(losses["total"].detach().cpu())
@@ -1247,7 +1221,7 @@ def _best_available_metric(
 
 def _filter_sweeps_for_stage(
     sweeps: Sequence[AllenSweepBatch],
-    sweep_kind: Literal["all", "silent", "lowrate", "spiking", "countcal"],
+    sweep_kind: SweepKind,
 ) -> list[AllenSweepBatch]:
     """Select stage-appropriate sweeps."""
     if sweep_kind == "all":
@@ -1321,6 +1295,18 @@ def _restore_parameter_values(
                 param.copy_(snapshot[name].to(device=param.device, dtype=param.dtype))
 
 
+def _stage_eval_kwargs(loss: FitLossConfig) -> dict[str, float | None]:
+    """Evaluation kwargs used to rank stages (smoothing/mask keep defaults)."""
+    return {
+        "spike_count_weight": loss.spike_count_weight,
+        "spike_timing_weight": loss.spike_timing_weight,
+        "spike_count_over_weight": loss.spike_count_over_weight,
+        "spike_count_under_weight": loss.spike_count_under_weight,
+        "spike_match_window_ms": loss.spike_match_window_ms,
+        "spike_miss_penalty_ms": loss.spike_miss_penalty_ms,
+    }
+
+
 def _stage_objective_score(metrics: dict[str, float]) -> tuple[float, float, float]:
     """Rank stage outcomes by firing regime first, then timing, then
     voltage."""
@@ -1369,17 +1355,7 @@ def _fit_two_compartment_model_tbptt(
     chunk_size: int = 500,
     device: str | torch.device | None = None,
     dtype: torch.dtype = torch.float32,
-    voltage_weight: float = 1.0,
-    spike_weight: float = 1.0,
-    spike_count_weight: float = 0.0,
-    spike_timing_weight: float = 0.0,
-    spike_count_over_weight: float = 1.0,
-    spike_count_under_weight: float = 1.0,
-    sparsity_weight: float = 1e-4,
-    spike_tau_ms: float = 10.0,
-    post_spike_mask_ms: float = 3.0,
-    spike_match_window_ms: float = 10.0,
-    spike_miss_penalty_ms: float | None = None,
+    loss: FitLossConfig,
 ) -> list[dict[str, float | str]]:
     """Fit the model to Allen sweeps with truncated BPTT.
 
@@ -1394,28 +1370,14 @@ def _fit_two_compartment_model_tbptt(
 
     for epoch in range(epochs):
         for sweep in sweeps:
-            i_soma = sweep.i_soma.to(device=device, dtype=dtype)
-            v_true = sweep.v_true.to(device=device, dtype=dtype)
-            spike_true = sweep.spike_true.to(device=device, dtype=dtype)
-            i_apical = None
-            if sweep.i_apical is not None:
-                i_apical = sweep.i_apical.to(device=device, dtype=dtype)
-
-            if not initialized:
-                functional.init_net_state(
-                    model,
-                    batch_size=i_soma.shape[1],
-                    device=device,
-                    dtype=dtype,
-                )
-                initialized = True
-
-            functional.reset_net(
+            i_soma, v_true, spike_true, i_apical = _prepare_sweep(
                 model,
-                batch_size=i_soma.shape[1],
+                sweep,
                 device=device,
                 dtype=dtype,
+                init_state=not initialized,
             )
+            initialized = True
             optimizer.zero_grad()
 
             with environ.context(dt=float(sweep.dt_ms)):
@@ -1429,24 +1391,14 @@ def _fit_two_compartment_model_tbptt(
                         i_soma[start:stop],
                         None if i_apical is None else i_apical[start:stop],
                     )
-                    losses = two_compartment_loss(
+                    losses = _loss_from_config(
                         v_pred=rollout["v"],
                         spike_pred=rollout["spike"],
                         v_true=v_true[start:stop],
                         spike_true=spike_true[start:stop],
                         dt_ms=sweep.dt_ms,
                         w_Ca=getattr(model, "w_Ca", None),
-                        voltage_weight=voltage_weight,
-                        spike_weight=spike_weight,
-                        spike_count_weight=spike_count_weight,
-                        spike_timing_weight=spike_timing_weight,
-                        spike_count_over_weight=spike_count_over_weight,
-                        spike_count_under_weight=spike_count_under_weight,
-                        sparsity_weight=sparsity_weight,
-                        spike_tau_ms=spike_tau_ms,
-                        post_spike_mask_ms=post_spike_mask_ms,
-                        spike_match_window_ms=spike_match_window_ms,
-                        spike_miss_penalty_ms=spike_miss_penalty_ms,
+                        config=loss,
                     )
                     losses["total"].backward()
                     optimizer.step()
@@ -1480,17 +1432,7 @@ def _fit_two_compartment_model_global(
     *,
     device: str | torch.device | None = None,
     dtype: torch.dtype = torch.float32,
-    voltage_weight: float = 1.0,
-    spike_weight: float = 1.0,
-    spike_count_weight: float = 0.0,
-    spike_timing_weight: float = 0.0,
-    spike_count_over_weight: float = 1.0,
-    spike_count_under_weight: float = 1.0,
-    sparsity_weight: float = 1e-4,
-    spike_tau_ms: float = 10.0,
-    post_spike_mask_ms: float = 3.0,
-    spike_match_window_ms: float = 10.0,
-    spike_miss_penalty_ms: float | None = None,
+    loss: FitLossConfig,
     param_bounds: dict[str, tuple[float, float]] | None = None,
     global_maxiter: int = 20,
     global_popsize: int = 8,
@@ -1503,6 +1445,17 @@ def _fit_two_compartment_model_global(
     x0, slices = _pack_trainable_parameters(model)
     bounds = _build_parameter_bounds(model, slices, param_bounds=param_bounds)
     history: list[dict[str, float | str]] = []
+    # The search objective only honours the weights, not the smoothing / mask /
+    # matching settings (those keep their defaults); final metrics use ``loss``.
+    search_loss = FitLossConfig(
+        voltage_weight=loss.voltage_weight,
+        spike_weight=loss.spike_weight,
+        spike_count_weight=loss.spike_count_weight,
+        spike_timing_weight=loss.spike_timing_weight,
+        spike_count_over_weight=loss.spike_count_over_weight,
+        spike_count_under_weight=loss.spike_count_under_weight,
+        sparsity_weight=loss.sparsity_weight,
+    )
 
     def objective(x: np.ndarray) -> float:
         _set_trainable_parameters(model, x, slices)
@@ -1511,17 +1464,7 @@ def _fit_two_compartment_model_global(
             sweep_list,
             device=device,
             dtype=dtype,
-            voltage_weight=voltage_weight,
-            spike_weight=spike_weight,
-            spike_count_weight=spike_count_weight,
-            spike_timing_weight=spike_timing_weight,
-            spike_count_over_weight=spike_count_over_weight,
-            spike_count_under_weight=spike_count_under_weight,
-            sparsity_weight=sparsity_weight,
-            spike_tau_ms=spike_tau_ms,
-            post_spike_mask_ms=post_spike_mask_ms,
-            spike_match_window_ms=spike_match_window_ms,
-            spike_miss_penalty_ms=spike_miss_penalty_ms,
+            loss=search_loss,
         )
         return metrics["total_loss"]
 
@@ -1540,17 +1483,7 @@ def _fit_two_compartment_model_global(
         sweep_list,
         device=device,
         dtype=dtype,
-        voltage_weight=voltage_weight,
-        spike_weight=spike_weight,
-        spike_count_weight=spike_count_weight,
-        spike_timing_weight=spike_timing_weight,
-        spike_count_over_weight=spike_count_over_weight,
-        spike_count_under_weight=spike_count_under_weight,
-        sparsity_weight=sparsity_weight,
-        spike_tau_ms=spike_tau_ms,
-        post_spike_mask_ms=post_spike_mask_ms,
-        spike_match_window_ms=spike_match_window_ms,
-        spike_miss_penalty_ms=spike_miss_penalty_ms,
+        loss=loss,
     )
     history.append(
         {
@@ -1584,17 +1517,7 @@ def _fit_two_compartment_model_global(
         sweep_list,
         device=device,
         dtype=dtype,
-        voltage_weight=voltage_weight,
-        spike_weight=spike_weight,
-        spike_count_weight=spike_count_weight,
-        spike_timing_weight=spike_timing_weight,
-        spike_count_over_weight=spike_count_over_weight,
-        spike_count_under_weight=spike_count_under_weight,
-        sparsity_weight=sparsity_weight,
-        spike_tau_ms=spike_tau_ms,
-        post_spike_mask_ms=post_spike_mask_ms,
-        spike_match_window_ms=spike_match_window_ms,
-        spike_miss_penalty_ms=spike_miss_penalty_ms,
+        loss=loss,
     )
     history.append(
         {
@@ -1620,17 +1543,7 @@ def _fit_two_compartment_model_staged(
     *,
     device: str | torch.device | None = None,
     dtype: torch.dtype = torch.float32,
-    voltage_weight: float = 1.0,
-    spike_weight: float = 1.0,
-    spike_count_weight: float = 0.0,
-    spike_timing_weight: float = 0.0,
-    spike_count_over_weight: float = 1.0,
-    spike_count_under_weight: float = 1.0,
-    sparsity_weight: float = 1e-4,
-    spike_tau_ms: float = 10.0,
-    post_spike_mask_ms: float = 3.0,
-    spike_match_window_ms: float = 10.0,
-    spike_miss_penalty_ms: float | None = None,
+    loss: FitLossConfig,
     param_bounds: dict[str, tuple[float, float]] | None = None,
     global_maxiter: int = 20,
     global_popsize: int = 8,
@@ -1654,12 +1567,7 @@ def _fit_two_compartment_model_staged(
         sweep_list,
         device=device,
         dtype=dtype,
-        spike_count_weight=spike_count_weight,
-        spike_timing_weight=spike_timing_weight,
-        spike_count_over_weight=spike_count_over_weight,
-        spike_count_under_weight=spike_count_under_weight,
-        spike_match_window_ms=spike_match_window_ms,
-        spike_miss_penalty_ms=spike_miss_penalty_ms,
+        **_stage_eval_kwargs(loss),
     )
     best_score = _stage_objective_score(best_metrics)
 
@@ -1681,17 +1589,16 @@ def _fit_two_compartment_model_staged(
                 stage_sweeps,
                 device=device,
                 dtype=dtype,
-                voltage_weight=stage.voltage_weight,
-                spike_weight=stage.spike_weight,
-                spike_count_weight=stage.spike_count_weight,
-                spike_timing_weight=stage.spike_timing_weight,
-                spike_count_over_weight=stage.spike_count_over_weight,
-                spike_count_under_weight=stage.spike_count_under_weight,
-                sparsity_weight=stage.sparsity_weight,
-                spike_tau_ms=spike_tau_ms,
-                post_spike_mask_ms=post_spike_mask_ms,
-                spike_match_window_ms=spike_match_window_ms,
-                spike_miss_penalty_ms=spike_miss_penalty_ms,
+                loss=replace(
+                    loss,
+                    voltage_weight=stage.voltage_weight,
+                    spike_weight=stage.spike_weight,
+                    spike_count_weight=stage.spike_count_weight,
+                    spike_timing_weight=stage.spike_timing_weight,
+                    spike_count_over_weight=stage.spike_count_over_weight,
+                    spike_count_under_weight=stage.spike_count_under_weight,
+                    sparsity_weight=stage.sparsity_weight,
+                ),
                 param_bounds=stage_bounds,
                 global_maxiter=global_maxiter,
                 global_popsize=global_popsize,
@@ -1707,12 +1614,7 @@ def _fit_two_compartment_model_staged(
             sweep_list,
             device=device,
             dtype=dtype,
-            spike_count_weight=spike_count_weight,
-            spike_timing_weight=spike_timing_weight,
-            spike_count_over_weight=spike_count_over_weight,
-            spike_count_under_weight=spike_count_under_weight,
-            spike_match_window_ms=spike_match_window_ms,
-            spike_miss_penalty_ms=spike_miss_penalty_ms,
+            **_stage_eval_kwargs(loss),
         )
         stage_score = _stage_objective_score(stage_metrics)
 
@@ -1809,6 +1711,19 @@ def fit_two_compartment_model(
         search handles the large basin-finding problem more robustly than pure
         BPTT, while the optional TBPTT stage can still fine-tune the result.
     """
+    loss = FitLossConfig(
+        voltage_weight=voltage_weight,
+        spike_weight=spike_weight,
+        spike_count_weight=spike_count_weight,
+        spike_timing_weight=spike_timing_weight,
+        spike_count_over_weight=spike_count_over_weight,
+        spike_count_under_weight=spike_count_under_weight,
+        sparsity_weight=sparsity_weight,
+        spike_tau_ms=spike_tau_ms,
+        post_spike_mask_ms=post_spike_mask_ms,
+        spike_match_window_ms=spike_match_window_ms,
+        spike_miss_penalty_ms=spike_miss_penalty_ms,
+    )
     sweep_list = list(sweeps)
     if method == "tbptt":
         return _fit_two_compartment_model_tbptt(
@@ -1819,17 +1734,7 @@ def fit_two_compartment_model(
             chunk_size=chunk_size,
             device=device,
             dtype=dtype,
-            voltage_weight=voltage_weight,
-            spike_weight=spike_weight,
-            spike_count_weight=spike_count_weight,
-            spike_timing_weight=spike_timing_weight,
-            spike_count_over_weight=spike_count_over_weight,
-            spike_count_under_weight=spike_count_under_weight,
-            sparsity_weight=sparsity_weight,
-            spike_tau_ms=spike_tau_ms,
-            post_spike_mask_ms=post_spike_mask_ms,
-            spike_match_window_ms=spike_match_window_ms,
-            spike_miss_penalty_ms=spike_miss_penalty_ms,
+            loss=loss,
         )
 
     if method == "staged":
@@ -1838,17 +1743,7 @@ def fit_two_compartment_model(
             sweep_list,
             device=device,
             dtype=dtype,
-            voltage_weight=voltage_weight,
-            spike_weight=spike_weight,
-            spike_count_weight=spike_count_weight,
-            spike_timing_weight=spike_timing_weight,
-            spike_count_over_weight=spike_count_over_weight,
-            spike_count_under_weight=spike_count_under_weight,
-            sparsity_weight=sparsity_weight,
-            spike_tau_ms=spike_tau_ms,
-            post_spike_mask_ms=post_spike_mask_ms,
-            spike_match_window_ms=spike_match_window_ms,
-            spike_miss_penalty_ms=spike_miss_penalty_ms,
+            loss=loss,
             param_bounds=param_bounds,
             global_maxiter=global_maxiter,
             global_popsize=global_popsize,
@@ -1863,17 +1758,7 @@ def fit_two_compartment_model(
         sweep_list,
         device=device,
         dtype=dtype,
-        voltage_weight=voltage_weight,
-        spike_weight=spike_weight,
-        spike_count_weight=spike_count_weight,
-        spike_timing_weight=spike_timing_weight,
-        spike_count_over_weight=spike_count_over_weight,
-        spike_count_under_weight=spike_count_under_weight,
-        sparsity_weight=sparsity_weight,
-        spike_tau_ms=spike_tau_ms,
-        post_spike_mask_ms=post_spike_mask_ms,
-        spike_match_window_ms=spike_match_window_ms,
-        spike_miss_penalty_ms=spike_miss_penalty_ms,
+        loss=loss,
         param_bounds=param_bounds,
         global_maxiter=global_maxiter,
         global_popsize=global_popsize,
@@ -1893,17 +1778,7 @@ def fit_two_compartment_model(
             chunk_size=chunk_size,
             device=device,
             dtype=dtype,
-            voltage_weight=voltage_weight,
-            spike_weight=spike_weight,
-            spike_count_weight=spike_count_weight,
-            spike_timing_weight=spike_timing_weight,
-            spike_count_over_weight=spike_count_over_weight,
-            spike_count_under_weight=spike_count_under_weight,
-            sparsity_weight=sparsity_weight,
-            spike_tau_ms=spike_tau_ms,
-            post_spike_mask_ms=post_spike_mask_ms,
-            spike_match_window_ms=spike_match_window_ms,
-            spike_miss_penalty_ms=spike_miss_penalty_ms,
+            loss=loss,
         )
     )
     return history

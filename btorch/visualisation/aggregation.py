@@ -131,7 +131,7 @@ def plot_group_violin(
 ) -> tuple[Figure, Axes]:
     """Convenience wrapper for `plot_group_distribution(...,
     kind='violin')`."""
-    return _plot_group_distribution_kind(
+    return plot_group_distribution(
         values=values,
         neurons_df=neurons_df,
         group_by=group_by,
@@ -147,7 +147,7 @@ def plot_group_box(
     **kwargs,
 ) -> tuple[Figure, Axes]:
     """Convenience wrapper for `plot_group_distribution(..., kind='box')`."""
-    return _plot_group_distribution_kind(
+    return plot_group_distribution(
         values=values,
         neurons_df=neurons_df,
         group_by=group_by,
@@ -163,28 +163,11 @@ def plot_group_ecdf(
     **kwargs,
 ) -> tuple[Figure, Axes]:
     """Convenience wrapper for `plot_group_distribution(..., kind='ecdf')`."""
-    return _plot_group_distribution_kind(
-        values=values,
-        neurons_df=neurons_df,
-        group_by=group_by,
-        kind="ecdf",
-        **kwargs,
-    )
-
-
-def _plot_group_distribution_kind(
-    values: TensorLike,
-    neurons_df: pd.DataFrame,
-    group_by: str,
-    *,
-    kind: GroupPlotKind,
-    **kwargs,
-) -> tuple[Figure, Axes]:
     return plot_group_distribution(
         values=values,
         neurons_df=neurons_df,
         group_by=group_by,
-        kind=kind,
+        kind="ecdf",
         **kwargs,
     )
 

@@ -172,22 +172,22 @@ class ALIF(BaseNode):
         self.register_memory("g_k", g_k_init, self.n_neuron)
 
     @property
-    def v_rest(self):
+    def v_rest(self) -> Tensor:
         if self._v_rest is None:
             return self.v_reset
         return self._v_rest
 
     @v_rest.setter
-    def v_rest(self, v_rest):
+    def v_rest(self, v_rest: Tensor) -> None:
         if self._v_rest is not None:
             self._v_rest = v_rest
 
     @property
-    def v_peak(self):
+    def v_peak(self) -> Tensor:
         return self.v_threshold
 
     @v_peak.setter
-    def v_peak(self, value):
+    def v_peak(self, value: Tensor) -> None:
         self.v_threshold = value
 
     def dV(
@@ -195,29 +195,27 @@ class ALIF(BaseNode):
         v: Float[Tensor, "*batch n_neuron"],
         g_k: Float[Tensor, "*batch n_neuron"],
         x: Float[Tensor, "*batch n_neuron"],
-    ):
+    ) -> tuple[Tensor, Tensor]:
         leak_term = -self.g_leak * (v - self.E_leak)
         adapt_term = -g_k * (v - self.E_k)
         derivative = (leak_term + adapt_term + x) / self.c_m
         linear = (-self.g_leak - g_k) / self.c_m
         return derivative, linear
 
-    def dgk(
-        self, g_k: Float[Tensor, "*batch n_neuron"]
-    ) -> Float[Tensor, "*batch n_neuron"]:
+    def dgk(self, g_k: Float[Tensor, "*batch n_neuron"]) -> tuple[Tensor, Tensor]:
         derivative = -g_k / self.tau_adapt
         linear = -1.0 / self.tau_adapt
         return derivative, linear
 
-    def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]):
+    def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]) -> None:
         dt = environ.get("dt")
         self.v = exp_euler_step(self.dV, self.v, self.g_k, x, dt=dt)
 
-    def neuronal_adaptation(self):
+    def neuronal_adaptation(self) -> None:
         dt = environ.get("dt")
         self.g_k = exp_euler_step(self.dgk, self.g_k, dt=dt)
 
-    def neuronal_fire(self):
+    def neuronal_fire(self) -> Float[Tensor, "*batch n_neuron"]:
         spike = self.surrogate_function(
             (self.v - self.v_threshold) / (self.v_threshold - self.v_reset)
         )
@@ -227,7 +225,7 @@ class ALIF(BaseNode):
         spike = spike * not_in_refractory.detach().to(self.v.dtype)
         return spike
 
-    def neuronal_reset(self, spike: Float[Tensor, "*batch n"]):
+    def neuronal_reset(self, spike: Float[Tensor, "*batch n"]) -> None:
         if self.detach_reset:
             spike_d = spike.detach()
         else:
@@ -248,7 +246,7 @@ class ALIF(BaseNode):
                 self.refractory + spike_d * self.tau_ref - environ.get("dt")
             )
 
-    def extra_repr(self):
+    def extra_repr(self) -> str:
         g_k_init = self._memories_rv["g_k"].value
         parts = [
             f"c_m={self._format_repr_value(self.c_m)}",
@@ -384,7 +382,7 @@ class ELIF(ALIF):
         v: Float[Tensor, "*batch n_neuron"],
         g_k: Float[Tensor, "*batch n_neuron"],
         x: Float[Tensor, "*batch n_neuron"],
-    ):
+    ) -> tuple[Tensor, Tensor]:
         leak_term = -self.g_leak * (v - self.E_leak)
         adapt_term = -g_k * (v - self.E_k)
         exp_term = self.g_leak * self.delta_T * torch.exp((v - self.v_T) / self.delta_T)
@@ -392,11 +390,11 @@ class ELIF(ALIF):
         linear = (-self.g_leak - g_k + exp_term / self.delta_T) / self.c_m
         return derivative, linear
 
-    def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]):
+    def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]) -> None:
         dt = environ.get("dt")
         self.v = exp_euler_step(self.dV, self.v, self.g_k, x, dt=dt)
 
-    def extra_repr(self):
+    def extra_repr(self) -> str:
         parts = [
             f"delta_T={self._format_repr_value(self.delta_T)}",
             f"v_T={self._format_repr_value(self.v_T)}",

@@ -22,7 +22,6 @@ def calculate_kaplan_yorke_dimension(lyapunov_spectrum: np.ndarray) -> float:
 
     n = len(ls)
 
-    # Calculate cumulative sums
     cum_sum = np.cumsum(ls)
 
     # Find k: max index such that sum >= 0
@@ -40,7 +39,6 @@ def calculate_kaplan_yorke_dimension(lyapunov_spectrum: np.ndarray) -> float:
     if k == n - 1:
         return float(n)
 
-    # Apply formula
     # Note: indices are 0-based in Python, so k corresponds to the (k+1)-th
     # element in 1-based math notation.
     # The formula uses 1-based k.
@@ -93,7 +91,6 @@ def calculate_structural_eigenvalue_outliers(
     if W.shape[0] != W.shape[1]:
         raise ValueError("Weight matrix must be square.")
 
-    # Compute eigenvalues
     eigenvalues = np.linalg.eigvals(W)
 
     # Determine spectral radius if not provided

@@ -1,5 +1,5 @@
-import logging
-from collections.abc import Callable, Sequence
+import warnings
+from collections.abc import Sequence
 from typing import Any, Literal
 
 import torch
@@ -10,11 +10,38 @@ from . import base
 from .scale import SupportScaleState
 
 
+def _call_on_modules(
+    net: nn.Module,
+    method: Literal["init_state", "reset"],
+    batch_size: int | Sequence[int] | None,
+    **kwargs: Any,
+) -> None:
+    """Move ``net`` to ``kwargs`` device/dtype, then call ``method``
+    everywhere.
+
+    Warns (instead of failing) for modules that expose ``method`` without being
+    a :class:`base.MemoryModule`. The check unwraps ``torch.compile`` wrappers
+    via ``_orig_mod``, which plain modules do not have.
+    """
+    net.to(device=kwargs.get("device"), dtype=kwargs.get("dtype"))
+    for m in net.modules():
+        fn = getattr(m, method, None)
+        if not callable(fn):
+            continue
+        if not isinstance(getattr(m, "_orig_mod", m), base.MemoryModule):
+            # stacklevel=3: skip this helper and the public caller
+            warnings.warn(
+                f"Trying to call `{method}()` of {m}, which is not base.MemoryModule",
+                stacklevel=3,
+            )
+        fn(batch_size, **kwargs)
+
+
 def init_net_state(
     net: nn.Module,
     batch_size: int | Sequence[int] | None = None,
-    **kwargs,
-):
+    **kwargs: Any,
+) -> None:
     """Initialize state for all MemoryModule instances in a network.
 
     Walks through every ``Module`` in ``net`` and calls ``init_state()``
@@ -30,29 +57,14 @@ def init_net_state(
         >>> functional.init_net_state(model, batch_size=4, device="cuda")
     """
 
-    def fn(m: nn.Module):
-        if hasattr(m, "init_state") and callable(m.init_state):
-            # can be a torch.compiled module
-            if not (
-                isinstance(m, base.MemoryModule)
-                or isinstance(m._orig_mod, base.MemoryModule)
-            ):
-                logging.warning(
-                    f"Trying to call `init_state()` of {m}, which is not "
-                    "base.MemoryModule"
-                )
-            m.init_state(batch_size, **kwargs)
-
-    net.to(device=kwargs.get("device"), dtype=kwargs.get("dtype"))
-    for m in net.modules():
-        fn(m)
+    _call_on_modules(net, "init_state", batch_size, **kwargs)
 
 
 def reset_net(
     net: nn.Module,
     batch_size: int | Sequence[int] | None = None,
-    **kwargs,
-):
+    **kwargs: Any,
+) -> None:
     """Reset state for all MemoryModule instances in a network.
 
     Walks through every ``Module`` in ``net`` and calls ``reset()``
@@ -68,21 +80,7 @@ def reset_net(
         >>> functional.reset_net(model, batch_size=4)
     """
 
-    def fn(m: nn.Module):
-        if hasattr(m, "reset") and callable(m.reset):
-            if not (
-                isinstance(m, base.MemoryModule)
-                or isinstance(m._orig_mod, base.MemoryModule)
-            ):
-                logging.warning(
-                    f"Trying to call `reset()` of {m}, which is not "
-                    "model.base.MemoryModule"
-                )
-            m.reset(batch_size, **kwargs)
-
-    net.to(device=kwargs.get("device"), dtype=kwargs.get("dtype"))
-    for m in net.modules():
-        fn(m)
+    _call_on_modules(net, "reset", batch_size, **kwargs)
 
 
 reset_net_state = reset_net
@@ -119,29 +117,26 @@ def _collect_memory_vars(
     return ret
 
 
-# ugly, just to unify common code between memories and memories_rv
-def _set_memory_vars(
+def _walk_memory_targets(
     mod: nn.Module,
-    set_whole: Callable,
-    set_attr: Callable,
     target_attr: Literal["_memories", "_memories_rv"],
     hidden_states: dict[str, Any] | None,
     allow_buffer: bool = False,
-    inplace: bool = False,
 ):
-    """For convenience, the memories* level doesn't have to be flatten to dot
-    dict.
+    """Resolve each dotted entry of ``hidden_states`` to what it addresses.
 
-    e.g. {"mod": {"v": array1, "Iasc": array2}}
+    The memories* level doesn't have to be flattened to a dotted dict, e.g.
+    ``{"mod": {"v": array1, "Iasc": array2}}`` is accepted. This only
+    *locates* targets; the caller decides how to write them. Yields
+    ``(kind, module, key, value)`` where ``kind`` is one of:
+
+    * ``"whole"``: ``value`` is a dict for all memories of a MemoryModule.
+    * ``"attr"``: ``value`` is one memory ``key`` of a MemoryModule.
+    * ``"buffer_whole"`` / ``"buffer_attr"``: the same for plain buffers of a
+      non-MemoryModule (only with ``allow_buffer``).
     """
     if hidden_states is None:
         return
-
-    def set_buffer(m: nn.Module, kv: dict[str, Any]):
-        # inplace copies into the existing buffer (keeps its address); else rebinds
-        for k, v in kv.items():
-            assert k in m._buffers, f"{k} not in {m._buffers}"
-            getattr(m, k).copy_(v) if inplace else setattr(m, k, v)
 
     # TODO: ensure no state is set twice. The following case should not happen
     #       {"a.mem": v0, "a.mem.V": v1}
@@ -152,36 +147,84 @@ def _set_memory_vars(
         path = name.removeprefix("self.").removeprefix("self").split(".")
         m = mod
         if path[0] == "":
+            # set self's mem vars via either {"": {"v": tensor}}
+            # or {"self": {"v": tensor}}
             if isinstance(m, base.MemoryModule):
-                # set self's mem vars via either {"": {"v": tensor}}
-                # or {"self": {"v": tensor}}
-                # e.g. m._memories = hidden_state
-                set_whole(m, hidden_state)
+                yield "whole", m, None, hidden_state
             elif allow_buffer and isinstance(m, nn.Module):
-                # set self's mem vars via either {"": {"v": tensor}}
-                # or {"self": {"v": tensor}}
-                # e.g. m._memories = hidden_state
-                set_buffer(m, hidden_state)
+                yield "buffer_whole", m, None, hidden_state
+            continue
+        for p in path[:-1]:
+            m = getattr(m, p)
+        if target_attr == "_memories_rv":
+            # reset values are not attributes; look them up in the registry
+            m_leaf = m._memories_rv[path[-1]]
         else:
-            for p in path[:-1]:
-                m = getattr(m, p)
-            if target_attr == "_memories_rv":
-                m_leaf = m._memories_rv[path[-1]]
+            m_leaf = getattr(m, path[-1])
+        if isinstance(m_leaf, nn.Module):
+            # set the whole module's mem vars via {"m.subm": {"v": tensor}}
+            if isinstance(m_leaf, base.MemoryModule):
+                yield "whole", m_leaf, None, hidden_state
+            elif allow_buffer:
+                yield "buffer_whole", m_leaf, None, hidden_state
+        elif allow_buffer:
+            # set a specific mem var via {"m.subm.v": tensor}
+            yield "buffer_attr", m, path[-1], hidden_state
+        else:
+            if not isinstance(m, base.MemoryModule):
+                raise TypeError(
+                    f"cannot set memory {path[-1]!r}: {type(m).__name__} is not a "
+                    "MemoryModule"
+                )
+            yield "attr", m, path[-1], hidden_state
+
+
+def _set_buffers(m: nn.Module, kv: dict[str, Any], inplace: bool):
+    # inplace copies into the existing buffer (keeps its address); else rebinds
+    for k, v in kv.items():
+        if k not in m._buffers:
+            raise KeyError(f"{k} not in buffers {list(m._buffers)}")
+        getattr(m, k).copy_(v) if inplace else setattr(m, k, v)
+
+
+def _set_memories(
+    mod: nn.Module,
+    hidden_states: dict[str, Any] | None,
+    allow_buffer: bool = False,
+    inplace: bool = False,
+):
+    """Write ``_memories`` entries (rebinding, or copying when ``inplace``)."""
+    for kind, m, key, v in _walk_memory_targets(
+        mod, "_memories", hidden_states, allow_buffer
+    ):
+        if kind == "whole":
+            if inplace:
+                for k, val in v.items():
+                    m._memories[k].copy_(val)
             else:
-                m_leaf = getattr(m, path[-1])
-            if isinstance(m_leaf, nn.Module):
-                # set the whole module's mem vars via {"m.subm": {"v": tensor}}
-                if isinstance(m_leaf, base.MemoryModule):
-                    set_whole(m_leaf, hidden_state)
-                elif allow_buffer:
-                    set_buffer(m_leaf, hidden_state)
+                m._memories = v
+        elif kind == "attr":
+            if inplace:
+                m._memories[key].copy_(v)
             else:
-                # set a specific mem var via {"m.subm.v": tensor}
-                if allow_buffer:
-                    set_buffer(m, {path[-1]: hidden_state})
-                else:
-                    assert isinstance(m, base.MemoryModule)
-                    set_attr(m, path[-1], hidden_state)
+                m._memories = {key: v}
+        elif kind == "buffer_whole":
+            _set_buffers(m, v, inplace)
+        else:
+            _set_buffers(m, {key: v}, inplace)
+
+
+def _set_reset_values(
+    mod: nn.Module, hidden_states: dict[str, Any] | None, strict: bool
+):
+    """Write ``_memories_rv`` entries through the MemoryModule setters."""
+    for kind, m, key, v in _walk_memory_targets(
+        mod, "_memories_rv", hidden_states, allow_buffer=False
+    ):
+        if kind == "whole":
+            m.set_memories_rv(v, strict=strict)
+        else:
+            m.set_reset_value(key, v, strict=strict)
 
 
 # for serialisation as well as rnn to collect states
@@ -239,31 +282,7 @@ def set_hidden_states(
     Example:
         >>> functional.set_hidden_states(model, {"neuron.v": v_tensor})
     """
-    if inplace:
-
-        def set_whole(m: base.MemoryModule, v):
-            for k, val in v.items():
-                m._memories[k].copy_(val)
-
-        def set_attr(m: base.MemoryModule, k, v):
-            m._memories[k].copy_(v)
-    else:
-
-        def set_whole(m: base.MemoryModule, v):
-            m._memories = v
-
-        def set_attr(m: base.MemoryModule, k, v):
-            m._memories = {k: v}
-
-    _set_memory_vars(
-        mod,
-        set_whole,
-        set_attr,
-        "_memories",
-        hidden_states,
-        allow_buffer=allow_buffer,
-        inplace=inplace,
-    )
+    _set_memories(mod, hidden_states, allow_buffer=allow_buffer, inplace=inplace)
 
 
 set_memory_values = set_hidden_states
@@ -304,15 +323,7 @@ def set_memory_reset_values(
         >>> functional.set_memory_reset_values(model, rv_dict)
     """
 
-    def set_whole(m: base.MemoryModule, v):
-        m.set_memories_rv(v, strict=strict)
-
-    def set_attr(m: base.MemoryModule, k, v):
-        m.set_reset_value(k, v, strict=strict)
-
-    _set_memory_vars(
-        mod, set_whole, set_attr, "_memories_rv", hidden_states, allow_buffer=False
-    )
+    _set_reset_values(mod, hidden_states, strict=strict)
 
 
 def _unflatten_leaf(d: dict) -> dict:
@@ -327,10 +338,10 @@ def _unflatten_leaf(d: dict) -> dict:
 
 def _scale_state(
     mod: nn.Module,
-    hidden_states: dict[str, Any],
+    hidden_states: dict[str, Any] | None,
     scale: Literal["scale_state", "unscale_state"],
     enforce: Literal["ignore", "assert", "repeated"] = "repeated",
-):
+) -> dict[str, Any] | None:
     if hidden_states is None:
         return None
 
@@ -348,9 +359,9 @@ def _scale_state(
 
 def scale_state(
     mod: nn.Module,
-    hidden_states: dict,
+    hidden_states: dict | None,
     enforce: Literal["ignore", "assert", "repeated"] = "repeated",
-) -> dict:
+) -> dict | None:
     """Scale hidden states for modules that support state scaling.
 
     Expects a proper dotted dict flattened up to items of _memories*,
@@ -363,16 +374,17 @@ def scale_state(
             or ``repeated``).
 
     Returns:
-        Scaled hidden states as a dotted dictionary.
+        Scaled hidden states as a dotted dictionary, or ``None`` if
+        ``hidden_states`` is ``None``.
     """
     return _scale_state(mod, hidden_states, "scale_state", enforce=enforce)
 
 
 def unscale_state(
     mod: nn.Module,
-    hidden_states: dict,
+    hidden_states: dict | None,
     enforce: Literal["ignore", "assert", "repeated"] = "repeated",
-) -> dict:
+) -> dict | None:
     """Unscale hidden states for modules that support state scaling.
 
     Expects a proper dotted dict flattened up to items of _memories*,
@@ -385,7 +397,8 @@ def unscale_state(
             or ``repeated``).
 
     Returns:
-        Unscaled hidden states as a dotted dictionary.
+        Unscaled hidden states as a dotted dictionary, or ``None`` if
+        ``hidden_states`` is ``None``.
     """
     return _scale_state(
         mod,
@@ -457,8 +470,9 @@ def detach_net(net: nn.Module):
     for m in net.modules():
         if hasattr(m, "detach") and callable(m.detach):
             if not isinstance(m, base.MemoryModule):
-                logging.warning(
+                warnings.warn(
                     f"Trying to call `detach()` of {m}, which is not "
-                    "btorch.models.base.MemoryModule"
+                    "btorch.models.base.MemoryModule",
+                    stacklevel=2,
                 )
             m.detach()

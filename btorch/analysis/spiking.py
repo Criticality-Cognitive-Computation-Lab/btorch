@@ -39,6 +39,22 @@ from scipy.ndimage import convolve1d
 from .statistics import use_percentiles, use_stats
 
 
+def _check_window(window: int, overlap: int, T: int) -> None:
+    """Validate sliding-window arguments.
+
+    Raises:
+        ValueError: If ``window`` is not in ``[1, T]`` or ``overlap`` is not
+            smaller than ``window``.
+    """
+    if not 1 <= window <= T:
+        raise ValueError(f"window must be in [1, T={T}], got {window}")
+    if overlap >= window:
+        raise ValueError(
+            f"overlap must be smaller than window, got overlap={overlap}, "
+            f"window={window}"
+        )
+
+
 # =============================================================================
 # Internal Helper Functions (without percentile handling)
 # =============================================================================
@@ -75,7 +91,6 @@ def _cv_numpy(
     t_sorted = t_idx[sort_order]
     n_sorted = n_idx[sort_order]
 
-    # Calculate all global ISIs
     diffs = np.diff(t_sorted) * dt_ms
 
     # Valid ISIs are those where the neuron index didn't change
@@ -149,7 +164,6 @@ def _cv_torch(
     t_sorted = t_idx[sort_order].float() * dt_ms
     n_sorted = n_idx[sort_order]
 
-    # Calculate ISIs
     isis = torch.diff(t_sorted)
     valid_mask = n_sorted[:-1] == n_sorted[1:]
     valid_isis = isis[valid_mask]
@@ -166,7 +180,6 @@ def _cv_torch(
 
     cv_values_flat[count_isi < 2] = float("nan")
 
-    # Return to original device
     cv_values = cv_values_flat.reshape(work_shape[1:]).to(device)
     mean_isi_arr = mean_isi_arr.reshape(work_shape[1:]).to(device)
     std_isi_arr = std_isi_arr.reshape(work_shape[1:]).to(device)
@@ -196,8 +209,7 @@ def _fano_numpy(
         # Need at least 2 bins for valid variance with ddof=1
         window = max(1, T // 10)
 
-    assert 1 <= window <= T, "window must be in [1, T]"
-    assert overlap < window, "overlap must be smaller than window"
+    _check_window(window, overlap, T)
 
     step = window - overlap
 
@@ -244,8 +256,7 @@ def _fano_torch(
     orig_shape = spike.shape
     T = orig_shape[0]
 
-    assert 1 <= window <= T, "window must be in [1, T]"
-    assert overlap < window, "overlap must be smaller than window"
+    _check_window(window, overlap, T)
 
     step = window - overlap
 
@@ -299,8 +310,7 @@ def _kurtosis_numpy(
     orig_shape = spike.shape
     T = orig_shape[0]
 
-    assert 1 <= window <= T, "window must be in [1, T]"
-    assert overlap < window, "overlap must be smaller than window"
+    _check_window(window, overlap, T)
 
     step = window - overlap
 
@@ -347,8 +357,7 @@ def _kurtosis_torch(
     orig_shape = spike.shape
     T = orig_shape[0]
 
-    assert 1 <= window <= T, "window must be in [1, T]"
-    assert overlap < window, "overlap must be smaller than window"
+    _check_window(window, overlap, T)
 
     step = window - overlap
 
@@ -585,7 +594,6 @@ def _isis_population_numpy(spike_data: np.ndarray, dt_ms: float):
     T = spike_data.shape[0]
     flat_data = spike_data.reshape(T, -1)
 
-    # Extract all spike times
     t_idx, n_idx = np.where(flat_data > 0)
 
     # Sort by time only (pool across neurons)
@@ -594,7 +602,6 @@ def _isis_population_numpy(spike_data: np.ndarray, dt_ms: float):
     if len(t_sorted) < 2:
         return np.array(np.nan), {}
 
-    # Compute ISIs from pooled spikes
     isis = np.diff(t_sorted)
     return isis
 
@@ -607,7 +614,6 @@ def _isis_population_torch(spike_data: torch.Tensor, dt_ms: float):
     # Transfer to CPU for ISI extraction
     flat_data = spike_data.cpu().reshape(T, -1)
 
-    # Extract all spike times
     t_idx = torch.nonzero(flat_data, as_tuple=True)[0]
 
     if len(t_idx) < 2:
@@ -616,7 +622,6 @@ def _isis_population_torch(spike_data: torch.Tensor, dt_ms: float):
     # Sort by time only (pool across neurons)
     t_sorted = t_idx.sort().values.float() * dt_ms
 
-    # Compute ISIs from pooled spikes
     isis = torch.diff(t_sorted)
 
     return isis
@@ -672,8 +677,7 @@ def _fano_population_numpy(
     if window is None:
         window = T
 
-    assert 1 <= window <= T, "window must be in [1, T]"
-    assert overlap < window, "overlap must be smaller than window"
+    _check_window(window, overlap, T)
 
     step = window - overlap
 
@@ -713,8 +717,7 @@ def _fano_population_torch(
     if window is None:
         window = T
 
-    assert 1 <= window <= T, "window must be in [1, T]"
-    assert overlap < window, "overlap must be smaller than window"
+    _check_window(window, overlap, T)
 
     step = window - overlap
 
@@ -780,8 +783,7 @@ def _kurtosis_population_numpy(
     if window is None:
         window = T
 
-    assert 1 <= window <= T, "window must be in [1, T]"
-    assert overlap < window, "overlap must be smaller than window"
+    _check_window(window, overlap, T)
 
     step = window - overlap
 
@@ -822,8 +824,7 @@ def _kurtosis_population_torch(
     if window is None:
         window = T
 
-    assert 1 <= window <= T, "window must be in [1, T]"
-    assert overlap < window, "overlap must be smaller than window"
+    _check_window(window, overlap, T)
 
     step = window - overlap
 
@@ -1169,7 +1170,6 @@ def _lv_numpy(
     flat_data = spike_aggregated.reshape(T, -1)
     n_flat = flat_data.shape[1]
 
-    # Extract spike times
     t_idx, n_idx = np.where(flat_data > 0)
 
     # Sort by neuron, then time
@@ -1177,7 +1177,6 @@ def _lv_numpy(
     t_sorted = t_idx[sort_order].astype(np.float64) * dt_ms
     n_sorted = n_idx[sort_order]
 
-    # Compute ISIs
     isis = np.diff(t_sorted)
 
     # Valid consecutive ISI pairs (same neuron for 3 consecutive spikes)
@@ -1202,7 +1201,6 @@ def _lv_numpy(
     # NaN for neurons with insufficient ISI pairs
     lv_values_flat[count_pairs < 1] = np.nan
 
-    # Build stats
     lv_stats = {}
     for i in range(n_flat):
         if count_pairs[i] < 1:
@@ -1242,7 +1240,6 @@ def _lv_torch(
     flat_data = spike_cpu.reshape(T, -1)
     n_flat = flat_data.shape[1]
 
-    # Extract spike times
     t_idx, n_idx = torch.nonzero(flat_data, as_tuple=True)
 
     # Sort by neuron, then time (torch.lexsort doesn't exist,
@@ -1252,7 +1249,6 @@ def _lv_torch(
     t_sorted = t_idx[sort_order].float() * dt_ms
     n_sorted = n_idx[sort_order]
 
-    # Compute ISIs
     isis = torch.diff(t_sorted)
 
     # Valid consecutive ISI pairs (same neuron for 3 consecutive spikes)
@@ -1276,7 +1272,6 @@ def _lv_torch(
 
     lv_values_flat[count_pairs < 1] = float("nan")
 
-    # Build stats
     lv_stats = {}
     for i in range(n_flat):
         if count_pairs[i].item() < 1:
@@ -1341,7 +1336,9 @@ def local_variation(
 # =============================================================================
 
 
-def compute_raster(sp_matrix: np.ndarray, times: np.ndarray):
+def compute_raster(
+    sp_matrix: np.ndarray, times: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
     """Get spike raster plot which displays the spiking activity of a group of
     neurons over time."""
     times = np.asarray(times)
@@ -1414,7 +1411,9 @@ def firing_rate(
         return y.squeeze(1).T.reshape(orig_shape) / dt
 
 
-def compute_spectrum(y, dt, nperseg=None):
+def compute_spectrum(
+    y: np.ndarray, dt: float, nperseg: int | None = None
+) -> tuple[np.ndarray, np.ndarray]:
     from scipy.signal import welch
 
     freqs, Y_mag = welch(y, fs=1 / dt, nperseg=nperseg, axis=0)

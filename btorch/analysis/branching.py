@@ -219,7 +219,6 @@ def branching_ratio(
     all_counts: np.ndarray | list[np.ndarray] | list[list[float]] | str,
     k_max: int = 40,
     *,
-    maxslopes: int | None = None,
     scatterpoints: bool = False,
     eps: float = 1e-12,
     ar1_fallback: bool = True,
@@ -234,7 +233,6 @@ def branching_ratio(
     Args:
         all_counts: One trial, stacked trials, list of trials, or path input.
         k_max: Maximum lag used for the MR fit.
-        maxslopes: Legacy synonym for ``k_max``.
         scatterpoints: Keep centered lagged ``x`` and ``y`` samples in result.
         eps: Small stabilizer for divisions and weights.
         ar1_fallback: Use AR(1) fallback when MR fit is ill-posed.
@@ -249,8 +247,6 @@ def branching_ratio(
     """
     counts_list = input_handler(all_counts)
 
-    if maxslopes is not None:
-        k_max = maxslopes
     k_max = int(max(2, k_max))
 
     shortest = min(len(c) for c in counts_list)
