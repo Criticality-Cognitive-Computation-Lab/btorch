@@ -1,4 +1,34 @@
-"""Helper for importing optional dependencies lazily."""
+"""Policy and helper for optional dependencies.
+
+Every third-party library that is not a core dependency is declared in a
+``btorch[<extra>]`` extra in ``pyproject.toml`` and follows exactly one of two
+patterns:
+
+(a) **Hard requirement** -- the feature cannot work without the library
+    (xarray/zarr serialization, HDF5/YAML/OmegaConf helpers,
+    powerlaw/nolds/fastdtw analysis, plotly plots, Triton GPU timing).
+    Import it lazily with :func:`require`, which raises ``ImportError`` with a
+    ``pip install "btorch[<extra>]"`` hint. Importing btorch itself never
+    needs the library; a module that is *entirely* about the library (e.g.
+    :mod:`btorch.utils.hdf5_utils`) may call :func:`require` at module scope.
+
+(b) **Accelerator with a correct fallback** -- results are identical (up to
+    numerical precision) without the library, only slower
+    (``numba`` in :mod:`btorch.config`, ``polars`` in
+    :func:`btorch.analysis.aggregation.aggregate_by_neuropil`,
+    ``torch_sparse`` in :mod:`btorch.models.linear`). Use a try-import
+    (module scope or lazy), document the fallback where it happens and never
+    produce a silently different result. These libraries are still declared
+    in an extra (``fast``, ``sparse``) so users can opt in.
+
+Mapping of extras: ``io`` (xarray, zarr, numcodecs, h5py, hdf5plugin),
+``config`` (omegaconf, pyyaml), ``analysis`` (powerlaw, nolds, fastdtw),
+``viz`` (networkx, plotly), ``sparse`` (torch_scatter, torch_sparse),
+``fast`` (numba, polars), ``gpu`` (triton) and ``all``. AllenSDK is
+deliberately in no extra: its release pins an ancient numpy/pandas stack that
+the resolver cannot satisfy next to btorch, so install it separately
+(``pip install allensdk``) and keep its guard a plain ``ImportError`` hint.
+"""
 
 import importlib
 from types import ModuleType

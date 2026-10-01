@@ -39,9 +39,17 @@ def agg_by_neuropil(
     agg: AggName = "mean",
     use_polars: bool = False,
 ) -> tuple[dict, dict]:
-    """Aggregate activations by neuropil under a validated aggregation mode."""
+    """Aggregate activations by neuropil under a validated aggregation mode.
+
+    Raises:
+        ValueError: If ``mode="top_innervated"`` and ``neurons`` is None, if
+            ``mode="all_innervated"`` and ``connections`` is None, or if
+            ``mode`` is not one of the two supported values.
+    """
     agg_func = getattr(np, agg) if isinstance(y, np.ndarray) else getattr(torch, agg)
     if use_polars:
+        # polars is an accelerator (``pip install "btorch[fast]"``): without it
+        # the numpy/torch path below gives identical results, only slower.
         try:
             import polars as pl
         except ImportError:
@@ -125,7 +133,12 @@ def agg_conn(
     neuron_type_column: str = "cell_type",
     agg: AggName = "mean",
 ) -> pd.Series:
-    """Aggregate connectivity weights by neuropil or neuron-type pairs."""
+    """Aggregate connectivity weights by neuropil or neuron-type pairs.
+
+    Raises:
+        ValueError: If ``mode="neuron"`` and ``neurons`` is None, or if
+            ``mode`` is not ``"neuropil"`` or ``"neuron"``.
+    """
     if conn_weight is not None:
         conn_weight = conn_weight.tocoo()
         conn = conn.merge(
@@ -194,6 +207,13 @@ def build_group_frame(
             `values`.
         value_name: Name for the output value column.
         dropna: Drop missing values in group/value columns when `True`.
+
+    Raises:
+        ValueError: If ``values`` is 0-d; if ``simple_id_col`` or ``group_by`` is
+            missing from ``neurons_df``; if no neuron metadata remains after
+            dropping missing groups; if ``simple_id_col`` has duplicates, is not
+            numeric, or contains ids outside ``[0, N - 1]``; or if no values
+            remain after dropping missing entries.
     """
     y = _to_numpy(values)
     if y.ndim < 1:

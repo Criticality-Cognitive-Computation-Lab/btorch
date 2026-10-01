@@ -20,7 +20,14 @@ def voltage_overshoot(
     skip_timestep: int | None = None,
     **params: float,
 ) -> np.ndarray | torch.Tensor:
-    """Quantify voltage stability/overshoot in different ways."""
+    """Quantify voltage stability/overshoot in different ways.
+
+    Raises:
+        ValueError: If ``mode`` is not one of ``"std"``, ``"mse_threshold"`` or
+            ``"threshold_resting"``.
+        KeyError: If a required threshold parameter (``V_th``, and ``V_reset``
+            for ``"threshold_resting"``) is missing from ``params``.
+    """
     is_numpy = isinstance(V, np.ndarray)
     V = V.astype(np.float32) if is_numpy else V.to(torch.float32)
 

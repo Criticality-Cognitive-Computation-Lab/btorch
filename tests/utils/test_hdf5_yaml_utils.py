@@ -1,16 +1,23 @@
 """Round-trip tests for the HDF5 and YAML serialization helpers."""
 
 import numpy as np
+import pytest
 
-from btorch.utils.dict_utils import (
+
+# These helpers need the optional io/config extras; skip when absent.
+pytest.importorskip("h5py")
+pytest.importorskip("hdf5plugin")
+pytest.importorskip("yaml")
+
+from btorch.utils.dict_utils import (  # noqa: E402
     flatten_dict,
     recurse_dict,
     reverse_map,
     unflatten_dict,
 )
-from btorch.utils.hdf5_utils import load_dict_from_hdf5, save_dict_to_hdf5
-from btorch.utils.pandas_utils import groupby_to_dict
-from btorch.utils.yaml_utils import load_yaml, save_yaml
+from btorch.utils.hdf5_utils import load_dict_from_hdf5, save_dict_to_hdf5  # noqa: E402
+from btorch.utils.pandas_utils import groupby_to_dict  # noqa: E402
+from btorch.utils.yaml_utils import load_yaml, save_yaml  # noqa: E402
 
 
 def test_hdf5_roundtrip_nested(tmp_path):

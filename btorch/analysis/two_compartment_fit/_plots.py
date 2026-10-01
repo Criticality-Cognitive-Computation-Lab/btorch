@@ -12,7 +12,7 @@ import numpy as np
 
 
 if TYPE_CHECKING:
-    from .two_compartment_fit import FitEvaluation
+    from .evaluation import FitEvaluation
 
 
 def plot_two_compartment_fit(

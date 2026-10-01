@@ -369,85 +369,68 @@ class GLIF3(BaseNode):
             parts.append(base)
         return ", ".join(parts)
 
-    # TODO: headache to define precise input-output shapes
-    # TODO: shape handling not torch.compile friendly
-    def forward_exact_no_spike(
+    def exact_no_spike_at(
         self,
         x: Float[TensorLike, "*#state"] | float,
-        t: float | Float[TensorLike, " n_time"] | None = None,
+        t: Float[TensorLike, "*#state"] | float,
         v0: Float[Tensor, "*state"] | None = None,
         Iasc0: Float[Tensor, "*state {self.n_Iasc}"] | None = None,
-        update_state: bool = False,
-    ) -> tuple[
-        Float[Tensor, " n_time *state"],
-        Float[Tensor, " n_time *state {self.n_Iasc}"],
-    ]:
-        r"""Evaluate the closed-form no-spike trajectory at the given times.
+    ) -> tuple[Float[Tensor, "*state"], Float[Tensor, "*state {self.n_Iasc}"]]:
+        r"""Closed-form no-spike state ``t`` after ``(v0, Iasc0)``, elementwise.
 
         Between spikes the GLIF3 ODEs are linear, so for a constant input
-        :math:`x` they have an exact solution. This evaluates it directly at
-        every requested time (vectorised, not step by step):
+        :math:`x` they have an exact solution:
 
         .. math::
             I_{asc}(t) = I_{asc,0} e^{-k t}
 
         and :math:`v(t)` is the leaky-integrator response to :math:`x` plus the
         contribution of the decaying after-spike currents. Spikes and resets are
-        **not** modelled; use it for the sub-threshold regime.
+        **not** modelled (sub-threshold regime).
 
-        Shape contract (``state`` is the neuron state shape, i.e.
-        ``(*batch, *n_neuron)``; every argument is broadcast against it from the
-        right, exactly like ordinary tensor arithmetic):
+        This is the elementwise primitive: there is **no time axis**. Every
+        argument is broadcast against the others from the right, like ordinary
+        tensor arithmetic, so each batch element and each neuron can have its own
+        ``x``, ``t``, ``v0`` and ``Iasc0`` (and its own parameters). ``state`` below
+        is the broadcast of ``x``, ``t``, ``v0`` and ``Iasc0[..., 0]``:
 
+        * ``x``: constant input current, ``(*#state)`` (a python/0-dim scalar,
+          ``(n_neuron,)``, ``(*batch, n_neuron)``, ...). A per-batch scalar needs
+          an explicit trailing axis, e.g. ``x[..., None]``.
+        * ``t``: elapsed time since ``v0`` / ``Iasc0``, ``(*#state)``, in the same
+          unit as ``dt``.
         * ``v0``: ``(*state)``, defaults to the current ``self.v``.
         * ``Iasc0``: ``(*state, n_Iasc)``, defaults to the current ``self.Iasc``.
-        * ``x``: constant input current, broadcastable to ``(*state)`` (a
-          python/0-dim scalar, ``(n_neuron,)``, or ``(*batch, n_neuron)``). A
-          per-batch scalar needs an explicit trailing axis, e.g. ``x[..., None]``.
-        * ``t``: elapsed time(s) since the initial state in the same unit as
-          ``dt``: a python float / 0-dim tensor (one time point) or a 1-D
-          tensor ``(time,)``. Defaults to a single step ``environ.get("dt")``.
+
+        It is a pure, differentiable function (the module state is only read,
+        and gradients flow to ``t``, ``x``, ``v0`` and ``Iasc0``), which makes it
+        a building block for iterative root finding such as "when does ``v``
+        reach the threshold?". For example one Newton step on ``v(t) - v_th``,
+        with ``dv/dt`` from the model's own ODE (:meth:`dV`):
+
+        >>> v, Iasc = neuron.exact_no_spike_at(x, t, v0, Iasc0)
+        >>> dv_dt, _ = neuron.dV(v, Iasc, x)
+        >>> t = t - (v - neuron.v_threshold) / dv_dt
 
         Args:
             x: Constant input current.
-            t: Elapsed time(s) since ``v0`` / ``Iasc0``.
+            t: Elapsed time since ``v0`` / ``Iasc0``.
             v0: Initial membrane potential.
             Iasc0: Initial after-spike currents.
-            update_state: If True, store the state at the **last** requested
-                time in ``self.v`` / ``self.Iasc`` (the state has no time axis).
-                The module state is never touched otherwise.
 
         Returns:
-            ``(v, Iasc)`` with shapes ``(time, *state)`` and
-            ``(time, *state, n_Iasc)``, where the leading axis indexes ``t``.
+            ``(v, Iasc)`` of shapes ``(*state)`` and ``(*state, n_Iasc)``.
 
         Raises:
-            ValueError: If ``t`` is not a scalar or a 1-D tensor.
+            RuntimeError: If ``x``, ``t``, ``v0`` and ``Iasc0`` do not broadcast
+                (raised by torch).
         """
-        dtype, device = self.v_reset.dtype, self.v_reset.device
-        if t is None:
-            t = environ.get("dt")
-        t = torch.as_tensor(t, dtype=dtype, device=device)
-        if t.ndim == 0:
-            t = t.reshape(1)
-        if t.ndim != 1:
-            raise ValueError(
-                "t must be a scalar or a 1-D tensor of shape (time,), "
-                f"got shape {tuple(t.shape)}"
-            )
+        t = torch.as_tensor(t, dtype=self.v_reset.dtype, device=self.v_reset.device)
+        v0 = self.v if v0 is None else v0
+        Iasc0 = self.Iasc if Iasc0 is None else Iasc0
 
-        x = torch.as_tensor(x, dtype=dtype, device=device)
-        v0 = torch.as_tensor(self.v if v0 is None else v0, dtype=dtype, device=device)
-        Iasc0 = torch.as_tensor(
-            self.Iasc if Iasc0 is None else Iasc0, dtype=dtype, device=device
-        )
-        # Fail early (with a readable message) if the shapes cannot broadcast.
-        state_shape = torch.broadcast_shapes(x.shape, v0.shape, Iasc0.shape[:-1])
-
-        # (time, 1, ..., 1): one singleton axis per state axis.
-        t_b = t.reshape(-1, *([1] * len(state_shape)))
-        exp_m = torch.exp(-t_b / self.tau)  # (time, *state)
-        exp_asc = torch.exp(-t_b[..., None] * self.k)  # (time, *state, n_Iasc)
+        exp_m = torch.exp(-t / self.tau)  # (*state)
+        exp_asc = torch.exp(-t[..., None] * self.k)  # (*state, n_Iasc)
 
         v_inf = self.v_reset + x * self.tau / self.c_m
         Iasc = Iasc0 * exp_asc
@@ -463,12 +446,93 @@ class GLIF3(BaseNode):
         exp_m_asc = exp_m[..., None]
         Iasc_contrib = torch.where(
             degenerate,
-            Iasc_c_m * (t_b[..., None] * exp_m_asc),
+            Iasc_c_m * (t[..., None] * exp_m_asc),
             Iasc_c_m * (exp_asc - exp_m_asc) / safe_gap,
         )
         v = v_inf + (v0 - v_inf) * exp_m + Iasc_contrib.sum(dim=-1)
 
-        if update_state:
-            self.v = v[-1]
-            self.Iasc = Iasc[-1]
+        # ``v`` already has the full broadcast shape; ``Iasc`` only depends on
+        # ``Iasc0`` and ``t``, so expand it to match (a no-op when already full).
+        Iasc = Iasc.expand(*v.shape, Iasc.shape[-1]).contiguous()
         return v, Iasc
+
+    def forward_exact_no_spike(
+        self,
+        x: Float[TensorLike, "*#state"] | float,
+        t: float | Float[TensorLike, " n_time *#state"] | None = None,
+        v0: Float[Tensor, "*state"] | None = None,
+        Iasc0: Float[Tensor, "*state {self.n_Iasc}"] | None = None,
+        t_mode: Literal["homo", "heter"] = "homo",
+    ) -> tuple[
+        Float[Tensor, " n_time *state"],
+        Float[Tensor, " n_time *state {self.n_Iasc}"],
+    ]:
+        r"""Evaluate the closed-form no-spike trajectory at several times.
+
+        The trajectory version of :meth:`exact_no_spike_at` (see there for the
+        maths and the broadcasting rules). The first axis of ``t`` is always the
+        time axis; ``t_mode`` says how the remaining axes are read, so the layout
+        is never guessed from shapes:
+
+        * ``"homo"`` (default): one time grid shared by every batch element and
+          neuron. ``t`` is a python float / 0-dim tensor (one time point) or a
+          1-D tensor ``(n_time,)``; any other shape raises ``ValueError``.
+        * ``"heter"``: the grid may differ per batch element and/or neuron. The
+          axes of ``t`` after the time axis are aligned to the right of ``state``
+          and broadcast against it:
+
+          ========================  ==========================================
+          ``t`` shape               meaning
+          ========================  ==========================================
+          ``(n_time, n_neuron)``    a different time per neuron
+          ``(n_time, batch, 1)``    a different time per batch element
+          ``(n_time, batch, n)``    a different time per batch element and neuron
+          ========================  ==========================================
+
+        If ``t`` carries batch/neuron axes that ``v0`` / ``Iasc0`` / ``x`` lack,
+        the output gains them. ``t`` defaults to a single step
+        ``environ.get("dt")``. For heterogeneous times *without* a time axis (e.g.
+        inside a root finder) call :meth:`exact_no_spike_at` directly.
+
+        This is a pure function: the module state (``self.v`` /
+        ``self.Iasc``) is only read, never written. To continue a simulation
+        from the end of the trajectory, assign the last time point yourself:
+
+        >>> v, Iasc = neuron.forward_exact_no_spike(x, t=t)
+        >>> neuron.v, neuron.Iasc = v[-1], Iasc[-1]
+
+        Args:
+            x: Constant input current.
+            t: Elapsed time(s) since ``v0`` / ``Iasc0``, time axis first.
+            v0: Initial membrane potential.
+            Iasc0: Initial after-spike currents.
+            t_mode: ``"homo"`` for a grid shared by everything, ``"heter"`` for
+                a grid that varies per batch element and/or neuron.
+
+        Returns:
+            ``(v, Iasc)`` with shapes ``(n_time, *state)`` and
+            ``(n_time, *state, n_Iasc)``.
+
+        Raises:
+            ValueError: If ``t_mode`` is unknown, or ``t_mode="homo"`` and ``t``
+                is not a scalar or 1-D.
+            RuntimeError: If ``x``, ``v0``, ``Iasc0`` and the trailing axes of
+                ``t`` do not broadcast (raised by torch).
+        """
+        if t_mode not in ("homo", "heter"):
+            raise ValueError(f"t_mode must be 'homo' or 'heter', got {t_mode!r}")
+        if t is None:
+            t = environ.get("dt")
+        t = torch.as_tensor(t, dtype=self.v_reset.dtype, device=self.v_reset.device)
+        t = t.reshape(1) if t.ndim == 0 else t  # one shared time point
+        if t_mode == "homo" and t.ndim != 1:
+            raise ValueError(
+                f"t_mode='homo' needs a scalar or 1-D t of shape (n_time,), got "
+                f"{tuple(t.shape)}; use t_mode='heter' for per-element times"
+            )
+        v0 = self.v if v0 is None else v0
+        Iasc0 = self.Iasc if Iasc0 is None else Iasc0
+        # Align the trailing axes of ``t`` to the right of the state.
+        state_ndim = max(torch.as_tensor(x).ndim, v0.ndim, Iasc0.ndim - 1, t.ndim - 1)
+        t = t.reshape(t.shape[0], *([1] * (state_ndim - t.ndim + 1)), *t.shape[1:])
+        return self.exact_no_spike_at(x, t, v0, Iasc0)

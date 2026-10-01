@@ -8,7 +8,10 @@ import torch
 from ..statistics import use_percentiles, use_stats
 
 
-# TODO: handle multidim neuron axes and batch axes correctly, it is a mess currently
+# Axis convention shared by the functions below: axis 0 is time and the last axis
+# is neurons. ``batch_axis`` axes (plus time) are aggregated away; all other axes
+# are kept in the output. Multi-dimensional neuron axes get no special handling:
+# every non-aggregated axis is simply preserved.
 
 
 def _torch_dtype(dtype: torch.dtype | np.dtype | None) -> torch.dtype | None:

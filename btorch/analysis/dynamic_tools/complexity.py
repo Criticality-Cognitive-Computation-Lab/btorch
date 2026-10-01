@@ -31,6 +31,9 @@ def compute_ra(spike_initial: torch.Tensor, spike_final: torch.Tensor) -> float:
         float: The Representation Alignment (RA) score.
                Low RA -> Rich Regime (Radical restructuring)
                High RA -> Lazy Regime (Little change in internal structure)
+            Failure return: ``float("nan")`` (with a warning) when either
+            Gram matrix is all zeros (no spikes), so the alignment is
+            undefined.
     """
     if not isinstance(spike_initial, torch.Tensor):
         spike_initial = torch.tensor(spike_initial, dtype=torch.float32)
@@ -62,7 +65,13 @@ def compute_ra(spike_initial: torch.Tensor, spike_final: torch.Tensor) -> float:
     norm_final = torch.norm(g_final, p="fro")
 
     if norm_initial == 0 or norm_final == 0:
-        return 0.0  # Avoid division by zero
+        # Silent activity: alignment is undefined, report NaN (not a fake 0).
+        warnings.warn(
+            "compute_ra: all-zero spike activity, alignment is undefined; "
+            "returning NaN",
+            stacklevel=2,
+        )
+        return float("nan")
 
     ra = numerator / (norm_final * norm_initial)
 
@@ -185,7 +194,12 @@ def compute_lyapunov_exponent(spike_train: torch.Tensor, dt: float = 0.1) -> flo
         dt (float): Time bin size in milliseconds. Default is 0.1 ms.
 
     Returns:
-        float: The maximum Lyapunov exponent.
+        float: The maximum Lyapunov exponent. Failure return: whatever
+            :func:`compute_max_lyapunov_exponent` (``nolds.lyap_r``) yields for
+            a degenerate series; this function adds no NaN sentinel of its own.
+
+    Raises:
+        ValueError: If ``spike_train`` is not 2D.
     """
     if spike_train.ndim != 2:
         raise ValueError(

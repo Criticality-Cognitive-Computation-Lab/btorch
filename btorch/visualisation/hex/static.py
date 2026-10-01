@@ -57,7 +57,6 @@ def _hex_axis_directions(
     Returns:
         Three (dx, dy) direction vectors for q, r, s axes.
     """
-    # Compute natural pixel directions for +q, +r, +s
     q_dir = np.array(
         to_pixel(np.array([1.0]), np.array([0.0]), size=size, orientation=orientation)
     )
@@ -68,7 +67,6 @@ def _hex_axis_directions(
         to_pixel(np.array([-1.0]), np.array([1.0]), size=size, orientation=orientation)
     )
 
-    # Stack as (3, 2) array
     dirs = np.stack([q_dir, r_dir, s_dir], axis=0).squeeze()
 
     if alignment == "edge":
@@ -126,7 +124,6 @@ def draw_axes(
             length_includes_head=True,
             zorder=1000,
         )
-        # Label near arrow tip
         ax.text(
             ox + dx * 1.15,
             oy + dy * 1.15,
@@ -176,10 +173,8 @@ def compass(
     """
     from matplotlib.patches import Circle, FancyBboxPatch
 
-    # Create inset axes
     inset = ax.inset_axes((0, 0, size, size), transform=ax.transAxes)
 
-    # Position based on loc string
     pos_map = {
         "upper left": (0.02, 0.98 - size),
         "upper right": (0.98 - size, 0.98 - size),
@@ -189,13 +184,11 @@ def compass(
     x0, y0 = pos_map.get(loc, pos_map["lower left"])
     inset.set_position((x0, y0, size, size))
 
-    # Set up the coordinate system
     inset.set_xlim(-1.4, 1.4)
     inset.set_ylim(-1.4, 1.4)
     inset.set_aspect("equal")
     inset.axis("off")
 
-    # Draw background box with border
     bbox = FancyBboxPatch(
         (-1.35, -1.35),
         2.7,
@@ -209,7 +202,6 @@ def compass(
     )
     inset.add_patch(bbox)
 
-    # Compute 6 directions
     q_dir = np.array([1.0, 0.0])
     r_dir = np.array([0.5, np.sqrt(3) / 2])
     s_dir = np.array([-0.5, np.sqrt(3) / 2])
@@ -252,7 +244,6 @@ def compass(
             zorder=2,
         )
 
-        # Label
         inset.text(
             lx,
             ly,
@@ -265,7 +256,6 @@ def compass(
             zorder=3,
         )
 
-    # Central circle
     circle = Circle(
         (0, 0), 0.15, facecolor="white", edgecolor="#888888", linewidth=1, zorder=4
     )
@@ -328,17 +318,14 @@ def scatter(
         rotation_deg=rotation_deg,
     )
 
-    # Create figure if needed
     if ax is None:
         fig, ax = plt.subplots(figsize=figsize)
     else:
         fig = ax.figure
 
-    # Normalize values for coloring
     vmin = vmin if vmin is not None else np.nanmin(values)
     vmax = vmax if vmax is not None else np.nanmax(values)
 
-    # Create hexagon patches
     norm = plt.Normalize(vmin=vmin, vmax=vmax)
     cmap_obj = plt.get_cmap(cmap)
 
@@ -366,7 +353,6 @@ def scatter(
         )
         ax.add_patch(hex_patch)
 
-    # Set limits and aspect
     ax.set_aspect("equal")
     ax.set_xlim(x.min() - size, x.max() + size)
     ax.set_ylim(y.min() - size, y.max() + size)
@@ -450,17 +436,14 @@ def quiver(
         dx = tx - x
         dy = ty - y
 
-    # Create figure if needed
     if ax is None:
         fig, ax = plt.subplots(figsize=figsize)
     else:
         fig = ax.figure
 
-    # Calculate magnitudes for coloring
     magnitudes = np.sqrt(dx**2 + dy**2)
     vmin, vmax = np.nanmin(magnitudes), np.nanmax(magnitudes)
 
-    # Plot quiver
     norm = plt.Normalize(vmin=vmin, vmax=vmax)
     cmap_obj = plt.get_cmap(cmap)
     colors = cmap_obj(norm(magnitudes))
@@ -544,13 +527,11 @@ def grid(
     else:
         raise ValueError(f"Unknown coord_format: {coord_format}")
 
-    # Create figure if needed
     if ax is None:
         fig, ax = plt.subplots(figsize=figsize)
     else:
         fig = ax.figure
 
-    # Draw hexagons
     hex_orientation = np.pi / 6 if eff in ("flat", "flywire") else 0
 
     for xi, yi, label in zip(x, y, labels):
@@ -614,11 +595,9 @@ def looming_stimulus(
         >>> looming_stimulus(["0,0"], all_coords, n_time=3)
         [['0,0'], ['0,0', '1,0', '-1,0', '0,2', '0,-2'], [...]]
     """
-    # Parse all coordinates to get grid bounds
     coords = [tuple(map(float, c.split(","))) for c in all_coords]
     x_vals, y_vals = zip(*coords)
 
-    # Build coordinate lookup
     x_sorted = sorted(set(x_vals))
     x_to_rank = {x: i for i, x in enumerate(x_sorted)}
     rank_to_x = {i: x for x, i in x_to_rank.items()}
@@ -627,10 +606,8 @@ def looming_stimulus(
     y_to_rank = {y: i for i, y in enumerate(y_sorted)}
     rank_to_y = {i: y for y, i in y_to_rank.items()}
 
-    # Parse start coordinates
     start = [tuple(map(float, c.split(","))) for c in start_coords]
 
-    # Generate expanding stimulus
     stimulus = [start]
     current = start.copy()
 
@@ -663,16 +640,13 @@ def looming_stimulus(
                         (rank_to_x[x_to_rank[x] - 1], rank_to_y[y_to_rank[y] - 1])
                     )
 
-        # Remove duplicates and store
         current = list(set(next_hexes))
         stimulus.append(current)
 
-    # Format back to strings
     result = []
     for hex_list in stimulus:
         formatted = []
         for x, y in hex_list:
-            # Format to remove .0 for integers
             x_str = str(int(x)) if x == int(x) else str(x)
             y_str = str(int(y)) if y == int(y) else str(y)
             formatted.append(f"{x_str},{y_str}")

@@ -141,6 +141,9 @@ def compute_percentiles(
 
     Returns:
         Dictionary with "levels" and "percentiles" keys
+
+    Raises:
+        ValueError: If any requested percentile is outside ``[0, 100]``.
     """
     # Normalize percentiles to a tuple
     if isinstance(percentiles, (int, float)):
@@ -639,9 +642,10 @@ def use_stats(
     return decorator(func)
 
 
-# TODO: compat with use_stats
-#   the return value may become a scalar e.g. if use_stats(f)(stat="mean"),
-#   need to get the original value from info
+# Note on stacking with use_stats: use_percentiles works on whatever the wrapped
+# callable returns. If it wraps use_stats and ``stat`` is set, that value is the
+# already aggregated scalar (the per-neuron values are only kept in ``info``), so
+# percentiles are then taken over the scalar rather than over neurons.
 @overload
 def use_percentiles(func: Callable[..., Any], /) -> PercentilesDecorated: ...
 

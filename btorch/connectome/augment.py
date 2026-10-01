@@ -64,12 +64,10 @@ def slice_neurons_connections(
     if (simple_id is None) == (root_id is None):
         raise ValueError("Provide exactly one of 'simple_id' or 'root_id'.")
 
-    # 1. Resolve ordered target indices
     if root_id is not None:
         if neurons is None:
             raise ValueError("`neurons` DataFrame required to resolve `root_id`.")
         targets = np.atleast_1d(root_id)
-        # Reorder neurons to match root_id input sequence
         sliced_neurons = neurons.set_index("root_id").loc[targets].reset_index()
         indices = sliced_neurons["simple_id"].values
     else:
@@ -80,7 +78,6 @@ def slice_neurons_connections(
             else None
         )
 
-    # 2. Map original IDs (Only on the sliced subset to save memory)
     if keep_original_ids:
         if (
             sliced_neurons is not None
@@ -88,17 +85,14 @@ def slice_neurons_connections(
         ):
             sliced_neurons["original_simple_id"] = indices
 
-    # 3. Create mapping for 0..N-1 reassignment
-    # pd.Series is more memory efficient than dict for large ID sets
+    # Old id -> new id 0..N-1; a Series is lighter than a dict for large id sets.
     mapper = pd.Series(np.arange(len(indices)), index=indices)
 
     if sliced_neurons is not None:
         sliced_neurons["simple_id"] = mapper.values
 
-    # 4. Filter and remap connections
     sliced_conn = None
     if connections is not None:
-        # Masking on global dataframe avoids premature copies
         pre_in = connections["pre_simple_id"].isin(indices)
         post_in = connections["post_simple_id"].isin(indices)
 
@@ -163,7 +157,6 @@ def sample_by_column_expand_none(
     pd.DataFrame
         Concatenated DataFrame of full group and partial samples.
     """
-    # --- Fully-specified groups ---
     mask_full = df[group_cols].notnull().all(axis=1)
     df_full = df[mask_full]
     df_partial = df[~mask_full]
@@ -179,7 +172,6 @@ def sample_by_column_expand_none(
         else pd.DataFrame(columns=df.columns)
     )
 
-    # --- Partial sampling ---
     sampled_partial = []
 
     if isinstance(j, dict):
@@ -188,7 +180,6 @@ def sample_by_column_expand_none(
             if len(null_rows) == 0:
                 continue
             if product_sample:
-                # Group by other non-null columns (excluding the null one)
                 other_cols = [c for c in group_cols if c != col]
                 grouped = null_rows[
                     null_rows[other_cols].notnull().all(axis=1)

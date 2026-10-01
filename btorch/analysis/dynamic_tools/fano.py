@@ -376,8 +376,14 @@ def fano_operational_time(
             batch_axis: Axes to average across for FF computation.
 
         Returns:
-            fano_op: Operational time Fano factor values.
+            fano_op: Operational time Fano factor values. Failure return: when
+                fewer than 2 windows fit, a NaN array of shape
+                ``spikes.shape[1:]`` (``(1,)`` for 1D input) with a warning
+                and ``info={"n_windows": n}``.
             info: Dictionary with operational time info and computed statistics.
+
+        Raises:
+            ValueError: If ``overlap`` is neither ``None`` nor ``0``.
 
         Example:
             >>> # Compare Fano factors at different rates
@@ -646,8 +652,15 @@ def fano_mean_matching(
             batch_axis: Additional axes to aggregate across.
 
         Returns:
-            fano_mm: Mean-matched Fano factor values.
+            fano_mm: Mean-matched Fano factor values. Failure return: when
+                fewer than 2 windows fit, a NaN array of shape
+                ``spikes.shape[2:]`` (the condition axis is removed;
+                ``(1,)`` for [T, C] input) with a warning and
+                ``info={"n_windows": n}``.
             info: Dictionary with matching info and computed statistics.
+
+        Raises:
+            ValueError: If ``window <= overlap``.
 
         Example:
             >>> # spikes shape: [T, n_conditions, n_neurons]
@@ -921,8 +934,14 @@ def fano_model_based(
         batch_axis: Axes to average across for FF computation.
 
     Returns:
-        fano_model: Model-based Fano factor values.
+        fano_model: Model-based Fano factor values. Failure return: when fewer
+            than 2 windows fit, a NaN array of shape ``spikes.shape[1:]`` with
+            a warning and ``info={"n_windows": n}``.
         info: Dictionary with model fit info and computed statistics.
+
+    Raises:
+        ValueError: If the requested ``model`` or the ``nonlinearity`` in
+            ``model_params`` is unknown.
 
     Example:
         >>> ff_mod, info = fano_model_based(
@@ -1082,8 +1101,15 @@ def fano_compensated(
         **kwargs: Method-specific arguments passed to underlying functions.
 
     Returns:
-        fano: Compensated Fano factor values.
+        fano: Compensated Fano factor values. The failure return (NaN array
+            plus warning when fewer than 2 windows fit) is that of the
+            selected method, see :func:`fano_operational_time`,
+            :func:`fano_mean_matching` and :func:`fano_model_based`.
         info: Dictionary with method info and computed statistics.
+
+    Raises:
+        ValueError: If ``method`` is not one of the supported names, plus
+            whatever the selected method raises.
 
     Example:
         >>> # Operational time method (recommended for rate comparisons)

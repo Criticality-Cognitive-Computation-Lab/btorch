@@ -8,8 +8,11 @@ import os
 from pathlib import Path
 from typing import Any
 
-import h5py
-import hdf5plugin
+from btorch.utils._optional import require
+
+
+h5py = require("h5py", "io", "HDF5 serialization")
+hdf5plugin = require("hdf5plugin", "io", "HDF5 Blosc2 compression")
 
 
 def save_dict_to_hdf5(

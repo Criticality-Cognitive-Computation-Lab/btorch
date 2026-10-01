@@ -4,7 +4,7 @@
 
 ## 模块
 
-### `timeseries.py`
+### `timeseries/` (package)
 脉冲和连续数据的时间序列可视化。
 
 | 函数 | 描述 |

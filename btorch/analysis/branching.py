@@ -76,7 +76,14 @@ def _to_1d_numeric_array(values: np.ndarray | list[float] | list[int]) -> np.nda
 
 
 def input_handler(items: object) -> list[np.ndarray]:
-    """Normalize supported input forms to list-of-trials arrays."""
+    """Normalize supported input forms to list-of-trials arrays.
+
+    Raises:
+        ValueError: If a numpy array is not a 1D/2D numeric array, a list mixes
+            types (it must hold only arrays/lists or only ``.npy`` paths), the
+            input type is not recognized, or a trial is not 1D, is empty or
+            contains non-finite values.
+    """
     if isinstance(items, np.ndarray):
         if items.ndim == 1 and items.dtype.kind in "iuf":
             return [_to_1d_numeric_array(items)]

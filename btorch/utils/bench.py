@@ -11,6 +11,8 @@ from typing import Callable, Literal
 
 import torch
 
+from btorch.utils._optional import require
+
 
 class PerfTimer:
     """Context manager for measuring execution time.
@@ -117,7 +119,8 @@ def do_bench(
             if warmup < 0.0 or rep <= 0.0:
                 raise ValueError("warmup and rep must be positive durations in ms")
 
-        from triton.testing import _summarize_statistics, runtime
+        testing = require("triton.testing", "gpu", "GPU event timing")
+        _summarize_statistics, runtime = testing._summarize_statistics, testing.runtime
 
         di = runtime.driver.active.get_device_interface()
 

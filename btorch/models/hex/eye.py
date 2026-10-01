@@ -59,16 +59,12 @@ class HexEye(nn.Module):
         if mode not in valid_modes:
             raise ValueError(f"mode must be one of {valid_modes}, got {mode}")
 
-        # Neighborhood size for aggregation modes (proportional to ppo)
-        # Use odd kernel size for symmetric neighborhoods
-        self.kernel_size = max(3, ppo // 3) | 1  # Ensure odd
+        # Odd kernel (proportional to ppo) so neighbourhoods are symmetric.
+        self.kernel_size = max(3, ppo // 3) | 1
 
-        # Calculate extent from n_ommatidia
-        # n_ommatidia = 1 + 3*radius*(radius+1)
-        # Solve for radius approximately
+        # Invert n_ommatidia = 1 + 3 * radius * (radius + 1) for the radius.
         self.radius = int((-3 + np.sqrt(12 * n_ommatidia - 3)) / 6)
 
-        # Verify n_ommatidia fills a regular hex grid
         expected = disk_count(self.radius)
         if expected != n_ommatidia:
             raise ValueError(
@@ -90,16 +86,13 @@ class HexEye(nn.Module):
 
         x, y = to_pixel(q, r, size=self.ppo)
 
-        # Calculate hex grid bounds to properly fit within image
         x_min, x_max = x.min(), x.max()
         y_min, y_max = y.min(), y.max()
 
-        # Scale to fit within image with some margin, preserving aspect ratio
         hex_width = x_max - x_min
         hex_height = y_max - y_min
 
-        # Calculate scale to fit hex grid within image dimensions
-        # Leave a small margin (ppo/2) on each side
+        # Fit the grid inside the image, leaving a margin of ppo/2 on each side.
         available_width = self.width_px - self.ppo
         available_height = self.height_px - self.ppo
 
@@ -140,7 +133,6 @@ class HexEye(nn.Module):
             Hexagonal response tensor, shape (..., n_ommatidia)
             or receptor positions (2, n_ommatidia) if stim is None and mode is None.
         """
-        # Return receptor positions if no stimulus provided and mode is None
         if stim is None and self.mode is None:
             return torch.stack(
                 [self.receptor_x.float(), self.receptor_y.float()], dim=0
@@ -167,7 +159,6 @@ class HexEye(nn.Module):
         n_batch = stim_flat.shape[0]
 
         if self.mode == "point":
-            # Fast path: simple indexing at receptor centers
             results = []
             for i in range(n_batch):
                 img = stim_flat[i]
@@ -175,7 +166,6 @@ class HexEye(nn.Module):
                 results.append(samples)
             output = torch.stack(results)
         else:
-            # Aggregation modes: extract neighborhoods and aggregate
             output = self._aggregate_receptor_regions(stim_flat)
 
         return output.view(*batch_shape, self.n_ommatidia)
@@ -198,13 +188,10 @@ class HexEye(nn.Module):
         rx = self.receptor_x.clamp(pad, w + pad - 1)
         ry = self.receptor_y.clamp(pad, h + pad - 1)
 
-        # Extract k×k neighborhoods around each receptor
-        # Use unfold to get sliding windows, then index
         unfolded = padded.unfold(1, k, 1).unfold(2, k, 1)  # (batch, h, w, k, k)
 
         neighborhoods = []
         for i in range(n_batch):
-            # Shift by pad to account for padding
             ny = ry  # y in padded coords
             nx = rx  # x in padded coords
             nhood = unfolded[i, ny - pad, nx - pad]  # (n_ommatidia, k, k)
@@ -313,7 +300,6 @@ class BoxEye(nn.Module):
             Hexagonal response tensor or receptor positions (2, n_ommatidia)
             if stim is None and mode is None.
         """
-        # Return receptor positions if no stimulus provided and mode is None
         if stim is None and self.mode is None:
             return torch.stack(
                 [self.receptor_x.float(), self.receptor_y.float()], dim=0
@@ -340,11 +326,9 @@ class BoxEye(nn.Module):
 
         filtered = self.pool(stim_flat)
 
-        # Sample at hex positions (simplified - just flatten for now)
-        # NOTE: This is a simplified approximation. A proper implementation
-        # would sample at each ommatidium's exact hex position using
-        # receptor_x/receptor_y, but for the box-filter variant this
-        # sequential flattening gives acceptable results.
+        # Approximation: the pooled map is flattened in raster order instead of
+        # being sampled at each ommatidium's exact hex position
+        # (receptor_x/receptor_y); adequate for the box-filter variant.
         output = filtered.view(*batch_shape, -1)[..., : self.n_ommatidia]
 
         return output

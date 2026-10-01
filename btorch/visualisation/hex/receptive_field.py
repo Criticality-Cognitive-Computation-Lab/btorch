@@ -57,7 +57,6 @@ def kernel(
     Returns:
         Figure and axes objects
     """
-    # Convert coordinates to pixel space for annotations
     if coord_format == "axial":
         x, y = to_pixel(c1, c2)
     elif coord_format == "zigzag":
@@ -73,7 +72,6 @@ def kernel(
     else:
         fig = ax.figure
 
-    # Determine value range
     vmin = vmin if vmin is not None else np.nanmin(values)
     vmax = vmax if vmax is not None else np.nanmax(values)
 
@@ -83,7 +81,6 @@ def kernel(
         vmin = midpoint - max_abs
         vmax = midpoint + max_abs
 
-    # Create scatter plot
     scatter(
         c1,
         c2,
@@ -95,7 +92,6 @@ def kernel(
         ax=ax,
     )
 
-    # Add annotations
     if annotate or annotate_coords:
         for xi, yi, vi, qi, ri in zip(x, y, values, c1, c2):
             if annotate:
@@ -171,7 +167,6 @@ def strf(
         )
         ax.set_title(f"t={t:.2f}", fontsize=fontsize)
 
-    # Hide unused axes
     for ax in axes[n_time:]:
         ax.axis("off")
 
@@ -224,7 +219,6 @@ class ReceptiveFieldViewer:
         Returns:
             Figure object
         """
-        # Filter edges
         mask = self.edges["target_type"] == self.target_type
         if source:
             mask = mask & (self.edges["source_type"] == source)
@@ -234,12 +228,10 @@ class ReceptiveFieldViewer:
         if len(filtered) == 0:
             raise ValueError(f"No edges found for {source} -> {self.target_type}")
 
-        # Get coordinates and weights
         c1 = filtered[self.c1_col].to_numpy()
         c2 = filtered[self.c2_col].to_numpy()
         values = filtered[self.weight_col].to_numpy()
 
-        # Limit extent if requested
         if max_extent is not None:
             from ...utils.hex.distance import radius
 

@@ -170,7 +170,6 @@ def plot_multiscale_fano(
         >>> config = FanoFactorConfig(windows=[10, 50, 100])
         >>> fig = plot_multiscale_fano(data=data, config=config)
     """
-    # Resolve dataclass vs plain args
     if data is not None:
         spikes = data.spikes if spikes is None else spikes
         dt = data.dt if dt == 1.0 else dt
@@ -191,7 +190,6 @@ def plot_multiscale_fano(
             format.neuron_indices if neuron_indices is None else neuron_indices
         )
 
-    # Validate
     if spikes is None:
         raise ValueError("spikes is required")
 
@@ -202,13 +200,11 @@ def plot_multiscale_fano(
     if windows is None:
         windows = [int(w) for w in np.logspace(1, np.log10(n_time // 4), 10)]
 
-    # Compute Fano factor for each window
     fano_results = {}
     for w in windows:
         fano_values, info = fano(spikes, window=w, overlap=overlap)
         fano_results[w] = fano_values
 
-    # Create figure based on mode
     if mode == "individual":
         return _plot_fano_individual(
             fano_results, windows, dt, neuron_indices, n_neurons
@@ -280,7 +276,6 @@ def _plot_fano_grouped(
     # Organize data by group first: {group_name: [val_w1, val_w2, ...]}
     group_data = {}
 
-    # Initialize groups from first window to ensure consistency
     first_window_data = fano_results[windows[0]]
     if group_by == "neuron_type":
         grouped_init = agg_by_neuron(
@@ -303,7 +298,6 @@ def _plot_fano_grouped(
         for group_name in grouped_init.keys():
             group_data[group_name] = []
 
-        # Collect data for all windows
         for w in windows:
             fano_arr = fano_results[w]
 
@@ -330,12 +324,10 @@ def _plot_fano_grouped(
                 else:
                     group_data[group_name].append(np.nan)
 
-        # Plot lines for each group
         times = np.array(windows) * dt
         for group_name, values in group_data.items():
             ax.plot(times, values, marker="o", label=group_name)
     else:
-        # Fallback if no groups found
         pass
 
     ax.set_xlabel("Time Window (ms)")
@@ -364,7 +356,6 @@ def _plot_fano_distribution(fano_results, windows, dt):
         showmedians=True,
     )
 
-    # Set x-ticks to show actual time windows
     ax.set_xticks(positions)
     # Format labels: integer if whole number, else 1 decimal
     labels = [f"{w * dt:.1f}" if (w * dt) % 1 else f"{int(w * dt)}" for w in windows]
@@ -425,7 +416,6 @@ def plot_dfa_analysis(
     Example:
         >>> fig = plot_dfa_analysis(spikes, bin_size=10)
     """
-    # Resolve dataclass vs plain args
     if data is not None:
         spikes = data.spikes if spikes is None else spikes
         dt = data.dt if dt == 1.0 else dt
@@ -435,18 +425,15 @@ def plot_dfa_analysis(
         max_window = config.max_window if max_window is None else max_window
         bin_size = config.bin_size
 
-    # Validate
     if spikes is None:
         raise ValueError("spikes is required")
 
     spikes = to_numpy(spikes)
 
-    # Compute DFA
     from ..analysis.dynamic_tools.criticality import compute_dfa
 
     alpha = compute_dfa(spikes, bin_size=bin_size)
 
-    # Create simple plot showing the result
     fig, ax = plt.subplots(1, 1, figsize=(8, 6))
     ax.text(
         0.5,
@@ -521,7 +508,6 @@ def plot_isi_cv(
         >>> fig = plot_isi_cv(spikes, neurons_df=df,
         ...                   mode="grouped", group_by="neuron_type")
     """
-    # Resolve dataclass vs plain args
     if data is not None:
         spikes = data.spikes if spikes is None else spikes
         dt = data.dt if dt == 1.0 else dt
@@ -532,21 +518,17 @@ def plot_isi_cv(
         group_by = format.group_by if group_by is None else group_by
         neuron_type_column = format.neuron_type_column
 
-    # Validate
     if spikes is None:
         raise ValueError("spikes is required")
 
     spikes = to_numpy(spikes)
 
-    # Compute ISI CV
     cv_results = _isi_cv_stats(spikes, dt)
     cv_values = cv_results["cv_isi"]
 
-    # Create figure based on mode
     fig, ax = plt.subplots(1, 1, figsize=(10, 6))
 
     if mode == "distribution" or mode == "individual":
-        # Histogram
         valid_cv = cv_values[~np.isnan(cv_values)]
         ax.hist(valid_cv, bins=30, color="skyblue", edgecolor="black", alpha=0.7)
         ax.axvline(
@@ -565,12 +547,10 @@ def plot_isi_cv(
         if group_by is None or neurons_df is None:
             raise ValueError("group_by and neurons_df required for grouped mode")
 
-        # Group by neuron type
         grouped = agg_by_neuron(
             cv_values, neurons_df, agg="mean", neuron_type_column=neuron_type_column
         )
 
-        # Bar plot
         names = list(grouped.keys())
         values = list(grouped.values())
         ax.bar(names, values, color="teal", alpha=0.7, edgecolor="black")
@@ -620,7 +600,6 @@ def plot_avalanche_analysis(
 
     fig = plt.figure(figsize=(15, 4))
 
-    # 1. Size Distribution P(S)
     ax1 = fig.add_subplot(1, 3, 1)
     if results["fit_S"]:
         results["fit_S"].plot_pdf(color="b", linewidth=2, ax=ax1, label="Data")
@@ -633,7 +612,6 @@ def plot_avalanche_analysis(
     if ax1.get_legend_handles_labels()[0]:
         ax1.legend()
 
-    # 2. Duration Distribution P(T)
     ax2 = fig.add_subplot(1, 3, 2)
     if results["fit_T"]:
         results["fit_T"].plot_pdf(color="r", linewidth=2, ax=ax2, label="Data")
@@ -649,7 +627,6 @@ def plot_avalanche_analysis(
     if ax2.get_legend_handles_labels()[0]:
         ax2.legend()
 
-    # 3. Average Size vs Duration <S>(T)
     ax3 = fig.add_subplot(1, 3, 3)
     if (
         "avg_size_by_duration" in results
@@ -658,7 +635,6 @@ def plot_avalanche_analysis(
         durations, mean_sizes = results["avg_size_by_duration"]
         ax3.loglog(durations, mean_sizes, "ko", markersize=4, label="Data")
 
-        # Plot fit
         if not np.isnan(results["gamma"]):
             if results.get("gamma_stats") and "popt" in results["gamma_stats"]:
                 popt = results["gamma_stats"]["popt"]
@@ -674,7 +650,6 @@ def plot_avalanche_analysis(
                     label=f"Fit (gamma={results['gamma']:.2f})",
                 )
 
-    # Annotate CCC
     if not np.isnan(results["CCC"]):
         txt = f"CCC = {results['CCC']:.2f}\nPred gamma = {results['gamma_pred']:.2f}"
         ax3.text(
@@ -734,7 +709,6 @@ def plot_eigenvalue_spectrum(
     evals = results["eigenvalues"]
     r_spec = results["spectral_radius"]
 
-    # Draw unit circle / spectral radius
     circle = plt.Circle(
         (0, 0),
         r_spec,
@@ -746,10 +720,8 @@ def plot_eigenvalue_spectrum(
     )
     ax.add_artist(circle)
 
-    # Scatter eigenvalues
     ax.scatter(evals.real, evals.imag, s=10, alpha=0.6, c="gray", edgecolors="none")
 
-    # Highlight outliers
     outliers = results["outliers"]
     if len(outliers) > 0:
         ax.scatter(
@@ -808,7 +780,6 @@ def plot_lyapunov_spectrum(
     ax.plot(x, spec, "o-", markersize=4, linewidth=1, color="black")
     ax.axhline(0, color="k", linestyle="--", linewidth=0.8)
 
-    # Calculate Kaplan-Yorke Dim
     ky_dim = compute_kaplan_yorke_dimension(spec)
 
     title = f"Lyapunov Spectrum (D_KY = {ky_dim:.2f})"
@@ -898,12 +869,10 @@ def plot_micro_dynamics(
         >>> fig, stats = plot_micro_dynamics(spikes, dt=1.0)
         >>> print(f"Rate: {stats['fr']['mean']:.1f} Hz, CV: {stats['cv']['mean']:.2f}")
     """
-    # Plot FR
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
     _, fr_stats = plot_firing_rate_distribution(spikes, dt=dt, ax=ax1)
 
-    # Plot CV (Re-implementing simplified version or using plot_isi_cv logic)
     # reusing logic from plot_isi_cv for consistency but without full overhead
     spikes_np = to_numpy(spikes)
     cv_results = _isi_cv_stats(spikes_np, dt)
@@ -954,10 +923,8 @@ def plot_gain_stability(data: tuple) -> tuple[Figure, Axes]:
 
     fig, ax = plt.subplots(figsize=(6, 4))
 
-    # Plot scatter of metrics
     ax.scatter(g_values, lambda_values, label="Data", color="blue", alpha=0.6)
 
-    # Plot fit line
     x_range = np.linspace(min(g_values), max(g_values), 100)
     y_fit = slope * x_range + intercept
     ax.plot(x_range, y_fit, "r--", label=f"Fit: y={slope:.2f}x+{intercept:.2f}")

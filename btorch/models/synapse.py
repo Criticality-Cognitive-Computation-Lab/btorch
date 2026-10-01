@@ -23,7 +23,6 @@ from .ode import exp_euler_step
 class Synapse(Protocol):
     """Minimum Synapse interface."""
 
-    # TODO: rework spikingjelly's synapse abstraction
     n_neuron: tuple[int, ...]
     size: int
     psc: torch.Tensor

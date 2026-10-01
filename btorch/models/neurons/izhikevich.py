@@ -227,7 +227,6 @@ class Izhikevich(BaseNode):
         n_neuron: int | Sequence[int],
         p1: float = 0.04,
         p2: float = 5.0,
-        # TODO: p3: float = 0.0, adjust equation
         v_rest: float = -65.0,
         c_m: float = 1.0,
         v_peak: float = 30.0,
@@ -241,10 +240,12 @@ class Izhikevich(BaseNode):
         ``k/c_m`` equals ``p1``. The linear term enforces
         ``v_threshold = -p2/p1 - v_rest``. Remaining
         keyword arguments are passed directly to :class:`Izhikevich`.
+
+        The constant term ``p3`` of the canonical form is not supported; it is
+        fixed to ``p1 * v_rest * v_threshold`` by the other parameters.
         """
         k = p1 * c_m
         v_threshold = -p2 / p1 - v_rest
-        # i_bias = p3 - p1 * v_rest * v_threshold
 
         return cls(
             n_neuron,
@@ -282,8 +283,8 @@ class Izhikevich(BaseNode):
         self.u = euler_step(self.dU, self.u, self.v, dt=dt)
 
     def neuronal_fire(self):
-        # TODO: confirm scaling with (self.v_threshold - self.v_reset)
-        # or (self.v_peak - self.v_reset)
+        # The surrogate input is normalised by the threshold-to-reset gap and
+        # centred on v_peak, the spike cutoff.
         spike = self.surrogate_function(
             (self.v - self.v_peak) / (self.v_threshold - self.v_reset)
         )

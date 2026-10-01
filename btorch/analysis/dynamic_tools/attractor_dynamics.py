@@ -15,7 +15,9 @@ def compute_kaplan_yorke_dimension(lyapunov_spectrum: np.ndarray) -> float:
     Returns:
         float: The Kaplan-Yorke dimension. Returns 0 if the system is stable
             (all lambda < 0). Returns the number of exponents if the sum of all
-            is positive (unbounded/hyperchaos).
+            is positive (unbounded/hyperchaos). A stable or fully expanding
+            spectrum is a valid result, not a failure; no NaN sentinel is
+            used (an empty spectrum gives 0.0).
     """
     ls = np.sort(lyapunov_spectrum)[::-1]
 
@@ -82,6 +84,10 @@ def compute_structural_eigenvalue_outliers(
             - 'outliers': Eigenvalues outside the spectral radius.
             - 'outlier_count': Number of outliers.
             - 'spectral_radius': The radius used for thresholding.
+            There is no NaN failure return; invalid input raises.
+
+    Raises:
+        ValueError: If ``weight_matrix`` is not square.
     """
     W = np.array(weight_matrix)
     N = W.shape[0]

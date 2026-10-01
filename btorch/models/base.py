@@ -1021,8 +1021,6 @@ class MemoryModule(StepModule, torch.nn.Module):
             self.set_reset_value(k, v, strict=strict)
 
 
-# TODO: pre_spike_v should be merged with v to avoid double memory consumption
-# TODO: ODE integration method should be configurable
 class BaseNode(ParamBufferMixin, MemoryModule):
     """Base class for differentiable spiking neurons.
 
@@ -1043,6 +1041,14 @@ class BaseNode(ParamBufferMixin, MemoryModule):
         backend: Compute backend. Default: "torch".
         device: Tensor device. Default: None.
         dtype: Tensor dtype. Default: None.
+
+    Note:
+        ``v_pre_spike`` is a separate buffer (a clone of ``v`` taken before the
+        reset), so enabling ``pre_spike_v`` roughly doubles the membrane-voltage
+        memory; it is only allocated when requested.  The ODE integrator is not
+        configured on the base class: each subclass picks its own scheme in
+        ``neuronal_charge`` (e.g. :func:`~btorch.models.ode.euler_step` or
+        :func:`~btorch.models.ode.exp_euler_step`).
     """
 
     n_neuron: tuple[int, ...]

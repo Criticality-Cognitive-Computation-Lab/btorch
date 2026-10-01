@@ -4,17 +4,18 @@ from pathlib import Path
 
 import pytest
 
-from btorch.utils.conf import (
+
+omegaconf = pytest.importorskip("omegaconf")
+
+from omegaconf import OmegaConf  # noqa: E402
+
+from btorch.utils.conf import (  # noqa: E402
     diff_conf,
     diff_conf_records,
     get_dotkey,
     load_config,
     to_dotlist,
 )
-
-
-omegaconf = pytest.importorskip("omegaconf")
-from omegaconf import OmegaConf  # noqa: E402
 
 
 @dataclass

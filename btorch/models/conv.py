@@ -59,8 +59,7 @@ class Conv1dSpatial(nn.Conv1d):
             dtype=dtype,
         )
 
-        # interprete row as post-neuron, and col as pre-neuron
-        # coo doesn't support slicing??, have to use csr
+        # Rows are post neurons, columns are pre neurons.
         from ..connectome.connection import make_spatial_localised_conn
 
         conn = make_spatial_localised_conn(
@@ -85,12 +84,7 @@ class Conv1dSpatial(nn.Conv1d):
 
         kernel_size = self.kernel_size[0]  # (n,) -> n
 
-        # Reshape indices to (n_neurons, kernel_size)
         neighbor_indices = self.indices.view(n_neurons, kernel_size)
-
-        # x shape: (..., in_channels, n_neurons)
-        # neighbor_indices shape: (n_neurons, kernel_size)
-        # We want: (..., in_channels, n_neurons, kernel_size)
 
         expanded_shape = x.shape + (
             kernel_size,
@@ -107,11 +101,8 @@ class Conv1dSpatial(nn.Conv1d):
             index=neighbor_indices_expanded,
         )  # Shape: (..., in_channels, n_neurons, kernel_size)
 
-        # self.weight shape: (out_channels, in_channels, kernel_size)
-        # x_neighbors shape: (..., in_channels, n_neurons, kernel_size)
-        # We want: (..., out_channels, n_neurons)
-
-        # Move kernel_size to the end and combine with in_channels
+        # Contract (in_channels, kernel_size) against weight (out_channels,
+        # in_channels, kernel_size) to get (..., out_channels, n_neurons).
         x_reshaped = x_neighbors.permute(*range(len(leading_dims)), -2, -3, -1)
         # Shape: (..., n_neurons, in_channels, kernel_size)
 

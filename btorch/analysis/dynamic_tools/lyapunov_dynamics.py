@@ -20,6 +20,7 @@ def get_continuous_spiking_rate(
 
     Returns:
         Continuous firing rate traces of shape ``(time_steps, n_neurons)``.
+        There is no NaN failure return; NaN/inf in the input propagate.
     """
     if isinstance(spikes, torch.Tensor):
         spikes = spikes.detach().cpu().numpy()
@@ -48,7 +49,8 @@ def compute_max_lyapunov_exponent(
         tau: Time delay. Default 1.
 
     Returns:
-        The estimated largest Lyapunov exponent.
+        The estimated largest Lyapunov exponent. No NaN sentinel is added
+        here; degenerate series give whatever ``nolds.lyap_r`` returns.
     """
     nolds = require("nolds", "analysis", "Lyapunov/entropy estimation")
     lyapunov_exponent = nolds.lyap_r(time_series, emb_dim=emb_dim, lag=lag, tau=tau)
@@ -71,7 +73,8 @@ def compute_lyapunov_exponent_spectrum(
         tau: Time delay. Default 1.
 
     Returns:
-        A list of estimated Lyapunov exponents.
+        A list of estimated Lyapunov exponents. No NaN sentinel is added
+        here; degenerate series give whatever ``nolds.lyap_e`` returns.
     """
     nolds = require("nolds", "analysis", "Lyapunov/entropy estimation")
     lyapunov_spectrum = nolds.lyap_e(
@@ -92,7 +95,8 @@ def compute_ks_entropy(
         lag: Lag between samples. Default 1.
 
     Returns:
-        The estimated KS entropy.
+        The estimated KS entropy. No NaN sentinel is added here; degenerate
+        series give whatever ``nolds.sampen`` returns.
     """
     nolds = require("nolds", "analysis", "Lyapunov/entropy estimation")
     ks_entropy = nolds.sampen(time_series, emb_dim=emb_dim, lag=lag)
@@ -110,7 +114,9 @@ def compute_expansion_to_contraction_ratio(
 
     Returns:
         The ratio of the sum of positive exponents to the absolute sum of
-        negative exponents.
+        negative exponents. ``np.inf`` when there is no negative exponent
+        (pure expansion; for an all-zero spectrum this is also ``inf``). No
+        NaN is returned.
     """
     lyapunov_spectrum = np.array(lyapunov_spectrum)
     positive_sum = np.sum(lyapunov_spectrum[lyapunov_spectrum > 0])

@@ -51,9 +51,11 @@ def _chunk_to_cpu(z, states: dict):
     return to_cpu(z), {k: to_cpu(v) for k, v in states.items()}
 
 
-# TODO: handle multiple output
 class RecurrentNNAbstract(base.MemoryModule):
     """Base class for the time-unrolled recurrent loop.
+
+    ``single_step_forward`` returns one output tensor plus a dict of states per
+    step; models with several output ports should pack them into one tensor.
 
     CUDA-graph acceleration comes in two flavours, one per use case:
 

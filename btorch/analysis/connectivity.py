@@ -39,7 +39,12 @@ def compute_ie_ratio(
     neurons: pd.DataFrame | None = None,
     warn_strict: bool = True,
 ) -> tuple[float, np.ndarray]:
-    """Compute inhibitory/excitatory ratio per neuron and whole-brain mean."""
+    """Compute inhibitory/excitatory ratio per neuron and whole-brain mean.
+
+    Raises:
+        ValueError: If ``excitatory_neuron_only`` is True and ``neurons`` is
+            None.
+    """
     if excitatory_neuron_only:
         if neurons is None:
             raise ValueError("`neurons` must be provided when excitatory_neuron_only")

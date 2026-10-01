@@ -4,7 +4,7 @@ The `btorch.visualisation` module provides plotting functions for neural simulat
 
 ## Modules
 
-### `timeseries.py`
+### `timeseries/` (package)
 Time-series visualization for spike and continuous data.
 
 | Function | Description |

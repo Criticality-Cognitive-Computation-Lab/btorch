@@ -82,7 +82,7 @@ shape of a successful result:
 
 | Success return | Failure return |
 |----------------|----------------|
-| scalar `float` (e.g. `compute_dfa`, `compute_pcist`, `compute_spike_distance`) | `float("nan")` |
+| scalar `float` (e.g. `compute_dfa`, `compute_pcist`, `compute_spike_distance`, `compute_ra`) | `float("nan")` |
 | `(exponent, fit)` pairs (power-law / scaling fits) | `(np.nan, None)` |
 | arrays (e.g. per-neuron CV, per-gain Lyapunov values) | same shape, NaN in the failed entries |
 | dict of results (e.g. `compute_avalanche_statistics`) | same keys, NaN exponents and `None` fit objects |

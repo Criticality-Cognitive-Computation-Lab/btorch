@@ -63,7 +63,6 @@ class HexScatter:
             layout=effective,
         )
 
-        # Create figure
         if ax is None:
             self.fig, self.ax = plt.subplots(figsize=figsize)
         else:
@@ -75,7 +74,6 @@ class HexScatter:
         self.vmax = vmax
         self.interval = interval
 
-        # Initialize scatter
         self._init_plot()
 
     def _init_plot(self) -> None:
@@ -166,7 +164,6 @@ class HexQuiver:
             layout=effective,
         )
 
-        # Create figure
         if ax is None:
             self.fig, self.ax = plt.subplots(figsize=figsize)
         else:
@@ -177,16 +174,13 @@ class HexQuiver:
         self.cwheel = cwheel
         self.interval = interval
 
-        # Initialize quiver
         self._init_plot()
 
     def _init_plot(self) -> None:
         """Initialize the plot."""
-        # Calculate initial flow
         u = self.flow[0, 0] * self.scale
         v = self.flow[0, 1] * self.scale
 
-        # Calculate angles for coloring
         angles = np.arctan2(v, u)
 
         self.quiver = self.ax.quiver(

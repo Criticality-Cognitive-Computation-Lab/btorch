@@ -7,7 +7,10 @@ automatic directory creation.
 import os
 from typing import Any
 
-import yaml
+from btorch.utils._optional import require
+
+
+yaml = require("yaml", "config", "YAML serialization")
 
 
 def save_yaml(obj: Any, folder_or_file: str, filename: "str | None" = None) -> None:

@@ -6,12 +6,11 @@ within the repository structure.
 
 import logging
 import sys
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
 import matplotlib.figure
-
-from btorch.utils import conf
 
 
 logger = logging.getLogger(__name__)
@@ -73,20 +72,25 @@ def caller_file(stack_level: int = 2) -> str:
     return sys._getframe(stack_level).f_code.co_filename
 
 
-def _resolve_cfg(cfg: FigPathConfig | dict | conf.DictConfig | None):
-    """Merge user config with defaults."""
-    defaults = conf.OmegaConf.structured(FigPathConfig)
+def _resolve_cfg(cfg: "FigPathConfig | Mapping | None") -> FigPathConfig:
+    """Merge user config with defaults.
+
+    Accepts a :class:`FigPathConfig`, any mapping (``dict``, OmegaConf
+    ``DictConfig``, ...) with a subset of its fields, or None.
+    """
     if cfg is None:
-        return defaults
+        return FigPathConfig()
     if isinstance(cfg, FigPathConfig):
-        cfg = conf.OmegaConf.structured(cfg)
-    elif isinstance(cfg, dict):
-        cfg = conf.OmegaConf.create(cfg)
-    return conf.OmegaConf.merge(defaults, cfg)
+        return cfg
+    names = {f.name for f in fields(FigPathConfig)}
+    unknown = set(cfg) - names
+    if unknown:
+        raise ValueError(f"Unknown FigPathConfig keys: {sorted(unknown)}")
+    return replace(FigPathConfig(), **{k: cfg[k] for k in cfg})
 
 
 def fig_path(
-    file: str | Path | None = None, cfg: FigPathConfig | dict | None = None
+    file: str | Path | None = None, cfg: FigPathConfig | Mapping | None = None
 ) -> Path:
     """Resolve figure output directory based on caller location.
 
@@ -136,7 +140,7 @@ def save_fig(
     path: Path | None = None,
     *,
     file: str | Path | None = None,
-    cfg: FigPathConfig | dict | None = None,
+    cfg: FigPathConfig | Mapping | None = None,
     suffix: str = "pdf",
     transparent: bool = False,
 ) -> Path:

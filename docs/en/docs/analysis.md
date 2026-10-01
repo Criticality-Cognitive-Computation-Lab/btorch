@@ -132,7 +132,7 @@ Selection and masking utilities.
 
 ---
 
-### `two_compartment_fit.py`
+### `two_compartment_fit/` (package)
 
 Fitting and evaluation helpers for `TwoCompartmentGLIF` against Allen Cell Types
 sweeps. All loss settings are carried by a single `FitLossConfig` dataclass that

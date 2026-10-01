@@ -61,7 +61,26 @@ OPTIONAL_LIBS = {
     ),
 }
 
+# Modules whose whole purpose is one optional library: importing them (not just
+# calling a function) must raise the install hint.
+OPTIONAL_LIBS.update(
+    {
+        "h5py": ("io", "import btorch.utils.hdf5_utils"),
+        "hdf5plugin": ("io", "import btorch.utils.hdf5_utils"),
+        "omegaconf": ("config", "import btorch.utils.conf"),
+        "yaml": ("config", "import btorch.utils.yaml_utils"),
+    }
+)
+
+# Accelerators with a correct fallback: only the import-time property applies.
+OPTIONAL_LIBS.update(
+    {"numba": ("fast", None), "polars": ("fast", None), "triton": ("gpu", None)}
+)
+
 PUBLIC_MODULES = [
+    "btorch.utils",
+    "btorch.utils.file",
+    "btorch.models",
     "btorch",
     "btorch.io",
     "btorch.analysis",
@@ -110,6 +129,18 @@ def test_missing_lib_gives_install_hint(lib):
     assert "pip install" in msg
     assert f"btorch[{extra}]" in msg
     assert lib in msg
+
+
+def test_fig_path_works_without_omegaconf():
+    """``fig_path``/``save_fig`` config handling needs no OmegaConf."""
+    body = """
+    from btorch.utils.file import FigPathConfig, _resolve_cfg
+    cfg = _resolve_cfg({"root_dir": "figx"})
+    assert cfg == FigPathConfig(root_dir="figx")
+    assert _resolve_cfg(None) == FigPathConfig()
+    """
+    res = _run("omegaconf", body)
+    assert res.returncode == 0, res.stderr
 
 
 def test_public_imports_without_any_optional_lib():

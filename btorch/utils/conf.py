@@ -10,8 +10,13 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal, TypeVar, overload
 
-from omegaconf import DictConfig, ListConfig, OmegaConf
+from btorch.utils._optional import require
 
+
+_omegaconf = require("omegaconf", "config", "OmegaConf configuration helpers")
+DictConfig = _omegaconf.DictConfig
+ListConfig = _omegaconf.ListConfig
+OmegaConf = _omegaconf.OmegaConf
 
 ConfigT = TypeVar("ConfigT")
 

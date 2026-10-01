@@ -22,8 +22,11 @@ imported lazily; calling a feature whose library is missing raises an
 
 | Extra | Installs | Enables |
 | --- | --- | --- |
-| *(core)* | torch, numpy, pandas, scipy, h5py, matplotlib, ... | models, connectome tools, static plots |
-| `btorch[io]` | xarray, zarr, numcodecs | `btorch.io.serialization` (xarray/Zarr save and load) |
+| *(core)* | torch, numpy, pandas, scipy, jaxtyping, matplotlib | models, connectome tools, static plots |
+| `btorch[io]` | xarray, zarr, numcodecs, h5py, hdf5plugin | `btorch.io.serialization` (xarray/Zarr save and load), `btorch.utils.hdf5_utils` |
+| `btorch[config]` | omegaconf, pyyaml | `btorch.utils.conf` (OmegaConf helpers), `btorch.utils.yaml_utils` |
+| `btorch[fast]` | numba, polars | optional accelerators (hex grid ops, `use_polars` aggregation); results are identical without them |
+| `btorch[gpu]` | triton | GPU event timing in `btorch.utils.bench.do_bench` |
 | `btorch[analysis]` | powerlaw, nolds, fastdtw | avalanche/DFA criticality, Lyapunov and entropy estimates, DTW trace clustering |
 | `btorch[viz]` | networkx, plotly | interactive hex plots (`btorch.visualisation.hex.interactive`), graph plots |
 | `btorch[sparse]` | torch_scatter, torch_sparse | faster sparse backend (see below; needs PyG wheels) |

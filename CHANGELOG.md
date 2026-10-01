@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `tests/test_pipeline_e2e.py` — end-to-end example test chaining connectome ->
+  sparse conn -> LIF/ExponentialPSC RNN -> spike analysis -> xarray round trip.
 - **CUDA graph capture for RNNs** (`RecurrentNN(cudagraph=True)`) — collapses the
   many small per-step launches of the recurrent time loop into a single graph
   replay, a one-flag speedup for launch-bound inference. Guarded to inference
@@ -27,6 +29,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `btorch.analysis.two_compartment_fit` is now a package (`data`, `loss`,
+  `evaluation`, `report`, `fit`); all previously importable names are unchanged.
+  `compute_ra` returns NaN (with a warning) instead of 0.0 for all-zero spike
+  activity, matching the dynamic_tools failure-return convention. Docstrings of
+  `btorch.io.serialization` and several analysis functions now document `Raises`
+  and failure returns.
+- **Breaking (optional dependencies):** `h5py`, `hdf5plugin`, `omegaconf` and
+  `pyyaml` are no longer core dependencies. `h5py`/`hdf5plugin`
+  (`btorch.utils.hdf5_utils`) moved into `btorch[io]`; `omegaconf`/`pyyaml`
+  (`btorch.utils.conf`, `btorch.utils.yaml_utils`) form the new `btorch[config]`
+  extra. Importing these modules without the library raises an `ImportError` with a
+  `pip install "btorch[...]"` hint; `btorch.utils.file` (`fig_path`, `save_fig`) no
+  longer needs OmegaConf (`cfg` accepts a `FigPathConfig` or any mapping). New
+  extras `fast` (numba, polars) and `gpu` (triton, used by `do_bench(timing_method=
+  "gpu")`) declare the existing silent-fallback accelerators; all are in `all`.
+  The optional-import policy is documented in `btorch.utils._optional`.
 - **Breaking (analysis / utils / io cleanup):**
   - Two-compartment fitting: `fit_two_compartment_model`, `two_compartment_loss`,
     `evaluate_two_compartment_fit` and `evaluate_fit_across_sweeps` no longer take
@@ -175,12 +193,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `FiringRateLoss` now defaults to a valid `loss_type` (`"huber_pinball"`).
 
 ### Fixed
-- **Breaking:** `GLIF3.forward_exact_no_spike(x, t, v0, Iasc0, update_state)` has an explicit
-  shape contract: `t` is a scalar or a 1-D `(n_time,)` tensor (was `dt` with four accepted
-  shape unions), the batch shape comes from the state, outputs are
-  `(n_time, *state[, n_Iasc])`, and the module state is only written when
-  `update_state=True` (it used to be overwritten with the whole time series whenever `v0` and
-  `Iasc0` were omitted). The `tau == 1/k` branch no longer risks NaN gradients.
+- `import btorch` no longer fails when the package is not installed (e.g. imported from a
+  source checkout): `__version__` falls back to `"9999"` (same convention as xarray) instead
+  of raising `PackageNotFoundError`.
+- **`make_hetersynapse_conn` delay expansion** crashed with a length mismatch (or
+  silently shifted delays between connections) whenever `delay_col` was combined
+  with duplicated (pre, post) pairs, `receptor_type_mode="connection"`,
+  `dropna="filter"` or `return_dict=True`. Delays are now applied per edge, so every
+  combination of `delay_col`, receptor mode and `return_dict` works.
+- **Breaking:** `make_hetersynapse_conn(..., receptor_type_col=None, return_dict=True)`
+  ignored `return_dict` and returned a sparse array (contradicting the overload); it
+  now raises `ValueError`, as there are no receptor types to key a dict by.
+- New `GLIF3.exact_no_spike_at(x, t, v0, Iasc0)`: the elementwise closed-form primitive (no time
+  axis; every batch element and neuron may have its own `t`, `x`, `v0`, `Iasc0` and
+  parameters). Pure, differentiable and `torch.compile` friendly, meant for iterative root
+  finding such as the time at which `v` reaches the threshold.
+- **Breaking:** `GLIF3.forward_exact_no_spike(x, t, v0, Iasc0)` has an explicit
+  shape contract: `t` has the time axis first and `t_mode` says how it is read -- `"homo"`
+  (default) a scalar or 1-D `(n_time,)` grid shared by everything, `"heter"` a grid whose
+  trailing axes broadcast against the state so times can differ per batch element and
+  neuron (was `dt` with four accepted shape unions, guessed from shapes), the batch shape comes from the state, outputs are
+  `(n_time, *state[, n_Iasc])`, and it is a pure function: it never writes the module
+  state (it used to overwrite it with the whole time series whenever `v0` and `Iasc0`
+  were omitted). Assign `neuron.v, neuron.Iasc = v[-1], Iasc[-1]` to continue from it. The `tau == 1/k` branch no longer risks NaN gradients.
 
 - `SparseConn`/`SparseConstrainedConn` (native backend) cached a sparse tensor
   at construction whose indices were not in the state dict; after a `.to()` /

@@ -20,17 +20,19 @@ requirements:
     - pandas >=2
     - scipy >=1.10
     - jaxtyping >=0.2.20
-    - h5py
-    - hdf5plugin
-    - pyyaml
-    - omegaconf
     - matplotlib-base >=3.7
-  # Optional extras (pip: btorch[io], btorch[analysis], btorch[viz]); not
+  # Optional extras (pip: btorch[io|config|analysis|viz|fast|allen|gpu]); not
   # installed by default, constrained here so conda keeps compatible versions.
   run_constrained:
     - xarray
     - zarr
     - numcodecs
+    - h5py
+    - hdf5plugin
+    - omegaconf
+    - pyyaml
+    - numba
+    - polars
     - powerlaw
     - nolds !=0.6.3
     - fastdtw

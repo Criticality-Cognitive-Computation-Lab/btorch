@@ -65,7 +65,6 @@ def plot_fi_vi_curve(
     frequencies = results["frequencies"].detach().cpu().numpy()
     voltages = results["voltages"].detach().cpu().numpy()
 
-    # Determine number of subplots
     num_plots = sum([plot_fi, plot_vi])
     if num_plots == 0:
         raise ValueError("At least one of plot_fi or plot_vi must be True.")
@@ -112,12 +111,10 @@ def plot_fi_vi_curve(
         for i in range(num_steps):
             color = cm(i / num_steps)
             offset = i * offset_step
-            # Plot trace with offset
             ax.plot(
                 time, voltages[:, i] + offset, color=color, alpha=0.8, linewidth=1.0
             )
 
-            # Record tick for this trace (centered on its baseline approx)
             # Or just label current values
             if i % (max(1, num_steps // 5)) == 0:  # Sparse labels
                 yticks.append(voltages[0, i] + offset)  # Assuming start at rest
@@ -127,7 +124,6 @@ def plot_fi_vi_curve(
         ax.set_ylabel("Membrane Potential (Offset)")
         ax.set_title("Voltage Traces (Waterfall)")
 
-        # Add a secondary axis or just colorbar
         sm = plt.cm.ScalarMappable(
             cmap=cm, norm=plt.Normalize(vmin=currents.min(), vmax=currents.max())
         )

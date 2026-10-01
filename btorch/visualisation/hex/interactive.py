@@ -332,7 +332,6 @@ def heatmap(
     global_min = min(0, float(df.values.min()))
     global_max = float(df.values.max())
 
-    # Background grid
     bg = dataset.drop_duplicates(subset=["p", "q"])[["p", "q"]].astype(float)
     _, _, _, _, bg_x, bg_y = _resolve_coords(
         bg.p.to_numpy(),
@@ -343,7 +342,6 @@ def heatmap(
         rotation_deg=rotation_deg,
     )
 
-    # Data hexes
     df_c = df.copy()
     dq, dr, dzx, dzy, dx, dy = _resolve_coords(
         df_c.p.to_numpy(),
@@ -640,7 +638,6 @@ def compass(
         ),
     )
 
-    # Base directions (pointy-top)
     q_dir = np.array([1.0, 0.0])
     r_dir = np.array([0.5, np.sqrt(3) / 2])
     s_dir = np.array([-0.5, np.sqrt(3) / 2])
@@ -666,7 +663,6 @@ def compass(
     arrow_len = size * 0.85
     label_offset = size * 1.15
 
-    # Background circle on secondary axes
     fig.add_shape(
         type="circle",
         xref="x2",
@@ -683,7 +679,6 @@ def compass(
     for vec, label, color in directions:
         dx, dy = vec * arrow_len
         lx, ly = vec * label_offset
-        # Arrow shaft
         fig.add_shape(
             type="line",
             xref="x2",
@@ -694,7 +689,6 @@ def compass(
             y1=dy,
             line=dict(color=color, width=1.5),
         )
-        # Arrowhead triangle
         hw = arrow_len * 0.25
         perp = np.array([-vec[1], vec[0]]) * hw
         bx, by = dx, dy
@@ -718,7 +712,6 @@ def compass(
             font=dict(color=label_color, size=8, family="bold"),
         )
 
-    # Central dot
     dot_r = size * 0.12
     fig.add_shape(
         type="circle",
@@ -781,7 +774,6 @@ def grid(
     sz = _merge_sizing(sizing)
     area_w, area_h, *_ = _compute_pixel_dims(sz, dpi)
 
-    # White hex shapes
     shapes = [
         _hex_shape(
             xi,
@@ -795,7 +787,6 @@ def grid(
         for xi, yi in zip(x, y)
     ]
 
-    # Invisible scatter for hover
     customdata = np.stack([x, y], axis=-1)
     scatter = go.Scatter(
         x=x,
@@ -905,7 +896,6 @@ def quiver(
     sz = _merge_sizing(sizing)
     area_w, area_h, f_ticks, f_title = _compute_pixel_dims(sz, dpi)
 
-    # Scatter at hex centres (invisible, for hover)
     scatter = go.Scatter(
         x=x,
         y=y,

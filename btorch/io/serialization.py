@@ -347,6 +347,16 @@ def memories_to_xarray(
     Returns:
         xr.Dataset with all variables, coordinates, and sparse encodings.
 
+    Raises:
+        ValueError: If a ``partial_map`` variable cannot be expanded because no
+            neuron dimensions are defined or the full neuron size is unknown
+            (provide ``hint_field`` or ``neuron_ids``); if a variable's size
+            conflicts with an already registered dimension while
+            ``hint_field`` is given; if ``strict_dims`` is True and a variable
+            has lower rank than the global dimensions; or if ``neuron_ids``
+            cannot fill the neuron dimensions for ``root_id``.
+        ImportError: If ``xarray`` is not installed.
+
     Example:
         >>> memories = {
         ...     "spike": torch.randn(100, 32, 128) > 0,  # (T, B, N)
@@ -641,6 +651,15 @@ def save_memories_to_xarray(
             ``{"time": 100, "neuron": -1}``.
         overwrite: If True, overwrite existing store. If False, raise error
             if store exists.
+
+    Raises:
+        ImportError: If ``zarr`` or ``xarray`` is not installed, or no Blosc
+            codec is available (``numcodecs`` for Zarr v2).
+        ValueError: Propagated from :func:`memories_to_xarray` on inconsistent
+            dimensions or partial-recording arguments.
+        Exception: With ``overwrite=False`` an existing store makes
+            ``xarray.Dataset.to_zarr`` fail (exception type depends on the
+            installed zarr version).
     """
     require("zarr", "io", "Zarr serialization")
     ds = memories_to_xarray(
@@ -716,6 +735,9 @@ def load_memories_from_xarray(
 
     Returns:
         Nested dictionary with restored structure.
+
+    Raises:
+        ImportError: If ``xarray`` or ``zarr`` is not installed.
     """
     xr = require("xarray", "io", "xarray/Zarr serialization")
     require("zarr", "io", "Zarr serialization")

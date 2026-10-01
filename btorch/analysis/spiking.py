@@ -886,7 +886,9 @@ def kurtosis_population(
         return _kurtosis_population_numpy(spikes, window, overlap, fisher)
 
 
-# TODO: dim=1 means stat over neurons, should instead be [1:] to allow multidim
+# Note: ``dim=1`` aggregates ``stat`` over the axis right after the window axis
+# (the neuron axis for [T, N] input). For input with several neuron/batch axes only
+# that first one is reduced; the remaining axes are kept in the result.
 @use_stats(value_key="cv_temporal", dim=1)
 def cv_temporal(
     spikes: np.ndarray | torch.Tensor,
@@ -1082,6 +1084,11 @@ def fano_sweep(
         fano_sweep: Fano factor values for each window size.
             Shape: [n_windows, ...] where n_windows depends on range.
         info: Dictionary with 'window_sizes' array and 'window' spec.
+
+    Raises:
+        ValueError: If ``window`` is not an int or a 2/3-tuple, ``step`` is not
+            positive, ``start`` is below 1, ``stop`` exceeds ``T + 1``, or the
+            range contains no window size.
 
     Examples:
         >>> # Sweep window sizes 1 to 50

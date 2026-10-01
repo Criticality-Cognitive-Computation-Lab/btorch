@@ -15,7 +15,9 @@ def compute_fr_distribution(
         dt: Simulation time step in ms.
 
     Returns:
-        Dictionary with keys ``rates``, ``mean``, ``skew``, ``kurt``.
+        Dictionary with keys ``rates``, ``mean``, ``skew``, ``kurt``. There
+        is no NaN failure path; ``skew``/``kurt`` are NaN when the rate trace
+        is constant (zero variance, as returned by scipy).
     """
     if isinstance(spikes, torch.Tensor):
         spikes = spikes.detach().cpu().numpy()
