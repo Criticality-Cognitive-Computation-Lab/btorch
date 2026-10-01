@@ -365,3 +365,17 @@ def test_plot_firing_rate_distribution():
 
     save_fig(fig, name="firing_rate_distribution")
     plt.close(fig)
+
+
+def test_fano_grouped_rejects_unknown_group_by():
+    """An unsupported ``group_by`` is a ``ValueError``, not a ``NameError``.
+
+    The grouped Fano plot only knows how to aggregate by ``neuron_type`` or
+    ``neuropil``; anything else must fail with a clear message up front.
+    """
+    from btorch.visualisation.dynamics import _plot_fano_grouped
+
+    with pytest.raises(ValueError, match="group_by must be"):
+        _plot_fano_grouped(
+            {10: np.ones(3)}, [10], 1.0, None, None, None, "bogus", "cell_type"
+        )

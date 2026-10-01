@@ -12,7 +12,7 @@ tracked during truncated BPTT.
 """
 
 from collections.abc import Callable, Sequence
-from typing import Any, Literal
+from typing import Any
 
 import torch
 from jaxtyping import Float
@@ -20,7 +20,14 @@ from torch import Tensor
 
 from ...types import TensorLike
 from .. import environ
-from ..base import MemoryModule, ParamBufferMixin, is_broadcastable, normalize_n_neuron
+from ..base import (
+    Backend,
+    MemoryModule,
+    ParamBufferMixin,
+    StepMode,
+    is_broadcastable,
+    normalize_n_neuron,
+)
 from ..surrogate import ATan
 
 
@@ -141,8 +148,8 @@ class TwoCompartmentGLIF(ParamBufferMixin, MemoryModule):
         trainable_param: set[str] | None = None,
         surrogate_function: Callable | None = None,
         detach_reset: bool = False,
-        step_mode: Literal["s", "m"] = "s",
-        backend: Literal["torch"] = "torch",
+        step_mode: StepMode = "s",
+        backend: Backend = "torch",
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):

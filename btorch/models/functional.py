@@ -155,9 +155,17 @@ def _walk_memory_targets(
             continue
         for p in path[:-1]:
             m = getattr(m, p)
-        if target_attr == "_memory_reset_values":
-            # reset values are not attributes; look them up in the registry
+        if target_attr == "_memory_reset_values" and path[-1] in getattr(
+            m, "_memory_reset_values", {}
+        ):
+            # reset values are not attributes; look them up in the registry.
+            # Anything else (a submodule, for {"m.subm": {...}}) is an attribute.
             m_leaf = m._memory_reset_values[path[-1]]
+        elif target_attr == "_memory_reset_values" and not hasattr(m, path[-1]):
+            raise KeyError(
+                f"{name!r} is neither a registered memory nor a submodule; "
+                f"registered: {list(getattr(m, '_memory_reset_values', {}))}"
+            )
         else:
             m_leaf = getattr(m, path[-1])
         if isinstance(m_leaf, nn.Module):
@@ -214,12 +222,12 @@ def _set_memories(
 
 
 def _set_reset_values(
-    mod: nn.Module, hidden_states: dict[str, Any] | None, strict: bool
+    mod: nn.Module, reset_values: dict[str, Any] | None, strict: bool
 ):
     """Write ``_memory_reset_values`` entries through the MemoryModule
     setters."""
     for kind, m, key, v in _walk_memory_targets(
-        mod, "_memory_reset_values", hidden_states, allow_buffer=False
+        mod, "_memory_reset_values", reset_values, allow_buffer=False
     ):
         if kind == "whole":
             m.set_memory_reset_values(v, strict=strict)
@@ -309,21 +317,31 @@ def named_memory_reset_values(
 
 
 def set_memory_reset_values(
-    mod: nn.Module, hidden_states: dict[str, Any], strict: bool = True
+    mod: nn.Module, reset_values: dict[str, Any], strict: bool = True
 ) -> None:
-    """Set memory reset values (_memory_reset_values) in a network from a
-    dotted dict.
+    """Set memory reset values (_memory_reset_values) in a network.
+
+    Network-wide counterpart of :meth:`MemoryModule.set_memory_reset_values`.
+    The method takes a flat ``{memory name: value}`` mapping for one module;
+    this function takes a dotted dict addressing memories anywhere in the
+    tree, in the layout of :func:`named_memory_reset_values`. An entry may also
+    address a whole module with a nested dict, e.g.
+    ``{"neuron": {"v": 0.0}}``. Both default to ``strict=True``.
 
     Args:
         mod: Network module to update.
-        hidden_states: Dotted dictionary of reset values.
-        strict: Passed through to ``set_memory_reset_values()``.
+        reset_values: Dotted dictionary ``{"module.memory": reset value}``
+            (e.g. from :func:`named_memory_reset_values`).
+        strict: If True, a ``ResetValue`` whose ``sizes`` differ from the
+            registered ones raises ``ValueError``. Passed to
+            :meth:`MemoryModule.set_reset_value`.
 
     Example:
-        >>> functional.set_memory_reset_values(model, rv_dict)
+        >>> rv = functional.named_memory_reset_values(model)
+        >>> functional.set_memory_reset_values(model, rv)
     """
 
-    _set_reset_values(mod, hidden_states, strict=strict)
+    _set_reset_values(mod, reset_values, strict=strict)
 
 
 def detach_net(net: nn.Module) -> None:

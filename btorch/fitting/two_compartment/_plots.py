@@ -1,6 +1,6 @@
 """Plotting helpers for two-compartment fit reports.
 
-Re-exported from :mod:`btorch.analysis.two_compartment_fit`.
+Re-exported from :mod:`btorch.fitting.two_compartment`.
 """
 
 from collections.abc import Sequence

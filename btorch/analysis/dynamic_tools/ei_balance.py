@@ -1,11 +1,15 @@
 """E/I balance analysis tools for spiking neural networks."""
 
-from typing import Any
-
 import numpy as np
 import torch
 
-from ..statistics import use_percentiles, use_stats
+from ..statistics import (
+    BatchAxis,
+    MultiStatsResult,
+    StatsResult,
+    use_percentiles,
+    use_stats,
+)
 
 
 # Axis convention shared by the functions below: axis 0 is time and the last axis
@@ -35,9 +39,9 @@ def compute_eci(
     I_i: torch.Tensor | np.ndarray,
     *,
     I_ext: torch.Tensor | np.ndarray | None = None,
-    batch_axis: int | tuple[int, ...] | None = None,
+    batch_axis: BatchAxis = None,
     dtype: torch.dtype | np.dtype | None = None,
-) -> torch.Tensor | np.ndarray:
+) -> StatsResult:
     """Compute Excitatory-Inhibitory Cancellation Index (ECI).
 
     ECI measures the degree of cancellation between excitatory and inhibitory
@@ -141,10 +145,10 @@ def compute_lag_correlation(
     *,
     dt: float = 1.0,
     max_lag_ms: float = 30.0,
-    batch_axis: int | tuple[int, ...] | None = None,
+    batch_axis: BatchAxis = None,
     use_fft: bool = True,
     dtype: torch.dtype | np.dtype | None = None,
-) -> tuple[Any, ...]:
+) -> MultiStatsResult:
     """Compute lagged cross-correlation between two signals.
 
     Uses FFT-based correlation for efficiency. Returns correlation values
@@ -215,7 +219,7 @@ def _compute_lag_correlation(
     *,
     dt: float = 1.0,
     max_lag_ms: float = 30.0,
-    batch_axis: int | tuple[int, ...] | None = None,
+    batch_axis: BatchAxis = None,
     use_fft: bool = True,
     dtype: torch.dtype | np.dtype | None = None,
 ):
@@ -429,9 +433,9 @@ def compute_ei_balance(
     I_ext: torch.Tensor | np.ndarray | None = None,
     dt: float = 1.0,
     max_lag_ms: float = 30.0,
-    batch_axis: int | tuple[int, ...] | None = None,
+    batch_axis: BatchAxis = None,
     dtype: torch.dtype | np.dtype | None = None,
-) -> tuple[Any, ...]:
+) -> MultiStatsResult:
     """Compute E/I balance metrics including ECI and lag correlation.
 
     This function is decorated with `@use_stats` and `@use_percentiles`.

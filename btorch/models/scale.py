@@ -94,7 +94,6 @@ def scale_state_(
         states["psc"] = fn(states["psc"], zero=False)
 
     if "asc_amps" in states:
-        # very annoying to write code for both torch and numpy
         scale = scale if isinstance(scale, Number) else scale[..., None]
         asc_amps = states["asc_amps"]
         if isinstance(asc_amps, Number):

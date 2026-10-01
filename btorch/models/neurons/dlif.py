@@ -15,7 +15,7 @@ from collections.abc import Sequence
 import torch
 from torch import Tensor, nn
 
-from ..base import MemoryModule, normalize_n_neuron
+from ..base import Backend, MemoryModule, StepMode, normalize_n_neuron
 from ..bilinear import SymmetricBilinear
 from ..synapse import BasePSC, DualExponentialPSC
 from .lif import LIF
@@ -66,8 +66,8 @@ class DendriticLIF(MemoryModule):
         bilinear_mask: float | Tensor | None = None,
         soma: LIF | None = None,
         soma_kwargs: dict | None = None,
-        step_mode: str = "s",
-        backend: str = "torch",
+        step_mode: StepMode = "s",
+        backend: Backend = "torch",
     ):
         super().__init__()
 
@@ -175,8 +175,8 @@ class DLIF(DendriticLIF):
         bilinear_mask: float | Tensor | None = None,
         soma: LIF | None = None,
         soma_kwargs: dict | None = None,
-        step_mode: str = "s",
-        backend: str = "torch",
+        step_mode: StepMode = "s",
+        backend: Backend = "torch",
     ):
         super().__init__(
             n_neuron=n_neuron,
@@ -204,8 +204,8 @@ class DBNN(DendriticLIF):
         bilinear_mask: float | Tensor | None = None,
         soma: LIF | None = None,
         soma_kwargs: dict | None = None,
-        step_mode: str = "s",
-        backend: str = "torch",
+        step_mode: StepMode = "s",
+        backend: Backend = "torch",
     ):
         synapse_kwargs = {} if synapse_kwargs is None else dict(synapse_kwargs)
         if issubclass(synapse_cls, DualExponentialPSC):

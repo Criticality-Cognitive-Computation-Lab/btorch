@@ -532,13 +532,13 @@ The visualization layer (`btorch.visualisation.hex`) supports three `coord_forma
 | `"pixel"` | Direct `(x, y)` pixel coords | Plotted as-is |
 
 ```python
-from btorch.visualisation.hex.static import scatter
+from btorch.visualisation.hex import HexGeometry, scatter
 
 # Axial with pointy-top (default)
-scatter(q, r, values, coord_format="axial", orientation="pointy")
+scatter(q, r, values, coord_format="axial", geometry=HexGeometry(orientation="pointy"))
 
 # Axial with flat-top
-scatter(q, r, values, coord_format="axial", orientation="flat")
+scatter(q, r, values, coord_format="axial", geometry=HexGeometry(orientation="flat"))
 
 # Zigzag (creates clean vertical columns with alternating x)
 scatter(q, r, values, coord_format="zigzag")

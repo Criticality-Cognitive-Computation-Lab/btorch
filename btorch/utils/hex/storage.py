@@ -55,12 +55,10 @@ def _align_numpy(
     fill: float,
 ) -> np.ndarray:
     """NumPy implementation of alignment."""
-    # Create lookup from (q, r) to index
     source_lookup = {
         (int(q), int(r)): i for i, (q, r) in enumerate(zip(q_source, r_source))
     }
 
-    # Build result array
     result_shape = values.shape[:-1] + (len(q_target),)
 
     # Handle fill=nan with integer dtype: promote to float
@@ -91,12 +89,10 @@ def _align_numba(
     n_target = len(q_target)
     n_source = len(q_source)
 
-    # Build hash map from source coordinates to indices
     coord_to_idx = {}
     for i in range(n_source):
         coord_to_idx[(int(q_source[i]), int(r_source[i]))] = i
 
-    # Allocate output
     result_shape = values.shape[:-1] + (n_target,)
     result = np.full(result_shape, fill, dtype=values.dtype)
 
@@ -131,17 +127,13 @@ def permute(radius: int, n_rot: int) -> np.ndarray:
     from .coords import spiral
     from .transform import rotate
 
-    # Get spiral-ordered coordinates
     q, r = spiral(radius)
 
-    # Rotate coordinates
     qr, rr = rotate(q, r, n_rot)
 
     # Find permutation: for each target, find source index
-    # Create lookup
     coord_to_idx = {(int(q[i]), int(r[i])): i for i in range(len(q))}
 
-    # Build permutation
     perm = np.zeros(len(q), dtype=np.int64)
     for i, (qt, rt) in enumerate(zip(qr, rr)):
         key = (int(qt), int(rt))
@@ -167,13 +159,10 @@ def reflect_index(radius: int, axis: Literal["q", "r", "s"]) -> np.ndarray:
     from .coords import spiral
     from .transform import reflect
 
-    # Get spiral-ordered coordinates
     q, r = spiral(radius)
 
-    # Reflect coordinates
     qr, rr = reflect(q, r, axis)
 
-    # Find permutation
     coord_to_idx = {(int(q[i]), int(r[i])): i for i in range(len(q))}
 
     perm = np.zeros(len(q), dtype=np.int64)

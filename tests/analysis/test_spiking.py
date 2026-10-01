@@ -18,6 +18,7 @@ from btorch.analysis.spiking import (
     fano_temporal,
     firing_rate,
     isi_cv,
+    isi_cv_population,
     kurtosis,
     kurtosis_population,
     local_variation,
@@ -1046,3 +1047,76 @@ class TestFanoTemporal:
                 # Verify window info
                 assert info["window"] == window
                 assert info["step"] == step
+
+
+# =============================================================================
+# Population ISI CV (pooled across neurons)
+# =============================================================================
+
+
+def _population_train(backend: str):
+    """Three neurons, spikes at t = 2, 5 and 9 (pooled ISIs are [3, 4])."""
+    spikes = np.zeros((12, 3))
+    spikes[2, 0] = 1
+    spikes[5, 1] = 1
+    spikes[9, 2] = 1
+    return torch.from_numpy(spikes) if backend == "torch" else spikes
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+class TestISICVPopulation:
+    """``isi_cv_population`` returns a scalar CV by default.
+
+    The pooled-ISI helpers return one consistent type (an ISI array, empty if
+    there are fewer than two spikes), so the ``stat`` aggregates, including the
+    degenerate case, are well defined.
+    """
+
+    def test_default_returns_scalar_cv_of_pooled_isis(self, backend):
+        spikes = _population_train(backend)
+        cv, info = isi_cv_population(spikes)
+        # The reducer follows the backend convention (NumPy ddof=0, torch
+        # ddof=1), so compare against the same convention.
+        isis = np.array([3.0, 4.0])
+        ddof = 1 if backend == "torch" else 0
+        expected = isis.std(ddof=ddof) / (isis.mean() + 1e-10)
+        assert np.ndim(cv) == 0
+        assert float(cv) == pytest.approx(expected, rel=1e-5)
+        np.testing.assert_allclose(np.asarray(info["isi_population"]), isis)
+        assert info["isi_population_cv"] == pytest.approx(float(cv))
+
+    def test_stat_none_returns_pooled_isis_in_time_units(self, backend):
+        spikes = _population_train(backend)
+        isis, info = isi_cv_population(spikes, dt=0.5, stat=None)
+        np.testing.assert_allclose(np.asarray(isis), [1.5, 2.0])
+        assert info == {}
+
+    def test_other_stat_aggregates_the_isis(self, backend):
+        spikes = _population_train(backend)
+        mean, _ = isi_cv_population(spikes, stat="mean")
+        assert float(mean) == pytest.approx(3.5)
+
+    @pytest.mark.parametrize("n_spikes", [0, 1])
+    def test_fewer_than_two_spikes_gives_nan_without_warning(
+        self, backend, n_spikes, recwarn
+    ):
+        spikes = np.zeros((10, 4))
+        spikes[:n_spikes, 0] = 1
+        if backend == "torch":
+            spikes = torch.from_numpy(spikes)
+
+        cv, info = isi_cv_population(spikes)
+        assert np.isnan(float(cv))
+        assert np.asarray(info["isi_population"]).size == 0
+        # Raw ISIs are an (empty) array, never a ``(nan, {})`` sentinel tuple.
+        isis, _ = isi_cv_population(spikes, stat=None)
+        assert np.asarray(isis).shape == (0,)
+        assert not [w for w in recwarn if issubclass(w.category, RuntimeWarning)]
+
+    def test_spike_order_of_neurons_does_not_matter(self, backend):
+        """Pooling sorts by time only: permuting neurons keeps the ISIs."""
+        spikes = _population_train(backend)
+        permuted = spikes[:, [2, 0, 1]]
+        a, _ = isi_cv_population(spikes, stat=None)
+        b, _ = isi_cv_population(permuted, stat=None)
+        np.testing.assert_allclose(np.asarray(a), np.asarray(b))

@@ -58,9 +58,9 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from btorch.models import environ
-from btorch.models.base import MemoryModule, ParamBufferMixin, normalize_n_neuron
-from btorch.models.linear import LearnableScale
+from . import environ
+from .base import MemoryModule, ParamBufferMixin, normalize_n_neuron
+from .linear import LearnableScale
 
 
 def _unflatten_td(seq: Tensor, rest_shape: Sequence[int]) -> Tensor:

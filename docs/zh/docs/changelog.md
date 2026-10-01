@@ -7,6 +7,24 @@ btorch 的所有重要变更都将记录在此文件中。
 
 ## [Unreleased]
 
+### 变更
+- **破坏性变更：** `memories_to_xarray` / `save_memories_to_xarray` 的选项归入 `DimLayout`、`SparseOptions` 与 `ZarrStoreOptions`（`btorch.io`）；`neuron_ids` 与 `partial_map` 变为仅关键字参数。
+- **破坏性变更：** 在第 `t` 步送达的脉冲现在会影响第 `t` 步返回的 PSC，所有 PSC 类型一致（此前 `AlphaPSC`、`AlphaPSCBilleh`、`DualExponentialPSC` 多花一个 `dt`）。
+- **破坏性变更：** `GLIF3.forward_exact_no_spike(x, t=None, v0=None, Iasc0=None, t_mode="homo")` 现为纯函数（不再更新状态）；逐元素原语 `exact_no_spike_at(x, t, v0, Iasc0)` 支持批量的异质时间与状态，例如用于迭代求根。`t_mode="heter"` 表示逐元素时间。
+- **破坏性变更：** 绘图与拟合选项归入数据类（`TbpttConfig`、`GlobalSearchConfig`、`StagedConfig`、`FitLossConfig`、raster 选项），见[分析](analysis.md)与[可视化](visualisation.md)页面。
+- **破坏性变更：** 六边形 `scatter` / `quiver` 使用 `HexGeometry`、`HexColorMap`、`HexPatchStyle`、`HexReference`；`plot_grouped_spectrum` 使用 `SpectrumGrouping` 与 `SpectrumStyle`。`quiver` 现在会遵循 `rotation_deg` 与颜色范围。
+- **破坏性变更：** 包布局按层次调整。`btorch.datasets.noise` -> `btorch.models.noise`；`btorch.datasets.transforms` -> `btorch.utils.hex.augment`；`btorch.analysis.two_compartment_fit` -> `btorch.fitting.two_compartment`，`btorch.analysis.tuning` -> `btorch.fitting.tuning`（拟合相关名称不再从 `btorch.analysis` 重新导出）。`btorch.datasets` 包已移除。
+- 分析函数命名规则：估计器/流水线统一为 `compute_*`。重命名：`branching_ratio` -> `compute_branching_ratio`，`get_slopes` -> `compute_lagged_slopes`，`get_continuous_spiking_rate` -> `compute_continuous_spiking_rate`，`voltage_overshoot` -> `compute_voltage_overshoot`。
+- 移除 `plot_group_violin`、`plot_group_box`、`plot_group_ecdf`；请使用 `plot_group_distribution(..., kind="violin" | "box" | "ecdf")`。
+- 较重的依赖现为可选扩展（`io`、`config`、`fast`、`gpu`、`analysis`、`viz`、`sparse`、`examples`、`all`），见[安装](installation.md)。
+- `fano_population` / `kurtosis_population` 标注为 `StatsResult`；多输出的装饰器分析函数（`compute_lag_correlation`、E/I 平衡）标注为 `MultiStatsResult`（新增，位于 `btorch.analysis.statistics`）。
+- `make_hetersynapse_constraint` 在同一处构造约束键；结果不变。
+
+### 修复
+- `make_hetersynapse_conn` 的延迟处理。
+- `plot_multiscale_fano` 使用不支持的 `group_by` 时现抛出 `ValueError`，而非 `NameError`。
+- 幂律缩放拟合在输入为常数时 `r_squared` 返回 `NaN`，不再除以零。
+
 ## [0.1.0]
 
 ### 新增

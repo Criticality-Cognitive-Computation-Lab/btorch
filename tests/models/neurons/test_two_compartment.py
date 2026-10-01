@@ -1,9 +1,11 @@
 import matplotlib.pyplot as plt
 import torch
 
-from btorch.analysis.two_compartment_fit import (
+from btorch.fitting.two_compartment import (
     AllenSweepBatch,
     FitLossConfig,
+    GlobalSearchConfig,
+    TbpttConfig,
     evaluate_fit_across_sweeps,
     exponential_filter_spike_train,
     fit_two_compartment_model,
@@ -219,9 +221,7 @@ def test_tbptt_fit_loop_runs_on_synthetic_sweep():
         model,
         [sweep],
         method="tbptt",
-        lr=1e-3,
-        epochs=1,
-        chunk_size=5,
+        tbptt=TbpttConfig(lr=1e-3, epochs=1, chunk_size=5),
     )
 
     assert len(history) == 4
@@ -285,11 +285,13 @@ def test_global_fit_improves_tau_s_from_poor_initialization():
         fit_model,
         [sweep],
         method="global",
-        global_maxiter=4,
-        global_popsize=4,
-        local_maxiter=15,
-        param_bounds={"tau_s": (1.0, 60.0)},
-        seed=0,
+        search=GlobalSearchConfig(
+            maxiter=4,
+            popsize=4,
+            local_maxiter=15,
+            param_bounds={"tau_s": (1.0, 60.0)},
+            seed=0,
+        ),
     )
 
     fitted_tau_s = float(fit_model.tau_s.detach().cpu())
@@ -383,10 +385,7 @@ def test_staged_fit_runs_with_mixed_sweeps():
         fit_model,
         sweeps,
         method="staged",
-        global_maxiter=2,
-        global_popsize=3,
-        local_maxiter=5,
-        seed=0,
+        search=GlobalSearchConfig(maxiter=2, popsize=3, local_maxiter=5, seed=0),
     )
 
     assert history

@@ -13,7 +13,7 @@ and c_m is membrane capacitance.
 """
 
 from collections.abc import Callable, Sequence
-from typing import Any, Literal
+from typing import Any
 
 import torch
 from jaxtyping import Float
@@ -21,7 +21,7 @@ from torch import Tensor
 
 from ...types import TensorLike
 from .. import environ
-from ..base import BaseNode
+from ..base import Backend, BaseNode, StepMode
 from ..ode import euler_step
 
 
@@ -93,8 +93,8 @@ class LIF(BaseNode):
         detach_reset: bool = False,
         hard_reset: bool = False,
         pre_spike_v: bool = False,
-        step_mode: Literal["s"] = "s",
-        backend: Literal["torch"] = "torch",
+        step_mode: StepMode = "s",
+        backend: Backend = "torch",
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ):

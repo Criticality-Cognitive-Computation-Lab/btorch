@@ -72,3 +72,12 @@ def test_sparse_input_rejects_connection_receptor_mode():
         make_hetersynapse_conn(
             pd.DataFrame({"simple_id": [0, 1]}), mat, receptor_type_mode="connection"
         )
+
+
+def test_dataframe_subset_without_simple_id_is_mapped(neurons):
+    """A subset DataFrame holding only ``root_id`` gets ``simple_id`` looked up
+    from the neuron table."""
+    out = neuron_subset_to_conn_mat(
+        pd.DataFrame({"root_id": [2000, 3000]}), "root_id", 3, neurons=neurons
+    )
+    np.testing.assert_array_equal(out, [1, 2])

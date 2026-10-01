@@ -13,6 +13,7 @@ from btorch.models import environ, functional
 
 from .data import AllenSweepBatch, SweepKind
 from .evaluation import (
+    TwoCompartmentModel,
     _prepare_sweep,
     evaluate_fit_across_sweeps,
     rollout_two_compartment,
@@ -35,6 +36,60 @@ class TwoCompartmentFitStage:
     spike_count_over_weight: float = 1.0
     spike_count_under_weight: float = 1.0
     param_bounds: dict[str, tuple[float, float]] | None = None
+
+
+@dataclass(frozen=True)
+class TbpttConfig:
+    """Options of the truncated-BPTT back-end
+    (``method="tbptt"``/``"hybrid"``).
+
+    Args:
+        lr: Adam learning rate.
+        epochs: Passes over the sweeps.
+        chunk_size: Truncated-BPTT chunk length in time steps; the hidden
+            state carries over between chunks while the graph is detached.
+    """
+
+    lr: float = 1e-3
+    epochs: int = 10
+    chunk_size: int = 500
+
+
+@dataclass(frozen=True)
+class GlobalSearchConfig:
+    """Options of the bounded global search (``"global"``, ``"hybrid"`` and
+    every stage of ``"staged"``).
+
+    Args:
+        param_bounds: Per-parameter ``(low, high)`` overrides; unspecified
+            parameters use ``DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS``.
+        maxiter: Differential-evolution outer iterations.
+        popsize: Differential-evolution population size multiplier.
+        local_maxiter: Maximum L-BFGS-B iterations of the polish step.
+        seed: Random seed (``None`` for non-deterministic); staged fits add
+            the stage index to it.
+        polish: Run L-BFGS-B after the global search.
+    """
+
+    param_bounds: dict[str, tuple[float, float]] | None = None
+    maxiter: int = 20
+    popsize: int = 8
+    local_maxiter: int = 50
+    seed: int | None = 0
+    polish: bool = True
+
+
+@dataclass(frozen=True)
+class StagedConfig:
+    """Options of the staged back-end (``method="staged"``).
+
+    Args:
+        stages: Stage definitions; ``None`` uses
+            ``DEFAULT_TWO_COMPARTMENT_FIT_STAGES``. Each stage is searched
+            with the :class:`GlobalSearchConfig` passed alongside.
+    """
+
+    stages: Sequence[TwoCompartmentFitStage] | None = None
 
 
 DEFAULT_TWO_COMPARTMENT_FIT_STAGES: tuple[TwoCompartmentFitStage, ...] = (
@@ -165,7 +220,7 @@ DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS: dict[str, tuple[float, float]] = {
 
 
 def _fit_sweeps_once(
-    model,
+    model: TwoCompartmentModel,
     sweeps: Iterable[AllenSweepBatch],
     *,
     device: str | torch.device | None = None,
@@ -192,7 +247,7 @@ def _fit_sweeps_once(
                     v_true=v_true,
                     spike_true=spike_true,
                     dt=sweep.dt,
-                    w_Ca=getattr(model, "w_Ca", None),
+                    w_Ca=model.w_Ca,
                     loss=loss,
                 )
             rows.append(_loss_floats(losses))
@@ -204,7 +259,7 @@ def _fit_sweeps_once(
 
 
 def _pack_trainable_parameters(
-    model,
+    model: TwoCompartmentModel,
 ) -> tuple[np.ndarray, list[_ParameterSlice]]:
     """Pack trainable model parameters into a flat numpy vector."""
     vector_parts: list[np.ndarray] = []
@@ -444,12 +499,10 @@ def _stage_objective_score(metrics: dict[str, float]) -> tuple[float, float, flo
 
 
 def _fit_two_compartment_model_tbptt(
-    model,
+    model: TwoCompartmentModel,
     sweeps: Iterable[AllenSweepBatch],
     *,
-    lr: float = 1e-3,
-    epochs: int = 10,
-    chunk_size: int = 500,
+    config: TbpttConfig,
     device: str | torch.device | None = None,
     dtype: torch.dtype = torch.float32,
     loss: FitLossConfig,
@@ -458,14 +511,14 @@ def _fit_two_compartment_model_tbptt(
 
     Notes:
         Each sweep is reset once at the beginning, then processed in
-        ``chunk_size`` timesteps. ``functional.detach_net`` is called between
+        ``config.chunk_size`` timesteps. ``functional.detach_net`` is called between
         chunks so the hidden state carries over while the graph stays bounded.
     """
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
     history: list[dict[str, float]] = []
     initialized = False
 
-    for epoch in range(epochs):
+    for epoch in range(config.epochs):
         for sweep in sweeps:
             i_soma, v_true, spike_true, i_apical = _prepare_sweep(
                 model,
@@ -478,10 +531,10 @@ def _fit_two_compartment_model_tbptt(
             optimizer.zero_grad()
 
             with environ.context(dt=float(sweep.dt)):
-                for start in range(0, i_soma.shape[0], chunk_size):
+                for start in range(0, i_soma.shape[0], config.chunk_size):
                     if start > 0:
                         functional.detach_net(model)
-                    stop = min(start + chunk_size, i_soma.shape[0])
+                    stop = min(start + config.chunk_size, i_soma.shape[0])
 
                     rollout = rollout_two_compartment(
                         model,
@@ -494,7 +547,7 @@ def _fit_two_compartment_model_tbptt(
                         v_true=v_true[start:stop],
                         spike_true=spike_true[start:stop],
                         dt=sweep.dt,
-                        w_Ca=getattr(model, "w_Ca", None),
+                        w_Ca=model.w_Ca,
                         loss=loss,
                     )
                     losses["total"].backward()
@@ -515,28 +568,23 @@ def _fit_two_compartment_model_tbptt(
 
 
 def _fit_two_compartment_model_global(
-    model,
+    model: TwoCompartmentModel,
     sweeps: Iterable[AllenSweepBatch],
     *,
+    config: GlobalSearchConfig,
     device: str | torch.device | None = None,
     dtype: torch.dtype = torch.float32,
     loss: FitLossConfig,
-    param_bounds: dict[str, tuple[float, float]] | None = None,
-    global_maxiter: int = 20,
-    global_popsize: int = 8,
-    local_maxiter: int = 50,
-    seed: int | None = 0,
-    polish: bool = True,
 ) -> list[dict[str, float | str]]:
     """Fit with bounded global search and optional local L-BFGS-B polish."""
     # Resolve through the package namespace at call time so that
-    # ``btorch.analysis.two_compartment_fit._fit_sweeps_once`` can be
+    # ``btorch.fitting.two_compartment._fit_sweeps_once`` can be
     # monkeypatched (the characterization tests spy on it).
     from . import _fit_sweeps_once  # noqa: PLC0415
 
     sweep_list = list(sweeps)
     x0, slices = _pack_trainable_parameters(model)
-    bounds = _build_parameter_bounds(model, slices, param_bounds=param_bounds)
+    bounds = _build_parameter_bounds(model, slices, param_bounds=config.param_bounds)
     history: list[dict[str, float | str]] = []
 
     def objective(x: np.ndarray) -> float:
@@ -553,9 +601,9 @@ def _fit_two_compartment_model_global(
     global_result = optimize.differential_evolution(
         objective,
         bounds=bounds,
-        maxiter=global_maxiter,
-        popsize=global_popsize,
-        seed=seed,
+        maxiter=config.maxiter,
+        popsize=config.popsize,
+        seed=config.seed,
         polish=False,
         updating="deferred",
     )
@@ -583,7 +631,7 @@ def _fit_two_compartment_model_global(
         }
     )
 
-    if not polish:
+    if not config.polish:
         return history
 
     local_result = optimize.minimize(
@@ -591,7 +639,7 @@ def _fit_two_compartment_model_global(
         global_result.x,
         method="L-BFGS-B",
         bounds=bounds,
-        options={"maxiter": int(local_maxiter)},
+        options={"maxiter": int(config.local_maxiter)},
     )
     _set_trainable_parameters(model, local_result.x, slices)
     metrics = _fit_sweeps_once(
@@ -620,19 +668,14 @@ def _fit_two_compartment_model_global(
 
 
 def _fit_two_compartment_model_staged(
-    model,
+    model: TwoCompartmentModel,
     sweeps: Iterable[AllenSweepBatch],
     *,
+    config: StagedConfig,
+    search: GlobalSearchConfig,
     device: str | torch.device | None = None,
     dtype: torch.dtype = torch.float32,
     loss: FitLossConfig,
-    param_bounds: dict[str, tuple[float, float]] | None = None,
-    global_maxiter: int = 20,
-    global_popsize: int = 8,
-    local_maxiter: int = 50,
-    seed: int | None = 0,
-    polish: bool = True,
-    stages: Sequence[TwoCompartmentFitStage] | None = None,
 ) -> list[dict[str, float | str]]:
     """Fit the model in identifiable stages with bounded search."""
     sweep_list = list(sweeps)
@@ -640,7 +683,9 @@ def _fit_two_compartment_model_staged(
         raise ValueError("At least one sweep is required for fitting.")
 
     active_stages = (
-        tuple(stages) if stages is not None else DEFAULT_TWO_COMPARTMENT_FIT_STAGES
+        tuple(config.stages)
+        if config.stages is not None
+        else DEFAULT_TWO_COMPARTMENT_FIT_STAGES
     )
     original_trainable = _original_trainable_parameter_names(model)
     history: list[dict[str, float | str]] = []
@@ -659,7 +704,7 @@ def _fit_two_compartment_model_staged(
         if not stage_trainable:
             continue
 
-        stage_bounds = dict(param_bounds or {})
+        stage_bounds = dict(search.param_bounds or {})
         if stage.param_bounds is not None:
             stage_bounds.update(stage.param_bounds)
 
@@ -681,12 +726,11 @@ def _fit_two_compartment_model_staged(
                     spike_count_under_weight=stage.spike_count_under_weight,
                     sparsity_weight=stage.sparsity_weight,
                 ),
-                param_bounds=stage_bounds,
-                global_maxiter=global_maxiter,
-                global_popsize=global_popsize,
-                local_maxiter=local_maxiter,
-                seed=None if seed is None else seed + stage_index,
-                polish=polish,
+                config=replace(
+                    search,
+                    param_bounds=stage_bounds,
+                    seed=None if search.seed is None else search.seed + stage_index,
+                ),
             )
         finally:
             _restore_trainable_parameter_names(model, previous)
@@ -718,57 +762,48 @@ def _fit_two_compartment_model_staged(
 
 
 def fit_two_compartment_model(
-    model: torch.nn.Module,
+    model: TwoCompartmentModel,
     sweeps: Iterable[AllenSweepBatch],
     *,
     method: Literal["hybrid", "global", "tbptt", "staged"] = "hybrid",
-    lr: float = 1e-3,
-    epochs: int = 10,
-    chunk_size: int = 500,
     device: str | torch.device | None = None,
     dtype: torch.dtype = torch.float32,
     loss: FitLossConfig | None = None,
-    param_bounds: dict[str, tuple[float, float]] | None = None,
-    global_maxiter: int = 20,
-    global_popsize: int = 8,
-    local_maxiter: int = 50,
-    seed: int | None = 0,
-    polish: bool = True,
-    stages: Sequence[TwoCompartmentFitStage] | None = None,
+    tbptt: TbpttConfig | None = None,
+    search: GlobalSearchConfig | None = None,
+    staged: StagedConfig | None = None,
 ) -> list[dict[str, float | str]]:
     """Fit the model with a robust strategy for poor initialization.
 
+    Each back-end receives exactly its own option object; ``None`` selects its
+    defaults.
+
     Args:
-        model: Two-compartment neuron instance to fit.
+        model: Two-compartment neuron to fit (see
+            :class:`~btorch.fitting.two_compartment.TwoCompartmentModel`).
         sweeps: Allen or synthetic sweeps to fit against.
         method: ``"hybrid"`` first performs bounded global search, then runs a
             short TBPTT refinement. ``"global"`` stops after the search/polish
             stage. ``"tbptt"`` keeps the original truncated-BPTT workflow.
             ``"staged"`` fits parameter groups sequentially with stage-specific
             sweep subsets and spike-count-first weighting.
-        lr: Learning rate for TBPTT refinement.
-        epochs: Number of TBPTT epochs for ``method="tbptt"`` or the hybrid
-            refinement stage.
-        chunk_size: Truncated-BPTT chunk length.
         device: Torch device for evaluation and refinement.
         dtype: Torch dtype used during fitting.
         loss: Loss weights and spike-matching settings; ``None`` uses the
             :class:`FitLossConfig` defaults. In ``method="staged"`` the
             per-stage weights override the weight fields of this config while
             its spike-matching settings are kept.
-        param_bounds: Optional per-parameter bounds override for the global
-            search. Unspecified parameters use
-            ``DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS``.
-        global_maxiter: Differential-evolution outer iterations.
-        global_popsize: Differential-evolution population size multiplier.
-        local_maxiter: Maximum L-BFGS-B iterations after the global search.
-        seed: Random seed for the global search.
-        polish: If ``True``, run L-BFGS-B after the global search.
-        stages: Optional staged-fit configuration. When omitted,
-            ``DEFAULT_TWO_COMPARTMENT_FIT_STAGES`` is used.
+        tbptt: :class:`TbpttConfig` for ``"tbptt"`` and ``"hybrid"``.
+        search: :class:`GlobalSearchConfig` for ``"global"``, ``"hybrid"`` and
+            ``"staged"``.
+        staged: :class:`StagedConfig` for ``"staged"``.
 
     Returns:
         A history list with one row per fitting stage or TBPTT chunk.
+
+    Raises:
+        ValueError: If an option object is passed that ``method`` does not
+            use (it would be silently ignored), or no sweep/stage can be fit.
 
     Notes:
         The default ``"hybrid"`` method is intended for real fitting runs where
@@ -776,62 +811,40 @@ def fit_two_compartment_model(
         search handles the large basin-finding problem more robustly than pure
         BPTT, while the optional TBPTT stage can still fine-tune the result.
     """
+    used = {
+        "tbptt": {"tbptt", "hybrid"},
+        "search": {"global", "hybrid", "staged"},
+        "staged": {"staged"},
+    }
+    for name, value in (("tbptt", tbptt), ("search", search), ("staged", staged)):
+        if value is not None and method not in used[name]:
+            raise ValueError(
+                f"`{name}` is not used by method={method!r} "
+                f"(used by: {sorted(used[name])})."
+            )
+
     loss = FitLossConfig() if loss is None else loss
+    tbptt = TbpttConfig() if tbptt is None else tbptt
+    search = GlobalSearchConfig() if search is None else search
+    staged = StagedConfig() if staged is None else staged
     sweep_list = list(sweeps)
+    common = {"device": device, "dtype": dtype, "loss": loss}
+
     if method == "tbptt":
         return _fit_two_compartment_model_tbptt(
-            model,
-            sweep_list,
-            lr=lr,
-            epochs=epochs,
-            chunk_size=chunk_size,
-            device=device,
-            dtype=dtype,
-            loss=loss,
+            model, sweep_list, config=tbptt, **common
         )
-
     if method == "staged":
         return _fit_two_compartment_model_staged(
-            model,
-            sweep_list,
-            device=device,
-            dtype=dtype,
-            loss=loss,
-            param_bounds=param_bounds,
-            global_maxiter=global_maxiter,
-            global_popsize=global_popsize,
-            local_maxiter=local_maxiter,
-            seed=seed,
-            polish=polish,
-            stages=stages,
+            model, sweep_list, config=staged, search=search, **common
         )
 
     history = _fit_two_compartment_model_global(
-        model,
-        sweep_list,
-        device=device,
-        dtype=dtype,
-        loss=loss,
-        param_bounds=param_bounds,
-        global_maxiter=global_maxiter,
-        global_popsize=global_popsize,
-        local_maxiter=local_maxiter,
-        seed=seed,
-        polish=polish,
+        model, sweep_list, config=search, **common
     )
     if method == "global":
         return history
-
     history.extend(
-        _fit_two_compartment_model_tbptt(
-            model,
-            sweep_list,
-            lr=lr,
-            epochs=epochs,
-            chunk_size=chunk_size,
-            device=device,
-            dtype=dtype,
-            loss=loss,
-        )
+        _fit_two_compartment_model_tbptt(model, sweep_list, config=tbptt, **common)
     )
     return history

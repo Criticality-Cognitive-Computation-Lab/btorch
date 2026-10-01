@@ -559,3 +559,110 @@ def test_get_dotkey_does_not_mask_errors_inside_property_getters():
     """
     with pytest.raises(AttributeError, match="does_not_exist"):
         get_dotkey(_Outer(), "inner.broken", default="masked")
+
+
+# ---------------------------------------------------------------------------
+# diff_conf_records characterization: exact per-path records for edge cases.
+# ---------------------------------------------------------------------------
+
+
+def _records(a, b, mode=None):
+    return diff_conf_records(OmegaConf.create(a), OmegaConf.create(b), mode=mode)
+
+
+def _rec(status, old, new):
+    return {"status": status, "old": old, "new": new}
+
+
+def test_diff_conf_records_nested_leaf_paths_and_sorting():
+    """One-sided subtrees are expanded to leaf paths; keys come out sorted."""
+    a = {"a": {"x": 1, "y": {"z": 2}}, "l": [1, {"k": 1}, 3]}
+    b = {"a": {"x": 2, "w": {"u": [1, 2]}}, "l": [1, {"k": 2}]}
+
+    records = _records(a, b)
+
+    assert records == {
+        "a.w.u.0": _rec("added", None, 1),
+        "a.w.u.1": _rec("added", None, 2),
+        "a.x": _rec("changed", 1, 2),
+        "a.y.z": _rec("removed", 2, None),
+        "l.1.k": _rec("changed", 1, 2),
+        "l.2": _rec("removed", 3, None),
+    }
+    assert list(records) == sorted(records)
+
+
+def test_diff_conf_records_mode_selects_statuses():
+    a = {"a": 1, "b": 2}
+    b = {"a": 5, "c": 3}
+
+    assert _records(a, b, mode={"changed"}) == {"a": _rec("changed", 1, 5)}
+    assert _records(a, b, mode={"added"}) == {"c": _rec("added", None, 3)}
+    assert _records(a, b, mode=["removed"]) == {"b": _rec("removed", 2, None)}
+    assert set(_records(a, b, mode={"added", "removed"})) == {"b", "c"}
+
+
+def test_diff_conf_records_invalid_mode_and_inputs():
+    conf = OmegaConf.create({"a": 1})
+    with pytest.raises(ValueError, match="mode must only contain"):
+        diff_conf_records(conf, conf, mode={"bogus"})
+    with pytest.raises(TypeError):
+        diff_conf_records({"a": 1}, conf)
+    with pytest.raises(TypeError):
+        diff_conf_records(conf, {"a": 1})
+
+
+def test_diff_conf_records_container_scalar_mismatch_is_one_changed_record():
+    """A dict replaced by a scalar (or the reverse) is reported at its root."""
+    records = _records({"a": {"b": 1}, "c": 5}, {"a": 3, "c": {"d": 1}})
+    assert records == {
+        "a": _rec("changed", {"b": 1}, 3),
+        "c": _rec("changed", 5, {"d": 1}),
+    }
+
+
+def test_diff_conf_records_list_roots_and_length_changes():
+    assert diff_conf_records(OmegaConf.create([1, 2, 3]), OmegaConf.create([1, 5])) == {
+        "1": _rec("changed", 2, 5),
+        "2": _rec("removed", 3, None),
+    }
+    assert diff_conf_records(OmegaConf.create([1]), OmegaConf.create([1, [2, 3]])) == {
+        "1.0": _rec("added", None, 2),
+        "1.1": _rec("added", None, 3),
+    }
+
+
+def test_diff_conf_records_equal_none_and_empty_container_cases():
+    assert _records({"a": 1}, {"a": 1}) == {}
+    # None vs value is a change in both directions (not an add/remove).
+    assert _records({"a": None, "b": 1}, {"a": 1, "b": None}) == {
+        "a": _rec("changed", None, 1),
+        "b": _rec("changed", 1, None),
+    }
+    # An added empty container has no leaves, hence no record.
+    assert _records({"a": 1}, {"a": 1, "e": {}}) == {}
+
+
+def test_diff_conf_records_type_marker_switch_collapses_subtree():
+    """A changed ``_type_`` replaces the whole subtree by one changed record,
+    dropping per-leaf removals/additions below it, at any depth."""
+    nested = _records(
+        {"m": {"_type_": "A", "v": 1, "old": 2}, "k": 1},
+        {"m": {"_type_": "B", "v": 1, "new": 3}, "k": 1},
+    )
+    assert nested == {
+        "m": _rec(
+            "changed",
+            {"_type_": "A", "v": 1, "old": 2},
+            {"_type_": "B", "v": 1, "new": 3},
+        )
+    }
+
+    root = _records({"_type_": "A", "v": 1}, {"_type_": "B", "w": 1})
+    assert root == {
+        "<root>": _rec("changed", {"_type_": "A", "v": 1}, {"_type_": "B", "w": 1})
+    }
+
+    # Same marker: ordinary leaf-level diff.
+    same = _records({"m": {"_type_": "A", "v": 1}}, {"m": {"_type_": "A", "v": 2}})
+    assert same == {"m.v": _rec("changed", 1, 2)}

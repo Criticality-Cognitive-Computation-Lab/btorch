@@ -23,6 +23,7 @@ from .data import (
 )
 from .evaluation import (
     FitEvaluation,
+    TwoCompartmentModel,
     _prepare_sweep,  # noqa: F401
     evaluate_fit_across_sweeps,
     evaluate_two_compartment_fit,
@@ -31,6 +32,9 @@ from .evaluation import (
 from .fit import (
     DEFAULT_TWO_COMPARTMENT_FIT_STAGES,
     DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS,
+    GlobalSearchConfig,
+    StagedConfig,
+    TbpttConfig,
     TwoCompartmentFitStage,
     _fit_sweeps_once,  # noqa: F401
     _fit_two_compartment_model_global,  # noqa: F401
@@ -54,7 +58,11 @@ __all__ = [
     "DEFAULT_TWO_COMPARTMENT_FIT_STAGES",
     "FitEvaluation",
     "FitLossConfig",
+    "GlobalSearchConfig",
+    "StagedConfig",
+    "TbpttConfig",
     "TwoCompartmentFitStage",
+    "TwoCompartmentModel",
     "choose_current_clamp_sweeps",
     "detect_spikes_from_voltage",
     "evaluate_fit_across_sweeps",

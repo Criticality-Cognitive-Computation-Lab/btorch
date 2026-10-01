@@ -14,6 +14,7 @@ string indices ("x,y" double-width coordinates).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -264,6 +265,156 @@ def _hide_axes(
         fig.update_yaxes(range=[y_range[0], y_range[1]])
 
 
+@dataclass
+class _HeatmapContext:
+    """Resolved geometry, colour scale and styling shared by heatmap frames."""
+
+    colorscale: list | str
+    vmin: float
+    vmax: float
+    orientation: str
+    sty: dict
+    sz: dict
+    f_ticks: float
+    f_title: float
+    value_name: str
+    include_flywire_hover: bool
+    bg_xy: tuple[np.ndarray, np.ndarray]
+    axial: tuple[np.ndarray, np.ndarray]
+    zigzag: tuple[np.ndarray, np.ndarray]
+    xy: tuple[np.ndarray, np.ndarray]
+
+
+def _heatmap_shapes(ctx: _HeatmapContext, series: pd.Series) -> list[dict]:
+    """Layout shapes for the white background hexes plus the coloured data
+    hexes."""
+    data_colors = _values_to_colors(series.values, ctx.colorscale, ctx.vmin, ctx.vmax)
+    line_color, line_width = ctx.sz["hex_line_color"], ctx.sz["hex_line_width"]
+    shapes = [
+        _hex_shape(cx, cy, 1.0, "white", line_color, line_width, ctx.orientation)
+        for cx, cy in zip(*ctx.bg_xy)
+    ]
+    shapes.extend(
+        _hex_shape(cx, cy, 1.0, col, line_color, line_width, ctx.orientation)
+        for cx, cy, col in zip(*ctx.xy, data_colors)
+    )
+    return shapes
+
+
+def _heatmap_scatter(
+    go, ctx: _HeatmapContext, series: pd.Series, show_cbar: bool
+) -> go.Scatter:
+    """Invisible scatter at hex centres for hover and the colour bar."""
+    vals = series.values
+    dx, dy = ctx.xy
+    if ctx.include_flywire_hover:
+        customdata = np.stack([*ctx.axial, *ctx.zigzag, vals], axis=-1)
+        hovertemplate = (
+            "p,q = %{customdata[0]:.0f},%{customdata[1]:.0f}<br>"
+            "x,y = %{customdata[2]:.0f},%{customdata[3]:.0f}<br>"
+            + ctx.value_name
+            + ": %{customdata[4]:.4f}<extra></extra>"
+        )
+    else:
+        customdata = np.stack([dx, dy, vals], axis=-1)
+        hovertemplate = (
+            "x: %{customdata[0]:.2f}<br>y: %{customdata[1]:.2f}<br>"
+            + ctx.value_name
+            + ": %{customdata[2]:.4f}<extra></extra>"
+        )
+    marker: dict = dict(
+        color=vals,
+        colorscale=ctx.colorscale,
+        cmin=ctx.vmin,
+        cmax=ctx.vmax,
+        size=0,
+    )
+    if show_cbar:
+        marker["showscale"] = True
+        marker["colorbar"] = _colorbar_dict(ctx.sty, ctx.sz, ctx.f_ticks, ctx.f_title)
+    return go.Scatter(
+        x=dx,
+        y=dy,
+        mode="markers",
+        marker=marker,
+        customdata=customdata,
+        hovertemplate=hovertemplate,
+        showlegend=False,
+    )
+
+
+def _static_heatmap(
+    go, ctx: _HeatmapContext, series: pd.Series, colorbar: bool, w: float, h: float
+) -> go.Figure:
+    """Single-frame heatmap figure."""
+    fig = go.Figure(
+        data=[_heatmap_scatter(go, ctx, series, colorbar)],
+        layout=go.Layout(shapes=_heatmap_shapes(ctx, series)),
+    )
+    fig.update_layout(
+        autosize=False,
+        height=h,
+        width=w,
+        margin={"l": 0, "r": 0, "b": 0, "t": 0, "pad": 0},
+        paper_bgcolor=ctx.sty["papercolor"],
+        plot_bgcolor=ctx.sty["papercolor"],
+    )
+    return fig
+
+
+def _animated_heatmap(
+    go,
+    ctx: _HeatmapContext,
+    df: pd.DataFrame,
+    value_cols: list[str],
+    colorbar: bool,
+    w: float,
+    h: float,
+) -> go.Figure:
+    """Heatmap with one frame per value column and a slider."""
+    slider_h = 100
+    fig = go.Figure()
+    fig.update_layout(
+        autosize=False,
+        height=h + slider_h,
+        width=w,
+        margin={"l": 0, "r": 0, "b": slider_h, "t": 0, "pad": 0},
+        paper_bgcolor=ctx.sty["papercolor"],
+        plot_bgcolor=ctx.sty["papercolor"],
+        sliders=[_slider_config()],
+    )
+
+    frames: list[go.Frame] = []
+    slider_steps: list[dict] = []
+    for i, col_name in enumerate(value_cols):
+        series = df[col_name]
+        frames.append(
+            go.Frame(
+                data=[_heatmap_scatter(go, ctx, series, colorbar)],
+                layout=go.Layout(shapes=_heatmap_shapes(ctx, series)),
+                name=str(i),
+            )
+        )
+        slider_steps.append(
+            {
+                "args": [
+                    [str(i)],
+                    {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"},
+                ],
+                "label": col_name,
+                "method": "animate",
+            }
+        )
+        if i == 0:
+            fig.add_trace(_heatmap_scatter(go, ctx, series, colorbar))
+            fig.layout.shapes = _heatmap_shapes(ctx, series)
+
+    # plotly's layout typing does not expose ``sliders`` element attributes.
+    fig.layout.sliders[0].steps = slider_steps  # type: ignore[attr-defined]
+    fig.frames = frames
+    return fig
+
+
 # -- public API ------------------------------------------------------------
 
 
@@ -327,10 +478,6 @@ def heatmap(
     sty = _merge_style(style)
     sz = _merge_sizing(sizing)
     area_w, area_h, f_ticks, f_title = _compute_pixel_dims(sz, dpi)
-    colorscale = custom_colorscale or _DEFAULT_COLORSCALE
-
-    global_min = min(0, float(df.values.min()))
-    global_max = float(df.values.max())
 
     bg = dataset.drop_duplicates(subset=["p", "q"])[["p", "q"]].astype(float)
     _, _, _, _, bg_x, bg_y = _resolve_coords(
@@ -341,156 +488,42 @@ def heatmap(
         layout=layout,
         rotation_deg=rotation_deg,
     )
-
-    df_c = df.copy()
     dq, dr, dzx, dzy, dx, dy = _resolve_coords(
-        df_c.p.to_numpy(),
-        df_c.q.to_numpy(),
+        df.p.to_numpy(),
+        df.q.to_numpy(),
         coord_format,
         orientation,
         layout=layout,
         rotation_deg=rotation_deg,
     )
+    ctx = _HeatmapContext(
+        colorscale=custom_colorscale or _DEFAULT_COLORSCALE,
+        vmin=min(0, float(df.values.min())),
+        vmax=float(df.values.max()),
+        orientation=orientation,
+        sty=sty,
+        sz=sz,
+        f_ticks=f_ticks,
+        f_title=f_title,
+        value_name=value_name,
+        include_flywire_hover=include_flywire_hover,
+        bg_xy=(bg_x, bg_y),
+        axial=(dq, dr),
+        zigzag=(dzx, dzy),
+        xy=(dx, dy),
+    )
 
-    value_cols = [c for c in df_c.columns if c not in ("p", "q")]
     hex_pad = 1.2  # hex circumradius (1.0) + margin
-
-    # -- builders ----------------------------------------------------------
-
-    def _build_shapes(series: pd.Series) -> list[dict]:
-        """Layout shapes for background + data hexes."""
-        data_colors = _values_to_colors(
-            series.values, colorscale, global_min, global_max
-        )
-        shapes = [
-            _hex_shape(
-                cx,
-                cy,
-                1.0,
-                "white",
-                sz["hex_line_color"],
-                sz["hex_line_width"],
-                orientation,
-            )
-            for cx, cy in zip(bg_x, bg_y)
-        ]
-        shapes.extend(
-            _hex_shape(
-                cx,
-                cy,
-                1.0,
-                col,
-                sz["hex_line_color"],
-                sz["hex_line_width"],
-                orientation,
-            )
-            for cx, cy, col in zip(dx, dy, data_colors)
-        )
-        return shapes
-
-    def _build_scatter(series: pd.Series, show_cbar: bool) -> go.Scatter:
-        """Invisible scatter at hex centres for hover + colorbar."""
-        vals = series.values
-        if include_flywire_hover:
-            customdata = np.stack([dq, dr, dzx, dzy, vals], axis=-1)
-            hovertemplate = (
-                "p,q = %{customdata[0]:.0f},%{customdata[1]:.0f}<br>"
-                "x,y = %{customdata[2]:.0f},%{customdata[3]:.0f}<br>"
-                + value_name
-                + ": %{customdata[4]:.4f}<extra></extra>"
-            )
-        else:
-            customdata = np.stack([dx, dy, vals], axis=-1)
-            hovertemplate = (
-                "x: %{customdata[0]:.2f}<br>y: %{customdata[1]:.2f}<br>"
-                + value_name
-                + ": %{customdata[2]:.4f}<extra></extra>"
-            )
-        marker: dict = dict(
-            color=vals,
-            colorscale=colorscale,
-            cmin=global_min,
-            cmax=global_max,
-            size=0,
-        )
-        if show_cbar:
-            marker["showscale"] = True
-            marker["colorbar"] = _colorbar_dict(sty, sz, f_ticks, f_title)
-        return go.Scatter(
-            x=dx,
-            y=dy,
-            mode="markers",
-            marker=marker,
-            customdata=customdata,
-            hovertemplate=hovertemplate,
-            showlegend=False,
-        )
-
     x_range = (float(bg_x.min()) - hex_pad, float(bg_x.max()) + hex_pad)
     y_range = (float(bg_y.min()) - hex_pad, float(bg_y.max()) + hex_pad)
 
-    # -- static or animated ------------------------------------------------
-
+    value_cols = [c for c in df.columns if c not in ("p", "q")]
     if len(value_cols) <= 1:
-        series = df_c[value_cols[0]] if value_cols else df_c.iloc[:, 0]
-        fig = go.Figure(
-            data=[_build_scatter(series, colorbar)],
-            layout=go.Layout(shapes=_build_shapes(series)),
-        )
-        fig.update_layout(
-            autosize=False,
-            height=area_h,
-            width=area_w,
-            margin={"l": 0, "r": 0, "b": 0, "t": 0, "pad": 0},
-            paper_bgcolor=sty["papercolor"],
-            plot_bgcolor=sty["papercolor"],
-        )
-        _hide_axes(fig, x_range=x_range, y_range=y_range)
+        series = df[value_cols[0]] if value_cols else df.iloc[:, 0]
+        fig = _static_heatmap(go, ctx, series, colorbar, area_w, area_h)
     else:
-        slider_h = 100
-        fig = go.Figure()
-        fig.update_layout(
-            autosize=False,
-            height=area_h + slider_h,
-            width=area_w,
-            margin={"l": 0, "r": 0, "b": slider_h, "t": 0, "pad": 0},
-            paper_bgcolor=sty["papercolor"],
-            plot_bgcolor=sty["papercolor"],
-            sliders=[_slider_config()],
-        )
-        _hide_axes(fig, x_range=x_range, y_range=y_range)
-
-        frames: list[go.Frame] = []
-        slider_steps: list[dict] = []
-        for i, col_name in enumerate(value_cols):
-            series = df_c[col_name]
-            frame = go.Frame(
-                data=[_build_scatter(series, colorbar)],
-                layout=go.Layout(shapes=_build_shapes(series)),
-                name=str(i),
-            )
-            frames.append(frame)
-            slider_steps.append(
-                {
-                    "args": [
-                        [str(i)],
-                        {
-                            "frame": {"duration": 0, "redraw": True},
-                            "mode": "immediate",
-                        },
-                    ],
-                    "label": col_name,
-                    "method": "animate",
-                }
-            )
-            if i == 0:
-                fig.add_trace(_build_scatter(series, colorbar))
-                fig.layout.shapes = _build_shapes(series)
-
-        # plotly's layout typing does not expose ``sliders`` element attributes,
-        # although the slider is created earlier in this function.
-        fig.layout.sliders[0].steps = slider_steps  # type: ignore[attr-defined]
-        fig.frames = frames
+        fig = _animated_heatmap(go, ctx, df, value_cols, colorbar, area_w, area_h)
+    _hide_axes(fig, x_range=x_range, y_range=y_range)
 
     if title:
         fig.update_layout(title=dict(text=title))
@@ -913,7 +946,6 @@ def quiver(
         showlegend=False,
     )
 
-    # Arrow annotations for each vector
     fig = go.Figure(data=[scatter])
     for xi, yi, dxi, dyi in zip(x, y, dx, dy):
         if abs(dxi) < 1e-9 and abs(dyi) < 1e-9:

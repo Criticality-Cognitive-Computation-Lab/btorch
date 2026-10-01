@@ -1,4 +1,16 @@
+from typing import TypedDict
+
 import numpy as np
+
+
+class EigenvalueOutliers(TypedDict):
+    """Result of :func:`compute_structural_eigenvalue_outliers`."""
+
+    eigenvalues: np.ndarray  # complex, shape (N,)
+    max_eigenvalue: float  # largest eigenvalue magnitude |lambda| (0.0 if N == 0)
+    outliers: np.ndarray  # complex eigenvalues with |lambda| > spectral_radius
+    outlier_count: int
+    spectral_radius: float  # bulk radius used as the threshold
 
 
 def compute_kaplan_yorke_dimension(lyapunov_spectrum: np.ndarray) -> float:
@@ -25,8 +37,7 @@ def compute_kaplan_yorke_dimension(lyapunov_spectrum: np.ndarray) -> float:
 
     cum_sum = np.cumsum(ls)
 
-    # Find k: max index such that sum >= 0
-    # We look for the last index where cum_sum >= 0
+    # k: last index whose cumulative sum is still non-negative.
     positive_sums = np.where(cum_sum >= 0)[0]
 
     if len(positive_sums) == 0:
@@ -36,25 +47,15 @@ def compute_kaplan_yorke_dimension(lyapunov_spectrum: np.ndarray) -> float:
 
     k = positive_sums[-1]
 
-    # Check if k is the last element (sum of all is positive)
     if k == n - 1:
         return float(n)
 
-    # Note: indices are 0-based in Python, so k corresponds to the (k+1)-th
-    # element in 1-based math notation.
-    # The formula uses 1-based k.
-    # Let's map carefully:
-    # Python index k is the index of the last element included in the sum.
-    # So we have summed ls[0]...ls[k].
-    # The next element is ls[k+1].
-    # The integer part of dimension is (k + 1).
-
+    # 0-based k is the last summed index, so the integer part is k + 1.
     sum_lambda = cum_sum[k]
     lambda_next = ls[k + 1]
 
     if lambda_next == 0:
-        # Avoid division by zero, though theoretically lambda_{k+1} should be
-        # negative here.
+        # Guard against division by zero (lambda_{k+1} is normally negative).
         return float(k + 1)
 
     d_ky = (k + 1) + sum_lambda / abs(lambda_next)
@@ -63,8 +64,8 @@ def compute_kaplan_yorke_dimension(lyapunov_spectrum: np.ndarray) -> float:
 
 
 def compute_structural_eigenvalue_outliers(
-    weight_matrix: np.ndarray, spectral_radius: float = None
-) -> dict:
+    weight_matrix: np.ndarray, spectral_radius: float | None = None
+) -> EigenvalueOutliers:
     """Analyze the eigenvalues of the weight matrix to identify structural
     outliers.
 
@@ -79,8 +80,9 @@ def compute_structural_eigenvalue_outliers(
             random component. If None, it is estimated as std(W) * sqrt(N).
 
     Returns:
-        dict: Dictionary containing:
+        EigenvalueOutliers: Dictionary containing:
             - 'eigenvalues': All eigenvalues.
+            - 'max_eigenvalue': Largest eigenvalue magnitude.
             - 'outliers': Eigenvalues outside the spectral radius.
             - 'outlier_count': Number of outliers.
             - 'spectral_radius': The radius used for thresholding.
@@ -97,13 +99,8 @@ def compute_structural_eigenvalue_outliers(
 
     eigenvalues = np.linalg.eigvals(W)
 
-    # Determine spectral radius if not provided
     if spectral_radius is None:
-        # Estimate radius based on random matrix theory
-        # For entries with variance sigma^2/N, radius is sigma.
-        # Here we have entries with variance var(W).
-        # If W_ij ~ N(0, sigma^2), then radius R = sigma * sqrt(N).
-        # std(W) corresponds to sigma.
+        # Circular law: W_ij ~ N(0, sigma^2) gives bulk radius sigma * sqrt(N).
         sigma = np.std(W)
         spectral_radius = sigma * np.sqrt(N)
 

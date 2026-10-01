@@ -15,7 +15,7 @@ import numpy as np
 from btorch.utils.file import save_fig
 from btorch.utils.hex import axial_to_zigzag, zigzag_to_axial
 from btorch.utils.hex.coords import disk
-from btorch.visualisation.hex import grid, scatter
+from btorch.visualisation.hex import HexGeometry, HexReference, grid, scatter
 
 
 def test_zigzag_roundtrip():
@@ -67,11 +67,10 @@ def test_zigzag_scatter_visualization():
         r,
         values,
         coord_format="zigzag",
-        size=1.0,
-        orientation="pointy",
+        geometry=HexGeometry(size=1.0, orientation="pointy"),
         ax=axes[0],
         title="Zigzag (vertex compass)",
-        show_compass="vertex",
+        reference=HexReference(show_compass="vertex"),
     )
 
     scatter(
@@ -79,11 +78,10 @@ def test_zigzag_scatter_visualization():
         r,
         values,
         coord_format="zigzag",
-        size=1.0,
-        orientation="pointy",
+        geometry=HexGeometry(size=1.0, orientation="pointy"),
         ax=axes[1],
         title="Zigzag (edge compass)",
-        show_compass="edge",
+        reference=HexReference(show_compass="edge"),
     )
 
     plt.tight_layout()

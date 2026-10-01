@@ -24,7 +24,8 @@ patterns:
 Mapping of extras: ``io`` (xarray, zarr, numcodecs, h5py, hdf5plugin),
 ``config`` (omegaconf, pyyaml), ``analysis`` (powerlaw, nolds, fastdtw),
 ``viz`` (networkx, plotly), ``sparse`` (torch_scatter, torch_sparse),
-``fast`` (numba, polars), ``gpu`` (triton) and ``all``. AllenSDK is
+``fast`` (numba, polars), ``gpu`` (triton), ``examples`` (torchvision,
+seaborn, tqdm) and ``all`` (every extra above). AllenSDK is
 deliberately in no extra: its release pins an ancient numpy/pandas stack that
 the resolver cannot satisfy next to btorch, so install it separately
 (``pip install allensdk``) and keep its guard a plain ``ImportError`` hint.

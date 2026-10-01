@@ -20,6 +20,8 @@
 - `NeuronSpec`: 单个神经元样式（颜色、标记、线型）
 - `SimulationStates`: 仿真数据容器
 - `TracePlotFormat`: 图形格式化选项
+- `RasterStyle`、`RasterGrouping`、`GroupStripOptions`、`RatePanelOptions`、`RasterAnnotations`: `plot_raster` 的选项分组
+- `SpectrumGrouping`、`SpectrumStyle`: `plot_grouped_spectrum` 的选项分组，例如 `plot_grouped_spectrum(data, dt, SpectrumGrouping(neurons_df=df, group_by="type"), style=SpectrumStyle(show_traces=False))`
 
 ---
 
@@ -65,6 +67,8 @@
 | `compass` | 指南针玫瑰嵌入图 |
 | `looming_stimulus` | 从中心扩展的刺激序列 |
 
+**数据类**（`hex/options.py`）：`HexGeometry`（布局、尺寸、朝向、旋转）、`HexColorMap`（cmap、vmin、vmax）、`HexPatchStyle`（边框、透明度）、`HexReference`（q/r/s 轴、指南针）。它们作为仅限关键字参数 `geometry=`、`color=`、`patch=`（仅 `scatter`）和 `reference=` 传给 `scatter`/`quiver`，例如 `scatter(q, r, v, color=HexColorMap(cmap="RdBu_r", vmin=-1, vmax=1))`。
+
 ---
 
 ### `hex/interactive.py`
@@ -92,9 +96,6 @@
 | 函数 | 描述 |
 |----------|-------------|
 | `plot_group_distribution` | 通用分组绘图 API，支持 `violin`、`box` 或 `ecdf` |
-| `plot_group_violin` | 分组小提琴图便捷封装 |
-| `plot_group_box` | 分组箱线图便捷封装 |
-| `plot_group_ecdf` | 分组 ECDF 图便捷封装 |
 | `plot_neuropil_timeseries_overview` | 波形/热图风格的聚合神经毯概览 |
 | `plot_neuropil_timeseries_panels` | 用于详细对比的区域级子图网格 |
 
@@ -103,24 +104,46 @@
 ## 使用示例
 
 ```python
-from btorch.visualisation.timeseries import plot_raster, plot_neuron_traces, NeuronSpec
+from btorch.visualisation.timeseries import (
+    GroupStripOptions,
+    NeuronSpec,
+    RasterAnnotations,
+    RasterGrouping,
+    RasterStyle,
+    RatePanelOptions,
+    SimulationStates,
+    TracePlotFormat,
+    plot_neuron_traces,
+    plot_raster,
+)
 
 # 基础光栅图
-plot_raster(spikes, dt=0.1, marker="|", markersize=5)
+plot_raster(spikes, dt=0.1, style=RasterStyle(marker="|", marker_size=5))
 
-# 带颜色的分组光栅图
+# 带颜色、分组色条和发放率面板的分组光栅图
 plot_raster(
     spikes,
-    neurons_df=df,
-    group_by="cell_type",
-    color={"excitatory": "red", "inhibitory": "blue"},
-    show_separators=True,
-    events=[100, 200],  # 事件标记
-    regions=[(50, 80)],  # 阴影区域
-    show_tracks=True,
+    style=RasterStyle(spike_color={"excitatory": "red", "inhibitory": "blue"}),
+    grouping=RasterGrouping(
+        neurons_df=df, group_key="cell_type", show_separators=True
+    ),
+    strip=GroupStripOptions(side="left"),  # colour strip beside the raster
+    rate=RatePanelOptions(total=True, window_ms=10.0),
+    annotations=RasterAnnotations(
+        events=[100, 200],  # 事件标记
+        regions=[(50, 80)],  # 阴影区域
+        show_tracks=True,
+    ),
 )
 
 # 具有单个神经元样式的神经元轨迹
 specs = [NeuronSpec(color="red"), NeuronSpec(color="blue")]
-plot_neuron_traces(voltage=V, dt=0.1, neuron_specs=specs)
+plot_neuron_traces(
+    SimulationStates(voltage=V, dt=0.1),
+    TracePlotFormat(neuron_specs=specs),
+)
 ```
+
+光栅图选项被分组为若干小型冻结数据类（`RasterStyle`、`RasterGrouping`、
+`GroupStripOptions`、`RatePanelOptions`、`RasterAnnotations`），均为
+`plot_raster` 的可选关键字参数。

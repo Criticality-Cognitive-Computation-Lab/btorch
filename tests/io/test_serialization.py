@@ -4,6 +4,9 @@ import scipy.sparse as sp
 import torch
 
 from btorch.io.serialization import (
+    DimLayout,
+    SparseOptions,
+    ZarrStoreOptions,
     load_memories_from_xarray,
     memories_to_xarray,
     save_memories_to_xarray,
@@ -31,7 +34,7 @@ def test_save_load_roundtrip(tmp_path):
     save_path = tmp_path / "sim_result.zarr"
 
     # Save
-    save_memories_to_xarray(data, save_path, dim_counts=(1, 1, 1))
+    save_memories_to_xarray(data, save_path, DimLayout(dim_counts=(1, 1, 1)))
 
     # Check if zarr exists
     assert save_path.exists()
@@ -64,7 +67,7 @@ def test_sparse_matrix_support(tmp_path):
     save_path = tmp_path / "sparse_matrix.zarr"
     # dim_counts=(1, 1) -> maps to (dim0, dim1)
     save_memories_to_xarray(
-        data, save_path, dim_names=("pre", "post"), dim_counts=(1, 1)
+        data, save_path, DimLayout(dim_names=("pre", "post"), dim_counts=(1, 1))
     )
 
     ds = xr.open_zarr(save_path)
@@ -103,11 +106,14 @@ def test_strict_dims_validation(tmp_path):
 
     # 1. Strict Mode = True (Default) -> Should Raise ValueError
     with pytest.raises(ValueError, match="Strict dimensions required"):
-        save_memories_to_xarray(data, save_path, dim_counts=(1, 1, 1), strict_dims=True)
+        save_memories_to_xarray(data, save_path, DimLayout(dim_counts=(1, 1, 1)))
 
     # 2. Strict Mode = False -> Should Succeed
     save_memories_to_xarray(
-        data, save_path, dim_counts=(1, 1, 1), strict_dims=False, overwrite=True
+        data,
+        save_path,
+        DimLayout(dim_counts=(1, 1, 1), strict_dims=False),
+        store=ZarrStoreOptions(overwrite=True),
     )
 
     loaded = load_memories_from_xarray(save_path)
@@ -126,7 +132,7 @@ def test_spike_suffix_auto_sparse(tmp_path):
     save_path = tmp_path / "spikes.zarr"
     # Ensure dim_names matches dim_counts length to avoid IndexError in inference
     save_memories_to_xarray(
-        data, save_path, dim_counts=(1, 1), dim_names=("dim0", "dim1")
+        data, save_path, DimLayout(dim_counts=(1, 1), dim_names=("dim0", "dim1"))
     )
 
     ds = xr.open_zarr(save_path)
@@ -175,12 +181,10 @@ def test_glif_memory_states_complex(tmp_path):
     save_memories_to_xarray(
         data,
         save_path,
-        dim_counts=None,  # Should infer (1, 1, 1) from neuron.v
-        dim_names=("time", "batch", "neuron"),
+        # dim_counts=None: inferred as (1, 1, 1) from neuron.v
+        DimLayout(hint_field="neuron.v", strict_dims=True),
         neuron_ids=root_id,
-        hint_field="neuron.v",
         partial_map=partial_map,
-        strict_dims=True,  # Regular variables must match
     )
 
     loaded = load_memories_from_xarray(save_path)
@@ -204,9 +208,7 @@ def test_multidim_dims(tmp_path):
 
     save_path = tmp_path / "multidim.zarr"
     # dim_counts: time=2, batch=2, neuron=1
-    save_memories_to_xarray(
-        data, save_path, dim_counts=(2, 2, 1), dim_names=("time", "batch", "neuron")
-    )
+    save_memories_to_xarray(data, save_path, DimLayout(dim_counts=(2, 2, 1)))
     loaded = load_memories_from_xarray(save_path)
     np.testing.assert_allclose(loaded["Iasc"], data["Iasc"])
 
@@ -220,7 +222,9 @@ def test_neuron_indices(tmp_path):
 
     save_path = tmp_path / "neuron_ids.zarr"
     # Infer dims counts from hint or manual
-    save_memories_to_xarray(data, save_path, dim_counts=(1, 0, 2), neuron_ids=my_ids)
+    save_memories_to_xarray(
+        data, save_path, DimLayout(dim_counts=(1, 0, 2)), neuron_ids=my_ids
+    )
 
     ds = xr.open_zarr(save_path)
     assert "root_id" in ds.coords
@@ -238,8 +242,7 @@ def test_partial_map_without_neuron_dims_raises():
     with pytest.raises(ValueError, match="no neuron dimensions"):
         memories_to_xarray(
             data,
-            dim_counts=(1, 1, 0),
-            dim_names=("time", "batch", "neuron"),
+            DimLayout(dim_counts=(1, 1, 0)),
             partial_map={"v": np.array([0])},
         )
 
@@ -252,10 +255,14 @@ def test_root_id_shape_mismatch_raises():
     """
     data = {"v": np.zeros((4, 1, 2, 3))}
     with pytest.raises(ValueError, match="root_id"):
-        memories_to_xarray(data, dim_counts=(1, 1, 2), neuron_ids=np.arange(5))
+        memories_to_xarray(
+            data, DimLayout(dim_counts=(1, 1, 2)), neuron_ids=np.arange(5)
+        )
 
     # A flat id array with the right number of entries is reshaped.
-    ds = memories_to_xarray(data, dim_counts=(1, 1, 2), neuron_ids=np.arange(6))
+    ds = memories_to_xarray(
+        data, DimLayout(dim_counts=(1, 1, 2)), neuron_ids=np.arange(6)
+    )
     assert ds["root_id"].shape == (2, 3)
 
 
@@ -269,3 +276,112 @@ def test_infer_dim_counts_defaults_by_rank():
     assert _infer_dim_counts(np.zeros(3), None) == (0, 0, 1)
     with pytest.raises(TypeError):
         _infer_dim_counts(np.zeros(3), None, partial=True)
+
+
+def test_partial_map_expands_multi_neuron_dims_with_flat_indices():
+    """Partial recordings expand to the full neuron grid.
+
+    ``neuron_ids`` of shape (2, 3) lock the two physical neuron dims to
+    ``(2, 3)``. ``v`` is recorded for 2 neurons only, addressed by 1D
+    indices into the *flattened* (6,) neuron axis (the recorded values carry
+    one trailing axis per neuron dim: ``(T, B, 1, 2)``). The expanded array must
+    have shape (T, B, 2, 3), hold the recorded values at the flat positions
+    and NaN (float) everywhere else; an integer variable is zero-filled.
+    """
+    T, B = 4, 2
+    neuron_ids = np.arange(6).reshape(2, 3)
+    flat_idx = np.array([1, 4])  # (0, 1) and (1, 1) in the (2, 3) grid
+    v = np.arange(T * B * 2, dtype=np.float32).reshape(T, B, 1, 2)
+    count = np.ones((T, B, 1, 2), dtype=np.int64)
+
+    ds = memories_to_xarray(
+        {"v": v, "count": count},
+        DimLayout(dim_counts=(1, 1, 2)),
+        neuron_ids=neuron_ids,
+        partial_map={"v": flat_idx, "count": flat_idx},
+    )
+
+    assert ds["v"].dims == ("time", "batch", "neuron_0", "neuron_1")
+    full = ds["v"].values.reshape(T, B, 6)
+    np.testing.assert_array_equal(full[..., flat_idx], v[:, :, 0])
+    assert np.isnan(np.delete(full, flat_idx, axis=-1)).all()
+    full_count = ds["count"].values.reshape(T, B, 6)
+    np.testing.assert_array_equal(full_count[..., flat_idx], count[:, :, 0])
+    assert (np.delete(full_count, flat_idx, axis=-1) == 0).all()
+    np.testing.assert_array_equal(ds["root_id"].values, neuron_ids)
+
+
+def test_partial_map_single_neuron_dim_and_unknown_size():
+    """With one neuron dim, indices address it directly; no size -> error."""
+    v = np.ones((3, 1, 2), dtype=np.float32)
+    ds = memories_to_xarray(
+        {"v": v},
+        DimLayout(dim_counts=(1, 1, 1)),
+        neuron_ids=np.arange(5),
+        partial_map={"v": np.array([0, 3])},
+    )
+    assert ds["v"].shape == (3, 1, 5)
+    assert np.isnan(ds["v"].values[..., [1, 2, 4]]).all()
+
+    # Without neuron_ids / hint the full neuron size is unknown.
+    with pytest.raises(ValueError, match="Full neuron"):
+        memories_to_xarray(
+            {"v": v},
+            DimLayout(dim_counts=(1, 1, 1)),
+            partial_map={"v": np.array([0, 3])},
+        )
+
+
+def test_store_and_sparse_options_roundtrip(tmp_path):
+    """Chunking, compression and sparse options are applied and round-trip.
+
+    ``ZarrStoreOptions`` controls how the store is written (chunk layout, zstd
+    level, overwrite) and ``SparseOptions`` how spikes are encoded; neither may
+    change the loaded values.
+    """
+    rng = np.random.default_rng(0)
+    data = {
+        "v": rng.standard_normal((20, 2, 6)).astype(np.float32),
+        "spike": rng.random((20, 2, 6)) < 0.3,  # dense: above the 5% threshold
+    }
+    path = tmp_path / "opts.zarr"
+    store = ZarrStoreOptions(compression_level=9, chunks={"time": 10})
+    save_memories_to_xarray(
+        data,
+        path,
+        DimLayout(dim_counts=(1, 1, 1)),
+        # Forcing sparse encoding stores the spike array as COO entries.
+        sparse=SparseOptions(force_sparse=["spike"]),
+        store=store,
+    )
+
+    ds = xr.open_zarr(path)
+    assert ds["spike"].attrs.get("_btorch_sparse")
+    assert ds["v"].chunks[0] == (10, 10)  # time split in chunks of 10
+
+    loaded = load_memories_from_xarray(path)
+    np.testing.assert_allclose(loaded["v"], data["v"])
+    np.testing.assert_array_equal(loaded["spike"], data["spike"])
+
+    # ``overwrite=False`` must refuse to clobber the existing store.
+    with pytest.raises(Exception):
+        save_memories_to_xarray(
+            data,
+            path,
+            DimLayout(dim_counts=(1, 1, 1)),
+            store=ZarrStoreOptions(overwrite=False),
+        )
+
+
+def test_invalid_options_raise():
+    """Invalid option values fail at construction, before any IO happens."""
+    with pytest.raises(ValueError, match="compression_level"):
+        ZarrStoreOptions(compression_level=0)
+    with pytest.raises(ValueError, match="Chunk size"):
+        ZarrStoreOptions(chunks={"time": 0})
+    with pytest.raises(ValueError, match="sparse_threshold"):
+        SparseOptions(sparse_threshold=1.5)
+    with pytest.raises(ValueError, match="one entry per"):
+        DimLayout(dim_counts=(1, 1))  # default dim_names has 3 groups
+    with pytest.raises(ValueError, match="non-negative"):
+        DimLayout(dim_counts=(1, -1, 1))

@@ -733,31 +733,27 @@ def make_hetersynapse_constraint(
         scipy.sparse.sparray: Sparse array matching hetersynapse connection shape,
             where each non-zero value is a group ID for that connection.
     """
-    cell_constraint = make_constraint_by_neuron_type(
-        neurons, connections, nan_in_same_group=nan_in_same_group
+    conn_mat, receptor_idx = make_hetersynapse_conn(
+        neurons,
+        connections,
+        receptor_type_col,
+        receptor_type_mode,
+        return_dict=False,
+        ignore_post_type=ignore_post_type,
     )
+    n_receptor_pairs = len(receptor_idx)
 
     if constraint_mode == "cell_only":
-        conn_temp, receptor_idx = make_hetersynapse_conn(
-            neurons,
-            connections,
-            receptor_type_col,
-            receptor_type_mode,
-            return_dict=False,
-            ignore_post_type=ignore_post_type,
-        )
-        n_receptor_pairs = len(receptor_idx)
-
-        cell_constraint = cell_constraint.tocoo()
-        new_row = []
-        new_col = []
-        new_val = []
-
-        for i in range(n_receptor_pairs):
-            new_row.append(cell_constraint.row)
-            new_col.append(cell_constraint.col * n_receptor_pairs + i)
-            new_val.append(cell_constraint.data)
-
+        # One constraint group per (pre, post) cell-type pair, repeated for every
+        # receptor pair along the hetersynapse column axis.
+        cell_constraint = make_constraint_by_neuron_type(
+            neurons, connections, nan_in_same_group=nan_in_same_group
+        ).tocoo()
+        new_row = [cell_constraint.row for _ in range(n_receptor_pairs)]
+        new_col = [
+            cell_constraint.col * n_receptor_pairs + i for i in range(n_receptor_pairs)
+        ]
+        new_val = [cell_constraint.data for _ in range(n_receptor_pairs)]
         return scipy.sparse.coo_array(
             (
                 np.concatenate(new_val),
@@ -768,15 +764,6 @@ def make_hetersynapse_constraint(
                 cell_constraint.shape[1] * n_receptor_pairs,
             ),
         )
-
-    conn_mat, receptor_idx = make_hetersynapse_conn(
-        neurons,
-        connections,
-        receptor_type_col,
-        receptor_type_mode,
-        return_dict=False,
-        ignore_post_type=ignore_post_type,
-    )
 
     tmp_neurons = neurons.copy()
 
@@ -806,8 +793,6 @@ def make_hetersynapse_constraint(
         }
     )
 
-    # Map back to original post neuron and receptor index
-    n_receptor_pairs = len(receptor_idx)
     hetersynapse_conn_df["post"] = (
         hetersynapse_conn_df["post_hetersynapse"] // n_receptor_pairs
     )
@@ -829,45 +814,24 @@ def make_hetersynapse_constraint(
         how="left",
     )
 
-    if constraint_mode == "full":
-        # Each (pre_cell_type, post_cell_type, pre_receptor, post_receptor)
-        # gets unique ID
-        if ignore_post_type:
-            constraint_key = hetersynapse_conn_df[
-                ["pre_cell_type", "post_cell_type", "receptor_type"]
-            ].agg(tuple, axis=1)
-        elif receptor_type_mode == "neuron":
-            constraint_key = hetersynapse_conn_df[
-                [
-                    "pre_cell_type",
-                    "post_cell_type",
-                    "pre_receptor_type",
-                    "post_receptor_type",
-                ]
-            ].agg(tuple, axis=1)
-        else:
-            constraint_key = hetersynapse_conn_df[
-                ["pre_cell_type", "post_cell_type", "receptor_type"]
-            ].agg(tuple, axis=1)
+    # Receptor columns that join the cell types in the constraint key. Per-neuron
+    # receptors keep the pre/post pair ("full") or collapse it to one "pre-post"
+    # category ("cell_and_receptor"); otherwise a single receptor_type column is
+    # used (per-connection receptors, or post type ignored).
+    if ignore_post_type or receptor_type_mode != "neuron":
+        receptor_cols = ["receptor_type"]
+    elif constraint_mode == "full":
+        receptor_cols = ["pre_receptor_type", "post_receptor_type"]
     else:  # "cell_and_receptor"
-        # Group by cell type and receptor category (E-E, E-I, I-E, I-I)
-        if ignore_post_type:
-            constraint_key = hetersynapse_conn_df[
-                ["pre_cell_type", "post_cell_type", "receptor_type"]
-            ].agg(tuple, axis=1)
-        elif receptor_type_mode == "neuron":
-            hetersynapse_conn_df["receptor_category"] = (
-                hetersynapse_conn_df["pre_receptor_type"].astype(str)
-                + "-"
-                + hetersynapse_conn_df["post_receptor_type"].astype(str)
-            )
-            constraint_key = hetersynapse_conn_df[
-                ["pre_cell_type", "post_cell_type", "receptor_category"]
-            ].agg(tuple, axis=1)
-        else:
-            constraint_key = hetersynapse_conn_df[
-                ["pre_cell_type", "post_cell_type", "receptor_type"]
-            ].agg(tuple, axis=1)
+        hetersynapse_conn_df["receptor_category"] = (
+            hetersynapse_conn_df["pre_receptor_type"].astype(str)
+            + "-"
+            + hetersynapse_conn_df["post_receptor_type"].astype(str)
+        )
+        receptor_cols = ["receptor_category"]
+    constraint_key = hetersynapse_conn_df[
+        ["pre_cell_type", "post_cell_type", *receptor_cols]
+    ].agg(tuple, axis=1)
 
     hetersynapse_conn_df["constraint_group_id"] = pd.factorize(constraint_key)[0] + 1
 
@@ -1117,7 +1081,6 @@ def expand_conn_for_delays(
     """
     conn_coo = conn.tocoo()
     n_pre, n_post = conn.shape
-    # Expand rows: each pre neuron gets n_delay_bins slots; post is unchanged.
     new_row = _delay_rows(conn_coo.row, delays, n_delay_bins)
     new_shape = (n_pre * n_delay_bins, n_post)
     return scipy.sparse.coo_array(

@@ -10,7 +10,9 @@ from torch import Tensor, nn
 from ..types import TensorLike
 from . import environ
 from .base import (
+    Backend,
     MemoryModule,
+    StepMode,
     flatten_neuron,
     normalize_n_neuron,
     unflatten_neuron,
@@ -59,8 +61,8 @@ class BasePSC(MemoryModule):
         self,
         n_neuron: int | Sequence[int],
         linear: torch.nn.Module,
-        step_mode: str = "s",
-        backend: str = "torch",
+        step_mode: StepMode = "s",
+        backend: Backend = "torch",
     ):
         super().__init__()
 
@@ -78,7 +80,6 @@ class BasePSC(MemoryModule):
         raise NotImplementedError()
 
     def adaptation_charge(self, z: torch.Tensor) -> None:
-        # Flatten only when input still carries multi-dimensional neuron dims
         z_flat, leading = flatten_neuron(z, self.n_neuron, self.size)
         wz = self.linear(z_flat)
         wz = unflatten_neuron(wz, leading, self.n_neuron)
@@ -94,7 +95,7 @@ class BasePSC(MemoryModule):
         else:
             return self.psc
 
-    def single_step_forward(self, z: torch.Tensor):
+    def single_step_forward(self, z: torch.Tensor) -> torch.Tensor:
         self.conductance_charge()
         self.adaptation_charge(z)
         current = self.current_charge()
@@ -160,8 +161,8 @@ class ExponentialPSC(BasePSC):
         n_neuron: int | Sequence[int],
         tau_syn: float | TensorLike,
         linear,
-        step_mode: str = "s",
-        backend: str = "torch",
+        step_mode: StepMode = "s",
+        backend: Backend = "torch",
     ):
         super().__init__(
             n_neuron,
@@ -198,8 +199,8 @@ class _Adaptive2VarPSC(BasePSC):
         self,
         n_neuron: int | Sequence[int],
         linear,
-        step_mode: str = "s",
-        backend: str = "torch",
+        step_mode: StepMode = "s",
+        backend: Backend = "torch",
     ):
         super().__init__(n_neuron, linear, step_mode=step_mode, backend=backend)
 
@@ -215,8 +216,8 @@ class AlphaPSCBilleh(_Adaptive2VarPSC):
         n_neuron: int | Sequence[int],
         tau_syn: float | TensorLike,
         linear: torch.nn.Module,
-        step_mode: str = "s",
-        backend: str = "torch",
+        step_mode: StepMode = "s",
+        backend: Backend = "torch",
     ):
         """The Current-Based Alpha form of PSC, from [1], ensuring a post-
         synaptic current with synapse weight W = 1.0 has an amplitude of 1.0 pA
@@ -253,7 +254,6 @@ class AlphaPSCBilleh(_Adaptive2VarPSC):
         return self.psc
 
     def adaptation_charge(self, z: torch.Tensor) -> None:
-        # Flatten only when input still carries multi-dimensional neuron dims
         if len(self.n_neuron) > 1 and z.shape[-len(self.n_neuron) :] == self.n_neuron:
             z_flat, leading = flatten_neuron(z, self.n_neuron, self.size)
         else:
@@ -293,8 +293,8 @@ class AlphaPSC(_Adaptive2VarPSC):
         tau_syn: float | TensorLike,
         linear: torch.nn.Module,
         g_max=1.0,
-        step_mode: str = "s",
-        backend: str = "torch",
+        step_mode: StepMode = "s",
+        backend: Backend = "torch",
     ):
         """The Alpha form (current-based) of PSC, from Brainpy/BrainState."""
 
@@ -319,7 +319,6 @@ class AlphaPSC(_Adaptive2VarPSC):
         self.h = exp_euler_step(self.dh, self.h, dt=environ.get("dt"))
 
     def adaptation_charge(self, z: torch.Tensor) -> None:
-        # Flatten only when input still carries multi-dimensional neuron dims
         if len(self.n_neuron) > 1 and z.shape[-len(self.n_neuron) :] == self.n_neuron:
             z_flat, leading = flatten_neuron(z, self.n_neuron, self.size)
         else:
@@ -361,8 +360,8 @@ class DualExponentialPSC(BasePSC):
         tau_rise: float | TensorLike,
         linear: torch.nn.Module,
         A: float | TensorLike | None = None,
-        step_mode: str = "s",
-        backend: str = "torch",
+        step_mode: StepMode = "s",
+        backend: Backend = "torch",
     ):
         """The Double Exponential form of PSC, from Brainpy/BrainState."""
 
@@ -405,7 +404,6 @@ class DualExponentialPSC(BasePSC):
         self.g_decay = exp_euler_step(self.dg_decay, self.g_decay, dt=environ.get("dt"))
 
     def adaptation_charge(self, z: torch.Tensor) -> None:
-        # Flatten only when input still carries multi-dimensional neuron dims
         if len(self.n_neuron) > 1 and z.shape[-len(self.n_neuron) :] == self.n_neuron:
             z_flat, leading = flatten_neuron(z, self.n_neuron, self.size)
         else:
@@ -482,7 +480,7 @@ class BilinearMixingSynapse(MemoryModule):
         return self._psc
 
     @psc.setter
-    def psc(self, value: torch.Tensor):
+    def psc(self, value: torch.Tensor) -> None:
         self._psc = value
 
     def init_state(
@@ -527,7 +525,7 @@ class BilinearMixingSynapse(MemoryModule):
             device=device,
         )
 
-    def single_step_forward(self, z: torch.Tensor):
+    def single_step_forward(self, z: torch.Tensor) -> torch.Tensor:
         z_flat, leading = flatten_neuron(z, self.n_neuron, self.size)
         z_expanded = z_flat.reshape(*leading, self.size * self.n_receptor)
         psc_expanded = self.base_psc.single_step_forward(z_expanded)
@@ -607,26 +605,26 @@ class DelayedPSC(MemoryModule):
         return self.psc_module.size
 
     @property
-    def step_mode(self) -> str:
+    def step_mode(self) -> StepMode:
         return self.psc_module.step_mode
 
     @step_mode.setter
-    def step_mode(self, value: str):
+    def step_mode(self, value: StepMode) -> None:
         self.psc_module.step_mode = value
 
     @property
-    def backend(self) -> str:
+    def backend(self) -> Backend:
         return self.psc_module.backend
 
     @backend.setter
-    def backend(self, value: str):
+    def backend(self, value: Backend) -> None:
         self.psc_module.backend = value
 
     @property
     def psc(self) -> torch.Tensor:
         return self.psc_module.psc
 
-    def single_step_forward(self, z: torch.Tensor):
+    def single_step_forward(self, z: torch.Tensor) -> torch.Tensor:
         if self.history is not None:
             self.history.update(z)
             z_delayed = self.history.get_delay(self.max_delay_steps)
@@ -645,7 +643,7 @@ class DelayedPSC(MemoryModule):
             y_seq.append(y)
         return torch.stack(y_seq)
 
-    def extra_repr(self):
+    def extra_repr(self) -> str:
         return (
             f"max_delay_steps={self.max_delay_steps}, "
             f"circular={self.use_circular_buffer}"
@@ -682,8 +680,8 @@ class HeterSynapsePSC(BasePSC):
         base_psc: type[BasePSC] = AlphaPSC,
         max_delay_steps: int = 1,
         use_circular_buffer: bool = False,
-        step_mode: str = "s",
-        backend: str = "torch",
+        step_mode: StepMode = "s",
+        backend: Backend = "torch",
         **kwargs,
     ):
         super().__init__(n_neuron, linear, step_mode=step_mode, backend=backend)
@@ -777,7 +775,7 @@ class HeterSynapsePSC(BasePSC):
     ) -> torch.Tensor:
         return psc_flat.reshape(*leading, *self.n_neuron, self.n_receptor).sum(-1)
 
-    def single_step_forward(self, z: torch.Tensor):
+    def single_step_forward(self, z: torch.Tensor) -> torch.Tensor:
         z_flat, leading, has_receptor_axis = self._flatten_input(z)
 
         if self.history is not None:
@@ -794,7 +792,7 @@ class HeterSynapsePSC(BasePSC):
         receptor_type: int | str | tuple[str, str] | None = None,
         psc: torch.Tensor | None = None,
         validate_nan: bool = True,
-    ):
+    ) -> torch.Tensor:
         """Get PSC for specific receptor type(s).
 
         Mode is automatically detected from receptor_type_index columns:
@@ -803,29 +801,40 @@ class HeterSynapsePSC(BasePSC):
 
         Args:
             receptor_type:
-                - None: return summed PSC across all receptor types
+                - None: return ``psc`` unchanged, i.e. *not* summed over
+                  receptors (the receptor axis stays flattened into the last
+                  dimension)
                 - int: receptor index
                 - str: receptor type name (connection mode only)
                 - tuple[str, str]: (pre_type, post_type) pair (neuron mode only)
-            psc: Optional PSC tensor to query, defaults to self.base_psc.psc
-            validate_nan: If True, raise error if NaN values detected
+            psc: Optional flat per-receptor PSC tensor of shape
+                ``(*batch, size * n_receptor)`` to query, defaults to
+                ``self.base_psc.psc``. (``self.psc`` is already summed over
+                receptors.)
+            validate_nan: If True, raise ``ValueError`` if NaN values detected
 
         Returns:
-            PSC tensor for the specified receptor type(s).
+            With ``receptor_type=None``, ``psc`` itself with shape
+            ``(*batch, size * n_receptor)``. Otherwise the PSC of the selected
+            receptor with shape ``(*batch, *n_neuron)``.
+
+        Raises:
+            ValueError: If a tuple is given outside neuron mode, a string is
+                given in neuron mode, or the result contains NaN while
+                ``validate_nan`` is True.
+            KeyError: If the receptor type is not in ``receptor_type_index``.
         """
         psc = psc if psc is not None else self.base_psc.psc
 
         if receptor_type is None:
             result = psc
         else:
-            # Autodetect mode from receptor_type_index columns
             has_pre_post = (
                 "pre_receptor_type" in self.receptor_type_index.columns
                 and "post_receptor_type" in self.receptor_type_index.columns
             )
 
             if isinstance(receptor_type, tuple):
-                # Must be neuron mode
                 if not has_pre_post:
                     raise ValueError(
                         "Tuple receptor_type requires neuron mode "
@@ -838,7 +847,6 @@ class HeterSynapsePSC(BasePSC):
                 )
                 receptor_idx = idx.loc[(pre_type, post_type), "receptor_index"]
             elif isinstance(receptor_type, str):
-                # String lookup - mode depends on columns
                 if has_pre_post:
                     raise ValueError(
                         "String receptor_type not supported in neuron mode. "
@@ -847,7 +855,6 @@ class HeterSynapsePSC(BasePSC):
                 idx = self.receptor_type_index.set_index("receptor_type")
                 receptor_idx = idx.loc[receptor_type, "receptor_index"]
             else:
-                # Integer index
                 receptor_idx = int(receptor_type)
 
             result = psc.view(*psc.shape[:-1], *self.n_neuron, self.n_receptor)[
@@ -924,7 +931,7 @@ class GapJunction(nn.Module):
         n_neuron: int | Sequence[int],
         g_gap: float | TensorLike = 1.0,
         linear: torch.nn.Module | None = None,
-        step_mode: str = "s",
+        step_mode: StepMode = "s",
     ):
         super().__init__()
 
@@ -1032,7 +1039,7 @@ class VoltageCoupling(nn.Module):
         n_neuron: int | Sequence[int],
         g_couple: float | TensorLike = 1.0,
         linear: torch.nn.Module | None = None,
-        step_mode: str = "s",
+        step_mode: StepMode = "s",
     ):
         super().__init__()
 

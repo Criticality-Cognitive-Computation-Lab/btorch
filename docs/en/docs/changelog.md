@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Breaking:** a spike delivered at step `t` now affects the PSC returned at step
+  `t` for every PSC type (`AlphaPSC`, `AlphaPSCBilleh`, `DualExponentialPSC`
+  previously took one extra `dt`).
+- **Breaking:** `GLIF3.forward_exact_no_spike(x, t=None, v0=None, Iasc0=None,
+  t_mode="homo")` is a pure function (it no longer updates state); the elementwise
+  primitive `exact_no_spike_at(x, t, v0, Iasc0)` supports batched heterogeneous
+  times and states, e.g. for iterative root finding. `t_mode="heter"` selects
+  per-element times.
+- **Breaking:** plotting and fitting options are grouped in dataclasses
+  (`TbpttConfig`, `GlobalSearchConfig`, `StagedConfig`, `FitLossConfig`, raster
+  options); see the [analysis](analysis.md) and [visualisation](visualisation.md)
+  pages.
+- **Breaking:** the options of `memories_to_xarray` / `save_memories_to_xarray`
+  are grouped into `DimLayout`, `SparseOptions` and `ZarrStoreOptions`
+  (`btorch.io`); `neuron_ids` and `partial_map` are keyword-only.
+- **Breaking:** hex `scatter` / `quiver` take `HexGeometry`, `HexColorMap`,
+  `HexPatchStyle` and `HexReference`; `plot_grouped_spectrum` takes
+  `SpectrumGrouping` and `SpectrumStyle`. `quiver` now honours `rotation_deg` and
+  the colour limits.
+- **Breaking:** package layout follows layers. `btorch.datasets.noise` ->
+  `btorch.models.noise`; `btorch.datasets.transforms` ->
+  `btorch.utils.hex.augment`; `btorch.analysis.two_compartment_fit` ->
+  `btorch.fitting.two_compartment` and `btorch.analysis.tuning` ->
+  `btorch.fitting.tuning` (the fitting names are no longer re-exported from
+  `btorch.analysis`). The `btorch.datasets` package is removed.
+- Analysis naming rule: estimators/pipelines are `compute_*`. Renamed
+  `branching_ratio` -> `compute_branching_ratio`, `get_slopes` ->
+  `compute_lagged_slopes`, `get_continuous_spiking_rate` ->
+  `compute_continuous_spiking_rate`, `voltage_overshoot` ->
+  `compute_voltage_overshoot`.
+- Removed `plot_group_violin`, `plot_group_box` and `plot_group_ecdf`; use
+  `plot_group_distribution(..., kind="violin" | "box" | "ecdf")`.
+- Heavy dependencies are optional extras (`io`, `config`, `fast`, `gpu`,
+  `analysis`, `viz`, `sparse`, `examples`, `all`); see
+  [installation](installation.md).
+- `fano_population` / `kurtosis_population` are annotated as `StatsResult`;
+  multi-output decorated analysis functions (`compute_lag_correlation`, E/I
+  balance) are annotated as `MultiStatsResult` (new, in
+  `btorch.analysis.statistics`).
+- `make_hetersynapse_constraint` builds its constraint key in one place; results
+  are unchanged.
+
+### Fixed
+- `make_hetersynapse_conn` delay handling.
+- `plot_multiscale_fano` with an unsupported `group_by` now raises `ValueError`
+  instead of `NameError`.
+- The power-law scaling fit reports `r_squared = NaN` for constant input instead
+  of dividing by zero.
+
 ## [0.1.0]
 
 ### Added

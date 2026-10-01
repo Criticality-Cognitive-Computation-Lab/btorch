@@ -6,13 +6,13 @@ from typing import Literal
 
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import torch
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
 from ...analysis.spiking import compute_spectrum
 from ...utils.array import to_numpy
+from .spectrum_options import SpectrumGrouping, SpectrumStyle
 
 
 def plot_spectrum(
@@ -94,35 +94,45 @@ def plot_spectrum(
 def plot_grouped_spectrum(
     data: np.ndarray | torch.Tensor,
     dt: float = 1.0,
-    neurons_df: pd.DataFrame | None = None,
-    group_by: str | None = None,
-    groups: dict[str, list[int]] | None = None,  # Manual override
+    grouping: SpectrumGrouping | None = None,
+    *,
     mode: Literal["overlay", "subplots"] = "overlay",
     separate_figures: bool = False,
     nperseg: int | None = None,
-    show_traces: bool = True,
-    show_mean: bool = True,
-    colors: dict[str, str] | None = None,
+    style: SpectrumStyle | None = None,
     title: str | None = "Grouped Spectrum",
-    plot_width: float = 6.0,
-    plot_height: float = 4.0,
 ) -> Figure | dict[str, Figure]:
     """Plot spectrum for multiple groups.
 
     Args:
         data: (Time, Neurons)
         dt: Timestep
-        neurons_df: Metadata
-        group_by: Column to group by
-        groups: Manual dict of {group_label: [neuron_indices]}
+        grouping: Neuron grouping (metadata column or manual groups); see
+            :class:`~btorch.visualisation.timeseries.SpectrumGrouping`.
+            Defaults to a single group with all neurons.
         mode: "overlay" (all in one) or "subplots" (rows)
         separate_figures: Return dict of figs
-        colors: Dict of {group_label: color}
+        nperseg: Welch segment length passed to :func:`plot_spectrum`
+        style: Traces/mean flags, colours and panel size; see
+            :class:`~btorch.visualisation.timeseries.SpectrumStyle`.
+        title: Title of the overlay figure
+
+    Returns:
+        A figure, or a dict of figures keyed by group when
+        ``separate_figures`` is True.
     """
+    grouping = grouping or SpectrumGrouping()
+    style = style or SpectrumStyle()
+    neurons_df, group_by, groups = (
+        grouping.neurons_df,
+        grouping.group_by,
+        grouping.groups,
+    )
+    show_traces, show_mean, colors = style.show_traces, style.show_mean, style.colors
+    plot_width, plot_height = style.plot_width, style.plot_height
     data_np = to_numpy(data)
     if groups is None:
         if neurons_df is None or group_by is None:
-            # No grouping, treat as one group "All"
             groups = {"All": list(range(data_np.shape[1]))}
         else:
             if group_by not in neurons_df.columns:

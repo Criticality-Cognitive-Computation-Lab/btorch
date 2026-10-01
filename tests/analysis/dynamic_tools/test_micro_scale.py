@@ -29,11 +29,6 @@ def test_spike_distance_identical_trains_is_zero():
     assert micro_scale.compute_spike_distance(spikes, dt=1.0) == pytest.approx(0.0)
 
 
-def test_compute_cv_isi_was_merged_into_isi_cv():
-    """``isi_cv`` is the single ISI-CV implementation."""
-    assert not hasattr(micro_scale, "compute_cv_isi")
-
-
 def test_isi_cv_nan_below_three_spikes():
     """A neuron needs >= 2 ISIs (3 spikes) for a CV; otherwise NaN."""
     spikes = np.zeros((100, 3))

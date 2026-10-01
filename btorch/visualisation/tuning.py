@@ -91,16 +91,14 @@ def plot_fi_vi_curve(
         else:
             time = np.arange(voltages.shape[0])
 
-        # Use "waterfall" plot: offset traces vertically
-        # Calculate offset based on voltage range
+        # Waterfall plot: traces are offset vertically by a fraction of the range.
         v_min = voltages.min()
         v_max = voltages.max()
         v_range = v_max - v_min
         if v_range == 0:
-            v_range = 1.0  # Avoid division by zero
+            v_range = 1.0
 
-        # Offset amount: fraction of range per trace
-        offset_step = v_range * 0.2  # Space out well
+        offset_step = v_range * 0.2
 
         num_steps = voltages.shape[1]
         cm = plt.get_cmap("viridis")
@@ -115,9 +113,8 @@ def plot_fi_vi_curve(
                 time, voltages[:, i] + offset, color=color, alpha=0.8, linewidth=1.0
             )
 
-            # Or just label current values
-            if i % (max(1, num_steps // 5)) == 0:  # Sparse labels
-                yticks.append(voltages[0, i] + offset)  # Assuming start at rest
+            if i % (max(1, num_steps // 5)) == 0:
+                yticks.append(voltages[0, i] + offset)
                 yticklabels.append(f"{currents[i]:.1f}")
 
         ax.set_xlabel("Time (ms)")

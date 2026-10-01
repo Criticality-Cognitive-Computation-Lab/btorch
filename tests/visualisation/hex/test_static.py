@@ -15,7 +15,15 @@ from matplotlib.patches import RegularPolygon
 from btorch.utils.file import save_fig
 from btorch.utils.hex import disk, to_pixel
 from btorch.utils.hex.offset import axial_to_zigzag
-from btorch.visualisation.hex import grid, quiver, scatter
+from btorch.visualisation.hex import (
+    HexColorMap,
+    HexGeometry,
+    HexPatchStyle,
+    HexReference,
+    grid,
+    quiver,
+    scatter,
+)
 from btorch.visualisation.hex.static import (
     _resolve_to_pixel,
     compass,
@@ -36,17 +44,33 @@ def test_scatter_coordinate_formats():
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
     # Axial coordinates (converted to pixel for display)
-    scatter(q, r, values, coord_format="axial", ax=axes[0], cmap="RdBu_r")
+    scatter(
+        q, r, values, coord_format="axial", ax=axes[0], color=HexColorMap(cmap="RdBu_r")
+    )
     axes[0].set_title("Axial Coordinates (q,r)")
 
     # Zigzag coordinates: must convert axial → zigzag first
     zx, zy = axial_to_zigzag(q, r)
-    scatter(zx, zy, values, coord_format="zigzag", ax=axes[1], cmap="RdBu_r")
+    scatter(
+        zx,
+        zy,
+        values,
+        coord_format="zigzag",
+        ax=axes[1],
+        color=HexColorMap(cmap="RdBu_r"),
+    )
     axes[1].set_title("Zigzag Coordinates (x,y)")
 
     # Pixel coordinates (direct)
     px, py = to_pixel(q, r, size=1.0)
-    scatter(px, py, values, coord_format="pixel", ax=axes[2], cmap="RdBu_r")
+    scatter(
+        px,
+        py,
+        values,
+        coord_format="pixel",
+        ax=axes[2],
+        color=HexColorMap(cmap="RdBu_r"),
+    )
     axes[2].set_title("Pixel Coordinates")
 
     plt.suptitle("Scatter: Same Data, Different Coordinate Systems", fontsize=14)
@@ -91,7 +115,14 @@ def test_flow_field_visualization():
 
     # Quiver plot
     ret = quiver(
-        q, r, dq, dr, coord_format="axial", ax=axes[0], scale=2.0, cmap="viridis"
+        q,
+        r,
+        dq,
+        dr,
+        coord_format="axial",
+        ax=axes[0],
+        scale=2.0,
+        color=HexColorMap(cmap="viridis"),
     )
     # quiver returns (fig, ax) and adds exactly one Quiver artist with one arrow
     # per input hex.
@@ -102,7 +133,15 @@ def test_flow_field_visualization():
 
     # Overlay on scalar field
     vorticity = magnitude  # proxy for visualization
-    scatter(q, r, vorticity, coord_format="axial", ax=axes[1], cmap="Blues", alpha=0.5)
+    scatter(
+        q,
+        r,
+        vorticity,
+        coord_format="axial",
+        ax=axes[1],
+        color=HexColorMap(cmap="Blues"),
+        patch=HexPatchStyle(alpha=0.5),
+    )
     # Add flow arrows
     x, y = to_pixel(q, r)
     dx, dy = to_pixel(q + dq, r + dr)
@@ -167,18 +206,35 @@ def test_receptive_field_visualization():
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
     # Center component
-    scatter(q, r, center, coord_format="axial", ax=axes[0], cmap="Reds", vmin=0, vmax=1)
+    scatter(
+        q,
+        r,
+        center,
+        coord_format="axial",
+        ax=axes[0],
+        color=HexColorMap(cmap="Reds", vmin=0, vmax=1),
+    )
     axes[0].set_title("Center (Excitatory)")
 
     # Surround component
     scatter(
-        q, r, surround, coord_format="axial", ax=axes[1], cmap="Blues", vmin=0, vmax=0.6
+        q,
+        r,
+        surround,
+        coord_format="axial",
+        ax=axes[1],
+        color=HexColorMap(cmap="Blues", vmin=0, vmax=0.6),
     )
     axes[1].set_title("Surround (Inhibitory)")
 
     # Full RF
     scatter(
-        q, r, rf, coord_format="axial", ax=axes[2], cmap="RdBu_r", vmin=-0.6, vmax=1
+        q,
+        r,
+        rf,
+        coord_format="axial",
+        ax=axes[2],
+        color=HexColorMap(cmap="RdBu_r", vmin=-0.6, vmax=1),
     )
     axes[2].set_title("Full Receptive Field (DoG)")
 
@@ -217,7 +273,12 @@ def test_orientation_map():
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
     scatter(
-        q, r, orientation, coord_format="axial", ax=axes[0], cmap="hsv", vmin=0, vmax=1
+        q,
+        r,
+        orientation,
+        coord_format="axial",
+        ax=axes[0],
+        color=HexColorMap(cmap="hsv", vmin=0, vmax=1),
     )
     axes[0].set_title("Orientation Preference")
 
@@ -227,9 +288,7 @@ def test_orientation_map():
         combined,
         coord_format="axial",
         ax=axes[1],
-        cmap="twilight",
-        vmin=0,
-        vmax=1.3,
+        color=HexColorMap(cmap="twilight", vmin=0, vmax=1.3),
     )
     axes[1].set_title("Orientation + Spatial Frequency")
 
@@ -278,10 +337,8 @@ def test_looming_stimulus():
             values,
             coord_format="axial",
             ax=axes[t],
-            cmap="Reds",
-            vmin=0,
-            vmax=1,
-            edgecolor="gray",
+            color=HexColorMap(cmap="Reds", vmin=0, vmax=1),
+            patch=HexPatchStyle(edgecolor="gray"),
         )
         axes[t].set_title(f"t={t}")
 
@@ -501,3 +558,66 @@ def test_full_combo():
     np.testing.assert_allclose(py, [0.0, 1.5], atol=1e-9)
     save_fig(fig, "full_combo")
     plt.close()
+
+
+def test_hex_options_change_output():
+    """Option dataclasses must visibly change what scatter/quiver draw."""
+    q, r = disk(3)
+    values = np.arange(len(q), dtype=float)
+
+    def facecolors(ax):
+        return [p.get_facecolor() for p in ax.patches]
+
+    # Baseline: defaults (viridis, pointy, size 1, no edge colour, alpha 1).
+    _, ax0 = scatter(q, r, values)
+    base_xy = np.array([p.xy for p in ax0.patches])
+    base_colors = facecolors(ax0)
+
+    # HexColorMap: a different colormap changes every face colour; explicit
+    # limits wider than the data compress the colour range.
+    _, ax1 = scatter(q, r, values, color=HexColorMap(cmap="Reds"))
+    assert facecolors(ax1) != base_colors
+    _, ax2 = scatter(q, r, values, color=HexColorMap(vmin=0, vmax=10 * values.max()))
+    assert facecolors(ax2) != base_colors
+
+    # HexGeometry: size scales the hex centres, rotation moves them.
+    _, ax3 = scatter(q, r, values, geometry=HexGeometry(size=2.0))
+    assert np.allclose(np.array([p.xy for p in ax3.patches]), 2.0 * base_xy)
+    # (rotation_deg is only applied by the "flywire" layout.)
+    _, ax4a = scatter(q, r, values, geometry=HexGeometry(layout="flywire"))
+    _, ax4b = scatter(
+        q, r, values, geometry=HexGeometry(layout="flywire", rotation_deg=30.0)
+    )
+    assert not np.allclose(
+        np.array([p.xy for p in ax4a.patches]), np.array([p.xy for p in ax4b.patches])
+    )
+
+    # HexPatchStyle: alpha and edge colour are forwarded to every patch.
+    _, ax5 = scatter(
+        q, r, values, patch=HexPatchStyle(alpha=0.3, edgecolor="red", edgewidth=2)
+    )
+    assert all(p.get_alpha() == 0.3 for p in ax5.patches)
+    assert all(p.get_linewidth() == 2 for p in ax5.patches)
+
+    # HexReference: axes arrows add patches, a compass adds an inset axes.
+    _, ax6 = scatter(
+        q,
+        r,
+        values,
+        reference=HexReference(axes_alignment="vertex", show_compass="edge"),
+    )
+    assert len(ax6.patches) > len(ax0.patches)
+    assert len(ax6.child_axes) == 1
+
+    # quiver honours geometry (size scales arrow origins) and HexColorMap.
+    dq = np.ones(len(q))
+    dr = np.zeros(len(q))
+    _, axq0 = quiver(q, r, dq, dr)
+    _, axq1 = quiver(q, r, dq, dr, geometry=HexGeometry(size=2.0))
+    assert np.allclose(axq1.collections[0].X, 2.0 * axq0.collections[0].X)
+    _, axq2 = quiver(q, r, dq, dr * 0 + np.arange(len(q)) / 10)
+    _, axq3 = quiver(q, r, dq, np.arange(len(q)) / 10, color=HexColorMap(cmap="Reds"))
+    assert not np.allclose(
+        axq2.collections[0].get_facecolor(), axq3.collections[0].get_facecolor()
+    )
+    plt.close("all")

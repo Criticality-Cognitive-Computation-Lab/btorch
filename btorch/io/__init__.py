@@ -8,6 +8,7 @@ Key features include:
 - Dimension-aware serialization with flexible (time, batch, neuron) grouping
 - Automatic handling of partial recordings on neuron subsets
 - Compression and chunking for large datasets
+- Option dataclasses: `DimLayout`, `SparseOptions`, `ZarrStoreOptions`
 
 Main entry points:
     - [`memories_to_xarray`](btorch/io/serialization.py): Convert nested
@@ -21,6 +22,9 @@ Main entry points:
 """
 
 from btorch.io.serialization import (
+    DimLayout,
+    SparseOptions,
+    ZarrStoreOptions,
     from_spike_sparse,
     load_memories_from_xarray,
     memories_to_xarray,
@@ -31,6 +35,9 @@ from btorch.io.serialization import (
 
 
 __all__ = [
+    "DimLayout",
+    "SparseOptions",
+    "ZarrStoreOptions",
     "from_spike_sparse",
     "load_memories_from_xarray",
     "memories_to_xarray",

@@ -9,7 +9,7 @@ import pytest
 import torch
 import yaml
 
-from btorch.analysis.branching import branching_ratio
+from btorch.analysis.branching import compute_branching_ratio
 from btorch.analysis.dynamic_tools import complexity, fano as dyn_fano
 from btorch.analysis.statistics import describe_array
 from btorch.utils.yaml_utils import load_yaml, save_yaml
@@ -61,7 +61,7 @@ def test_branching_ratio_no_maxslopes():
     """The legacy ``maxslopes`` synonym of ``k_max`` was removed."""
     counts = np.random.default_rng(0).poisson(5, size=500).astype(float)
     with pytest.raises(TypeError):
-        branching_ratio(counts, maxslopes=10)
+        compute_branching_ratio(counts, maxslopes=10)
 
 
 def test_describe_array_returns_stats(capsys):
@@ -130,7 +130,7 @@ def test_gain_stability_restores_weights_and_returns_nan(monkeypatch):
     monkeypatch.setattr(functional, "reset_net", lambda *a, **k: None)
     monkeypatch.setattr(minit, "uniform_v_", lambda *a, **k: None)
     monkeypatch.setattr(
-        complexity, "get_continuous_spiking_rate", lambda s, dt: s.numpy()
+        complexity, "compute_continuous_spiking_rate", lambda s, dt: s.numpy()
     )
     # Fake forward pass returning random spikes.
     model.forward = lambda x: (
@@ -195,9 +195,9 @@ def test_spiking_window_args_raise_value_error(window, overlap):
         fano(_spikes(T=100, N=2), window=window, overlap=overlap)
 
 
-def test_compute_lyapunov_exponent_runs_on_spike_train():
-    """``compute_lyapunov_exponent`` works on a ``(time, neurons)`` spike
-    train.
+def test_compute_lyapunov_exponent_from_spikes_runs_on_spike_train():
+    """``compute_lyapunov_exponent_from_spikes`` works on a ``(time, neurons)``
+    spike train.
 
     Regression test: it used to hand the 2D smoothed rate to nolds (which needs
     a 1D series) and pass ``dt`` in the ``emb_dim`` slot, so every call raised
@@ -208,7 +208,7 @@ def test_compute_lyapunov_exponent_runs_on_spike_train():
     gen = torch.Generator().manual_seed(0)
     spikes = (torch.rand(2000, 20, generator=gen) < 0.05).float()
 
-    value = complexity.compute_lyapunov_exponent(spikes, dt=0.1)
+    value = complexity.compute_lyapunov_exponent_from_spikes(spikes, dt=0.1)
 
     # A finite scalar: the exact value depends on nolds, so only check type.
     assert isinstance(value, float)

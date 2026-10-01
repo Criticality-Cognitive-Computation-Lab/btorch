@@ -13,6 +13,13 @@ All functions support both NumPy arrays and PyTorch tensors, with
 GPU-optimized implementations where applicable. The time dimension is
 assumed to be the first dimension (axis=0) for all inputs.
 
+Naming rule:
+    - Bare names (``isi_cv``, ``fano``, ``kurtosis``, ``local_variation``, ...)
+      are per-neuron or population *statistics*: they return arrays (or the
+      ``stat`` aggregate) together with an ``info`` dict, as ``(value, info)``.
+    - ``compute_*`` names are multi-step *pipelines* (e.g. smoothing then an
+      estimator, or a simulation) and return their own result types.
+
 Shape conventions:
     - Input spike trains: [T, ...] where T is time steps, remaining
       dimensions can be arbitrary (neurons, trials, batches, etc.)
@@ -29,14 +36,11 @@ aggregation (`stat`), additional statistics (`stat_info`), and
 percentile computation (`percentiles`) to many functions.
 """
 
-from collections.abc import Sequence
-from typing import Any
-
 import numpy as np
 import torch
 from scipy.ndimage import convolve1d
 
-from .statistics import use_percentiles, use_stats
+from .statistics import BatchAxis, StatsResult, use_percentiles, use_stats
 
 
 def _check_window(window: int, overlap: int, T: int) -> None:
@@ -404,7 +408,7 @@ def _kurtosis_torch(
 def _cv(
     spikes: np.ndarray | torch.Tensor,
     dt: float = 1.0,
-    batch_axis: int | tuple[int, ...] | None = None,
+    batch_axis: BatchAxis = None,
     dtype: np.dtype | torch.dtype | None = None,
 ):
     if isinstance(spikes, torch.Tensor):
@@ -418,9 +422,9 @@ def _cv(
 def isi_cv(
     spikes: np.ndarray | torch.Tensor,
     dt: float = 1.0,
-    batch_axis: int | tuple[int, ...] | None = None,
+    batch_axis: BatchAxis = None,
     dtype: np.dtype | torch.dtype | None = None,
-) -> tuple[Any, ...]:
+) -> StatsResult:
     """Calculate coefficient of variation of ISIs per neuron.
 
     Supports both NumPy and PyTorch inputs. For GPU tensors, uses a hybrid
@@ -472,9 +476,9 @@ def fano(
     spikes: np.ndarray | torch.Tensor,
     window: int | None = None,
     overlap: int = 0,
-    batch_axis: int | tuple[int, ...] | None = None,
+    batch_axis: BatchAxis = None,
     dtype: np.dtype | torch.dtype | None = None,
-) -> tuple[Any, ...]:
+) -> StatsResult:
     """Compute Fano factor for spike trains using optimized cumulative sums.
 
     Supports both NumPy and PyTorch inputs. GPU-friendly operation.
@@ -532,8 +536,8 @@ def kurtosis(
     window: int | None = None,
     overlap: int = 0,
     fisher: bool = True,
-    batch_axis: int | tuple[int, ...] | None = None,
-) -> tuple[Any, ...]:
+    batch_axis: BatchAxis = None,
+) -> StatsResult:
     """Compute kurtosis of spike counts using optimized cumulative sums.
 
     Supports both NumPy and PyTorch inputs. GPU-friendly operation.
@@ -588,49 +592,37 @@ def kurtosis(
 # =============================================================================
 
 
-def _isis_population_numpy(spikes: np.ndarray, dt: float):
-    """NumPy implementation of pooled CV across all neurons."""
-    T = spikes.shape[0]
-    flat_data = spikes.reshape(T, -1)
+def _isis_population_numpy(spikes: np.ndarray, dt: float) -> np.ndarray:
+    """Pooled inter-spike intervals across all neurons (NumPy).
 
-    t_idx, n_idx = np.where(flat_data > 0)
-
-    # Sort by time only (pool across neurons)
-    t_sorted = t_idx[np.argsort(t_idx)].astype(np.float64) * dt
-
-    if len(t_sorted) < 2:
-        return np.array(np.nan), {}
-
-    isis = np.diff(t_sorted)
-    return isis
+    Spikes of all neurons are merged into one train; the intervals between
+    consecutive events (in time units of ``dt``) are returned. Fewer than two
+    spikes give an empty array, never a sentinel tuple.
+    """
+    flat_data = spikes.reshape(spikes.shape[0], -1)
+    # np.where scans row-major, so the time indices are already sorted.
+    t_idx = np.where(flat_data > 0)[0].astype(np.float64) * dt
+    return np.diff(t_idx)
 
 
-def _isis_population_torch(spikes: torch.Tensor, dt: float):
-    """Torch implementation of pooled CV across all neurons."""
-    device = spikes.device
-    T = spikes.shape[0]
+def _isis_population_torch(spikes: torch.Tensor, dt: float) -> torch.Tensor:
+    """Pooled inter-spike intervals across all neurons (Torch).
 
-    # Transfer to CPU for ISI extraction
-    flat_data = spikes.cpu().reshape(T, -1)
-
-    t_idx = torch.nonzero(flat_data, as_tuple=True)[0]
-
-    if len(t_idx) < 2:
-        return torch.tensor(float("nan"), device=device), {}
-
-    # Sort by time only (pool across neurons)
-    t_sorted = t_idx.sort().values.float() * dt
-
-    isis = torch.diff(t_sorted)
-
-    return isis
+    Same contract as :func:`_isis_population_numpy`; the result is a float32
+    tensor on the input device (empty for fewer than two spikes).
+    """
+    # ISI extraction is done on CPU, the result goes back to the input device.
+    flat_data = spikes.cpu().reshape(spikes.shape[0], -1)
+    # nonzero scans row-major, so the time indices are already sorted.
+    t_idx = torch.nonzero(flat_data, as_tuple=True)[0].float() * dt
+    return torch.diff(t_idx).to(spikes.device)
 
 
 @use_stats(value_key="isi_population", default_stat="cv")
 def isi_cv_population(
     spikes: np.ndarray | torch.Tensor,
     dt: float = 1.0,
-) -> tuple[Any, ...]:
+) -> StatsResult:
     """Calculate coefficient of variation of ISIs pooled across all neurons.
 
     This computes CV from the pooled ISI distribution across the entire
@@ -656,9 +648,18 @@ def isi_cv_population(
             "assert"). See :func:`~btorch.analysis.statistics.use_stats`.
 
     Returns:
-        cv_pop: Single scalar CV value for the population, or aggregated
-            statistic if `stat` is provided.
-        info: Dictionary with computed statistics.
+        A ``(value, info)`` tuple. With the default ``stat="cv"``, ``value``
+        is the scalar population CV of the pooled ISIs (NaN when the
+        population emitted fewer than two spikes). With ``stat=None`` it is
+        the raw pooled ISI array in units of ``dt`` (empty for fewer than two
+        spikes); any other ``stat`` aggregates that array. ``info`` holds the
+        pooled ISIs under ``"isi_population"`` and the aggregate under
+        ``"isi_population_<stat>"``.
+
+    Notes:
+        ``cv`` follows the backend convention of
+        :func:`~btorch.analysis.statistics.compute_stats_batch` (NumPy:
+        population std, Torch: unbiased std).
     """
     if isinstance(spikes, torch.Tensor):
         return _isis_population_torch(spikes, dt)
@@ -751,7 +752,7 @@ def fano_population(
     spikes: np.ndarray | torch.Tensor,
     window: int | None = None,
     overlap: int = 0,
-) -> tuple[np.ndarray | torch.Tensor, dict]:
+) -> StatsResult:
     """Compute Fano factor for the pooled population activity.
 
     This computes Fano factor from the summed population spike count,
@@ -863,7 +864,7 @@ def kurtosis_population(
     window: int | None = None,
     overlap: int = 0,
     fisher: bool = True,
-) -> tuple[np.ndarray | torch.Tensor, dict]:
+) -> StatsResult:
     """Compute kurtosis for the pooled population activity.
 
     This computes kurtosis from the summed population spike count,
@@ -895,9 +896,9 @@ def cv_temporal(
     dt: float = 1.0,
     window: int = 100,
     step: int = 1,
-    batch_axis: int | tuple[int, ...] | None = None,
+    batch_axis: BatchAxis = None,
     dtype: np.dtype | torch.dtype | None = None,
-) -> tuple[Any, ...]:
+) -> StatsResult:
     """Compute CV in sliding temporal windows.
 
     Calculates the coefficient of variation of ISIs within sliding windows
@@ -977,8 +978,8 @@ def fano_temporal(
     spikes: np.ndarray | torch.Tensor,
     window: int = 100,
     step: int = 1,
-    batch_axis: int | tuple[int, ...] | None = None,
-) -> tuple[Any, ...]:
+    batch_axis: BatchAxis = None,
+) -> StatsResult:
     """Compute Fano factor in sliding temporal windows.
 
     Calculates the Fano factor within sliding windows over time,
@@ -1054,7 +1055,7 @@ def fano_sweep(
     spikes: np.ndarray | torch.Tensor,
     window: int | tuple[int, ...] | None = None,
     overlap: int = 0,
-    batch_axis: int | tuple[int, ...] | None = None,
+    batch_axis: BatchAxis = None,
     dtype: np.dtype | torch.dtype | None = None,
 ) -> tuple[np.ndarray | torch.Tensor, dict]:
     """Compute Fano factor sweeping over window sizes.
@@ -1296,8 +1297,8 @@ def _lv_torch(
 def local_variation(
     spikes: np.ndarray | torch.Tensor,
     dt: float = 1.0,
-    batch_axis: int | tuple[int, ...] | None = None,
-) -> tuple[Any, ...]:
+    batch_axis: BatchAxis = None,
+) -> StatsResult:
     """Calculate Local Variation (LV) of ISIs per neuron.
 
     LV is a measure of spike train irregularity that is less sensitive to
@@ -1358,7 +1359,7 @@ def firing_rate(
     spikes: np.ndarray | torch.Tensor,
     width: int | float | None = 4,
     dt: int | float | None = None,
-    batch_axis: int | Sequence[int] | None = None,
+    batch_axis: BatchAxis = None,
 ) -> np.ndarray | torch.Tensor:
     """Smooth spikes into firing rates.
 

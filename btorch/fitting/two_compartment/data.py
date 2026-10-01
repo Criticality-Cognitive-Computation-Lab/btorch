@@ -1,13 +1,19 @@
 """Allen sweep loading and resampling for the two-compartment fit."""
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import torch
 from torch import Tensor
+
+
+if TYPE_CHECKING:  # AllenSDK is an optional dependency
+    from allensdk.core.cell_types_cache import CellTypesCache
 
 
 @dataclass
@@ -53,9 +59,21 @@ def _require_allensdk():
 def get_cell_types_cache(
     manifest_file: str | Path | None = None,
     *,
-    cache: Any | None = None,
-) -> Any:
-    """Create or reuse an AllenSDK ``CellTypesCache`` instance."""
+    cache: CellTypesCache | None = None,
+) -> CellTypesCache:
+    """Create or reuse an AllenSDK ``CellTypesCache`` instance.
+
+    Args:
+        manifest_file: Path of the cache manifest; ``None`` uses AllenSDK's
+            default location. Ignored when ``cache`` is given.
+        cache: An existing cache, returned unchanged.
+
+    Returns:
+        ``cache`` if provided, else a new ``CellTypesCache``.
+
+    Raises:
+        ImportError: If AllenSDK is not installed and no ``cache`` is given.
+    """
     if cache is not None:
         return cache
     CellTypesCache = _require_allensdk()

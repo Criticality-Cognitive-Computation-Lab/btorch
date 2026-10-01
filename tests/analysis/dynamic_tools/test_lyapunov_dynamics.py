@@ -89,3 +89,25 @@ def test_lyapunov_spectrum_logistic_map_signs():
     if has_contraction:
         assert np.isfinite(ratio)
     assert ratio > 0.0
+
+
+def test_get_continuous_spiking_rate_follows_input_type():
+    """NumPy in -> NumPy out, torch in -> torch out (same values, on
+    device)."""
+    import torch
+
+    from btorch.analysis.dynamic_tools.lyapunov_dynamics import (
+        compute_continuous_spiking_rate,
+    )
+
+    spikes = np.zeros((50, 2))
+    spikes[10, 0] = 1.0
+    out_np = compute_continuous_spiking_rate(spikes, dt=1.0, sigma=2.0)
+    out_t = compute_continuous_spiking_rate(torch.from_numpy(spikes), dt=1.0, sigma=2.0)
+
+    assert isinstance(out_np, np.ndarray)
+    assert isinstance(out_t, torch.Tensor)
+    assert out_t.device == torch.device("cpu")
+    np.testing.assert_allclose(out_t.numpy(), out_np)
+    # Gaussian smoothing conserves the (single) spike.
+    assert out_np[:, 0].sum() == pytest.approx(1.0, rel=1e-6)

@@ -7,6 +7,7 @@ configuration management workflows.
 
 import inspect
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeVar, overload
 
@@ -333,6 +334,144 @@ def diff_conf(
     return OmegaConf.create(diff_tree)
 
 
+_ROOT = "<root>"
+_VALID_STATUS = frozenset({"changed", "added", "removed"})
+
+
+@dataclass
+class _DiffAccumulator:
+    """Collect diff entries as ``path -> value`` maps, one per status.
+
+    ``changed`` stores ``(old, new)`` pairs; ``added`` and ``removed`` store the
+    single value that exists on one side only.
+    """
+
+    changed: dict[str, tuple[object, object]] = field(default_factory=dict)
+    added: dict[str, object] = field(default_factory=dict)
+    removed: dict[str, object] = field(default_factory=dict)
+
+    def drop_under(self, parent: str) -> None:
+        """Forget every entry at or below ``parent``."""
+        for entries in (self.changed, self.added, self.removed):
+            for key in [k for k in entries if _is_under(k, parent)]:
+                del entries[key]
+
+
+def _is_container(node) -> bool:
+    return isinstance(node, (dict, list))
+
+
+def _is_under(key: str, parent: str) -> bool:
+    if parent == _ROOT:
+        return True
+    return key == parent or key.startswith(f"{parent}.")
+
+
+def _join_path(path: str, token) -> str:
+    return f"{path}.{token}" if path else str(token)
+
+
+def _select_plain(node, path: str):
+    """Return the node at dotted ``path`` inside plain dict/list containers."""
+    if path == _ROOT:
+        return node
+
+    cur = node
+    for token in path.split("."):
+        if isinstance(cur, dict):
+            cur = cur[token]
+        elif isinstance(cur, list):
+            cur = cur[int(token)]
+        else:
+            raise KeyError(f"Cannot descend through scalar at token '{token}'.")
+    return cur
+
+
+def _collect_leaf_paths(node, path: str) -> set[str]:
+    """Return the dotted paths of all scalar leaves below ``node``."""
+    if isinstance(node, dict):
+        children = node.items()
+    elif isinstance(node, list):
+        children = enumerate(node)
+    else:
+        return {path} if path else {_ROOT}
+
+    out: set[str] = set()
+    for key, value in children:
+        out |= _collect_leaf_paths(value, _join_path(path, key))
+    return out
+
+
+def _record_one_sided(
+    target: dict[str, object], subtree, path: str, plain_root
+) -> None:
+    """Record every leaf below ``subtree`` (present on one side only)."""
+    for leaf_path in _collect_leaf_paths(subtree, path):
+        target[leaf_path] = _select_plain(plain_root, leaf_path)
+
+
+def _walk_diff(
+    a_node, b_node, path: str, acc: _DiffAccumulator, plain_a, plain_b
+) -> None:
+    """Recursively diff two plain nodes, filling ``acc``."""
+    key = path if path else _ROOT
+
+    if isinstance(a_node, dict) and isinstance(b_node, dict):
+        # Structured union switch: treat as full subtree replacement so old
+        # type keys are discarded in one step.
+        if (
+            "_type_" in a_node
+            and "_type_" in b_node
+            and a_node["_type_"] != b_node["_type_"]
+        ):
+            acc.changed[key] = (a_node, b_node)
+            return
+
+        for k in a_node.keys() - b_node.keys():
+            _record_one_sided(acc.removed, a_node[k], _join_path(path, k), plain_a)
+        for k in b_node.keys() - a_node.keys():
+            _record_one_sided(acc.added, b_node[k], _join_path(path, k), plain_b)
+        for k in a_node.keys() & b_node.keys():
+            _walk_diff(a_node[k], b_node[k], _join_path(path, k), acc, plain_a, plain_b)
+        return
+
+    if isinstance(a_node, list) and isinstance(b_node, list):
+        common = min(len(a_node), len(b_node))
+        for idx in range(common):
+            _walk_diff(
+                a_node[idx], b_node[idx], _join_path(path, idx), acc, plain_a, plain_b
+            )
+        for idx in range(common, len(a_node)):
+            _record_one_sided(acc.removed, a_node[idx], _join_path(path, idx), plain_a)
+        for idx in range(common, len(b_node)):
+            _record_one_sided(acc.added, b_node[idx], _join_path(path, idx), plain_b)
+        return
+
+    if _is_container(a_node) != _is_container(b_node) or a_node != b_node:
+        acc.changed[key] = (a_node, b_node)
+
+
+def _collapse_union_switches(acc: _DiffAccumulator, plain_a, plain_b) -> None:
+    """Collapse subtrees whose ``_type_`` changed into one changed record.
+
+    This avoids emitting stale per-leaf removals for the previous union
+    member.
+    """
+    parents: set[str] = set()
+    for key in acc.changed:
+        if key == "_type_":
+            parents.add(_ROOT)
+        elif key.endswith("._type_"):
+            parents.add(key.rsplit(".", 1)[0])
+
+    for parent in sorted(parents, key=lambda p: (p != _ROOT, p)):
+        acc.drop_under(parent)
+        acc.changed[parent] = (
+            _select_plain(plain_a, parent),
+            _select_plain(plain_b, parent),
+        )
+
+
 def diff_conf_records(
     conf_a: DictConfig | ListConfig,
     conf_b: DictConfig | ListConfig,
@@ -359,192 +498,33 @@ def diff_conf_records(
             "diff_conf_records expects conf_b to be DictConfig or ListConfig."
         )
 
-    if mode is None:
-        mode_set = {"changed", "added", "removed"}
-    else:
-        mode_set = set(mode)
-
-    valid_status = {"changed", "added", "removed"}
-    if not mode_set.issubset(valid_status):
+    mode_set = set(_VALID_STATUS) if mode is None else set(mode)
+    if not mode_set.issubset(_VALID_STATUS):
         raise ValueError("mode must only contain: 'changed', 'added', 'removed'.")
-
-    changed: set[str] = set()
-    added: set[str] = set()
-    removed: set[str] = set()
-    changed_values: dict[str, tuple[object, object]] = {}
-    added_values: dict[str, object] = {}
-    removed_values: dict[str, object] = {}
 
     # Use plain containers so structured union explicit type metadata (`_type_`)
     # emitted by OmegaConf is visible to the recursive diff.
     plain_a = OmegaConf.to_container(conf_a, resolve=False)
     plain_b = OmegaConf.to_container(conf_b, resolve=False)
 
-    def _is_container(node) -> bool:
-        return isinstance(node, (dict, list))
+    acc = _DiffAccumulator()
+    _walk_diff(plain_a, plain_b, "", acc, plain_a, plain_b)
+    _collapse_union_switches(acc, plain_a, plain_b)
 
-    def _select_plain(node, path: str):
-        if path == "<root>":
-            return node
+    selected: set[str] = set()
+    for status in mode_set:
+        selected |= set(getattr(acc, status))
 
-        cur = node
-        for token in path.split("."):
-            if isinstance(cur, dict):
-                cur = cur[token]
-                continue
-            if isinstance(cur, list):
-                cur = cur[int(token)]
-                continue
-            raise KeyError(f"Cannot descend through scalar at token '{token}'.")
-        return cur
-
-    def _collect_leaf_paths(node, path: str) -> set[str]:
-        if isinstance(node, dict):
-            out: set[str] = set()
-            for key, value in node.items():
-                new_path = f"{path}.{key}" if path else str(key)
-                out |= _collect_leaf_paths(value, new_path)
-            return out
-
-        if isinstance(node, list):
-            out = set()
-            for idx, value in enumerate(node):
-                new_path = f"{path}.{idx}" if path else str(idx)
-                out |= _collect_leaf_paths(value, new_path)
-            return out
-
-        return {path} if path else {"<root>"}
-
-    def _walk(a_node, b_node, path: str = ""):
-        if isinstance(a_node, dict) and isinstance(b_node, dict):
-            # Structured union switch: treat as full subtree replacement so old
-            # type keys are discarded in one step.
-            if (
-                "_type_" in a_node
-                and "_type_" in b_node
-                and a_node["_type_"] != b_node["_type_"]
-            ):
-                key = path if path else "<root>"
-                changed.add(key)
-                changed_values[key] = (a_node, b_node)
-                return
-
-            keys_a = set(a_node.keys())
-            keys_b = set(b_node.keys())
-
-            for key in keys_a - keys_b:
-                key_path = f"{path}.{key}" if path else str(key)
-                leaf_paths = _collect_leaf_paths(a_node[key], key_path)
-                removed.update(leaf_paths)
-                for leaf_path in leaf_paths:
-                    removed_values[leaf_path] = _select_plain(plain_a, leaf_path)
-
-            for key in keys_b - keys_a:
-                key_path = f"{path}.{key}" if path else str(key)
-                leaf_paths = _collect_leaf_paths(b_node[key], key_path)
-                added.update(leaf_paths)
-                for leaf_path in leaf_paths:
-                    added_values[leaf_path] = _select_plain(plain_b, leaf_path)
-
-            for key in keys_a & keys_b:
-                key_path = f"{path}.{key}" if path else str(key)
-                _walk(a_node[key], b_node[key], key_path)
-            return
-
-        if isinstance(a_node, list) and isinstance(b_node, list):
-            len_a = len(a_node)
-            len_b = len(b_node)
-            common = min(len_a, len_b)
-
-            for idx in range(common):
-                key_path = f"{path}.{idx}" if path else str(idx)
-                _walk(a_node[idx], b_node[idx], key_path)
-
-            for idx in range(common, len_a):
-                key_path = f"{path}.{idx}" if path else str(idx)
-                leaf_paths = _collect_leaf_paths(a_node[idx], key_path)
-                removed.update(leaf_paths)
-                for leaf_path in leaf_paths:
-                    removed_values[leaf_path] = _select_plain(plain_a, leaf_path)
-
-            for idx in range(common, len_b):
-                key_path = f"{path}.{idx}" if path else str(idx)
-                leaf_paths = _collect_leaf_paths(b_node[idx], key_path)
-                added.update(leaf_paths)
-                for leaf_path in leaf_paths:
-                    added_values[leaf_path] = _select_plain(plain_b, leaf_path)
-            return
-
-        if _is_container(a_node) != _is_container(b_node):
-            key = path if path else "<root>"
-            changed.add(key)
-            changed_values[key] = (a_node, b_node)
-            return
-
-        if a_node != b_node:
-            key = path if path else "<root>"
-            changed.add(key)
-            changed_values[key] = (a_node, b_node)
-
-    _walk(plain_a, plain_b)
-
-    def _is_under(key: str, parent: str) -> bool:
-        if parent == "<root>":
-            return True
-        return key == parent or key.startswith(f"{parent}.")
-
-    # If explicit union type changed ("..._type_"), collapse that subtree into a
-    # single changed record at the parent path. This avoids emitting stale
-    # per-leaf removals for the previous union member.
-    union_switch_parents: set[str] = set()
-    for key in changed:
-        if key == "_type_":
-            union_switch_parents.add("<root>")
-            continue
-        if key.endswith("._type_"):
-            union_switch_parents.add(key.rsplit(".", 1)[0])
-
-    for parent in sorted(union_switch_parents, key=lambda p: (p != "<root>", p)):
-        for key in list(changed):
-            if _is_under(key, parent):
-                changed.remove(key)
-                changed_values.pop(key, None)
-        for key in list(added):
-            if _is_under(key, parent):
-                added.remove(key)
-                added_values.pop(key, None)
-        for key in list(removed):
-            if _is_under(key, parent):
-                removed.remove(key)
-                removed_values.pop(key, None)
-
-        changed.add(parent)
-        if parent == "<root>":
-            changed_values[parent] = (plain_a, plain_b)
-        else:
-            changed_values[parent] = (
-                _select_plain(plain_a, parent),
-                _select_plain(plain_b, parent),
-            )
-
-    out: set[str] = set()
-    if "changed" in mode_set:
-        out |= changed
-    if "added" in mode_set:
-        out |= added
-    if "removed" in mode_set:
-        out |= removed
-
+    # A path can appear under several statuses; "changed" wins, then "added".
     records: dict[str, dict[str, object]] = {}
-    for key in sorted(out):
-        if key in changed:
-            old_value, new_value = changed_values[key]
+    for key in sorted(selected):
+        if key in acc.changed:
+            old_value, new_value = acc.changed[key]
             records[key] = {"status": "changed", "old": old_value, "new": new_value}
-            continue
-        if key in added:
-            records[key] = {"status": "added", "old": None, "new": added_values[key]}
-            continue
-        records[key] = {"status": "removed", "old": removed_values[key], "new": None}
+        elif key in acc.added:
+            records[key] = {"status": "added", "old": None, "new": acc.added[key]}
+        else:
+            records[key] = {"status": "removed", "old": acc.removed[key], "new": None}
 
     return records
 

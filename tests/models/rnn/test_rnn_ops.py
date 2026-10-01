@@ -160,3 +160,26 @@ def test_rnn_edge_cases():
     x = torch.randn(T, batch_size, input_size)
     out, _ = rnn(x)
     assert out.shape == (T, batch_size, hidden_size)
+
+
+def test_get_grad_history_returns_copy():
+    """``get_grad_history`` hands out a copy, so callers cannot corrupt (or be
+    surprised by later changes to) the module's internal history."""
+    rnn = make_rnn(
+        SimpleRNNCell, unroll=1, save_grad_history=True, grad_state_names=["h"]
+    )(input_size=3, hidden_size=4)
+    x = torch.randn(5, 2, 3, dtype=DTYPE, requires_grad=True)
+    reset_net_state(rnn, batch_size=2)
+    out, _ = rnn(x)
+    last_step_sum(out).backward()
+
+    hist = rnn.get_grad_history()
+    assert len(hist["h"]) == 5
+    hist["h"].clear()
+    hist["extra"] = []
+    # The module's own history is untouched by mutating the returned dict.
+    assert len(rnn.get_grad_history()["h"]) == 5
+    assert "extra" not in rnn.get_grad_history()
+
+    rnn.clear_grad_history()
+    assert rnn.get_grad_history() == {}

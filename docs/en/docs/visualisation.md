@@ -20,6 +20,8 @@ Time-series visualization for spike and continuous data.
 - `NeuronSpec`: Per-neuron styling (color, marker, linestyle)
 - `SimulationStates`: Container for simulation data
 - `TracePlotFormat`: Figure formatting options
+- `RasterStyle`, `RasterGrouping`, `GroupStripOptions`, `RatePanelOptions`, `RasterAnnotations`: Option groups for `plot_raster`
+- `SpectrumGrouping`, `SpectrumStyle`: Option groups for `plot_grouped_spectrum`, e.g. `plot_grouped_spectrum(data, dt, SpectrumGrouping(neurons_df=df, group_by="type"), style=SpectrumStyle(show_traces=False))`
 
 ---
 
@@ -65,6 +67,8 @@ Static hex plots using matplotlib.
 | `compass` | Compass rose inset |
 | `looming_stimulus` | Expanding stimulus sequence from center |
 
+**Dataclasses** (`hex/options.py`): `HexGeometry` (layout, size, orientation, rotation), `HexColorMap` (cmap, vmin, vmax), `HexPatchStyle` (edge, alpha), `HexReference` (q/r/s axes, compass). They are passed to `scatter`/`quiver` as keyword-only `geometry=`, `color=`, `patch=` (`scatter` only) and `reference=`, e.g. `scatter(q, r, v, color=HexColorMap(cmap="RdBu_r", vmin=-1, vmax=1))`.
+
 ---
 
 ### `hex/interactive.py`
@@ -93,9 +97,6 @@ Grouped distribution and neuropil time-series visualization.
 | Function | Description |
 |----------|-------------|
 | `plot_group_distribution` | Generic grouped plot API with `violin`, `box`, or `ecdf` |
-| `plot_group_violin` | Grouped violin plot convenience wrapper |
-| `plot_group_box` | Grouped box plot convenience wrapper |
-| `plot_group_ecdf` | Grouped ECDF plot convenience wrapper |
 | `plot_neuropil_timeseries_overview` | Aggregated neuropil overview in wave/heatmap style |
 | `plot_neuropil_timeseries_panels` | Region-wise subplot grid for detailed comparison |
 
@@ -104,24 +105,47 @@ Grouped distribution and neuropil time-series visualization.
 ## Usage Examples
 
 ```python
-from btorch.visualisation.timeseries import plot_raster, plot_neuron_traces, NeuronSpec
+from btorch.visualisation.timeseries import (
+    GroupStripOptions,
+    NeuronSpec,
+    RasterAnnotations,
+    RasterGrouping,
+    RasterStyle,
+    RatePanelOptions,
+    SimulationStates,
+    TracePlotFormat,
+    plot_neuron_traces,
+    plot_raster,
+)
 
 # Basic raster
-plot_raster(spikes, dt=0.1, marker="|", markersize=5)
+plot_raster(spikes, dt=0.1, style=RasterStyle(marker="|", marker_size=5))
 
-# Grouped raster with colors
+# Grouped raster with colors, strip and rate panel
 plot_raster(
     spikes,
-    neurons_df=df,
-    group_by="cell_type",
-    color={"excitatory": "red", "inhibitory": "blue"},
-    show_separators=True,
-    events=[100, 200],  # Event markers
-    regions=[(50, 80)],  # Shaded regions
-    show_tracks=True,
+    style=RasterStyle(spike_color={"excitatory": "red", "inhibitory": "blue"}),
+    grouping=RasterGrouping(
+        neurons_df=df, group_key="cell_type", show_separators=True
+    ),
+    strip=GroupStripOptions(side="left"),  # colour strip beside the raster
+    rate=RatePanelOptions(total=True, window_ms=10.0),
+    annotations=RasterAnnotations(
+        events=[100, 200],  # Event markers
+        regions=[(50, 80)],  # Shaded regions
+        show_tracks=True,
+    ),
 )
 
 # Neuron traces with per-neuron styling
 specs = [NeuronSpec(color="red"), NeuronSpec(color="blue")]
-plot_neuron_traces(voltage=V, dt=0.1, neuron_specs=specs)
+plot_neuron_traces(
+    SimulationStates(voltage=V, dt=0.1),
+    TracePlotFormat(neuron_specs=specs),
+)
 ```
+
+Raster options are grouped into small frozen dataclasses (`RasterStyle`,
+`RasterGrouping`, `GroupStripOptions`, `RatePanelOptions`,
+`RasterAnnotations`), all optional keyword arguments of `plot_raster`.
+

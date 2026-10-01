@@ -4,7 +4,7 @@ Efficient 2D model reproducing diverse cortical spiking patterns.
 """
 
 from collections.abc import Callable, Sequence
-from typing import Any, Literal
+from typing import Any
 
 import torch
 from jaxtyping import Float
@@ -12,7 +12,7 @@ from torch import Tensor
 
 from ...types import TensorLike
 from .. import environ
-from ..base import BaseNode
+from ..base import Backend, BaseNode, StepMode
 from ..ode import euler_step
 
 
@@ -99,8 +99,8 @@ class Izhikevich(BaseNode):
         detach_reset: bool = False,
         hard_reset: bool = False,
         pre_spike: bool = False,
-        step_mode: Literal["s"] = "s",
-        backend: Literal["torch"] = "torch",
+        step_mode: StepMode = "s",
+        backend: Backend = "torch",
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ):
@@ -187,7 +187,7 @@ class Izhikevich(BaseNode):
         vpeak,
         vmin,
         **kwargs,
-    ):
+    ) -> "Izhikevich":
         """
         Build an :class:`Izhikevich` neuron using parameter names from
         https://hippocampome.org.
@@ -231,7 +231,7 @@ class Izhikevich(BaseNode):
         c_m: float = 1.0,
         v_peak: float = 30.0,
         **kwargs,
-    ):
+    ) -> "Izhikevich":
         """
         Instantiate using the canonical quadratic form
         ``dV/dt = p1*v^2 + p2*v + p3 - u + I``.
@@ -263,7 +263,7 @@ class Izhikevich(BaseNode):
         v: Float[Tensor, "*batch n_neuron"],
         u: Float[Tensor, "*batch n_neuron"],
         x: Float[Tensor, "*batch n_neuron"],
-    ):
+    ) -> Float[Tensor, "*batch n_neuron"]:
         quadratic = self.k * (v - self.v_rest) * (v - self.v_threshold)
         return (x + quadratic - u) / self.c_m
 
@@ -271,18 +271,18 @@ class Izhikevich(BaseNode):
         self,
         u: Float[Tensor, "*batch n_neuron"],
         v: Float[Tensor, "*batch n_neuron"],
-    ):
+    ) -> Float[Tensor, "*batch n_neuron"]:
         return self.a * (self.b * (v - self.v_rest) - u)
 
-    def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]):
+    def neuronal_charge(self, x: Float[Tensor, "*batch n_neuron"]) -> None:
         dt = environ.get("dt")
         self.v = euler_step(self.dV, self.v, self.u, x, dt=dt)
 
-    def neuronal_adaptation(self):
+    def neuronal_adaptation(self) -> None:
         dt = environ.get("dt")
         self.u = euler_step(self.dU, self.u, self.v, dt=dt)
 
-    def neuronal_fire(self):
+    def neuronal_fire(self) -> Float[Tensor, "*batch n_neuron"]:
         # The surrogate input is normalised by the threshold-to-reset gap and
         # centred on v_peak, the spike cutoff.
         spike = self.surrogate_function(
@@ -290,7 +290,7 @@ class Izhikevich(BaseNode):
         )
         return spike
 
-    def neuronal_reset(self, spike: Float[Tensor, "*batch n"]):
+    def neuronal_reset(self, spike: Float[Tensor, "*batch n"]) -> None:
         if self.detach_reset:
             spike_d = spike.detach()
         else:
@@ -307,7 +307,7 @@ class Izhikevich(BaseNode):
 
         self.u = self.u + self.d * spike_d
 
-    def extra_repr(self):
+    def extra_repr(self) -> str:
         parts = [
             f"c_m={self._format_repr_value(self.c_m)}",
             f"k={self._format_repr_value(self.k)}",

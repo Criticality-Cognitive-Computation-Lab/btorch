@@ -6,10 +6,8 @@ five plotting families:
 
 **Aggregation plots** (`aggregation`):
 - Grouped distributions:
-  [`plot_group_distribution`][btorch.visualisation.aggregation.plot_group_distribution],
-  [`plot_group_violin`][btorch.visualisation.aggregation.plot_group_violin],
-  [`plot_group_box`][btorch.visualisation.aggregation.plot_group_box],
-  [`plot_group_ecdf`][btorch.visualisation.aggregation.plot_group_ecdf]
+  [`plot_group_distribution`][btorch.visualisation.aggregation.plot_group_distribution]
+  (`kind="violin"`, `"box"` or `"ecdf"`)
 - Neuropil timeseries:
   [`plot_neuropil_timeseries_overview`][btorch.visualisation.aggregation.plot_neuropil_timeseries_overview],
   [`plot_neuropil_timeseries_panels`][btorch.visualisation.aggregation.plot_neuropil_timeseries_panels]
@@ -47,10 +45,7 @@ five plotting families:
 """
 
 from .aggregation import (
-    plot_group_box,
     plot_group_distribution,
-    plot_group_ecdf,
-    plot_group_violin,
     plot_neuropil_timeseries_overview,
     plot_neuropil_timeseries_panels,
 )
@@ -72,6 +67,11 @@ from .dynamics import (
 from .hex.interactive import heatmap as hex_heatmap
 from .network import plot_network
 from .timeseries import (
+    GroupStripOptions,
+    RasterAnnotations,
+    RasterGrouping,
+    RasterStyle,
+    RatePanelOptions,
     SimulationStates,
     TracePlotFormat,
     plot_log_hist,
@@ -85,10 +85,7 @@ from .timeseries import (
 __all__ = [
     "hex_heatmap",
     "plot_network",
-    "plot_group_box",
     "plot_group_distribution",
-    "plot_group_ecdf",
-    "plot_group_violin",
     "plot_neuropil_timeseries_overview",
     "plot_neuropil_timeseries_panels",
     "plot_log_hist",
@@ -98,6 +95,11 @@ __all__ = [
     "plot_neuron_traces",
     "SimulationStates",
     "TracePlotFormat",
+    "RasterStyle",
+    "RasterGrouping",
+    "GroupStripOptions",
+    "RatePanelOptions",
+    "RasterAnnotations",
     "plot_multiscale_fano",
     "plot_dfa_analysis",
     "plot_isi_cv",

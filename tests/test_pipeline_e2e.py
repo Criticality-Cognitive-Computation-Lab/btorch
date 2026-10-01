@@ -162,14 +162,23 @@ def test_pipeline_end_to_end():
 def test_pipeline_io_round_trip():
     # xarray is an optional dependency of btorch.io.
     pytest.importorskip("xarray")
-    from btorch.io.serialization import memories_to_xarray, xarray_to_memories
+    from btorch.io.serialization import (
+        DimLayout,
+        SparseOptions,
+        memories_to_xarray,
+        xarray_to_memories,
+    )
 
     spikes, states = simulate(seed=0)
     memories = {"spike": spikes, "v": states["neuron.v"]}
 
     # dim_counts=(1, 0, 1): (time, batch, neuron) with no batch axis, matching
     # the [T, N] layout of the simulation. Spikes are stored sparsely.
-    ds = memories_to_xarray(memories, dim_counts=(1, 0, 1), force_sparse=["spike"])
+    ds = memories_to_xarray(
+        memories,
+        DimLayout(dim_counts=(1, 0, 1)),
+        sparse=SparseOptions(force_sparse=["spike"]),
+    )
     assert ds["spike"].attrs.get("_btorch_sparse")  # marker of sparse encoding
     assert ds["v"].shape == (N_STEP, N_NEURON)
 

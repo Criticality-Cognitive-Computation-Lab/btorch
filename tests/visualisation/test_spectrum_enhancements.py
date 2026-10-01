@@ -5,7 +5,11 @@ import numpy as np
 import pandas as pd
 
 from btorch.utils.file import save_fig
-from btorch.visualisation.timeseries import plot_grouped_spectrum
+from btorch.visualisation.timeseries import (
+    SpectrumGrouping,
+    SpectrumStyle,
+    plot_grouped_spectrum,
+)
 
 
 def generate_data():
@@ -41,11 +45,10 @@ def test_grouped_spectrum_overlay():
     fig = plot_grouped_spectrum(
         data,
         dt=dt,
-        neurons_df=df,
-        group_by="type",
+        grouping=SpectrumGrouping(neurons_df=df, group_by="type"),
         mode="overlay",
         title="Grouped Spectrum (Overlay)",
-        show_traces=True,
+        style=SpectrumStyle(show_traces=True),
     )
 
     save_fig(fig, name="spectrum_grouped_overlay", suffix="png", transparent=False)
@@ -59,8 +62,7 @@ def test_grouped_spectrum_subplots():
     fig = plot_grouped_spectrum(
         data,
         dt=dt,
-        neurons_df=df,
-        group_by="type",
+        grouping=SpectrumGrouping(neurons_df=df, group_by="type"),
         mode="subplots",
         title="Grouped Spectrum (Subplots)",
     )
@@ -74,7 +76,10 @@ def test_grouped_spectrum_separate():
     data, df, dt = generate_data()
 
     figs = plot_grouped_spectrum(
-        data, dt=dt, neurons_df=df, group_by="type", separate_figures=True
+        data,
+        dt=dt,
+        grouping=SpectrumGrouping(neurons_df=df, group_by="type"),
+        separate_figures=True,
     )
 
     assert isinstance(figs, dict)
@@ -94,8 +99,49 @@ def test_grouped_spectrum_manual_groups():
     groups = {"Low Freq": list(range(10)), "High Freq": list(range(10, 20))}
 
     fig = plot_grouped_spectrum(
-        data, dt=dt, groups=groups, mode="overlay", title="Manual Groups"
+        data,
+        dt=dt,
+        grouping=SpectrumGrouping(groups=groups),
+        mode="overlay",
+        title="Manual Groups",
     )
 
     save_fig(fig, name="spectrum_grouped_manual", suffix="png", transparent=False)
     plt.close(fig)
+
+
+def test_grouped_spectrum_options_change_output():
+    """SpectrumGrouping / SpectrumStyle must actually alter the figure."""
+    data, df, dt = generate_data()
+    grouping = SpectrumGrouping(neurons_df=df, group_by="type")
+
+    # Default style: 3 groups, each with faint per-neuron traces plus a mean
+    # line, so the single axes holds many lines.
+    fig_default = plot_grouped_spectrum(data, dt=dt, grouping=grouping)
+    n_default = len(fig_default.axes[0].lines)
+
+    # show_traces=False drops the per-neuron lines, keeping only means.
+    fig_means = plot_grouped_spectrum(
+        data, dt=dt, grouping=grouping, style=SpectrumStyle(show_traces=False)
+    )
+    ax = fig_means.axes[0]
+    assert len(ax.lines) < n_default
+
+    # Manual groups override the metadata column: one group -> one legend entry.
+    fig_manual = plot_grouped_spectrum(
+        data, dt=dt, grouping=SpectrumGrouping(groups={"only": [0, 1, 2]})
+    )
+    labels = [t.get_text() for t in fig_manual.axes[0].get_legend().get_texts()]
+    assert labels == ["only"]
+
+    # Custom colours and panel size are honoured.
+    fig_style = plot_grouped_spectrum(
+        data,
+        dt=dt,
+        grouping=SpectrumGrouping(groups={"g": [0, 1]}),
+        style=SpectrumStyle(colors={"g": "red"}, plot_width=3.0, plot_height=2.0),
+    )
+    assert tuple(fig_style.get_size_inches()) == (3.0, 2.0)
+    mean_line = fig_style.axes[0].lines[-1]
+    assert mean_line.get_color() == "red"
+    plt.close("all")

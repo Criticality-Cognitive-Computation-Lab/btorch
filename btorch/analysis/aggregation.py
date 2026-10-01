@@ -7,6 +7,7 @@ import scipy.sparse
 import torch
 
 from ..types import TensorLike
+from ..utils.array import to_numpy
 
 
 AggName = Literal["mean", "sum", "std"]
@@ -215,7 +216,7 @@ def build_group_frame(
             numeric, or contains ids outside ``[0, N - 1]``; or if no values
             remain after dropping missing entries.
     """
-    y = _to_numpy(values)
+    y = to_numpy(values, strict=True, name="values")
     if y.ndim < 1:
         raise ValueError("`values` must have at least one dimension.")
 
@@ -379,11 +380,3 @@ def _resolve_group_order(
     if missing:
         raise ValueError(f"`group_order` contains unknown groups: {missing}")
     return requested
-
-
-def _to_numpy(values: TensorLike) -> np.ndarray:
-    if isinstance(values, torch.Tensor):
-        return values.detach().cpu().numpy()
-    if isinstance(values, np.ndarray):
-        return values
-    raise TypeError("`values` must be a numpy array or torch tensor.")

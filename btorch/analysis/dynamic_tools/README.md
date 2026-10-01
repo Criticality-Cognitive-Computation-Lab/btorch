@@ -39,7 +39,7 @@ These metrics characterize the stability of the network's trajectory in phase sp
     -   $\lambda_{max} < 0$: Stable (Fixed point or Limit cycle).
     -   $\lambda_{max} > 0$: Chaotic.
     -   $\lambda_{max} \approx 0$: Edge of Chaos (common in biological networks).
-    -   **Usage**: `compute_max_lyapunov_exponent` or `compute_lyapunov_exponent_spectrum`.
+    -   **Usage**: `compute_max_lyapunov_exponent` or `compute_lyapunov_exponent_spectrum` for a 1-D series; `compute_lyapunov_exponent_from_spikes` (`complexity.py`) for a `(time, neurons)` spike train (smooths to a mean population rate first).
 -   **Kaplan-Yorke Dimension ($D_{KY}$)**: The fractal dimension of the attractor, derived from the full Lyapunov spectrum. Higher $D_{KY}$ implies a higher-dimensional effective state space.
     -   **Usage**: `compute_kaplan_yorke_dimension(spectrum)`.
 -   **Structural Eigenvalues**: Analyzes the eigenspectrum of the connectivity matrix $W$.

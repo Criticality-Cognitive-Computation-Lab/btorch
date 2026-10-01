@@ -182,9 +182,9 @@ rotated_values = values[perm]
 ### Static (Matplotlib)
 
 ```python
-from btorch.visualisation.hex import scatter, flow, grid
+from btorch.visualisation.hex import HexColorMap, scatter, flow, grid
 
-scatter(q, r, values, coord_format="axial", cmap="viridis")
+scatter(q, r, values, coord_format="axial", color=HexColorMap(cmap="viridis"))
 flow(q, r, dq, dr, coord_format="axial")
 grid(radius=3, annotate=True)
 ```

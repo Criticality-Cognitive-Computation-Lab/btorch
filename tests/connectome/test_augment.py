@@ -113,3 +113,21 @@ def test_mask_neurons_in_conn_mat_root_id_requires_neurons():
     conn = scipy.sparse.eye(3, format="csr")
     with pytest.raises(ValueError, match="neurons"):
         mask_neurons_in_conn_mat(conn, [1], id_type="root_id")
+
+
+def test_mask_neurons_in_conn_mat_maps_root_id_to_simple_id():
+    """With ``id_type="root_id"`` the ids are translated through ``neurons``
+    (root_id -> simple_id row/column index) before the rows and columns are
+    zeroed."""
+    import numpy as np
+    import scipy.sparse
+
+    from btorch.connectome.augment import mask_neurons_in_conn_mat
+
+    neurons = pd.DataFrame({"root_id": [1000, 2000, 3000], "simple_id": [0, 1, 2]})
+    conn = scipy.sparse.csr_array(np.ones((3, 3)))
+    out = mask_neurons_in_conn_mat(conn, [2000], id_type="root_id", neurons=neurons)
+    expected = np.ones((3, 3))
+    expected[1, :] = 0
+    expected[:, 1] = 0
+    np.testing.assert_array_equal(out.toarray(), expected)

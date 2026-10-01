@@ -3,7 +3,7 @@
 import numpy as np
 import torch
 
-from btorch.datasets.transforms import (
+from btorch.utils.hex.augment import (
     HexReflection,
     HexRotation,
     reflect_hex,

@@ -9,7 +9,6 @@ from typing import Any, Callable, Literal, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import torch
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
@@ -40,17 +39,14 @@ def _extract_batch_dim(
 
     arr = to_numpy(data)
     if arr.ndim == 2:
-        # No batch dimension: (time, neurons)
         return arr
     elif arr.ndim == 3:
-        # Has batch dimension: (time, batch, neurons)
         if batch_idx >= arr.shape[1]:
             raise ValueError(
                 f"batch_idx {batch_idx} is out of bounds for batch dim {arr.shape[1]}"
             )
         return arr[:, batch_idx]
     elif arr.ndim == 4:
-        # Has batch and ASC dimension: (time, batch, neurons, n_asc)
         if batch_idx >= arr.shape[1]:
             raise ValueError(
                 f"batch_idx {batch_idx} is out of bounds for batch dim {arr.shape[1]}"
@@ -85,37 +81,6 @@ _SEPARATE_TITLES = {**_COMBINED_TITLES, "voltage": "Voltage Traces"}
 
 
 @dataclass
-class _TraceConfig:
-    """Arguments of :func:`plot_neuron_traces` before/after merging
-    dataclasses."""
-
-    voltage: Any
-    dt: float | None
-    asc: Any
-    psc: Any
-    epsc: Any
-    ipsc: Any
-    input: Any
-    psc_labels: Sequence[str] | None
-    spikes: Any
-    v_threshold: Any
-    v_reset: Any
-    neuron_indices: list[int] | None
-    sample_size: int | None
-    seed: int
-    show_voltage: bool
-    show_asc: bool
-    show_psc: bool
-    neuron_labels: Sequence[str] | Callable[[int], str] | None
-    neuron_label_position: str
-    neuron_specs: list[NeuronSpec | dict] | NeuronSpec | dict | None
-    separate_figures: bool
-    auto_width: bool
-    neurons_per_row: int | None
-    batch_idx: int | None
-
-
-@dataclass
 class _TraceData:
     """Numpy trace arrays with the batch dimension removed."""
 
@@ -130,66 +95,18 @@ class _TraceData:
     psc_has_extra_dim: bool
 
 
-def _merge_trace_config(
-    cfg: _TraceConfig,
-    states: SimulationStates | pd.DataFrame | None,
-    format: TracePlotFormat | None,
-) -> _TraceConfig:
-    """Fill unset arguments from ``states`` and override from ``format``.
-
-    ``dt=None`` means "not given" (taken from ``states``, else 1.0 ms); the
-    sentinel ``seed == 42`` still means "not explicitly given".
-    """
-    if states is not None:
-        cfg.voltage = states.voltage if cfg.voltage is None else cfg.voltage
-        cfg.dt = states.dt if cfg.dt is None else cfg.dt
-        cfg.asc = states.asc if cfg.asc is None else cfg.asc
-        cfg.psc = states.psc if cfg.psc is None else cfg.psc
-        cfg.epsc = states.epsc if cfg.epsc is None else cfg.epsc
-        cfg.ipsc = states.ipsc if cfg.ipsc is None else cfg.ipsc
-        cfg.input = states.input if cfg.input is None else cfg.input
-        cfg.spikes = states.spikes if cfg.spikes is None else cfg.spikes
-        if cfg.v_threshold is None:
-            cfg.v_threshold = states.v_threshold
-        cfg.v_reset = states.v_reset if cfg.v_reset is None else cfg.v_reset
-
-    if format is not None:
-        if cfg.neuron_indices is None:
-            cfg.neuron_indices = format.neuron_indices
-        if cfg.sample_size is None:
-            cfg.sample_size = format.sample_size
-        cfg.seed = format.seed if cfg.seed == 42 else cfg.seed
-        cfg.show_voltage = format.show_voltage
-        cfg.show_asc = format.show_asc
-        cfg.show_psc = format.show_psc
-        if cfg.neuron_labels is None:
-            cfg.neuron_labels = format.neuron_labels
-        cfg.neuron_label_position = format.neuron_label_position
-        if cfg.neuron_specs is None:
-            cfg.neuron_specs = format.neuron_specs
-        cfg.separate_figures = format.separate_figures
-        cfg.auto_width = format.auto_width
-        if cfg.neurons_per_row is None:
-            cfg.neurons_per_row = format.neurons_per_row
-        if cfg.batch_idx is None:
-            cfg.batch_idx = format.batch_idx
-    if cfg.dt is None:
-        cfg.dt = 1.0
-    return cfg
-
-
-def _prepare_trace_data(cfg: _TraceConfig) -> _TraceData:
+def _prepare_trace_data(states: SimulationStates, batch_idx: int | None) -> _TraceData:
     """Validate PSC layout and strip the batch dimension from every array."""
-    batch_idx = 0 if cfg.batch_idx is None else cfg.batch_idx
-    psc_labels = cfg.psc_labels
+    batch_idx = 0 if batch_idx is None else batch_idx
+    psc_labels = states.psc_labels
 
     # Multi-component PSC layouts: (time, neurons, n_psc) next to 2D voltage
     # (no batch dimension), or (time, batch, neurons, n_psc) (4D).  A 3D PSC
     # next to 3D voltage is a plain batched PSC (time, batch, neurons).
     psc_has_extra_dim = False
-    psc_raw = to_numpy(cfg.psc) if cfg.psc is not None else None
+    psc_raw = to_numpy(states.psc) if states.psc is not None else None
     if psc_raw is not None:
-        voltage_shape = to_numpy(cfg.voltage).shape
+        voltage_shape = to_numpy(states.voltage).shape
         if psc_raw.ndim == 4:
             psc_has_extra_dim = True
         elif (
@@ -200,9 +117,9 @@ def _prepare_trace_data(cfg: _TraceConfig) -> _TraceData:
             psc_has_extra_dim = True
         if psc_has_extra_dim:
             for name, value in (
-                ("epsc", cfg.epsc),
-                ("ipsc", cfg.ipsc),
-                ("input", cfg.input),
+                ("epsc", states.epsc),
+                ("ipsc", states.ipsc),
+                ("input", states.input),
             ):
                 if value is not None:
                     raise ValueError(
@@ -212,16 +129,16 @@ def _prepare_trace_data(cfg: _TraceConfig) -> _TraceData:
             if psc_labels is None:
                 psc_labels = [f"PSC_{i}" for i in range(psc_raw.shape[-1])]
 
-    voltage = _extract_batch_dim(cfg.voltage, batch_idx)
-    spikes = _extract_batch_dim(cfg.spikes, batch_idx)
-    asc = _extract_batch_dim(cfg.asc, batch_idx)
+    voltage = _extract_batch_dim(states.voltage, batch_idx)
+    spikes = _extract_batch_dim(states.spikes, batch_idx)
+    asc = _extract_batch_dim(states.asc, batch_idx)
     if psc_has_extra_dim and psc_raw.ndim == 3:
         psc = psc_raw
     else:
-        psc = _extract_batch_dim(cfg.psc, batch_idx)
-    epsc = _extract_batch_dim(cfg.epsc, batch_idx)
-    ipsc = _extract_batch_dim(cfg.ipsc, batch_idx)
-    input_current = _extract_batch_dim(cfg.input, batch_idx)
+        psc = _extract_batch_dim(states.psc, batch_idx)
+    epsc = _extract_batch_dim(states.epsc, batch_idx)
+    ipsc = _extract_batch_dim(states.ipsc, batch_idx)
+    input_current = _extract_batch_dim(states.input, batch_idx)
     return _TraceData(
         voltage=to_numpy(voltage),
         spikes=spikes,
@@ -245,10 +162,9 @@ def _select_trace_neurons(
     if neuron_indices is None and sample_size is None:
         return list(range(min(5, n_neurons)))
     if neuron_indices is None:
-        np.random.seed(seed)
-        return sorted(
-            np.random.choice(n_neurons, min(sample_size, n_neurons), replace=False)
-        )
+        # RandomState keeps the legacy sequence without touching the global RNG.
+        rng = np.random.RandomState(seed)
+        return sorted(rng.choice(n_neurons, min(sample_size, n_neurons), replace=False))
     return neuron_indices
 
 
@@ -300,15 +216,15 @@ def _colors_for_spec(colors: dict[str, str], spec: NeuronSpec) -> dict[str, str]
 
 
 def _trace_panel_kinds(
-    cfg: _TraceConfig, data: _TraceData
+    fmt: TracePlotFormat, data: _TraceData
 ) -> list[Literal["voltage", "asc", "psc"]]:
     """Panels to draw: requested by the user and backed by data."""
     kinds: list[Literal["voltage", "asc", "psc"]] = []
-    if cfg.show_voltage:
+    if fmt.show_voltage:
         kinds.append("voltage")
-    if cfg.show_asc and data.asc is not None:
+    if fmt.show_asc and data.asc is not None:
         kinds.append("asc")
-    if cfg.show_psc and data.psc is not None:
+    if fmt.show_psc and data.psc is not None:
         kinds.append("psc")
     return kinds
 

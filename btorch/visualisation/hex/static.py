@@ -11,6 +11,7 @@ from matplotlib.patches import RegularPolygon
 
 from ...utils.hex.resolve import CoordFormat, resolve_hex
 from ...utils.hex.transform import to_pixel
+from .options import HexColorMap, HexGeometry, HexPatchStyle, HexReference
 
 
 def _resolve_to_pixel(
@@ -264,26 +265,46 @@ def compass(
     return inset
 
 
+def _decorate(
+    ax: plt.Axes,
+    x: np.ndarray,
+    y: np.ndarray,
+    geometry: HexGeometry,
+    reference: HexReference,
+    title: str | None,
+) -> None:
+    """Apply title, reference axes, compass and hide the frame."""
+    if title:
+        ax.set_title(title)
+
+    if reference.axes_alignment in ("vertex", "edge"):
+        draw_axes(
+            ax,
+            origin=(x.min() + geometry.size, y.min() + geometry.size),
+            size=geometry.size * 2,
+            orientation=geometry.orientation,
+            alignment=reference.axes_alignment,
+        )
+
+    if reference.show_compass in ("vertex", "edge"):
+        compass(ax, alignment=reference.show_compass, loc="lower left")
+
+    ax.axis("off")
+
+
 def scatter(
     c1: np.ndarray,
     c2: np.ndarray,
     values: np.ndarray,
     coord_format: CoordFormat = "axial",
-    layout: str | None = None,
-    size: float = 1.0,
-    orientation: str = "pointy",
-    rotation_deg: float = 0.0,
-    cmap: str = "viridis",
-    vmin: float | None = None,
-    vmax: float | None = None,
-    edgecolor: str | None = None,
-    edgewidth: float = 0.5,
-    alpha: float = 1.0,
+    *,
+    geometry: HexGeometry | None = None,
+    color: HexColorMap | None = None,
+    patch: HexPatchStyle | None = None,
+    reference: HexReference | None = None,
     figsize: tuple[float, float] = (6, 6),
     ax: plt.Axes | None = None,
     title: str | None = None,
-    axes_alignment: str | None = None,
-    show_compass: str | None = None,
 ) -> tuple[plt.Figure, plt.Axes]:
     """Colored hex scatter.
 
@@ -291,31 +312,35 @@ def scatter(
         c1, c2: Coordinates (interpreted based on coord_format)
         values: Color values for each hex
         coord_format: Any :data:`~btorch.utils.hex.resolve.CoordFormat`
-        size: Hexagon size (for axial/zigzag conversion to pixel)
-        orientation: "pointy" or "flat"
-        rotation_deg: Optional global display rotation in degrees
-        cmap: Matplotlib colormap name
-        vmin, vmax: Color limits
-        edgecolor: Hexagon edge color
-        edgewidth: Hexagon edge width
-        alpha: Transparency (0-1)
-        figsize: Figure size
+        geometry: Pixel layout (size, orientation, rotation); see
+            :class:`~btorch.visualisation.hex.options.HexGeometry`.
+        color: Colormap and colour limits; see
+            :class:`~btorch.visualisation.hex.options.HexColorMap`.
+        patch: Edge colour/width and alpha; see
+            :class:`~btorch.visualisation.hex.options.HexPatchStyle`.
+        reference: Reference axes / compass; see
+            :class:`~btorch.visualisation.hex.options.HexReference`.
+        figsize: Figure size (used when ``ax`` is None)
         ax: Optional axes to plot on
         title: Plot title
-        axes_alignment: If "vertex" or "edge", draw q/r/s reference axes
-        show_compass: If "vertex" or "edge", draw a hex compass rose inset
 
     Returns:
         Figure and axes objects
     """
+    geometry = geometry or HexGeometry()
+    color = color or HexColorMap()
+    patch = patch or HexPatchStyle()
+    reference = reference or HexReference()
+    size = geometry.size
+
     (x, y), effective_layout = _resolve_to_pixel(
         c1,
         c2,
         coord_format,
         size=size,
-        orientation=orientation,
-        layout=layout,
-        rotation_deg=rotation_deg,
+        orientation=geometry.orientation,
+        layout=geometry.layout,
+        rotation_deg=geometry.rotation_deg,
     )
 
     if ax is None:
@@ -323,56 +348,35 @@ def scatter(
     else:
         fig = ax.figure
 
-    vmin = vmin if vmin is not None else np.nanmin(values)
-    vmax = vmax if vmax is not None else np.nanmax(values)
+    vmin = color.vmin if color.vmin is not None else np.nanmin(values)
+    vmax = color.vmax if color.vmax is not None else np.nanmax(values)
 
     norm = plt.Normalize(vmin=vmin, vmax=vmax)
-    cmap_obj = plt.get_cmap(cmap)
+    cmap_obj = plt.get_cmap(color.cmap)
+
+    if effective_layout in ("flat", "flywire"):
+        hex_orientation = np.pi / 6  # flat top
+    else:
+        hex_orientation = 0  # pointy top
 
     for xi, yi, vi in zip(x, y, values):
-        if np.isnan(vi):
-            color = "white"
-        else:
-            color = cmap_obj(norm(vi))
-
-        # Determine hexagon orientation based on effective layout
-        if effective_layout in ("flat", "flywire"):
-            hex_orientation = np.pi / 6  # flat top
-        else:
-            hex_orientation = 0  # pointy top
-
+        face = "white" if np.isnan(vi) else cmap_obj(norm(vi))
         hex_patch = RegularPolygon(
             (xi, yi),
             numVertices=6,
             radius=size * 0.95,  # slight gap between hexes
             orientation=hex_orientation,
-            facecolor=color,
-            edgecolor=edgecolor,
-            linewidth=edgewidth,
-            alpha=alpha,
+            facecolor=face,
+            edgecolor=patch.edgecolor,
+            linewidth=patch.edgewidth,
+            alpha=patch.alpha,
         )
         ax.add_patch(hex_patch)
 
     ax.set_aspect("equal")
     ax.set_xlim(x.min() - size, x.max() + size)
     ax.set_ylim(y.min() - size, y.max() + size)
-
-    if title:
-        ax.set_title(title)
-
-    if axes_alignment in ("vertex", "edge"):
-        draw_axes(
-            ax,
-            origin=(x.min() + size, y.min() + size),
-            size=size * 2,
-            orientation=orientation,
-            alignment=axes_alignment,
-        )
-
-    if show_compass in ("vertex", "edge"):
-        compass(ax, alignment=show_compass, loc="lower left")
-
-    ax.axis("off")
+    _decorate(ax, x, y, geometry, reference, title)
 
     return fig, ax
 
@@ -383,16 +387,14 @@ def quiver(
     dc1: np.ndarray,
     dc2: np.ndarray,
     coord_format: CoordFormat = "axial",
-    layout: str | None = None,
-    size: float = 1.0,
-    orientation: str = "pointy",
     scale: float = 1.0,
-    cmap: str = "viridis",
+    *,
+    geometry: HexGeometry | None = None,
+    color: HexColorMap | None = None,
+    reference: HexReference | None = None,
     figsize: tuple[float, float] = (6, 6),
     ax: plt.Axes | None = None,
     title: str | None = None,
-    axes_alignment: str | None = None,
-    show_compass: str | None = None,
 ) -> tuple[plt.Figure, plt.Axes]:
     """Vector field on hex grid.
 
@@ -400,38 +402,38 @@ def quiver(
         c1, c2: Coordinates
         dc1, dc2: Vector components
         coord_format: Any :data:`~btorch.utils.hex.resolve.CoordFormat`
-        size: Hexagon size
-        orientation: "pointy" or "flat"
         scale: Vector scale factor
-        cmap: Colormap for vector magnitude
-        figsize: Figure size
+        geometry: Pixel layout (size, orientation, rotation); see
+            :class:`~btorch.visualisation.hex.options.HexGeometry`.
+        color: Colormap (and limits) for vector magnitude; see
+            :class:`~btorch.visualisation.hex.options.HexColorMap`.
+        reference: Reference axes / compass; see
+            :class:`~btorch.visualisation.hex.options.HexReference`.
+        figsize: Figure size (used when ``ax`` is None)
         ax: Optional axes
         title: Plot title
-        axes_alignment: If "vertex" or "edge", draw q/r/s reference axes
-        show_compass: If "vertex" or "edge", draw a hex compass rose inset
 
     Returns:
         Figure and axes objects
     """
-    (x, y), _ = _resolve_to_pixel(
-        c1,
-        c2,
-        coord_format,
+    geometry = geometry or HexGeometry()
+    color = color or HexColorMap()
+    reference = reference or HexReference()
+    size = geometry.size
+    pix = dict(
         size=size,
-        orientation=orientation,
-        layout=layout,
+        orientation=geometry.orientation,
+        layout=geometry.layout,
+        rotation_deg=geometry.rotation_deg,
     )
+
+    (x, y), _ = _resolve_to_pixel(c1, c2, coord_format, **pix)
 
     if coord_format == "pixel":
         dx, dy = dc1 * scale, dc2 * scale
     else:
         (tx, ty), _ = _resolve_to_pixel(
-            c1 + dc1 * scale,
-            c2 + dc2 * scale,
-            coord_format,
-            size=size,
-            orientation=orientation,
-            layout=layout,
+            c1 + dc1 * scale, c2 + dc2 * scale, coord_format, **pix
         )
         dx = tx - x
         dy = ty - y
@@ -442,34 +444,18 @@ def quiver(
         fig = ax.figure
 
     magnitudes = np.sqrt(dx**2 + dy**2)
-    vmin, vmax = np.nanmin(magnitudes), np.nanmax(magnitudes)
+    vmin = color.vmin if color.vmin is not None else np.nanmin(magnitudes)
+    vmax = color.vmax if color.vmax is not None else np.nanmax(magnitudes)
 
     norm = plt.Normalize(vmin=vmin, vmax=vmax)
-    cmap_obj = plt.get_cmap(cmap)
-    colors = cmap_obj(norm(magnitudes))
+    colors = plt.get_cmap(color.cmap)(norm(magnitudes))
 
     ax.quiver(x, y, dx, dy, color=colors, scale_units="xy", angles="xy", scale=1)
 
     ax.set_aspect("equal")
     ax.set_xlim(x.min() - size * 2, x.max() + size * 2)
     ax.set_ylim(y.min() - size * 2, y.max() + size * 2)
-
-    if title:
-        ax.set_title(title)
-
-    if axes_alignment in ("vertex", "edge"):
-        draw_axes(
-            ax,
-            origin=(x.min() + size, y.min() + size),
-            size=size * 2,
-            orientation=orientation,
-            alignment=axes_alignment,
-        )
-
-    if show_compass in ("vertex", "edge"):
-        compass(ax, alignment=show_compass, loc="lower left")
-
-    ax.axis("off")
+    _decorate(ax, x, y, geometry, reference, title)
 
     return fig, ax
 

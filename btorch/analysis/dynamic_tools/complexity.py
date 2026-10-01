@@ -3,9 +3,10 @@ import warnings
 import numpy as np
 import torch
 
+from ...utils.array import to_numpy
 from .lyapunov_dynamics import (
+    compute_continuous_spiking_rate,
     compute_max_lyapunov_exponent,
-    get_continuous_spiking_rate,
 )
 
 
@@ -174,19 +175,21 @@ def compute_pcist(
 
     num_transitions = transitions.sum(dim=0)  # (K,)
 
-    # 5. Weighted Sum "Sum significant state transitions weighted by the
-    # component's Signal-to-Noise ratio." We might want to filter components
-    # with SNR < 1? The text doesn't strictly say so, but "weighted by SNR"
-    # implies low SNR components contribute little. However, if SNR is very
-    # high, it dominates. Let's follow the instruction literally.
-
+    # Transitions weighted by each component's SNR (no SNR < 1 filtering).
     pcist_score = (num_transitions * snr).sum()
 
     return pcist_score.item()
 
 
-def compute_lyapunov_exponent(spike_train: torch.Tensor, dt: float = 0.1) -> float:
+def compute_lyapunov_exponent_from_spikes(
+    spike_train: torch.Tensor, dt: float = 0.1
+) -> float:
     """Calculate the maximum Lyapunov exponent for a given spike train.
+
+    Pipeline: smooth the spikes into rates, average over neurons and pass the
+    resulting 1-D series to :func:`compute_max_lyapunov_exponent`, which is the
+    one to use when you already have a 1-D series and want to set embedding
+    arguments.
 
     Args:
         spike_train (torch.Tensor): The spike train data. Shape
@@ -206,16 +209,13 @@ def compute_lyapunov_exponent(spike_train: torch.Tensor, dt: float = 0.1) -> flo
             "spike_train must be a 2D tensor with shape (time_steps, num_neurons)"
         )
 
-    # 1. Calculate the continuous spiking rate using a Gaussian kernel (smooth
-    # the spike train) This is effectively a form of kernel density estimation.
-    # We use a small bandwidth, as the original dynamics should be captured at a
-    # fine timescale.
-    bandwidth = 5.0  # in ms, this may need adjustment
-    continuous_rate = get_continuous_spiking_rate(spike_train, dt, bandwidth)
+    # Small Gaussian bandwidth (ms): the dynamics live on a fine timescale.
+    bandwidth = 5.0
+    continuous_rate = to_numpy(
+        compute_continuous_spiking_rate(spike_train, dt, bandwidth)
+    )
 
-    # 2. Calculate the Lyapunov exponent of the mean population rate (nolds
-    # needs a 1D series). The largest Lyapunov exponent is the measure of
-    # chaos/complexity. Embedding parameters keep their defaults.
+    # nolds needs a 1-D series: use the mean population rate.
     mean_rate = continuous_rate.mean(axis=1)
     lyapunov_exponent = compute_max_lyapunov_exponent(mean_rate)
 
@@ -305,7 +305,7 @@ def compute_gain_stability_sensitivity(
             # spikes: (Time, 1, Neurons) -> (Time, Neurons)
             spikes_sq = spikes.squeeze(1)
 
-            rates = get_continuous_spiking_rate(spikes_sq, dt=dt)
+            rates = to_numpy(compute_continuous_spiking_rate(spikes_sq, dt=dt))
 
             # Mean population rate for LE calculation
             mean_rate = rates.mean(axis=1)

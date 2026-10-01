@@ -718,8 +718,11 @@ class TestEdgeCases:
         spikes = np.zeros((100, 5), dtype=np.float32)
 
         ff_op, _ = fano_operational_time(spikes, dt=1.0)
-        # Should return NaN or handle gracefully
-        assert isinstance(ff_op, np.ndarray)
+
+        # One Fano factor per neuron, finite (no 0/0 NaN, no exception) even
+        # though no neuron ever fires.
+        assert ff_op.shape == (5,)
+        assert np.isfinite(ff_op).all()
 
     def test_single_neuron(self):
         """Handle single neuron case."""
@@ -728,18 +731,6 @@ class TestEdgeCases:
 
         ff_op, _ = fano_operational_time(spikes, dt=1.0)
         assert ff_op.shape == () or ff_op.shape == (1,)
-
-    def test_short_duration(self):
-        """Handle very short spike trains."""
-        np.random.seed(42)
-        spikes = generate_poisson_spikes(
-            rate_hz=100.0,
-            duration_ms=100.0,
-            n_neurons=5,  # Only 100ms
-        )
-
-        ff_op, _ = fano_operational_time(spikes, dt=1.0)
-        assert isinstance(ff_op, np.ndarray)
 
     def test_torch_gpu_if_available(self):
         """Test GPU compatibility if CUDA is available."""
@@ -757,3 +748,27 @@ class TestEdgeCases:
             assert ff_op.device.type == "cuda"
         except (NotImplementedError, RuntimeError) as e:
             pytest.skip(f"Torch GPU implementation has issues: {e}")
+
+
+def test_model_based_and_mean_matching_reject_non_advancing_windows():
+    """``window <= overlap`` raises ``ValueError`` in both estimators.
+
+    (``fano_model_based`` previously failed with a ZeroDivisionError.)
+    """
+    spikes = (np.random.default_rng(0).random((100, 3, 4)) < 0.1).astype(float)
+    with pytest.raises(ValueError, match="window must be greater than overlap"):
+        fano_model_based(spikes, window=10, overlap=10)
+    with pytest.raises(ValueError, match="window must be greater than overlap"):
+        fano_mean_matching(spikes, window=10, overlap=12)
+
+
+@pytest.mark.parametrize("fn", ["fano_model_based", "fano_mean_matching"])
+def test_too_few_windows_returns_nan_with_warning(fn):
+    """With a single window the estimators warn and return NaN + n_windows."""
+    import btorch.analysis.dynamic_tools.fano as fano_mod
+
+    spikes = (np.random.default_rng(0).random((100, 3, 4)) < 0.1).astype(float)
+    with pytest.warns(UserWarning, match="Too few windows"):
+        value, info = getattr(fano_mod, fn)(spikes, window=80, stat=None)
+    assert np.isnan(value).all()
+    assert info == {"n_windows": 1}

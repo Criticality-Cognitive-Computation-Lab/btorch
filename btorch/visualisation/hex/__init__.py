@@ -3,15 +3,10 @@
 Supports multiple coordinate formats: axial (q,r), FlyWire (x,y).
 """
 
-# Interactive (Plotly)
-# Animations (Matplotlib)
 from .animate import HexQuiver, HexScatter
 from .interactive import heatmap
-
-# Receptive field (Matplotlib)
+from .options import HexColorMap, HexGeometry, HexPatchStyle, HexReference
 from .receptive_field import ReceptiveFieldViewer, kernel, strf
-
-# Static (Matplotlib)
 from .static import (
     compass,
     draw_axes,
@@ -23,19 +18,19 @@ from .static import (
 
 
 __all__ = [
-    # Interactive
+    "HexColorMap",
+    "HexGeometry",
+    "HexPatchStyle",
+    "HexReference",
     "heatmap",
-    # Static
     "scatter",
     "quiver",
     "grid",
     "looming_stimulus",
     "draw_axes",
     "compass",
-    # Animation
     "HexScatter",
     "HexQuiver",
-    # Receptive field
     "kernel",
     "strf",
     "ReceptiveFieldViewer",

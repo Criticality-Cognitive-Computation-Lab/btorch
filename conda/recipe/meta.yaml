@@ -15,13 +15,13 @@ requirements:
     - pip
   run:
     - python >=3.10
-    - pytorch
+    - pytorch >=2.3
     - numpy >=1.24
     - pandas >=2
     - scipy >=1.10
     - jaxtyping >=0.2.20
     - matplotlib-base >=3.7
-  # Optional extras (pip: btorch[io|config|analysis|viz|fast|allen|gpu]); not
+  # Optional extras (pip: btorch[io|config|analysis|viz|fast|sparse|gpu|examples]); not
   # installed by default, constrained here so conda keeps compatible versions.
   run_constrained:
     - xarray
@@ -38,6 +38,9 @@ requirements:
     - fastdtw
     - plotly
     - networkx
+    - torchvision
+    - seaborn
+    - tqdm
 
 test:
   requires:

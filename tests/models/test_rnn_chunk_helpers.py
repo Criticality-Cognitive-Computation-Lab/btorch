@@ -1,10 +1,13 @@
 """Focused tests for the small helpers shared by the RNN loop paths and for the
 explicit state-setter functions in ``btorch.models.functional``."""
 
+import numpy as np
 import pytest
 import torch
+from torch import nn
 
 from btorch.models import functional
+from btorch.models.base import ResetValue
 from btorch.models.cudagraph import CudaGraphRunner
 from btorch.models.neurons import LIF
 from btorch.models.rnn import _append_chunk, _chunk_to_cpu, make_rnn
@@ -144,3 +147,43 @@ def test_chunk_step_helpers_match_a_manual_loop():
         functional.set_hidden_states(cell, start)
         z_chunked, _ = cell._run_chunk_steps(x, loop_args=(0,), unroll_size=3)
     torch.testing.assert_close(torch.stack(z_chunked), torch.stack(z_ref))
+
+
+def test_functional_set_memory_reset_values_dotted_and_nested():
+    """The network-wide setter takes ``reset_values`` addressed by dotted name,
+    or per-module nested dicts (``{"neuron": {"v": ...}}``)."""
+    net = nn.ModuleDict({"neuron": LIF(n_neuron=3)})
+    assert set(functional.named_memory_reset_values(net)) == {"neuron.v"}
+
+    functional.set_memory_reset_values(net, {"neuron.v": 0.7})
+    assert float(net["neuron"].memory_reset_values["v"].value) == 0.7
+
+    # Whole-module entry: used to fail because the walker looked the name up in
+    # the (nonexistent) reset-value registry of the container.
+    functional.set_memory_reset_values(net, {"neuron": {"v": 0.2}})
+    assert float(net["neuron"].memory_reset_values["v"].value) == 0.2
+
+    # The keyword is ``reset_values`` (it used to be called ``hidden_states``).
+    functional.set_memory_reset_values(net, reset_values={"neuron.v": 0.1})
+    functional.init_net_state(net)
+    assert torch.allclose(net["neuron"].v.double(), torch.full((3,), 0.1).double())
+
+    with pytest.raises(KeyError, match="nope"):
+        functional.set_memory_reset_values(net, {"neuron.nope": 1.0})
+
+
+def test_set_memory_reset_values_strict_default_is_consistent():
+    """Function and method both default to ``strict=True``: a ``ResetValue``
+    with different ``sizes`` than the registered memory is rejected by both,
+    and accepted by both when ``strict=False``."""
+    bad = ResetValue(value=np.zeros(()), sizes=(5,), has_batch=False)
+
+    m = LIF(n_neuron=3)
+    with pytest.raises(ValueError, match="sizes mismatch"):
+        m.set_memory_reset_values({"v": bad})
+    with pytest.raises(ValueError, match="sizes mismatch"):
+        functional.set_memory_reset_values(m, {"v": bad})
+
+    m.set_memory_reset_values({"v": bad}, strict=False)
+    assert m.memory_reset_values["v"].sizes == (5,)
+    functional.set_memory_reset_values(m, {"v": bad}, strict=False)

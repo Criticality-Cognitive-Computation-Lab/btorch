@@ -28,15 +28,16 @@ OPTIONAL_LIBS = {
     "xarray": (
         "io",
         "import torch\n"
-        "from btorch.io.serialization import memories_to_xarray\n"
-        "memories_to_xarray({'v': torch.zeros(3, 2, 4)}, dim_counts=(1, 1, 1))",
+        "from btorch.io.serialization import DimLayout, memories_to_xarray\n"
+        "memories_to_xarray({'v': torch.zeros(3, 2, 4)},\n"
+        "                   DimLayout(dim_counts=(1, 1, 1)))",
     ),
     "zarr": (
         "io",
         "import torch\n"
-        "from btorch.io.serialization import save_memories_to_xarray\n"
+        "from btorch.io.serialization import DimLayout, save_memories_to_xarray\n"
         "save_memories_to_xarray({'v': torch.zeros(3, 2, 4)}, 'x.zarr',\n"
-        "                        dim_counts=(1, 1, 1))",
+        "                        DimLayout(dim_counts=(1, 1, 1)))",
     ),
     # numcodecs is only a Zarr v2 codec provider; with Zarr v3 installed its
     # absence is harmless, so only the import-time property is checked.

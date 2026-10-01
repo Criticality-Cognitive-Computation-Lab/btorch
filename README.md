@@ -64,8 +64,8 @@ uv pip install btorch
 Optional features are installed as extras (`btorch[io]` for xarray/Zarr/HDF5
 serialization, `btorch[config]` for OmegaConf/YAML helpers, `btorch[fast]` for
 numba/polars accelerators, `btorch[gpu]` for Triton timing, `btorch[analysis]` for criticality/Lyapunov/DTW tools,
-`btorch[viz]` for interactive plotly plots, `btorch[sparse]` for `torch_sparse`,
-or `btorch[all]` for everything):
+`btorch[viz]` for interactive plotly plots, `btorch[sparse]` for `torch_sparse`, `btorch[examples]` for the dependencies
+of the scripts in `examples/`, or `btorch[all]` for everything):
 
 ```bash
 pip install "btorch[all]"

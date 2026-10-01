@@ -18,13 +18,28 @@ from .histogram import plot_log_hist
 from .neuron_specs import NeuronSpec, SimulationStates, TracePlotFormat
 from .neuron_traces import plot_neuron_traces
 from .raster import plot_raster
+from .raster_options import (
+    GroupStripOptions,
+    RasterAnnotations,
+    RasterGrouping,
+    RasterStyle,
+    RatePanelOptions,
+)
 from .spectrum import plot_grouped_spectrum, plot_spectrum
+from .spectrum_options import SpectrumGrouping, SpectrumStyle
 from .traces import plot_traces
 
 
 __all__ = [
+    "GroupStripOptions",
     "NeuronSpec",
+    "RasterAnnotations",
+    "RasterGrouping",
+    "RasterStyle",
+    "RatePanelOptions",
     "SimulationStates",
+    "SpectrumGrouping",
+    "SpectrumStyle",
     "TracePlotFormat",
     "plot_grouped_spectrum",
     "plot_log_hist",

@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 authors = [{ name = "Btorch contributors" }]
 dynamic = ["version"]
 dependencies = [
-    "torch",
+    "torch>=2.3",
     "numpy>=1.24",
     "pandas>=2",
     "scipy>=1.10",
@@ -86,25 +86,14 @@ analysis = [
   "nolds!=0.6.3",
   "fastdtw",
 ]
-all = [
-  "torch_scatter",
-  "torch_sparse",
-  "networkx",
-  "plotly",
-  "xarray",
-  "zarr",
-  "numcodecs",
-  "h5py",
-  "hdf5plugin",
-  "omegaconf",
-  "pyyaml",
-  "numba",
-  "polars",
-  "triton; sys_platform == 'linux'",
-  "powerlaw",
-  "nolds!=0.6.3",
-  "fastdtw",
+# Visualisation/data libraries imported by the scripts in examples/.
+examples = [
+  "torchvision",
+  "seaborn",
+  "tqdm",
 ]
+# Self-referencing extra so ``all`` can never drift from the others.
+all = ["btorch[sparse,viz,io,config,fast,gpu,analysis,examples]"]
 
 [dependency-groups]
 docs = [
@@ -129,6 +118,7 @@ dev = [
 [tool.uv.sources]
 # torch resolved from PyTorch CPU index (uv/pip CI); CUDA users install torch separately
 torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
 # torch_scatter/sparse are NOT resolved via uv — their wheel URL encodes the torch+CUDA variant.
 # uv locks them as PyPI sdist stubs but CI and end users install from PyG (see sparse extra note).
 

@@ -59,8 +59,7 @@ def plot_traces(
     t = _get_time_axis(data_np.shape[0], dt, times)
 
     if data_np.ndim == 2:
-        # (Time, Neurons)
-        data_np = data_np[:, :, np.newaxis]  # make it (Time, Neurons, 1)
+        data_np = data_np[:, :, np.newaxis]
     elif data_np.ndim != 3:
         raise ValueError("Data must be 2D (T, N) or 3D (T, N, F)")
 

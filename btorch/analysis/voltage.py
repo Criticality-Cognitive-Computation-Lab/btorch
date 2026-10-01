@@ -14,7 +14,7 @@ def suggest_skip_timestep(data: np.ndarray | torch.Tensor) -> int:
     return skip_timestep
 
 
-def voltage_overshoot(
+def compute_voltage_overshoot(
     V: np.ndarray | torch.Tensor,
     mode: Literal["std", "mse_threshold", "threshold_resting"] = "threshold_resting",
     skip_timestep: int | None = None,

@@ -2,6 +2,7 @@
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Protocol
 
 import numpy as np
 import torch
@@ -20,6 +21,41 @@ from .loss import (
 )
 
 
+class TwoCompartmentModel(Protocol):
+    """What the fitting and evaluation code needs from a neuron model.
+
+    :class:`~btorch.models.neurons.two_compartment.TwoCompartmentGLIF`
+    satisfies it. Besides the members below, the model must be a
+    :class:`torch.nn.Module` that works with
+    :func:`btorch.models.functional.init_net_state` and ``reset_net`` (hidden
+    state buffers), and its fitted parameters are those with
+    ``requires_grad=True`` (names must have bounds, see
+    ``DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS``).
+
+    Attributes:
+        w_Ca: Calcium-coupling weights; their mean absolute value is the
+            sparsity penalty of the loss.
+    """
+
+    w_Ca: Tensor
+
+    def multi_step_forward(
+        self,
+        i_soma_seq: Tensor,
+        i_apical_seq: Tensor | None = None,
+        *,
+        return_state: bool = False,
+    ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
+        """Run ``(T, *batch, n_neuron)`` inputs and return ``(spike, v,
+        state)`` where ``state`` holds ``v_pre_spike``, ``i_a`` and ``i_bap``
+        (called with ``return_state=True``)."""
+        ...
+
+    def parameters(self) -> Iterable[torch.nn.Parameter]: ...
+
+    def named_parameters(self) -> Iterable[tuple[str, torch.nn.Parameter]]: ...
+
+
 @dataclass
 class FitEvaluation:
     """Evaluation artifacts for a fitted model on one sweep."""
@@ -32,7 +68,7 @@ class FitEvaluation:
 
 
 def rollout_two_compartment(
-    model,
+    model: TwoCompartmentModel,
     i_soma: Tensor,
     i_apical: Tensor | None = None,
 ) -> dict[str, Tensor]:
@@ -69,7 +105,7 @@ def _f1_score_from_binary_traces(
 
 
 def _prepare_sweep(
-    model,
+    model: TwoCompartmentModel,
     sweep: AllenSweepBatch,
     *,
     device: str | torch.device | None,
@@ -106,7 +142,7 @@ def _prepare_sweep(
 
 
 def evaluate_two_compartment_fit(
-    model,
+    model: TwoCompartmentModel,
     sweep: AllenSweepBatch,
     *,
     device: str | torch.device | None = None,
@@ -138,7 +174,7 @@ def evaluate_two_compartment_fit(
         v_true=v_true,
         spike_true=spike_true,
         dt=sweep.dt,
-        w_Ca=getattr(model, "w_Ca", None),
+        w_Ca=model.w_Ca,
         loss=config,
     )
     timing_stats = spike_timing_stats(
@@ -211,7 +247,7 @@ def evaluate_two_compartment_fit(
 
 
 def evaluate_fit_across_sweeps(
-    model,
+    model: TwoCompartmentModel,
     sweeps: Iterable[AllenSweepBatch],
     *,
     device: str | torch.device | None = None,

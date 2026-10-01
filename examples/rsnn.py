@@ -124,7 +124,11 @@ def sim(
 
     from btorch.utils.dict_utils import unflatten_dict
     from btorch.utils.file import save_fig
-    from btorch.visualisation.timeseries import plot_neuron_traces, plot_raster
+    from btorch.visualisation.timeseries import (
+        SimulationStates,
+        plot_neuron_traces,
+        plot_raster,
+    )
 
     # Global environment config required for ODE solvers inside neurons
     environ.set(dt=dt)
@@ -168,11 +172,13 @@ def sim(
 
     # Neuron Traces (Plotting first 5 neurons for clarity)
     ax_traces = plot_neuron_traces(
-        voltage=v_b0[:, :5],
-        dt=dt,
-        spikes=spike_b0[:, :5],
-        asc=Iasc_b0[:, :5, ...],
-        psc=psc_b0[:, :5, ...],
+        SimulationStates(
+            voltage=v_b0[:, :5],
+            dt=dt,
+            spikes=spike_b0[:, :5],
+            asc=Iasc_b0[:, :5, ...],
+            psc=psc_b0[:, :5, ...],
+        )
     )
     fig_traces = (
         ax_traces[0].figure if isinstance(ax_traces, tuple) else ax_traces.figure

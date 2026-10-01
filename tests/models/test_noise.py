@@ -1,7 +1,8 @@
 import pytest
 import torch
 
-from btorch.datasets.noise import (
+from btorch.models import environ
+from btorch.models.noise import (
     OUNoiseLayer,
     PinkNoiseLayer,
     PoissonNoiseLayer,
@@ -12,7 +13,6 @@ from btorch.datasets.noise import (
     poisson_noise,
     poisson_noise_like,
 )
-from btorch.models import environ
 
 
 @pytest.mark.parametrize(

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -26,6 +26,13 @@ from ._helpers import (
 )
 from .neuron_specs import (
     NeuronSpec,
+)
+from .raster_options import (
+    GroupStripOptions,
+    RasterAnnotations,
+    RasterGrouping,
+    RasterStyle,
+    RatePanelOptions,
 )
 
 
@@ -153,14 +160,12 @@ def _order_neurons_by_group(
 
 
 def _resolve_raster_groups(
-    n_neurons: int,
-    neurons_df: pd.DataFrame | None,
-    group_key: str | None,
-    group_color_key: str | None,
-    group_sort: list[str] | None,
-    sort_neurons: bool,
+    n_neurons: int, grouping: RasterGrouping, strip: GroupStripOptions
 ) -> _RasterGroups:
-    """Validate grouping arguments and resolve labels and neuron order."""
+    """Validate grouping options and resolve labels and neuron order."""
+    neurons_df = grouping.neurons_df
+    group_key = grouping.group_key
+    group_color_key = strip.color_key
     if group_key is not None or group_color_key is not None:
         if neurons_df is None:
             raise ValueError("neurons_df must be provided when grouping is used.")
@@ -183,8 +188,8 @@ def _resolve_raster_groups(
     boundaries: list[tuple[float, Any]] = []
     if group_key is not None:
         present_groups = set(group_labels.tolist())
-        if group_sort:
-            groups = [g for g in group_sort if g in present_groups]
+        if grouping.group_sort:
+            groups = [g for g in grouping.group_sort if g in present_groups]
             groups.extend(sorted(present_groups - set(groups)))
         else:
             groups = sorted(present_groups)
@@ -193,7 +198,7 @@ def _resolve_raster_groups(
             subgroup_labels,
             groups,
             group_color_key is not None,
-            sort_neurons,
+            grouping.sort_neurons,
             n_neurons,
         )
     return _RasterGroups(
@@ -233,17 +238,19 @@ def _raster_spec_attrs(
 
 
 def _resolve_spike_style(
-    spike_color: str | dict | Sequence[Any] | None,
-    neuron_specs: dict | list | NeuronSpec | None,
-    marker: str,
-    marker_size: float,
+    style: RasterStyle,
+    grouping: RasterGrouping,
+    groups: _RasterGroups,
     orig_neuron_indices: np.ndarray,
     n_neurons: int,
-    group_key: str | None,
-    group_labels: np.ndarray,
 ) -> _SpikeStyle:
-    """Resolve per-spike colours, sizes and markers from colour/spec
-    arguments."""
+    """Resolve per-spike colours, sizes and markers from the style options."""
+    spike_color = style.spike_color
+    neuron_specs = style.neuron_specs
+    marker = style.marker
+    marker_size = style.marker_size
+    group_key = grouping.group_key
+    group_labels = groups.group_labels
     c_array = spike_color
     color_by_neuron = None
 
@@ -288,7 +295,7 @@ def _resolve_spike_style(
     c_list = [a[0] for a in attrs]
     m_list = [a[1] for a in attrs]
     ms_list = [a[2] for a in attrs]
-    style = _SpikeStyle(
+    resolved = _SpikeStyle(
         c_list,
         marker,
         ms_list,
@@ -298,10 +305,10 @@ def _resolve_spike_style(
     )
     if len(set(m_list)) > 1:
         # scatter() takes a single marker style, so markers are drawn per group.
-        style.multi_marker = True
+        resolved.multi_marker = True
     else:
-        style.marker = m_list[0] if m_list else marker
-    return style
+        resolved.marker = m_list[0] if m_list else marker
+    return resolved
 
 
 def _scatter_spikes(ax, x, y, sizes, colors, marker) -> None:
@@ -344,16 +351,12 @@ def _draw_raster_annotations(
     ax: Axes,
     t: np.ndarray,
     n_neurons: int,
-    show_tracks: bool,
-    events: Sequence[float] | dict[str, Sequence[float]] | None,
-    regions: Sequence[tuple[float, float]]
-    | dict[str, Sequence[tuple[float, float]]]
-    | None,
-    event_kwargs: dict | None,
-    region_kwargs: dict | None,
+    annotations: RasterAnnotations,
 ) -> None:
     """Draw neuron tracks, event lines and shaded regions."""
-    if show_tracks:
+    events = annotations.events
+    regions = annotations.regions
+    if annotations.show_tracks:
         track_alpha = 0.1 if n_neurons > 100 else 0.2
         ax.hlines(
             y=np.arange(n_neurons),
@@ -372,8 +375,8 @@ def _draw_raster_annotations(
             "alpha": 0.8,
             "linewidth": 1.0,
         }
-        if event_kwargs:
-            evt_kwargs.update(event_kwargs)
+        if annotations.event_kwargs:
+            evt_kwargs.update(annotations.event_kwargs)
         event_times = (
             [et for ets in events.values() for et in ets]
             if isinstance(events, dict)
@@ -384,8 +387,8 @@ def _draw_raster_annotations(
 
     if regions is not None:
         reg_kwargs = {"color": "yellow", "alpha": 0.2}
-        if region_kwargs:
-            reg_kwargs.update(region_kwargs)
+        if annotations.region_kwargs:
+            reg_kwargs.update(annotations.region_kwargs)
         intervals = (
             [iv for ivs in regions.values() for iv in ivs]
             if isinstance(regions, dict)
@@ -548,12 +551,7 @@ def _draw_group_strip(
     groups: _RasterGroups,
     neurons_df: pd.DataFrame | None,
     group_key: str | None,
-    group_color_key: str | None,
-    strip_cmap: str,
-    group_strip_kwargs: dict | None,
-    group_strip_legend: bool,
-    group_label_mode: str,
-    group_strip_side: str,
+    strip: GroupStripOptions,
     n_neurons: int,
 ) -> _StripColors:
     """Draw the colour strip (patches, labels, legend) beside the raster.
@@ -563,17 +561,20 @@ def _draw_group_strip(
     """
     if neurons_df is None:
         raise ValueError("neurons_df must be provided for group strip.")
-    group_col = group_color_key or group_key
+    group_col = strip.color_key or group_key
     if group_col is None:
-        raise ValueError("group_color_key or group_key must be set for group strip.")
+        raise ValueError(
+            "GroupStripOptions.color_key or grouping.group_key must be set for "
+            "the group strip."
+        )
     if group_col not in neurons_df.columns:
         raise ValueError(f"Column '{group_col}' not found in neurons_df.")
 
     cb_args = dict(_STRIP_DEFAULTS)
-    if group_strip_kwargs:
-        cb_args.update(group_strip_kwargs)
+    if strip.layout:
+        cb_args.update(strip.layout)
 
-    cax = _add_strip_axes(ax_raster, group_strip_side, cb_args)
+    cax = _add_strip_axes(ax_raster, strip.side, cb_args)
 
     # Resolve subgroup and top-group labels per neuron in plotting order.
     sub_labels_raw = groups.subgroup_labels[groups.sorted_indices]
@@ -582,9 +583,9 @@ def _draw_group_strip(
 
     use_subgroups = group_key is not None and group_col != group_key
     if use_subgroups:
-        if group_label_mode == "top":
+        if strip.label_mode == "top":
             label_list = [str(top) for top in top_group_labels]
-        elif group_label_mode == "sub":
+        elif strip.label_mode == "sub":
             label_list = [str(sub) for sub in label_list]
         else:
             label_list = [
@@ -597,8 +598,8 @@ def _draw_group_strip(
             top_group_labels,
             sub_labels_raw,
             use_subgroups,
-            strip_cmap,
-            strip_cmap,
+            strip.cmap,
+            strip.cmap,
             cb_args["sub_hue_span"],
             cb_args["sub_val_span"],
         )
@@ -623,7 +624,7 @@ def _draw_group_strip(
             )
         )
 
-    _add_strip_labels(cax, label_list, n_neurons, group_strip_side, cb_args)
+    _add_strip_labels(cax, label_list, n_neurons, strip.side, cb_args)
 
     cax.set_xlim(0, 1)
     cax.set_ylim(ax_raster.get_ylim())
@@ -633,9 +634,9 @@ def _draw_group_strip(
     for spine in cax.spines.values():
         spine.set_visible(False)
 
-    if group_strip_legend:
+    if strip.legend:
         _add_strip_legend(
-            cax, colors, top_groups_order, subgroups_by_top, group_label_mode, cb_args
+            cax, colors, top_groups_order, subgroups_by_top, strip.label_mode, cb_args
         )
     return colors
 
@@ -787,6 +788,17 @@ def _plot_group_rates(
             )
 
 
+def _wants_total_rate(rate: RatePanelOptions) -> bool:
+    # isinstance first: bool() on a multi-element array/tensor raises.
+    return isinstance(rate.total, (np.ndarray, torch.Tensor)) or bool(rate.total)
+
+
+def _wants_group_rate(rate: RatePanelOptions) -> bool:
+    return isinstance(rate.per_group, (dict, np.ndarray, torch.Tensor)) or bool(
+        rate.per_group
+    )
+
+
 def _draw_rate_panel(
     ax_raster: Axes,
     ax_rate: Axes,
@@ -794,29 +806,25 @@ def _draw_rate_panel(
     spikes_np: np.ndarray,
     dt: float | None,
     xlabel: str,
-    rate: bool | np.ndarray | torch.Tensor | None,
-    group_rate: bool | dict[str, np.ndarray | torch.Tensor] | np.ndarray | None,
-    show_group_rate: bool,
-    rate_window_ms: float,
-    group_key: str | None,
+    rate: RatePanelOptions,
     groups: _RasterGroups,
-    spike_color: Any,
-    strip_cmap: str,
+    style: RasterStyle,
+    strip: GroupStripOptions,
 ) -> None:
     """Fill the rate axes and move the x label from the raster to it."""
-    fr = _resolve_total_rate(rate, spikes_np, t, dt, rate_window_ms)
+    fr = _resolve_total_rate(rate.total, spikes_np, t, dt, rate.window_ms)
 
-    if show_group_rate:
+    if _wants_group_rate(rate):
         _plot_group_rates(
             ax_rate,
             t,
             spikes_np,
             dt,
-            rate_window_ms,
-            group_rate,
+            rate.window_ms,
+            rate.per_group,
             groups,
-            spike_color,
-            strip_cmap,
+            style.spike_color,
+            strip.cmap,
         )
 
     if fr is not None:

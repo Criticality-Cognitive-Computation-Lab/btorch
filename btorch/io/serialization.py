@@ -20,7 +20,7 @@ collisions. Original dtype and shape are preserved in the marker attrs.
 
 Shape Conventions
 -----------------
-Dimension groups are specified via ``dim_names`` (default:
+Dimension groups are specified via :class:`DimLayout`: ``dim_names`` (default:
 ``("time", "batch", "neuron")``) and ``dim_counts`` (how many physical
 dimensions each logical group spans). For example:
 
@@ -35,42 +35,120 @@ size by filling missing entries with NaN (float) or 0 (integer/bool).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 import scipy.sparse as sp
-import torch
 
 from ..utils._optional import require
+from ..utils.array import to_numpy_or_sparse
 
 
 if TYPE_CHECKING:
     import xarray as xr
 
 
-def _to_numpy(val: Any) -> np.ndarray | sp.spmatrix | sp.sparray:
-    """Convert torch tensors, lists, or scalars to numpy/scipy arrays.
+@dataclass(frozen=True, kw_only=True)
+class DimLayout:
+    """Dimension layout of a memories dictionary.
 
-    Args:
-        val: Input value (torch.Tensor, numpy array, scipy sparse, or scalar).
+    Attributes:
+        dim_counts: Number of physical dimensions per logical group in
+            ``dim_names``. If None, inferred from ``hint_field`` or heuristics.
+        dim_names: Logical group names, in array order.
+        hint_field: Flattened (dot-separated) field name used as the shape
+            template for dimension inference.
+        strict_dims: If True, every variable must match the global dimension
+            structure exactly. If False, lower-rank arrays (e.g. parameters)
+            are allowed.
 
-    Returns:
-        Numpy array, scipy sparse matrix/array, or the input if already sparse.
+    Raises:
+        ValueError: If ``dim_counts`` has negative entries or a length that
+            differs from ``dim_names``.
     """
-    if sp.issparse(val):
-        return val
-    if isinstance(val, torch.Tensor):
-        val = val.detach().cpu()
-        if val.is_sparse:
-            # Convert sparse torch tensor to scipy sparse
-            return val.to_sparse_coo().to_scipy()
-        return val.numpy()
-    if not isinstance(val, (np.ndarray, np.generic)):
-        if hasattr(val, "numpy"):  # Handle other tensor-like
-            return val.numpy()
-        return np.asarray(val)
-    return val
+
+    dim_counts: tuple[int, ...] | None = None
+    dim_names: tuple[str, ...] = ("time", "batch", "neuron")
+    hint_field: str | None = None
+    strict_dims: bool = True
+
+    def __post_init__(self) -> None:
+        # Normalise sequences so the dataclass stays hashable and immutable.
+        object.__setattr__(self, "dim_names", tuple(self.dim_names))
+        if self.dim_counts is not None:
+            object.__setattr__(self, "dim_counts", tuple(self.dim_counts))
+            if len(self.dim_counts) != len(self.dim_names):
+                raise ValueError(
+                    f"dim_counts {self.dim_counts} must have one entry per "
+                    f"dim_names {self.dim_names}."
+                )
+            if any(c < 0 for c in self.dim_counts):
+                raise ValueError(
+                    f"dim_counts must be non-negative, got {self.dim_counts}."
+                )
+
+
+@dataclass(frozen=True, kw_only=True)
+class SparseOptions:
+    """Sparse COO encoding policy for spike arrays.
+
+    Attributes:
+        spike_suffix: Substring (case-insensitive) identifying spike arrays.
+        spike_dtype: Dtype dense spike arrays are cast to when sparse-encoded.
+        sparse_threshold: Encode sparsely when ``nnz / size`` is below this
+            ratio (0 to 1).
+        force_sparse: True to force sparse encoding of all spike arrays, or the
+            flattened variable names to force.
+
+    Raises:
+        ValueError: If ``sparse_threshold`` is outside ``[0, 1]``.
+    """
+
+    spike_suffix: str = "spike"
+    spike_dtype: Any = bool
+    sparse_threshold: float = 0.05
+    force_sparse: bool | tuple[str, ...] = False
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.sparse_threshold <= 1.0:
+            raise ValueError(
+                f"sparse_threshold must be in [0, 1], got {self.sparse_threshold}."
+            )
+        if not isinstance(self.force_sparse, bool):
+            object.__setattr__(self, "force_sparse", tuple(self.force_sparse))
+
+
+@dataclass(frozen=True, kw_only=True)
+class ZarrStoreOptions:
+    """Compression, chunking and overwrite policy of a Zarr store.
+
+    Attributes:
+        compression_level: Zstd compression level (1-9, higher is smaller).
+        chunks: Chunk size per dimension, e.g. ``{"time": 100, "neuron": -1}``;
+            unlisted dimensions are not chunked (-1).
+        overwrite: If True overwrite an existing store, else fail if it exists.
+
+    Raises:
+        ValueError: If ``compression_level`` is outside 1-9 or a chunk size is
+            neither -1 nor positive.
+    """
+
+    compression_level: int = 5
+    chunks: dict[str, int] | None = None
+    overwrite: bool = True
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.compression_level <= 9:
+            raise ValueError(
+                f"compression_level must be in 1-9, got {self.compression_level}."
+            )
+        for dim, size in (self.chunks or {}).items():
+            if size != -1 and size <= 0:
+                raise ValueError(
+                    f"Chunk size for '{dim}' must be -1 or positive, got {size}."
+                )
 
 
 def to_sparse_repr(
@@ -214,30 +292,23 @@ def _infer_dim_counts(
     neuron_ids: np.ndarray | None,
     dim_names: Sequence[str] = ("time", "batch", "neuron"),
 ) -> tuple[int, int, int]:
-    """Infer dim_counts (T, B, N) from a representative array.
+    """Infer dim_counts (T, B, N) from a representative array by its rank.
 
-    This is heuristic and may be ambiguous. Assumes:
-    - neuron_ids (if provided) dictates N rank
-    - If no neuron_ids, assume N=1
-    - Assume T=1, remaining is B
+    This is a heuristic (rank 3 -> T, B, N; rank 2 -> T, N; rank 1 -> N); pass
+    ``dim_counts`` or ``hint_field`` explicitly when it is ambiguous. Ranks
+    above 3 fall back to ``(1, 1, 1)`` and leave the extra trailing axes to the
+    private-dimension logic of :func:`memories_to_xarray`.
 
     Returns:
         Tuple of (time_dims, batch_dims, neuron_dims) counts.
     """
-    # This is a fallback heuristic. Better to have user hint.
-    # If val is (T_d, B_d, N_d)
     ndim = val.ndim
-
-    # Unspecified counts: fall back to conservative defaults by rank.
     if ndim == 3:
         return (1, 1, 1)
-    elif ndim == 2:
-        return (1, 0, 1)  # Time, Neuron
-    elif ndim == 1:
-        return (0, 0, 1)  # Just Neuron? Or Just Time?
-
-    # If we are here, it's ambiguous. Return (1, 1, 1) and let validation fail
-    # if mismatch.
+    if ndim == 2:
+        return (1, 0, 1)
+    if ndim == 1:
+        return (0, 0, 1)
     return (1, 1, 1)
 
 
@@ -250,52 +321,30 @@ def _validate_and_infer_dims(
 ) -> tuple[Sequence[int], list[str], list[str]]:
     """Determine global dimension structure (dim_counts) and physical names.
 
+    Counts come from ``dim_counts`` if given, else from the ``hint_field``
+    array, else from the first variable; an empty ``flat_data`` gives
+    ``(1, 1, 1)``.
+
     Returns:
         Tuple of (dim_counts, all_mapped_dims, neuron_group_dims).
     """
-
-    # 1. Resolve dim_counts
-    resolved_counts = None
-
     if dim_counts is not None:
         resolved_counts = dim_counts
     elif hint_field and hint_field in flat_data:
-        # Infer from hint
-        hint_val = _to_numpy(flat_data[hint_field])
+        hint_val = to_numpy_or_sparse(flat_data[hint_field])
         resolved_counts = _infer_dim_counts(hint_val, neuron_ids)
+    elif flat_data:
+        first = to_numpy_or_sparse(next(iter(flat_data.values())))
+        resolved_counts = _infer_dim_counts(first, neuron_ids)
     else:
-        # Infer from first available non-partial, non-sparse array?
-        # Or just default strict
-        # User requirement: "without it just assume uniform shape" -> implied
-        # uniform usually means (1,1,1) or existing logic
-        # We will default to (1,1,1) if nothing else guides us, effectively.
-        # But we need to handle rank mismatches.
+        resolved_counts = (1, 1, 1)
 
-        # Let's find a candidate
-        candidate = None
-        for k, v in flat_data.items():
-            candidate = _to_numpy(v)
-            break
-
-        if candidate is not None:
-            resolved_counts = _infer_dim_counts(candidate, neuron_ids)
-        else:
-            resolved_counts = (1, 1, 1)
-
-    if resolved_counts is None:
-        resolved_counts = (1, 1, 1)  # Should not happen
-
-    # 2. Expand names
     all_mapped_dims = _expand_dim_names(dim_names, resolved_counts)
 
-    # 3. Identify neuron dims
-    neuron_group_dims = []
-    # Re-run logic to find which valid physical dims belong to 'neuron'
-    # We need to know which index in dim_names corresponds to 'neuron'.
-    # Usually it's the last one.
+    # Physical dims that belong to the logical "neuron" group.
+    neuron_group_dims: list[str] = []
     if "neuron" in dim_names:
         neuron_idx = dim_names.index("neuron")
-        # How many dims before it?
         pre_dims = sum(resolved_counts[:neuron_idx])
         n_dims = resolved_counts[neuron_idx]
         neuron_group_dims = all_mapped_dims[pre_dims : pre_dims + n_dims]
@@ -303,18 +352,181 @@ def _validate_and_infer_dims(
     return resolved_counts, all_mapped_dims, neuron_group_dims
 
 
+def _expand_partial(
+    val: np.ndarray,
+    indices: np.ndarray,
+    var_name: str,
+    neuron_group_dims: Sequence[str],
+    dim_registry: dict[str, int],
+) -> np.ndarray:
+    """Expand a partially recorded variable to the full neuron size.
+
+    Contract: ``val`` holds only the recorded neurons along its trailing neuron
+    dims and ``indices`` locates them in the full population. 1D indices
+    address the flattened neuron dims; ``val`` must then still carry one
+    trailing axis per neuron dim whose sizes multiply to ``len(indices)``
+    (e.g. ``(T, B, 1, k)`` for two neuron dims). The leading (time/batch) shape is kept;
+    the neuron dims are expanded to the size registered in ``dim_registry``
+    (known from ``neuron_ids``) and unrecorded entries are filled with NaN
+    (0 for non-float dtypes).
+
+    Raises:
+        ValueError: If no neuron dims are defined or their full size is unknown.
+    """
+    if not neuron_group_dims:
+        raise ValueError(
+            f"Cannot expand partial variable '{var_name}': no neuron "
+            "dimensions are defined. Provide 'hint_field' or 'neuron_ids'."
+        )
+    if not all(d in dim_registry for d in neuron_group_dims):
+        # Storing the variable as-is would mismatch dims later.
+        raise ValueError(
+            f"Cannot expand partial variable '{var_name}': Full neuron "
+            f"dimensions unknown. Provide 'hint_field' or 'neuron_ids'."
+        )
+
+    lead_shape = val.shape[: -len(neuron_group_dims)]
+    full_neuron_shape = tuple(dim_registry[d] for d in neuron_group_dims)
+    full_shape = lead_shape + full_neuron_shape
+
+    fill_val = np.nan if np.issubdtype(val.dtype, np.floating) else 0
+    expanded = np.full(full_shape, fill_val, dtype=val.dtype)
+
+    # Index the (possibly flattened) neuron axes with a leading full slice per
+    # time/batch axis; ``reshape`` of the contiguous buffer is a view.
+    lead = (slice(None),) * len(lead_shape)
+    if len(neuron_group_dims) > 1 and indices.ndim == 1:
+        flat = expanded.reshape(lead_shape + (-1,))
+        flat[(*lead, indices)] = val.reshape(lead_shape + (-1,))
+    else:
+        expanded[(*lead, indices)] = val
+    return expanded
+
+
+def _resolve_var_dims(
+    var_name: str,
+    val: np.ndarray,
+    all_mapped_dims: list[str],
+    dim_registry: dict[str, int],
+    hint_field: str | None,
+    strict_dims: bool,
+) -> list[str]:
+    """Name the dimensions of one variable and register their sizes.
+
+    Alignment contract: core dims (e.g. T, B, N) are a fixed prefix of every
+    array; extra trailing dims (e.g. a synapse state of shape (T, B, N, 2)) get
+    private names; lower-rank arrays are right-aligned to the core dims. A size
+    that conflicts with an already registered dim is an error when
+    ``hint_field`` is given, otherwise that axis gets a private name.
+    ``dim_registry`` is updated in place.
+
+    Raises:
+        ValueError: On a size conflict with ``hint_field``, or if
+            ``strict_dims`` and the variable has lower rank than the core dims.
+    """
+    n_core = len(all_mapped_dims)
+    if val.ndim >= n_core:
+        current_dims = list(all_mapped_dims)
+        for i in range(val.ndim - n_core):
+            current_dims.append(f"{var_name}_dim_{n_core + i}")
+    else:
+        current_dims = all_mapped_dims[n_core - val.ndim :]
+
+    final_dims: list[str] = []
+    for i, (d_name, size) in enumerate(zip(current_dims, val.shape)):
+        if d_name not in dim_registry:
+            dim_registry[d_name] = size
+            final_dims.append(d_name)
+        elif dim_registry[d_name] == size:
+            final_dims.append(d_name)
+        elif hint_field and d_name in all_mapped_dims:
+            raise ValueError(
+                f"Dimension mismatch for '{var_name}' on dim "
+                f"'{d_name}': expected {dim_registry[d_name]}, "
+                f"got {size}."
+            )
+        else:
+            final_dims.append(f"{var_name}_d{i}")
+
+    if strict_dims and len(final_dims) < n_core:
+        # Lower-rank arrays (e.g. parameters) cannot be aligned to the global
+        # dims.
+        raise ValueError(
+            f"Strict dimensions required: Variable '{var_name}' has "
+            f"rank {len(final_dims)} but global dims are "
+            f"{n_core} {all_mapped_dims}."
+        )
+    return final_dims
+
+
+def _encode_variable(
+    var_name: str,
+    val: np.ndarray | sp.spmatrix | sp.sparray,
+    var_dims: list[str],
+    sparse: SparseOptions,
+) -> dict[str, Any]:
+    """Return the dataset entries for one variable (dense or sparse COO)."""
+    spike_suffix, spike_dtype = sparse.spike_suffix, sparse.spike_dtype
+    force_sparse = sparse.force_sparse
+    is_spike = spike_suffix in var_name.lower()
+    should_sparse = False
+
+    if sp.issparse(val):
+        should_sparse = True
+    elif is_spike:
+        if force_sparse is True or (
+            isinstance(force_sparse, (list, tuple)) and var_name in force_sparse
+        ):
+            should_sparse = True
+        else:
+            nnz = np.count_nonzero(val)
+            should_sparse = val.size == 0 or (nnz / val.size) < sparse.sparse_threshold
+
+    if not should_sparse:
+        return {var_name: (var_dims, val)}
+
+    # to_sparse_repr preserves the input dtype; only dense arrays identified as
+    # spikes are cast to ``spike_dtype``.
+    if is_spike and spike_dtype is not None and not sp.issparse(val):
+        val = val.astype(spike_dtype)
+    return to_sparse_repr(val, var_dims, var_name)
+
+
+def _root_id_entry(
+    neuron_group_dims: Sequence[str],
+    dim_registry: dict[str, int],
+    neuron_ids: np.ndarray | None,
+) -> tuple[list[str], np.ndarray] | None:
+    """Build the ``root_id`` variable, or None if the neuron size is unknown.
+
+    Without ``neuron_ids`` the ids default to ``arange``.
+
+    Raises:
+        ValueError: If ``neuron_ids`` cannot fill the neuron dims.
+    """
+    if not neuron_group_dims or not all(d in dim_registry for d in neuron_group_dims):
+        return None
+    shape = tuple(dim_registry[d] for d in neuron_group_dims)
+    dims = list(neuron_group_dims)
+    if neuron_ids is None:
+        return dims, np.arange(np.prod(shape)).reshape(shape)
+    if neuron_ids.shape == shape:
+        return dims, neuron_ids
+    if neuron_ids.size == np.prod(shape):
+        return dims, neuron_ids.reshape(shape)
+    raise ValueError(
+        f"neuron_ids of shape {neuron_ids.shape} cannot fill the "
+        f"neuron dims {dims} of shape {shape} for 'root_id'."
+    )
+
+
 def memories_to_xarray(
     memories: dict[str, Any],
-    dim_counts: Sequence[int] | None = None,
-    dim_names: Sequence[str] = ("time", "batch", "neuron"),
+    layout: DimLayout | None = None,
+    *,
     neuron_ids: Any | None = None,
-    hint_field: str | None = None,
     partial_map: dict[str, Any] | None = None,
-    strict_dims: bool = True,
-    spike_suffix: str = "spike",
-    spike_dtype: Any = bool,
-    sparse_threshold: float = 0.05,
-    force_sparse: bool | Sequence[str] = False,
+    sparse: SparseOptions | None = None,
 ) -> xr.Dataset:
     """Convert a nested dictionary of simulation results into an xr.Dataset.
 
@@ -326,23 +538,14 @@ def memories_to_xarray(
     Args:
         memories: Nested dictionary of arrays/tensors. Keys become variable
             names (dot-separated for nested dicts).
-        dim_counts: Number of dimensions per logical group (time, batch,
-            neuron). If None, inferred from ``hint_field`` or heuristics.
-        dim_names: Logical group names for dimensions.
+        layout: Dimension counts/names, shape hint and strictness (see
+            :class:`DimLayout`). Defaults to ``DimLayout()``.
         neuron_ids: Optional neuron identifiers for ``root_id`` coordinate.
-        hint_field: Field name (flattened, dot-separated) to use as shape
-            template for dimension inference.
         partial_map: Dict of ``{field_name: indices}`` for fields recorded
             on a subset of neurons. Missing values filled with NaN (float)
             or 0 (integer/bool).
-        strict_dims: If True, enforce exact dimension structure match.
-            If False, allow lower-rank arrays (e.g., parameters).
-        spike_suffix: Substring to identify spike arrays for sparse encoding.
-        spike_dtype: Data type for spikes when converting dense to sparse.
-        sparse_threshold: Sparsity ratio threshold for triggering sparse
-            encoding (nnz / total_size < threshold).
-        force_sparse: If True, force sparse encoding for all spike arrays.
-            Can also be a list of specific field names to force sparse.
+        sparse: Sparse spike encoding policy (see :class:`SparseOptions`).
+            Defaults to ``SparseOptions()``.
 
     Returns:
         xr.Dataset with all variables, coordinates, and sparse encodings.
@@ -350,7 +553,7 @@ def memories_to_xarray(
     Raises:
         ValueError: If a ``partial_map`` variable cannot be expanded because no
             neuron dimensions are defined or the full neuron size is unknown
-            (provide ``hint_field`` or ``neuron_ids``); if a variable's size
+            (provide ``layout.hint_field`` or ``neuron_ids``); if a variable's size
             conflicts with an already registered dimension while
             ``hint_field`` is given; if ``strict_dims`` is True and a variable
             has lower rank than the global dimensions; or if ``neuron_ids``
@@ -362,202 +565,52 @@ def memories_to_xarray(
         ...     "spike": torch.randn(100, 32, 128) > 0,  # (T, B, N)
         ...     "v": torch.randn(100, 32, 128),
         ... }
-        >>> ds = memories_to_xarray(memories, dim_counts=(1, 1, 1))
+        >>> ds = memories_to_xarray(memories, DimLayout(dim_counts=(1, 1, 1)))
         >>> ds  # Dataset with dims (time: 100, batch: 32, neuron: 128)
     """
     from btorch.utils.dict_utils import flatten_dict
 
+    layout = layout or DimLayout()
+    sparse = sparse or SparseOptions()
     flat_data = flatten_dict(memories, dot=True)
+    n_ids_arr = to_numpy_or_sparse(neuron_ids) if neuron_ids is not None else None
 
-    # Prepare inputs
-    n_ids_arr = _to_numpy(neuron_ids) if neuron_ids is not None else None
-
-    # 1. Determine Global Dimension Layout
-    resolved_counts, all_mapped_dims, neuron_group_dims = _validate_and_infer_dims(
-        flat_data, dim_names, dim_counts, hint_field, n_ids_arr
+    _, all_mapped_dims, neuron_group_dims = _validate_and_infer_dims(
+        flat_data,
+        layout.dim_names,
+        layout.dim_counts,
+        layout.hint_field,
+        n_ids_arr,
     )
 
-    # 2. Establish Reference Shape (Locked Dimensions)
-    # We strictly enforce that dimensions mapped by 'resolved_counts' match
-    # across variables (except for partials, which we expand).
-
-    # If we have a hint field, get the authoritative shape from it.
+    # Sizes of the core dims, locked by the first variable that uses them;
+    # neuron dims are pre-locked by ``neuron_ids`` so partials can be expanded.
     dim_registry: dict[str, int] = {}
-
-    # Pre-lock neuron dims if we have root_ids
     if n_ids_arr is not None and len(neuron_group_dims) == n_ids_arr.ndim:
-        for d, s in zip(neuron_group_dims, n_ids_arr.shape):
-            dim_registry[d] = s
+        for d, size in zip(neuron_group_dims, n_ids_arr.shape):
+            dim_registry[d] = size
 
-    # 3. Process Variables
     ds_vars: dict[str, Any] = {}
-
     for var_name, val in flat_data.items():
-        val = _to_numpy(val)
-
-        # Handle Partial Recording Expansion
+        val = to_numpy_or_sparse(val)
         if partial_map and var_name in partial_map:
-            indices = _to_numpy(partial_map[var_name])
-
-            # Contract: ``val`` holds only the recorded neurons along its trailing
-            # neuron dims, and ``indices`` locates them in the full neuron
-            # population. 1D indices address the flattened neuron dims. The
-            # leading (time/batch) shape is kept from ``val``; the neuron dims are
-            # expanded to their full size (known from ``hint_field`` or
-            # ``neuron_ids``) and unrecorded entries are filled with NaN (0 for
-            # non-float dtypes).
-            if not neuron_group_dims:
-                raise ValueError(
-                    f"Cannot expand partial variable '{var_name}': no neuron "
-                    "dimensions are defined. Provide 'hint_field' or 'neuron_ids'."
-                )
-
-            non_neuron_shape = val.shape[: -len(neuron_group_dims)]
-
-            if all(d in dim_registry for d in neuron_group_dims):
-                full_neuron_shape = tuple(dim_registry[d] for d in neuron_group_dims)
-                full_shape = non_neuron_shape + full_neuron_shape
-
-                fill_val = np.nan if np.issubdtype(val.dtype, np.floating) else 0
-                expanded = np.full(full_shape, fill_val, dtype=val.dtype)
-
-                if len(neuron_group_dims) > 1 and indices.ndim == 1:
-                    # Flatten last K dims of expanded to assign, then reshape
-                    # back. This is expensive but safe.
-                    flattened_neuron_size = np.prod(full_neuron_shape)
-                    temp = expanded.reshape(non_neuron_shape + (flattened_neuron_size,))
-                    val_flat = val.reshape(non_neuron_shape + (-1,))
-
-                    # Indexing logic: temp[..., indices] = val_flat
-                    # We need to build a slice object
-                    slicer = [slice(None)] * len(non_neuron_shape)
-                    slicer.append(indices)
-                    temp[tuple(slicer)] = val_flat
-
-                    expanded = temp.reshape(full_shape)
-                else:
-                    # Standard indexing
-                    slicer = [slice(None)] * len(non_neuron_shape)
-                    slicer.append(indices)
-                    expanded[tuple(slicer)] = val
-
-                val = expanded
-            else:
-                # The full neuron size is unknown, so the variable cannot be
-                # expanded; storing it as-is would mismatch dims later.
-                raise ValueError(
-                    f"Cannot expand partial variable '{var_name}': Full neuron "
-                    f"dimensions unknown. Provide 'hint_field' or 'neuron_ids'."
-                )
-
-        # Determine dimensions for this variable.
-        # Alignment contract: core dims (e.g. T, B, N) are a fixed prefix of every
-        # array; extra trailing dims (e.g. a synapse state of shape (T, B, N, 2))
-        # get private names. Lower-rank arrays are right-aligned to the core dims.
-        n_dims = val.ndim
-
-        if n_dims >= len(all_mapped_dims):
-            current_dims = list(all_mapped_dims)
-            extra_count = n_dims - len(all_mapped_dims)
-            for i in range(extra_count):
-                # private extra dim
-                current_dims.append(f"{var_name}_dim_{len(all_mapped_dims) + i}")
-        else:
-            # Rank deficiency: right-align against the core dims.
-            current_dims = all_mapped_dims[len(all_mapped_dims) - n_dims :]
-
-        # Validation against dim_registry
-        final_dims = []
-        for i, (d_name, size) in enumerate(zip(current_dims, val.shape)):
-            if d_name in dim_registry:
-                if dim_registry[d_name] != size:
-                    # Size conflict: with a hint field the core dims must agree
-                    # across variables (error); otherwise the mismatching axis
-                    # falls back to a private per-variable dim.
-                    if hint_field and d_name in all_mapped_dims:
-                        raise ValueError(
-                            f"Dimension mismatch for '{var_name}' on dim "
-                            f"'{d_name}': expected {dim_registry[d_name]}, "
-                            f"got {size}."
-                        )
-
-                    # Fallback to private dimension
-                    new_name = f"{var_name}_d{i}"
-                    final_dims.append(new_name)
-                else:
-                    final_dims.append(d_name)
-            else:
-                dim_registry[d_name] = size
-                final_dims.append(d_name)
-
-        # Validation of Rank/Suffix if Strict
-        if strict_dims and len(final_dims) < len(all_mapped_dims):
-            # Lower-rank arrays (e.g. parameters) cannot be aligned to the
-            # global dims.
-            raise ValueError(
-                f"Strict dimensions required: Variable '{var_name}' has "
-                f"rank {len(final_dims)} but global dims are "
-                f"{len(all_mapped_dims)} {all_mapped_dims}."
+            indices = to_numpy_or_sparse(partial_map[var_name])
+            val = _expand_partial(
+                val, indices, var_name, neuron_group_dims, dim_registry
             )
+        var_dims = _resolve_var_dims(
+            var_name,
+            val,
+            all_mapped_dims,
+            dim_registry,
+            layout.hint_field,
+            layout.strict_dims,
+        )
+        ds_vars.update(_encode_variable(var_name, val, var_dims, sparse))
 
-        var_dims = final_dims
-
-        # Sparsity Handling
-        is_spike = spike_suffix in var_name.lower()
-        should_sparse = False
-
-        if sp.issparse(val):
-            should_sparse = True
-        elif is_spike:
-            if force_sparse is True or (
-                isinstance(force_sparse, (list, tuple)) and var_name in force_sparse
-            ):
-                should_sparse = True
-            else:
-                nnz = np.count_nonzero(val)
-                should_sparse = (
-                    (nnz / val.size) < sparse_threshold if val.size > 0 else True
-                )
-
-        if should_sparse:
-            # to_sparse_repr preserves the input dtype; only dense arrays
-            # identified as spikes are cast to ``spike_dtype``.
-            if is_spike and spike_dtype is not None and not sp.issparse(val):
-                # Only cast dense arrays that we identified as "spikes"
-                val = val.astype(spike_dtype)
-
-            ds_vars.update(to_sparse_repr(val, var_dims, var_name))
-        else:
-            ds_vars[var_name] = (var_dims, val)
-
-    # 4. Add Root ID
-    # If the user provided dimension names, we only use them to confirm
-    # rank/order. We still rely on `resolved_counts` for the actual chunking
-    # logic.
-    if neuron_group_dims and all(d in dim_registry for d in neuron_group_dims):
-        if neuron_ids is not None:
-            # Verify shape
-            expected_shape = tuple(dim_registry[d] for d in neuron_group_dims)
-            if n_ids_arr.shape == expected_shape:
-                ds_vars["root_id"] = (neuron_group_dims, n_ids_arr)
-            elif n_ids_arr.size == np.prod(expected_shape):
-                ds_vars["root_id"] = (
-                    neuron_group_dims,
-                    n_ids_arr.reshape(expected_shape),
-                )
-            else:
-                raise ValueError(
-                    f"neuron_ids of shape {n_ids_arr.shape} cannot fill the "
-                    f"neuron dims {list(neuron_group_dims)} of shape "
-                    f"{expected_shape} for 'root_id'."
-                )
-        else:
-            # Default IDs
-            shape = tuple(dim_registry[d] for d in neuron_group_dims)
-            ds_vars["root_id"] = (
-                neuron_group_dims,
-                np.arange(np.prod(shape)).reshape(shape),
-            )
+    root_id = _root_id_entry(neuron_group_dims, dim_registry, n_ids_arr)
+    if root_id is not None:
+        ds_vars["root_id"] = root_id
 
     xr = require("xarray", "io", "xarray/Zarr serialization")
     ds = xr.Dataset(ds_vars)
@@ -612,19 +665,12 @@ def xarray_to_memories(
 def save_memories_to_xarray(
     memories: dict[str, Any],
     path: str | Path,
-    dim_counts: Sequence[int] | None = None,
-    dim_names: Sequence[str] = ("time", "batch", "neuron"),
+    layout: DimLayout | None = None,
+    *,
     neuron_ids: Any | None = None,
-    hint_field: str | None = None,
     partial_map: dict[str, Any] | None = None,
-    strict_dims: bool = True,
-    spike_suffix: str = "spike",
-    spike_dtype: Any = bool,
-    sparse_threshold: float = 0.05,
-    force_sparse: bool | Sequence[str] = False,
-    compression_level: int = 5,
-    chunks: dict[str, int] | None = None,
-    overwrite: bool = True,
+    sparse: SparseOptions | None = None,
+    store: ZarrStoreOptions | None = None,
 ) -> None:
     """Save a nested dictionary to a Zarr store via xarray.
 
@@ -634,46 +680,30 @@ def save_memories_to_xarray(
     Args:
         memories: Nested dictionary of arrays/tensors to save.
         path: Path to the output Zarr store.
-        dim_counts: Dimension counts per logical group (see
-            ``memories_to_xarray``).
-        dim_names: Logical dimension names.
+        layout: Dimension layout (see :class:`DimLayout`).
         neuron_ids: Optional neuron identifiers.
-        hint_field: Field to use for shape inference.
         partial_map: Partial recording indices for subset fields.
-        strict_dims: Enforce strict dimension matching.
-        spike_suffix: Substring identifying spike arrays.
-        spike_dtype: Dtype for spike conversion.
-        sparse_threshold: Sparsity threshold for sparse encoding.
-        force_sparse: Force sparse encoding for all spike arrays (True) or for
-            the listed variable names (see ``memories_to_xarray``).
-        compression_level: Zstd compression level (1-9, higher=smaller).
-        chunks: Optional chunk sizes per dimension, e.g.,
-            ``{"time": 100, "neuron": -1}``.
-        overwrite: If True, overwrite existing store. If False, raise error
-            if store exists.
+        sparse: Sparse spike encoding policy (see :class:`SparseOptions`).
+        store: Zarr compression, chunking and overwrite policy (see
+            :class:`ZarrStoreOptions`). Defaults to ``ZarrStoreOptions()``.
 
     Raises:
         ImportError: If ``zarr`` or ``xarray`` is not installed, or no Blosc
             codec is available (``numcodecs`` for Zarr v2).
         ValueError: Propagated from :func:`memories_to_xarray` on inconsistent
             dimensions or partial-recording arguments.
-        Exception: With ``overwrite=False`` an existing store makes
+        Exception: With ``store.overwrite=False`` an existing store makes
             ``xarray.Dataset.to_zarr`` fail (exception type depends on the
             installed zarr version).
     """
     require("zarr", "io", "Zarr serialization")
+    store = store or ZarrStoreOptions()
     ds = memories_to_xarray(
         memories,
-        dim_counts=dim_counts,
-        dim_names=dim_names,
+        layout,
         neuron_ids=neuron_ids,
-        hint_field=hint_field,
         partial_map=partial_map,
-        strict_dims=strict_dims,
-        spike_suffix=spike_suffix,
-        spike_dtype=spike_dtype,
-        sparse_threshold=sparse_threshold,
-        force_sparse=force_sparse,
+        sparse=sparse,
     )
 
     encoding = {}
@@ -689,13 +719,13 @@ def save_memories_to_xarray(
 
     if BloscCodec is not None:
         # Zarr v3 expects native codecs in `compressors`.
-        compressor: Any = BloscCodec(cname="zstd", clevel=compression_level)
+        compressor: Any = BloscCodec(cname="zstd", clevel=store.compression_level)
         compressor_key = "compressors"
         compressor_value: Any = [compressor]
     elif Blosc is not None:
         # Zarr v2 uses numcodecs and the `compressor` key.
         compressor = Blosc(
-            cname="zstd", clevel=compression_level, shuffle=Blosc.BITSHUFFLE
+            cname="zstd", clevel=store.compression_level, shuffle=Blosc.BITSHUFFLE
         )
         compressor_key = "compressor"
         compressor_value = compressor
@@ -708,15 +738,15 @@ def save_memories_to_xarray(
 
     for v_name in ds.variables:
         v_encoding: dict[str, Any] = {compressor_key: compressor_value}
-        if chunks:
-            v_chunks = [chunks.get(d, -1) for d in ds[v_name].dims]
+        if store.chunks:
+            v_chunks = [store.chunks.get(d, -1) for d in ds[v_name].dims]
             if any(c != -1 for c in v_chunks):
                 v_encoding["chunks"] = v_chunks
         encoding[v_name] = v_encoding
 
     ds.to_zarr(
         path,
-        mode="w" if overwrite else "w-",
+        mode="w" if store.overwrite else "w-",
         encoding=encoding,
         consolidated=True,
     )

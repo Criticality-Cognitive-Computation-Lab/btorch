@@ -8,9 +8,21 @@ import torch
 
 from btorch.utils.file import save_fig
 from btorch.visualisation.timeseries import (
+    GroupStripOptions,
     NeuronSpec,
+    RasterAnnotations,
+    RasterGrouping,
+    RasterStyle,
+    RatePanelOptions,
     plot_raster,
 )
+
+
+@pytest.fixture(autouse=True)
+def _seed_global_rng():
+    """Seed numpy's global RNG so the random spike matrices are
+    reproducible."""
+    np.random.seed(0)
 
 
 def test_raster_events_regions_tracks():
@@ -26,10 +38,8 @@ def test_raster_events_regions_tracks():
     plot_raster(
         spikes,
         ax=ax,
-        events=events,
-        regions=regions,
-        show_tracks=True,
         title="Raster with Events, Regions, Tracks",
+        annotations=RasterAnnotations(events=events, regions=regions, show_tracks=True),
     )
     save_fig(fig, name="raster_advanced_features", suffix="png", transparent=False)
     plt.close(fig)
@@ -50,7 +60,9 @@ def test_raster_mixed_markers():
             specs.append(NeuronSpec(color="blue", marker="x", markersize=15))
 
     fig, ax = plt.subplots()
-    plot_raster(spikes, ax=ax, neuron_specs=specs, title="Mixed Markers")
+    plot_raster(
+        spikes, ax=ax, title="Mixed Markers", style=RasterStyle(neuron_specs=specs)
+    )
     save_fig(fig, name="raster_mixed_markers", suffix="png", transparent=False)
     plt.close(fig)
 
@@ -64,12 +76,10 @@ def test_raster_large_population_with_rate():
     axes = plot_raster(
         spikes,
         dt=0.1,
-        rate=True,
-        marker="|",
-        marker_size=2.0,
-        spike_color="black",
         title="Large Population Raster with Rate",
-        show_tracks=False,
+        style=RasterStyle(marker="|", marker_size=2.0, spike_color="black"),
+        rate=RatePanelOptions(total=True),
+        annotations=RasterAnnotations(show_tracks=False),
     )
 
     assert isinstance(axes, tuple) and len(axes) == 2
@@ -100,12 +110,14 @@ def test_raster_grouping():
     plot_raster(
         spikes,
         ax=ax,
-        neurons_df=df,
-        group_key="group",
-        group_sort=["A", "B", "C"],
         title="Grouped Raster (A, B, C)",
-        spike_color={"A": "red", "B": "green", "C": "blue"},
-        show_group_separators=True,
+        style=RasterStyle(spike_color={"A": "red", "B": "green", "C": "blue"}),
+        grouping=RasterGrouping(
+            neurons_df=df,
+            group_key="group",
+            group_sort=["A", "B", "C"],
+            show_separators=True,
+        ),
     )
 
     save_fig(fig, name="raster_grouped", suffix="png", transparent=False)
@@ -124,7 +136,10 @@ def test_raster_styling_per_neuron():
 
     fig, ax = plt.subplots()
     plot_raster(
-        spikes, ax=ax, neuron_specs=specs, title="Styled Raster (Alternating Colors)"
+        spikes,
+        ax=ax,
+        title="Styled Raster (Alternating Colors)",
+        style=RasterStyle(neuron_specs=specs),
     )
     save_fig(fig, name="raster_styled", suffix="png", transparent=False)
     plt.close(fig)
@@ -162,14 +177,10 @@ def test_raster_show_rate():
     axes = plot_raster(
         spikes,
         dt=0.1,
-        rate=rate_series,
-        group_rate=True,
-        neurons_df=df,
-        group_key="group",
-        rate_window_ms=2.0,
-        events=[20, 60],
-        regions=[(10, 30)],
         title="Raster with Rate",
+        grouping=RasterGrouping(neurons_df=df, group_key="group"),
+        rate=RatePanelOptions(total=rate_series, per_group=True, window_ms=2.0),
+        annotations=RasterAnnotations(events=[20, 60], regions=[(10, 30)]),
     )
     assert len(axes) == 2
     fig = axes[0].figure
@@ -186,7 +197,12 @@ def test_raster_events_dict():
     events = {"stimulus": [25, 75], "response": [50]}
 
     fig, ax = plt.subplots()
-    plot_raster(spikes, ax=ax, events=events, title="Raster with Dict Events")
+    plot_raster(
+        spikes,
+        ax=ax,
+        title="Raster with Dict Events",
+        annotations=RasterAnnotations(events=events),
+    )
     save_fig(fig, name="raster_events_dict", suffix="png", transparent=False)
     plt.close(fig)
 
@@ -200,7 +216,12 @@ def test_raster_regions_dict():
     regions = {"baseline": [(0, 20)], "stimulus": [(40, 60), (80, 100)]}
 
     fig, ax = plt.subplots()
-    plot_raster(spikes, ax=ax, regions=regions, title="Raster with Dict Regions")
+    plot_raster(
+        spikes,
+        ax=ax,
+        title="Raster with Dict Regions",
+        annotations=RasterAnnotations(regions=regions),
+    )
     save_fig(fig, name="raster_regions_dict", suffix="png", transparent=False)
     plt.close(fig)
 
@@ -218,11 +239,13 @@ def test_raster_event_region_kwargs():
     plot_raster(
         spikes,
         ax=ax,
-        events=events,
-        regions=regions,
-        event_kwargs={"color": "purple", "linewidth": 2},
-        region_kwargs={"color": "green", "alpha": 0.5},
         title="Raster with Custom Event/Region Styling",
+        annotations=RasterAnnotations(
+            events=events,
+            regions=regions,
+            event_kwargs={"color": "purple", "linewidth": 2},
+            region_kwargs={"color": "green", "alpha": 0.5},
+        ),
     )
     save_fig(fig, name="raster_custom_styling", suffix="png", transparent=False)
     plt.close(fig)
@@ -241,8 +264,8 @@ def test_raster_color_dict_no_group():
         plot_raster(
             spikes,
             ax=ax,
-            spike_color={"group1": "red"},
             title="Raster Color Dict Warn",
+            style=RasterStyle(spike_color={"group1": "red"}),
         )
         save_fig(fig, name="raster_color_dict_warn", suffix="png", transparent=False)
         plt.close(fig)
@@ -261,11 +284,13 @@ def test_raster_separator_kwargs():
     plot_raster(
         spikes,
         ax=ax,
-        neurons_df=df,
-        group_key="group",
-        show_group_separators=True,
-        separator_style={"color": "red", "linewidth": 2, "linestyle": "-"},
         title="Raster with Custom Separators",
+        grouping=RasterGrouping(
+            neurons_df=df,
+            group_key="group",
+            show_separators=True,
+            separator_style={"color": "red", "linewidth": 2, "linestyle": "-"},
+        ),
     )
     save_fig(fig, name="raster_custom_separators", suffix="png", transparent=False)
     plt.close(fig)
@@ -300,13 +325,9 @@ def test_raster_group_strip_small_groups():
     plot_raster(
         spikes,
         ax=ax,
-        neurons_df=df,
-        group_key="group",
-        show_group_strip=True,
-        group_color_key="group",
-        strip_cmap="tab10",
-        group_label_mode="top",
         title="Raster Group Strip (5 Groups)",
+        grouping=RasterGrouping(neurons_df=df, group_key="group"),
+        strip=GroupStripOptions(color_key="group", cmap="tab10", label_mode="top"),
     )
 
     assert len(fig.axes) >= 2
@@ -351,14 +372,11 @@ def test_raster_group_strip_large_many_subgroups(side):
     plot_raster(
         spikes,
         ax=ax,
-        neurons_df=df,
-        group_key="group",
-        show_group_strip=True,
-        group_color_key="sub",
-        strip_cmap="tab20",
-        group_label_mode="top",
-        group_strip_side=side,
         title="Large Raster Many Subgroups",
+        grouping=RasterGrouping(neurons_df=df, group_key="group"),
+        strip=GroupStripOptions(
+            color_key="sub", cmap="tab20", label_mode="top", side=side
+        ),
     )
 
     # Expect legend to show top groups

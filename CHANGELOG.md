@@ -29,6 +29,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (visualisation):** `plot_raster` and `plot_neuron_traces` no longer
+  take dozens of flat keyword arguments.
+  - `plot_raster(spikes, *, dt, times, ax, title, xlabel, ylabel, style, grouping,
+    strip, rate, annotations)` takes the new frozen dataclasses `RasterStyle`
+    (`spike_color`, `marker`, `marker_size`, `neuron_specs`), `RasterGrouping`
+    (`neurons_df`, `group_key`, `group_sort`, `sort_neurons`, `show_separators`,
+    `separator_style`), `GroupStripOptions` (`show`, `color_key`, `cmap`, `layout`,
+    `legend`, `label_mode`, `side`; replaces `show_group_strip`, `group_color_key`,
+    `strip_cmap`, `group_strip_kwargs`, `group_strip_legend`, `group_label_mode`,
+    `group_strip_side`), `RatePanelOptions` (`total`, `per_group`, `window_ms`;
+    replaces `rate`, `group_rate`, `rate_window_ms`) and `RasterAnnotations`
+    (`events`, `regions`, `show_tracks`, `event_kwargs`, `region_kwargs`), all
+    exported from `btorch.visualisation.timeseries`. Every argument after
+    `spikes` is keyword-only.
+  - `plot_neuron_traces(states, format=None)` now takes only a `SimulationStates`
+    (which gained `psc_labels`) and an optional `TracePlotFormat`; the plain
+    `voltage=`, `dt=`, ... and `neuron_indices=`, ... keyword interface and the
+    unused `neurons_df` argument are removed. `voltage` is a required field of
+    `SimulationStates`.
+  - The group-rate and strip error messages now name the option fields.
+  - `_select_trace_neurons` no longer reseeds numpy's global RNG (same sample).
 - `btorch.analysis.two_compartment_fit` is now a package (`data`, `loss`,
   `evaluation`, `report`, `fit`); all previously importable names are unchanged.
   `compute_ra` returns NaN (with a warning) instead of 0.0 for all-zero spike
@@ -45,6 +66,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extras `fast` (numba, polars) and `gpu` (triton, used by `do_bench(timing_method=
   "gpu")`) declare the existing silent-fallback accelerators; all are in `all`.
   The optional-import policy is documented in `btorch.utils._optional`.
+- **Breaking (analysis / io review follow-up):**
+  - `fit_two_compartment_model` no longer takes the flat method options `lr`,
+    `epochs`, `chunk_size`, `param_bounds`, `global_maxiter`, `global_popsize`,
+    `local_maxiter`, `seed`, `polish`, `stages`. Use the new frozen dataclasses
+    `TbpttConfig(lr, epochs, chunk_size)` via `tbptt=`,
+    `GlobalSearchConfig(param_bounds, maxiter, popsize, local_maxiter, seed,
+    polish)` via `search=` and `StagedConfig(stages)` via `staged=`; a config the
+    chosen `method` does not use raises `ValueError`. The private back-ends take
+    only their own config. The model contract is now the exported
+    `TwoCompartmentModel` protocol: `w_Ca` is read directly instead of
+    `getattr(model, "w_Ca", None)`, so a model without `w_Ca` raises
+    `AttributeError`.
+  - `isi_cv_population`: the pooled-ISI helpers always return an ISI array (empty
+    for fewer than two spikes) instead of a `(nan, {})` tuple in that case; with
+    `stat=None` the result is therefore an empty array rather than `nan`.
+    `compute_stats_batch` returns NaN for every stat of an empty input (no
+    warnings or reduction errors). Docs and annotation now state that the default
+    result is the scalar population CV.
+  - `compute_lyapunov_exponent` (complexity) -> `compute_lyapunov_exponent_from_spikes`
+    (the 1-D series estimator stays `compute_max_lyapunov_exponent`).
+  - `analysis.tuning.get_fi_vi_curve` -> `compute_fi_vi_curve` (it builds and
+    simulates a network) with typed parameters.
+  - `get_continuous_spiking_rate` now returns a `torch.Tensor` for tensor input
+    (was always `np.ndarray`); `compute_gain_stability_sensitivity` and
+    `compute_lyapunov_exponent_from_spikes` convert internally.
+  - `get_slopes` returns the `LaggedSlopes` named tuple (still unpackable as the
+    former 7-tuple) with every member and NaN/0 sentinel documented;
+    `compute_structural_eigenvalue_outliers` returns the `EigenvalueOutliers`
+    TypedDict (`max_eigenvalue` is now documented) and `spectral_radius` is
+    `float | None`; `compute_avalanche_statistics` returns `AvalancheStatistics`.
+  - `fano_model_based` raises `ValueError` for `window <= overlap` (was a
+    `ZeroDivisionError`/nonsense windows), matching `fano_mean_matching`.
+  - `firing_rate(batch_axis=...)` is typed with the shared `BatchAxis` alias
+    (`int | tuple[int, ...] | None`) like the other statistics; decorated
+    statistics are annotated `StatsResult` (`tuple[Any, dict]`).
+  - The duplicate `_to_numpy` helpers in `analysis.aggregation` and `io.serialization`
+    are replaced by `btorch.utils.array.to_numpy(strict=True)` and the new
+    `to_numpy_or_sparse` (keeps SciPy sparse, converts sparse torch tensors to
+    SciPy COO, which previously called a nonexistent `Tensor.to_scipy`).
+  - `memories_to_xarray` was split into `_expand_partial`, `_resolve_var_dims`,
+    `_encode_variable` and `_root_id_entry` helpers (same output);
+    `fano_model_based`, `fano_mean_matching` and `compute_avalanche_statistics`
+    were split into shared window/prepare/compute helpers (outputs verified
+    identical to the previous implementation).
 - **Breaking (analysis / utils / io cleanup):**
   - Two-compartment fitting: `fit_two_compartment_model`, `two_compartment_loss`,
     `evaluate_two_compartment_fit` and `evaluate_fit_across_sweeps` no longer take
@@ -191,6 +256,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   log a warning; `save_yaml` fails explicitly; `fano_operational_time` rejects a
   non-zero `overlap` instead of ignoring it.
 - `FiringRateLoss` now defaults to a valid `loss_type` (`"huber_pinball"`).
+- **Breaking (models/connectome review cleanup):**
+  - `btorch.models.functional.set_memory_reset_values(mod, hidden_states, ...)`: the
+    argument is now `reset_values` (it sets reset values, not hidden states).
+    `MemoryModule.set_memory_reset_values` now defaults to `strict=True`, like the
+    function and `set_reset_value` (was `False`). The function now also accepts a
+    whole-module entry such as `{"neuron": {"v": 0.0}}` (it raised `AttributeError`)
+    and an unknown name raises `KeyError`.
+  - `RecurrentNN.get_grad_history()` returns a copy; mutating the result no longer
+    changes the module's history.
+  - `PoissonRandomSpike.derivative(x, damping_factor)` now has the base-class
+    signature `derivative(x, grad_output, damping_factor)`.
+  - `step_mode`/`backend` annotations use the shared `btorch.models.base.StepMode`
+    and `Backend` literals everywhere (typing only).
+  - `tests/benchmark/test_ode.py` -> `tests/benchmark/test_ode_bench.py`.
 
 ### Fixed
 - `import btorch` no longer fails when the package is not installed (e.g. imported from a
@@ -298,6 +377,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- New dedicated tests for the `Erf`, `Triangle`, `SuperSpike` and `PoissonRandomSpike`
+  surrogates (`tests/models/test_surrogate_functions.py`).
 - `plot_raster`/`plot_neuron_traces` are split into private helpers (public
   signatures unchanged) and pinned by characterization tests; the two-compartment
   fit routines share one `FitLossConfig` and a `_prepare_sweep` helper, and the
@@ -397,3 +478,10 @@ recommended.
   an optional install for large-scale sparse network workloads.
 - Sphinx, myst-parser, and obsolete pip lockfiles.
 - AI agent prompt section from README (replaced with clean install instructions).
+
+### Packaging and utils cleanup
+- New `btorch[examples]` extra (torchvision, seaborn, tqdm); `btorch[all]` is now
+  a self-referencing extra so it cannot drift from the others.
+- `torch>=2.3` is now required (`torch.compiler.is_compiling`).
+- `btorch.utils.conf.diff_conf_records` and `btorch.utils.bench.do_bench` were
+  split into small helpers with unchanged behaviour.

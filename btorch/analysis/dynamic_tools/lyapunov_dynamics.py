@@ -3,15 +3,20 @@ import torch
 from scipy.ndimage import gaussian_filter1d
 
 from ...utils._optional import require
+from ...utils.array import to_numpy
 
 
-def get_continuous_spiking_rate(
+def compute_continuous_spiking_rate(
     spikes: np.ndarray | torch.Tensor,
     dt: float,
     sigma: float = 20.0,
-) -> np.ndarray:
+) -> np.ndarray | torch.Tensor:
     """Convert discrete spike trains into continuous firing rates using
     Gaussian smoothing.
+
+    The output follows the input type: a ``torch.Tensor`` input gives a
+    ``float64`` tensor on the input device, anything else a ``float64`` NumPy
+    array. The smoothing itself runs in SciPy on the CPU.
 
     Args:
         spikes: Spike matrix of shape ``(time_steps, n_neurons)``.
@@ -19,17 +24,17 @@ def get_continuous_spiking_rate(
         sigma: Standard deviation of the Gaussian kernel in ms. Default 20 ms.
 
     Returns:
-        Continuous firing rate traces of shape ``(time_steps, n_neurons)``.
+        Continuous firing rate traces of shape ``(time_steps, n_neurons)``,
+        as a tensor for tensor input and as an array otherwise.
         There is no NaN failure return; NaN/inf in the input propagate.
     """
-    if isinstance(spikes, torch.Tensor):
-        spikes = spikes.detach().cpu().numpy()
-
     # sigma is in ms, dt in ms: convert to bins
     sigma_bins = sigma / dt
 
-    rates = gaussian_filter1d(spikes.astype(float), sigma=sigma_bins, axis=0)
+    rates = gaussian_filter1d(to_numpy(spikes).astype(float), sigma=sigma_bins, axis=0)
 
+    if isinstance(spikes, torch.Tensor):
+        return torch.from_numpy(rates).to(spikes.device)
     return rates
 
 

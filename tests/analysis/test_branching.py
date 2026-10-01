@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from btorch.analysis.branching import (
-    branching_ratio,
+    compute_branching_ratio,
     input_handler,
     simulate_binomial_subsampling,
     simulate_branching,
@@ -111,7 +111,7 @@ class TestBranchingRatioEstimator:
         mr_vals = []
         for idx, alpha in enumerate(alpha_grid):
             observed = simulate_binomial_subsampling(full_counts, alpha, rng=101 + idx)
-            fit = branching_ratio(observed, k_max=20)
+            fit = compute_branching_ratio(observed, k_max=20)
             naive_vals.append(fit["naive_branching_ratio"])
             mr_vals.append(fit["branching_ratio"])
 
@@ -144,7 +144,7 @@ class TestBranchingRatioEstimator:
             rng=19,
         )
         observed = simulate_binomial_subsampling(full_counts, alpha=0.1, rng=211)
-        fit = branching_ratio(observed, k_max=25)
+        fit = compute_branching_ratio(observed, k_max=25)
 
         k = fit["k"]
         r_k = fit["r_k"]
@@ -180,9 +180,39 @@ class TestBranchingRatioEstimator:
             simulate_branching(length=5000, m=0.92, activity=90, rng=2),
         ]
 
-        direct_1 = branching_ratio(trials, k_max=15)
-        direct_2 = branching_ratio(trials, k_max=15)
+        direct_1 = compute_branching_ratio(trials, k_max=15)
+        direct_2 = compute_branching_ratio(trials, k_max=15)
         assert direct_1["branching_ratio"] == direct_2["branching_ratio"]
 
         for key in ["branching_ratio", "naive_branching_ratio", "k", "r_k", "stderr"]:
             assert key in direct_1
+
+
+def test_get_slopes_returns_documented_named_tuple():
+    """``compute_lagged_slopes`` is a named tuple (still unpackable as 7
+    values).
+
+    A white-noise series has no lagged correlation; lags with too few
+    samples are NaN, and the scatter lists only hold the valid lags.
+    """
+    from btorch.analysis.branching import LaggedSlopes, compute_lagged_slopes
+
+    rng = np.random.default_rng(0)
+    counts = rng.poisson(5.0, size=200).astype(float)
+    # k = 1..4; lag 4 keeps 196 samples, so force NaN with a large min_points.
+    res = compute_lagged_slopes([counts], k_max=5, min_points=198, scatterpoints=True)
+
+    assert isinstance(res, LaggedSlopes)
+    k, r_k, stderr, data_length, mean_activity, xs, ys = res
+    np.testing.assert_array_equal(k, [1, 2, 3, 4])
+    # Lags 1 and 2 have 199/198 samples (valid); 3 and 4 fall below min_points.
+    assert np.isfinite(r_k[:2]).all() and np.isnan(r_k[2:]).all()
+    assert np.isnan(stderr[2:]).all()
+    assert len(xs) == len(ys) == 2  # only valid lags are stored
+    assert data_length == 200 - 1  # total samples minus the first valid lag
+    assert mean_activity == pytest.approx(counts.mean())
+
+    # No valid lag at all: documented sentinels.
+    empty = compute_lagged_slopes([counts], k_max=5, min_points=10_000)
+    assert empty.data_length == 0 and np.isnan(empty.mean_activity)
+    assert empty.xs == [] and np.isnan(empty.r_k).all()

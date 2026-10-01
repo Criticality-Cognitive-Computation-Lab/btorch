@@ -43,6 +43,18 @@ StatChoice = Literal[
 NanPolicy = Literal["skip", "warn", "assert"]
 InfPolicy = Literal["propagate", "skip", "warn", "assert"]
 DimSpec = int | tuple[int, ...] | dict[int, int | tuple[int, ...] | None] | None
+BatchAxis = int | tuple[int, ...] | None
+"""Axes (e.g. trials) a spike/current statistic aggregates over before it is
+computed; an ``int`` is shorthand for a one-element tuple, ``None`` keeps all
+non-time axes."""
+StatsResult = tuple[Any, dict[str, Any]]
+"""``(value, info)`` returned by a single-output function wrapped by
+:func:`use_stats`/:func:`use_percentiles`: ``value`` is the per-element array
+(or the aggregate if ``stat`` is given) and ``info`` the statistics dict."""
+MultiStatsResult = tuple[Any, ...]
+"""``(*values, info)`` returned by a multi-output function wrapped by
+:func:`use_stats`/:func:`use_percentiles`: one entry per wrapped return
+position followed by the ``info`` dict."""
 StatSpec = StatChoice | dict[int, StatChoice] | None
 StatInfoSpec = (
     StatChoice
@@ -281,6 +293,10 @@ def compute_stats_batch(
     if dim is None:
         values = values.flatten()
         dim = 0
+        if (values.numel() if is_tensor else values.size) == 0:
+            # Nothing left to aggregate (e.g. fewer than two spikes): every
+            # statistic is undefined, so report NaN instead of warning/raising.
+            return {name: float("nan") for name in stats}
 
     reducers = _TORCH_REDUCERS if is_tensor else _NUMPY_REDUCERS
     cache: dict[str, Any] = {}

@@ -25,7 +25,7 @@ from torch import Tensor
 
 from ...types import TensorLike
 from .. import environ
-from ..base import BaseNode
+from ..base import Backend, BaseNode, StepMode
 from ..ode import exp_euler_step
 from ..surrogate import Erf
 
@@ -148,8 +148,8 @@ class GLIF3(BaseNode):
         detach_reset: bool = False,
         hard_reset: bool = False,
         pre_spike_v: bool = False,
-        step_mode: Literal["s"] = "s",
-        backend: Literal["torch"] = "torch",
+        step_mode: StepMode = "s",
+        backend: Backend = "torch",
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ):
@@ -197,7 +197,6 @@ class GLIF3(BaseNode):
         else:
             self.tau_ref = None
 
-        # for compat
         if v_rest is not None:
             self.def_param(
                 "_v_rest",

@@ -11,6 +11,8 @@ https://doi.org/10.1038/s41467-018-04725-4
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import numpy as np
 
 
@@ -101,24 +103,58 @@ def input_handler(items: object) -> list[np.ndarray]:
     raise ValueError("Input type not recognized")
 
 
-def get_slopes(
+class LaggedSlopes(NamedTuple):
+    """Result of :func:`compute_lagged_slopes`.
+
+    Attributes:
+        k: Lags ``1 .. k_max-1``, shape ``(k_max-1,)``, ``int``.
+        r_k: Regression slope per lag, shape ``(k_max-1,)``. ``NaN`` marks a
+            lag that could not be estimated (no trial is longer than ``k``,
+            fewer than ``min_points`` samples, or variance ``<= eps``).
+        stderr: Standard error of each slope, same shape and ``NaN`` marking
+            as ``r_k``.
+        data_length: Total number of samples over all trials minus the first
+            valid lag; ``0`` when no lag is valid.
+        mean_activity: Mean of the per-trial means; ``NaN`` when no lag is
+            valid.
+        xs: Centered lagged regressors, one array per *valid* lag (empty
+            unless ``scatterpoints=True``; skipped lags are omitted, so index
+            ``i`` is not lag ``k[i]``).
+        ys: Centered lagged responses, aligned with ``xs``.
+    """
+
+    k: np.ndarray
+    r_k: np.ndarray
+    stderr: np.ndarray
+    data_length: int
+    mean_activity: float
+    xs: list[np.ndarray]
+    ys: list[np.ndarray]
+
+
+def compute_lagged_slopes(
     all_counts: list[np.ndarray],
     k_max: int,
     min_points: int = 50,
     scatterpoints: bool = False,
     eps: float = 1e-12,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    int,
-    float,
-    list[np.ndarray],
-    list[np.ndarray],
-]:
-    """Compute lagged regression slopes ``r_k`` for ``k = 1 ..
+) -> LaggedSlopes:
+    """Compute lagged regression slopes ``r_k`` for ``k = 1 .. k_max-1``.
 
-    k_max-1``.
+    For each lag the centered pairs ``(a[t], a[t+k])`` of all trials are
+    pooled and regressed through the origin.
+
+    Args:
+        all_counts: List of 1D count time series (trials).
+        k_max: Exclusive upper bound of the lags.
+        min_points: Minimum pooled sample count for a lag to be estimated.
+        scatterpoints: Also return the centered ``x``/``y`` samples per lag.
+        eps: Variance threshold below which a lag is declared degenerate.
+
+    Returns:
+        A :class:`LaggedSlopes` named tuple (unpackable as a 7-tuple). Failed
+        lags are reported as ``NaN`` in ``r_k``/``stderr``; see
+        :class:`LaggedSlopes` for every member and sentinel.
     """
     k_arr = np.arange(1, k_max, dtype=int)
     r_k = np.zeros(len(k_arr), dtype=np.float64)
@@ -182,7 +218,7 @@ def get_slopes(
         data_length = 0
         mean_activity = np.nan
 
-    return k_arr, r_k, stderr, data_length, mean_activity, xs, ys
+    return LaggedSlopes(k_arr, r_k, stderr, data_length, mean_activity, xs, ys)
 
 
 def _ar1_fallback(
@@ -222,7 +258,7 @@ def _ar1_fallback(
     }
 
 
-def branching_ratio(
+def compute_branching_ratio(
     all_counts: np.ndarray | list[np.ndarray] | list[list[float]] | str,
     k_max: int = 40,
     *,
@@ -261,7 +297,7 @@ def branching_ratio(
     if max_possible < 1:
         raise ValueError("Time series too short for branching-ratio estimation")
 
-    k, r_k_raw, stderr_raw, data_length, mean_activity, xs, ys = get_slopes(
+    k, r_k_raw, stderr_raw, data_length, mean_activity, xs, ys = compute_lagged_slopes(
         counts_list,
         max_possible + 1,
         scatterpoints=scatterpoints,

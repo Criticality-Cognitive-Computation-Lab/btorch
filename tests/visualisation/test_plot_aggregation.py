@@ -4,9 +4,7 @@ import pandas as pd
 
 from btorch.utils.file import save_fig
 from btorch.visualisation.aggregation import (
-    plot_group_box,
-    plot_group_ecdf,
-    plot_group_violin,
+    plot_group_distribution,
     plot_neuropil_timeseries_overview,
     plot_neuropil_timeseries_panels,
 )
@@ -76,21 +74,24 @@ def test_group_distribution_style_comparison_plot():
         "value_name": "response",
     }
 
-    plot_group_violin(
+    plot_group_distribution(
         values,
+        kind="violin",
         ax=axes[0],
         title="Violin: Distribution Shape",
         **common,
     )
-    plot_group_box(
+    plot_group_distribution(
         values,
+        kind="box",
         ax=axes[1],
         title="Box: Quantiles and Spread",
         showfliers=False,
         **common,
     )
-    plot_group_ecdf(
+    plot_group_distribution(
         values,
+        kind="ecdf",
         ax=axes[2],
         title="ECDF: Cumulative Comparison",
         linewidth=2.0,

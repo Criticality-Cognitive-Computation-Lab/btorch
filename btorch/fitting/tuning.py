@@ -1,3 +1,6 @@
+from collections.abc import Mapping
+from typing import Any
+
 import torch
 
 from btorch.models import environ
@@ -5,17 +8,20 @@ from btorch.models.functional import init_net_state
 from btorch.models.rnn import make_rnn
 
 
-def get_fi_vi_curve(
-    neuron_cls,
-    neuron_params,
-    current_start=0.0,
-    current_end=20.0,
-    steps=20,
-    duration=1000,
-    dt=1.0,
-    device="cpu",
+def compute_fi_vi_curve(
+    neuron_cls: type[torch.nn.Module],
+    neuron_params: Mapping[str, Any],
+    current_start: float = 0.0,
+    current_end: float = 20.0,
+    steps: int = 20,
+    duration: float = 1000,
+    dt: float = 1.0,
+    device: str | torch.device = "cpu",
 ) -> dict[str, torch.Tensor]:
-    """Run sweeps to generate f-I and V-I curves.
+    """Simulate a constant-current sweep and return the f-I and V-I curves.
+
+    Builds the neuron, wraps it in an RNN and runs it once with all currents
+    as a batch (this is a simulation, not a lookup).
 
     Args:
         neuron_cls: The neuron class to instantiate.
@@ -28,14 +34,15 @@ def get_fi_vi_curve(
         device: Device to run on.
 
     Returns:
-        dict: A dictionary containing:
+        A dictionary containing:
             - currents: Tensor of shape (steps,)
-            - frequencies: Tensor of shape (steps, n_neuron)
+            - frequencies: Firing rate in Hz, shape (steps, n_neuron)
             - voltages: Tensor of shape (time_steps, steps, n_neuron)
+            - time: Time axis in ms, shape (time_steps,)
     """
     currents = torch.linspace(current_start, current_end, steps, device=device)
 
-    params = neuron_params.copy()
+    params = dict(neuron_params)
     n_neuron = params.pop("n_neuron", 1)
     params["device"] = device
 

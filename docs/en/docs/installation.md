@@ -30,6 +30,7 @@ imported lazily; calling a feature whose library is missing raises an
 | `btorch[analysis]` | powerlaw, nolds, fastdtw | avalanche/DFA criticality, Lyapunov and entropy estimates, DTW trace clustering |
 | `btorch[viz]` | networkx, plotly | interactive hex plots (`btorch.visualisation.hex.interactive`), graph plots |
 | `btorch[sparse]` | torch_scatter, torch_sparse | faster sparse backend (see below; needs PyG wheels) |
+| `btorch[examples]` | torchvision, seaborn, tqdm | scripts in `examples/` |
 | `btorch[all]` | every extra above | everything |
 
 ```bash
@@ -39,7 +40,7 @@ pip install "btorch[all]"
 
 ### CUDA support
 
-`btorch` depends on PyTorch. PyPI ships CPU-only torch by default. For CUDA,
+`btorch` depends on PyTorch 2.3 or newer (`torch.compiler.is_compiling`). PyPI ships CPU-only torch by default. For CUDA,
 install PyTorch with the right compute platform **first**, then add `btorch`:
 
 ```bash

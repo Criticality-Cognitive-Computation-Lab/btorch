@@ -7,7 +7,7 @@ from .aggregation import (
     group_summary,
     group_values,
 )
-from .branching import branching_ratio
+from .branching import compute_branching_ratio
 from .connectivity import HopDistanceModel, compute_ie_ratio
 from .metrics import indices_to_mask, select_on_metric
 from .spiking import (
@@ -32,33 +32,7 @@ from .statistics import (
     use_percentiles,
     use_stats,
 )
-from .two_compartment_fit import (
-    DEFAULT_TWO_COMPARTMENT_FIT_STAGES,
-    DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS,
-    AllenSweepBatch,
-    FitEvaluation,
-    FitLossConfig,
-    TwoCompartmentFitStage,
-    choose_current_clamp_sweeps,
-    detect_spikes_from_voltage,
-    evaluate_fit_across_sweeps,
-    evaluate_two_compartment_fit,
-    exponential_filter_spike_train,
-    filter_mouse_visp_l5_pyramidal_cells,
-    fit_two_compartment_model,
-    get_cell_types_cache,
-    load_allen_sweep,
-    mask_post_spike_voltage_samples,
-    plot_two_compartment_fit,
-    query_mouse_visp_l5_pyramidal_cells,
-    resample_trace,
-    rollout_two_compartment,
-    save_fit_report,
-    spike_timing_loss,
-    spike_timing_stats,
-    two_compartment_loss,
-)
-from .voltage import suggest_skip_timestep, voltage_overshoot
+from .voltage import compute_voltage_overshoot, suggest_skip_timestep
 
 
 __all__ = [
@@ -69,7 +43,7 @@ __all__ = [
     "group_values",
     "group_summary",
     "group_ecdf",
-    "branching_ratio",
+    "compute_branching_ratio",
     "HopDistanceModel",
     "compute_ie_ratio",
     "indices_to_mask",
@@ -94,32 +68,8 @@ __all__ = [
     "compute_log_hist",
     "compute_spectrum",
     "describe_array",
-    "AllenSweepBatch",
-    "DEFAULT_TWO_COMPARTMENT_FIT_STAGES",
-    "DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS",
-    "FitEvaluation",
-    "FitLossConfig",
-    "TwoCompartmentFitStage",
-    "choose_current_clamp_sweeps",
-    "detect_spikes_from_voltage",
-    "evaluate_fit_across_sweeps",
-    "evaluate_two_compartment_fit",
-    "exponential_filter_spike_train",
-    "filter_mouse_visp_l5_pyramidal_cells",
-    "fit_two_compartment_model",
-    "get_cell_types_cache",
-    "load_allen_sweep",
-    "mask_post_spike_voltage_samples",
-    "plot_two_compartment_fit",
-    "query_mouse_visp_l5_pyramidal_cells",
-    "resample_trace",
-    "rollout_two_compartment",
-    "save_fit_report",
-    "spike_timing_loss",
-    "spike_timing_stats",
-    "two_compartment_loss",
     "suggest_skip_timestep",
-    "voltage_overshoot",
+    "compute_voltage_overshoot",
     "StatChoice",
     "use_stats",
     "use_percentiles",

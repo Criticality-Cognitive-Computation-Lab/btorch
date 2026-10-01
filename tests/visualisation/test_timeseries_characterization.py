@@ -25,6 +25,7 @@ a new numpy/matplotlib version) delete it and run::
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import warnings
@@ -45,12 +46,95 @@ from matplotlib.colors import to_hex  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 
 from btorch.visualisation.timeseries import (  # noqa: E402
+    GroupStripOptions,
     NeuronSpec,
+    RasterAnnotations,
+    RasterGrouping,
+    RasterStyle,
+    RatePanelOptions,
     SimulationStates,
     TracePlotFormat,
     plot_neuron_traces,
     plot_raster,
 )
+
+
+# Scenario tables below keep the flat ``name=value`` spelling for readability;
+# these helpers sort the flat keywords into the option dataclasses that
+# ``plot_raster`` / ``plot_neuron_traces`` take.
+_RASTER_GROUPS = {
+    "style": (
+        RasterStyle,
+        {k: k for k in ("spike_color", "marker", "marker_size", "neuron_specs")},
+    ),
+    "grouping": (
+        RasterGrouping,
+        {
+            "neurons_df": "neurons_df",
+            "group_key": "group_key",
+            "group_sort": "group_sort",
+            "sort_neurons": "sort_neurons",
+            "show_group_separators": "show_separators",
+            "separator_style": "separator_style",
+        },
+    ),
+    "strip": (
+        GroupStripOptions,
+        {
+            "group_color_key": "color_key",
+            "strip_cmap": "cmap",
+            "group_strip_kwargs": "layout",
+            "group_strip_legend": "legend",
+            "group_label_mode": "label_mode",
+            "group_strip_side": "side",
+        },
+    ),
+    "rate": (
+        RatePanelOptions,
+        {"rate": "total", "group_rate": "per_group", "rate_window_ms": "window_ms"},
+    ),
+    "annotations": (
+        RasterAnnotations,
+        {
+            k: k
+            for k in (
+                "events",
+                "regions",
+                "show_tracks",
+                "event_kwargs",
+                "region_kwargs",
+            )
+        },
+    ),
+}
+_RASTER_CORE = ("dt", "times", "ax", "title", "xlabel", "ylabel")
+
+
+def _plot_raster_flat(spikes, **kw):
+    """Call ``plot_raster`` from flat keywords (old spelling)."""
+    show_strip = kw.pop("show_group_strip", False)
+    call = {k: kw.pop(k) for k in _RASTER_CORE if k in kw}
+    for group, (cls, names) in _RASTER_GROUPS.items():
+        opts = {new: kw.pop(old) for old, new in names.items() if old in kw}
+        if group == "strip":
+            if show_strip:
+                call[group] = cls(**opts)
+            elif opts:
+                call[group] = cls(show=False, **opts)
+        elif opts:
+            call[group] = cls(**opts)
+    assert not kw, f"unmapped raster keywords: {sorted(kw)}"
+    return plot_raster(spikes, **call)
+
+
+_STATES_FIELDS = {f.name for f in dataclasses.fields(SimulationStates)}
+
+
+def _plot_traces_flat(**kw):
+    """Call ``plot_neuron_traces`` from flat keywords (old spelling)."""
+    states = SimulationStates(**{k: kw.pop(k) for k in _STATES_FIELDS & kw.keys()})
+    fmt = TracePlotFormat(**kw) if kw else None
+    return plot_neuron_traces(states, fmt)
 
 
 GOLDEN_PATH = Path(__file__).with_name("timeseries_characterization.json")
@@ -227,7 +311,7 @@ def _raster_scenarios() -> dict:
     group_rate_arr = np.stack([np.linspace(0, 5, N_T), np.linspace(5, 0, N_T)], 1)
 
     def s(**kw):
-        return lambda: _raster_result(plot_raster(sp, **kw))
+        return lambda: _raster_result(_plot_raster_flat(sp, **kw))
 
     sc = {
         "plain": s(),
@@ -373,10 +457,11 @@ def _raster_scenarios() -> dict:
         "strip_all_zero_with_specs": lambda: _raster_result(
             plot_raster(
                 np.zeros((N_T, N_N)),
-                neurons_df=df,
-                group_key="group",
-                show_group_strip=True,
-                neuron_specs=[NeuronSpec(marker="o"), NeuronSpec(marker="x")],
+                style=RasterStyle(
+                    neuron_specs=[NeuronSpec(marker="o"), NeuronSpec(marker="x")]
+                ),
+                grouping=RasterGrouping(neurons_df=df, group_key="group"),
+                strip=GroupStripOptions(),
             )
         ),
         "torch_input": lambda: _raster_result(plot_raster(torch.tensor(sp))),
@@ -392,7 +477,7 @@ def _raster_scenarios() -> dict:
     def on_ax_with_rate_warns():
         fig, ax = plt.subplots()
         with pytest.warns(UserWarning, match="ax argument is ignored"):
-            ret = plot_raster(sp, ax=ax, rate=True)
+            ret = plot_raster(sp, ax=ax, rate=RatePanelOptions(total=True))
         assert isinstance(ret, tuple) and ret[0] is not ax
         return _raster_result(ret)
 
@@ -419,7 +504,7 @@ def _traces_scenarios() -> dict:
 
     def s(include_size=True, **kw):
         def run():
-            return _traces_result(plot_neuron_traces(**kw), include_size)
+            return _traces_result(_plot_traces_flat(**kw), include_size)
 
         return run
 
@@ -503,7 +588,7 @@ def _traces_scenarios() -> dict:
         "separate_no_panels": s(**base, separate_figures=True, show_voltage=False),
         "states_dataclass": lambda: _traces_result(
             plot_neuron_traces(
-                states=SimulationStates(
+                SimulationStates(
                     voltage=d["voltage"],
                     dt=2.0,
                     asc=d["asc"],
@@ -514,9 +599,8 @@ def _traces_scenarios() -> dict:
         ),
         "format_dataclass": lambda: _traces_result(
             plot_neuron_traces(
-                voltage=d["voltage"],
-                spikes=d["spikes"],
-                format=TracePlotFormat(
+                SimulationStates(voltage=d["voltage"], spikes=d["spikes"]),
+                TracePlotFormat(
                     neuron_indices=[0, 1],
                     show_spikes_on_voltage=False,
                     auto_width=False,
@@ -527,9 +611,8 @@ def _traces_scenarios() -> dict:
         ),
         "format_separate": lambda: _traces_result(
             plot_neuron_traces(
-                voltage=d["voltage"],
-                asc=d["asc"],
-                format=TracePlotFormat(separate_figures=True, sample_size=2),
+                SimulationStates(voltage=d["voltage"], asc=d["asc"]),
+                TracePlotFormat(separate_figures=True, sample_size=2),
             )
         ),
         # Fixed (was a pinned quirk): the separate-figures path now honours
@@ -629,7 +712,7 @@ def test_raster_plain_returns_single_axes():
 
 def test_raster_rate_returns_pair_and_moves_xlabel():
     """Rate=True gives (raster, rate) axes; x label lives on the rate axis."""
-    ret = plot_raster(_spikes(), rate=True, xlabel="t (ms)")
+    ret = plot_raster(_spikes(), xlabel="t (ms)", rate=RatePanelOptions(total=True))
     assert isinstance(ret, tuple) and len(ret) == 2
     ax_r, ax_rate = ret
     assert len(ax_r.figure.axes) == 2
@@ -643,10 +726,8 @@ def test_raster_group_rate_draws_one_line_per_group_plus_total():
     """group_rate=True + rate=True: one line per group then the total line."""
     _, ax_rate = plot_raster(
         _spikes(),
-        neurons_df=_neurons_df(),
-        group_key="group",
-        group_rate=True,
-        rate=True,
+        grouping=RasterGrouping(neurons_df=_neurons_df(), group_key="group"),
+        rate=RatePanelOptions(per_group=True, total=True),
     )
     assert len(ax_rate.lines) == 3
     assert [ln.get_label() for ln in ax_rate.lines[:2]] == ["A", "B"]
@@ -654,7 +735,9 @@ def test_raster_group_rate_draws_one_line_per_group_plus_total():
 
 def test_raster_group_separators_and_labels():
     """Grouping draws separators between groups and text labels at the side."""
-    ax = plot_raster(_spikes(), neurons_df=_neurons_df(), group_key="group")
+    ax = plot_raster(
+        _spikes(), grouping=RasterGrouping(neurons_df=_neurons_df(), group_key="group")
+    )
     # Two groups -> only the inner boundary gets an axhline.
     assert len(ax.lines) == 1
     labels = [t.get_text() for t in ax.texts]
@@ -665,7 +748,9 @@ def test_raster_group_strip_adds_axes_and_legend():
     """The group strip is an extra axes with one patch per neuron and
     legend."""
     ax = plot_raster(
-        _spikes(), neurons_df=_neurons_df(), group_key="group", show_group_strip=True
+        _spikes(),
+        grouping=RasterGrouping(neurons_df=_neurons_df(), group_key="group"),
+        strip=GroupStripOptions(),
     )
     fig = ax.figure
     assert len(fig.axes) == 2
@@ -680,7 +765,9 @@ def test_raster_group_strip_adds_axes_and_legend():
 def test_raster_mixed_markers_split_into_one_scatter_per_marker():
     ax = plot_raster(
         _spikes(),
-        neuron_specs=[NeuronSpec(marker="o"), NeuronSpec(marker="x")],
+        style=RasterStyle(
+            neuron_specs=[NeuronSpec(marker="o"), NeuronSpec(marker="x")]
+        ),
     )
     # Neurons without a spec fall back to the default "." marker: 3 markers.
     assert len(ax.collections) == 3
@@ -691,39 +778,42 @@ def test_raster_error_contracts():
     with pytest.raises(ValueError, match="2D"):
         plot_raster(sp[0])
     with pytest.raises(ValueError, match="neurons_df must be provided"):
-        plot_raster(sp, group_key="group")
+        plot_raster(sp, grouping=RasterGrouping(group_key="group"))
     with pytest.raises(ValueError, match="not found"):
-        plot_raster(sp, neurons_df=_neurons_df(), group_key="nope")
+        plot_raster(
+            sp, grouping=RasterGrouping(neurons_df=_neurons_df(), group_key="nope")
+        )
     with pytest.raises(ValueError, match="sequence length"):
-        plot_raster(sp, spike_color=["red"])
+        plot_raster(sp, style=RasterStyle(spike_color=["red"]))
     with pytest.raises(ValueError, match="neurons_df must be provided for group"):
-        plot_raster(sp, show_group_strip=True)
-    with pytest.raises(ValueError, match="group_color_key or group_key"):
-        plot_raster(sp, neurons_df=_neurons_df(), show_group_strip=True)
+        plot_raster(sp, strip=GroupStripOptions())
+    with pytest.raises(ValueError, match="color_key or grouping.group_key"):
+        plot_raster(
+            sp,
+            grouping=RasterGrouping(neurons_df=_neurons_df()),
+            strip=GroupStripOptions(),
+        )
     with pytest.raises(ValueError, match="rate length"):
-        plot_raster(sp, rate=np.zeros(3))
+        plot_raster(sp, rate=RatePanelOptions(total=np.zeros(3)))
     with pytest.raises(ValueError, match="rate must be 1D"):
-        plot_raster(sp, rate=np.zeros((N_T, 2)))
+        plot_raster(sp, rate=RatePanelOptions(total=np.zeros((N_T, 2))))
     with pytest.raises(ValueError, match=r"\(T, G\)"):
         plot_raster(
             sp,
-            neurons_df=_neurons_df(),
-            group_key="group",
-            group_rate=np.zeros(N_T),
+            grouping=RasterGrouping(neurons_df=_neurons_df(), group_key="group"),
+            rate=RatePanelOptions(per_group=np.zeros(N_T)),
         )
     with pytest.raises(ValueError, match="number of groups"):
         plot_raster(
             sp,
-            neurons_df=_neurons_df(),
-            group_key="group",
-            group_rate=np.zeros((N_T, 5)),
+            grouping=RasterGrouping(neurons_df=_neurons_df(), group_key="group"),
+            rate=RatePanelOptions(per_group=np.zeros((N_T, 5))),
         )
     with pytest.raises(ValueError, match="1D and match"):
         plot_raster(
             sp,
-            neurons_df=_neurons_df(),
-            group_key="group",
-            group_rate={"A": np.zeros(3)},
+            grouping=RasterGrouping(neurons_df=_neurons_df(), group_key="group"),
+            rate=RatePanelOptions(per_group={"A": np.zeros(3)}),
         )
     with pytest.raises(ValueError, match="times"):
         plot_raster(sp, times=[0, 1])
@@ -731,13 +821,14 @@ def test_raster_error_contracts():
 
 def test_raster_warns_when_color_dict_without_group_key():
     with pytest.warns(UserWarning, match="group_key not set"):
-        plot_raster(_spikes(), spike_color={"A": "red"})
+        plot_raster(_spikes(), style=RasterStyle(spike_color={"A": "red"}))
 
 
 def test_traces_combined_returns_figure_with_expected_grid():
     d = _trace_data()
     fig = plot_neuron_traces(
-        voltage=d["voltage"], asc=d["asc"], psc=d["psc"], neuron_indices=[0, 1]
+        SimulationStates(voltage=d["voltage"], asc=d["asc"], psc=d["psc"]),
+        TracePlotFormat(neuron_indices=[0, 1]),
     )
     assert isinstance(fig, Figure)
     # 2 neurons (rows) x 3 panels (voltage, asc, psc)
@@ -758,18 +849,15 @@ def test_traces_combined_returns_figure_with_expected_grid():
 
 
 def test_traces_default_plots_first_five_neurons():
-    fig = plot_neuron_traces(voltage=_trace_data(n_n=8)["voltage"])
+    fig = plot_neuron_traces(SimulationStates(voltage=_trace_data(n_n=8)["voltage"]))
     assert len(fig.axes) == 5
 
 
 def test_traces_separate_figures_returns_dict_per_trace_type():
     d = _trace_data()
     figs = plot_neuron_traces(
-        voltage=d["voltage"],
-        asc=d["asc"],
-        psc=d["psc"],
-        neuron_indices=[0, 1],
-        separate_figures=True,
+        SimulationStates(voltage=d["voltage"], asc=d["asc"], psc=d["psc"]),
+        TracePlotFormat(neuron_indices=[0, 1], separate_figures=True),
     )
     assert isinstance(figs, dict)
     assert list(figs) == ["voltage", "asc", "psc"]
@@ -783,7 +871,8 @@ def test_traces_separate_figures_returns_dict_per_trace_type():
 def test_traces_neurons_per_row_hides_unused_axes():
     d = _trace_data()
     fig = plot_neuron_traces(
-        voltage=d["voltage"], neuron_indices=[0, 1, 2], neurons_per_row=2
+        SimulationStates(voltage=d["voltage"]),
+        TracePlotFormat(neuron_indices=[0, 1, 2], neurons_per_row=2),
     )
     assert len(fig.axes) == 4
     assert [a.get_visible() for a in fig.axes] == [True, True, True, False]
@@ -792,10 +881,10 @@ def test_traces_neurons_per_row_hides_unused_axes():
 def test_traces_top_labels_add_label_axes():
     d = _trace_data()
     fig = plot_neuron_traces(
-        voltage=d["voltage"],
-        neuron_indices=[0, 1],
-        neuron_labels=["a", "b"],
-        neuron_label_position="top",
+        SimulationStates(voltage=d["voltage"]),
+        TracePlotFormat(
+            neuron_indices=[0, 1], neuron_labels=["a", "b"], neuron_label_position="top"
+        ),
     )
     # One hidden-axis label row per neuron row + one trace row per neuron.
     assert len(fig.axes) == 4
@@ -806,10 +895,8 @@ def test_traces_top_labels_add_label_axes():
 def test_traces_threshold_reference_lines_and_legend():
     d = _trace_data()
     fig = plot_neuron_traces(
-        voltage=d["voltage"],
-        neuron_indices=[0],
-        v_threshold=-50.0,
-        v_reset=-65.0,
+        SimulationStates(voltage=d["voltage"], v_threshold=-50.0, v_reset=-65.0),
+        TracePlotFormat(neuron_indices=[0]),
     )
     ax = fig.axes[0]
     assert [t.get_text() for t in ax.get_legend().get_texts()] == ["V_th", "V_reset"]
@@ -817,20 +904,29 @@ def test_traces_threshold_reference_lines_and_legend():
 
 def test_traces_error_contracts():
     d = _trace_data()
-    with pytest.raises(ValueError, match="voltage is required"):
-        plot_neuron_traces()
+    with pytest.raises(TypeError, match="voltage"):
+        SimulationStates()  # type: ignore[call-arg]
     with pytest.raises(ValueError, match="neurons_per_row"):
-        plot_neuron_traces(voltage=d["voltage"], neurons_per_row=0)
+        plot_neuron_traces(
+            SimulationStates(voltage=d["voltage"]), TracePlotFormat(neurons_per_row=0)
+        )
     ext = np.zeros((40, 6, 2), dtype=np.float32)
     for kw in ("epsc", "ipsc", "input"):
         with pytest.raises(ValueError, match="must be None"):
-            plot_neuron_traces(voltage=d["voltage"], psc=ext, **{kw: d["epsc"]})
+            plot_neuron_traces(
+                SimulationStates(voltage=d["voltage"], psc=ext, **{kw: d["epsc"]})
+            )
     with pytest.raises(ValueError, match="out of bounds"):
-        plot_neuron_traces(voltage=_trace_data(batch=2)["voltage"], batch_idx=5)
+        plot_neuron_traces(
+            SimulationStates(voltage=_trace_data(batch=2)["voltage"]),
+            TracePlotFormat(batch_idx=5),
+        )
     with pytest.raises(ValueError, match="v_threshold"):
-        plot_neuron_traces(voltage=d["voltage"], v_threshold=[1.0, 2.0])
+        plot_neuron_traces(
+            SimulationStates(voltage=d["voltage"], v_threshold=[1.0, 2.0])
+        )
     with pytest.raises(ValueError, match="2D, 3D, or 4D"):
-        plot_neuron_traces(voltage=np.zeros(5))
+        plot_neuron_traces(SimulationStates(voltage=np.zeros(5)))
 
 
 def test_traces_batched_psc_with_3d_voltage():
@@ -841,7 +937,8 @@ def test_traces_batched_psc_with_3d_voltage():
     """
     d3 = _trace_data(batch=3)
     fig = plot_neuron_traces(
-        voltage=d3["voltage"], psc=d3["psc"], batch_idx=2, neuron_indices=[0, 1]
+        SimulationStates(voltage=d3["voltage"], psc=d3["psc"]),
+        TracePlotFormat(batch_idx=2, neuron_indices=[0, 1]),
     )
     assert [a.get_title() for a in fig.axes[:2]] == [
         "Voltage",
@@ -857,7 +954,8 @@ def test_traces_4d_psc_is_multi_component():
     volt = rng.normal(size=(40, 3, 6)).astype(np.float32)
     psc = rng.normal(size=(40, 3, 6, 2)).astype(np.float32)
     fig = plot_neuron_traces(
-        voltage=volt, psc=psc, batch_idx=1, neuron_indices=[0], psc_labels=["a", "b"]
+        SimulationStates(voltage=volt, psc=psc, psc_labels=["a", "b"]),
+        TracePlotFormat(batch_idx=1, neuron_indices=[0]),
     )
     assert len(fig.axes[1].lines) == 2
     np.testing.assert_allclose(fig.axes[1].lines[1].get_ydata(), psc[:, 1, 0, 1])
@@ -865,20 +963,19 @@ def test_traces_4d_psc_is_multi_component():
 
 def test_raster_group_rate_requires_group_key():
     """group_rate without group_key used to silently draw an empty panel."""
-    with pytest.raises(ValueError, match="group_rate requires group_key"):
-        plot_raster(_spikes(), group_rate=True)
-    with pytest.raises(ValueError, match="group_rate requires group_key"):
-        plot_raster(_spikes(), group_rate={"A": np.zeros(N_T)})
+    with pytest.raises(ValueError, match="per_group requires grouping.group_key"):
+        plot_raster(_spikes(), rate=RatePanelOptions(per_group=True))
+    with pytest.raises(ValueError, match="per_group requires grouping.group_key"):
+        plot_raster(_spikes(), rate=RatePanelOptions(per_group={"A": np.zeros(N_T)}))
 
 
 def test_raster_strip_all_zero_spikes_with_specs():
     """No spikes + strip + neuron_specs used to fail on ``marker_list[0]``."""
     ax = plot_raster(
         np.zeros((N_T, N_N)),
-        neurons_df=_neurons_df(),
-        group_key="group",
-        show_group_strip=True,
-        neuron_specs=[NeuronSpec(marker="o")],
+        style=RasterStyle(neuron_specs=[NeuronSpec(marker="o")]),
+        grouping=RasterGrouping(neurons_df=_neurons_df(), group_key="group"),
+        strip=GroupStripOptions(),
     )
     assert ax.get_title().startswith("Spike raster Fired 0/")
 
@@ -888,10 +985,9 @@ def test_raster_strip_honours_per_neuron_color_sequence():
     colors = ["red", "blue"] * (N_N // 2)
     ax = plot_raster(
         _spikes(),
-        neurons_df=_neurons_df(),
-        group_key="group",
-        show_group_strip=True,
-        spike_color=colors,
+        style=RasterStyle(spike_color=colors),
+        grouping=RasterGrouping(neurons_df=_neurons_df(), group_key="group"),
+        strip=GroupStripOptions(),
     )
     used = {to_hex(c) for c in ax.collections[0].get_facecolor()}
     assert used == {"#ff0000", "#0000ff"}
@@ -900,10 +996,12 @@ def test_raster_strip_honours_per_neuron_color_sequence():
 def test_traces_separate_figures_honour_neuron_specs():
     d = _trace_data()
     figs = plot_neuron_traces(
-        voltage=d["voltage"],
-        neuron_indices=[0, 1],
-        separate_figures=True,
-        neuron_specs=[NeuronSpec(label="L0", color="red", linestyle="--")],
+        SimulationStates(voltage=d["voltage"]),
+        TracePlotFormat(
+            neuron_indices=[0, 1],
+            separate_figures=True,
+            neuron_specs=[NeuronSpec(label="L0", color="red", linestyle="--")],
+        ),
     )
     ax0, ax1 = figs["voltage"].axes
     assert to_hex(ax0.lines[0].get_color()) == "#ff0000"
@@ -914,14 +1012,18 @@ def test_traces_separate_figures_honour_neuron_specs():
     assert len(ax1.texts) == 0
 
 
-def test_traces_explicit_dt_one_overrides_states_dt():
-    """An explicit dt=1.0 used to be mistaken for "not given"."""
+def test_traces_dt_one_is_not_mistaken_for_unset():
+    """An explicit dt=1.0 on the states must not fall back to another dt."""
     d = _trace_data()
     states = SimulationStates(voltage=d["voltage"], dt=2.0)
-    fig_states = plot_neuron_traces(states=states, neuron_indices=[0])
-    fig_explicit = plot_neuron_traces(states=states, dt=1.0, neuron_indices=[0])
+    fig_states = plot_neuron_traces(states, TracePlotFormat(neuron_indices=[0]))
+    fig_explicit = plot_neuron_traces(
+        dataclasses.replace(states, dt=1.0), TracePlotFormat(neuron_indices=[0])
+    )
     assert fig_states.axes[0].lines[0].get_xdata()[1] == 2.0
     assert fig_explicit.axes[0].lines[0].get_xdata()[1] == 1.0
-    # No states and no dt: default 1.0 ms.
-    fig_plain = plot_neuron_traces(voltage=d["voltage"], neuron_indices=[0])
+    # dt left at the SimulationStates default: 1.0 ms.
+    fig_plain = plot_neuron_traces(
+        SimulationStates(voltage=d["voltage"]), TracePlotFormat(neuron_indices=[0])
+    )
     assert fig_plain.axes[0].lines[0].get_xdata()[1] == 1.0

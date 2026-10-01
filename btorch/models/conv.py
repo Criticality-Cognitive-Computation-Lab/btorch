@@ -9,6 +9,8 @@ import torch
 from jaxtyping import Float
 from torch import nn
 
+from ..connectome.connection import make_spatial_localised_conn
+
 
 class Conv1dSpatial(nn.Conv1d):
     """1D Convolution with spatial locality - each neuron connects to nearest neighbors.
@@ -60,8 +62,6 @@ class Conv1dSpatial(nn.Conv1d):
         )
 
         # Rows are post neurons, columns are pre neurons.
-        from ..connectome.connection import make_spatial_localised_conn
-
         conn = make_spatial_localised_conn(
             neurons, mode="num", num=n_neighbor, include_self=include_self
         ).tocsr()

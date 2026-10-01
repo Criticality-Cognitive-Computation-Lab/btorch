@@ -14,6 +14,12 @@ from btorch.visualisation.timeseries import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _seed_global_rng():
+    """Seed numpy's global RNG so the random traces/labels are reproducible."""
+    np.random.seed(0)
+
+
 def test_plot_neuron_traces_plain_args():
     """Test plotting with plain arguments."""
     # Generate synthetic data
@@ -24,10 +30,8 @@ def test_plot_neuron_traces_plain_args():
 
     # Plot with plain args
     fig = plot_neuron_traces(
-        voltage=voltage,
-        psc=psc,
-        dt=dt,
-        neuron_indices=[0, 5, 10],
+        SimulationStates(voltage=voltage, psc=psc, dt=dt),
+        TracePlotFormat(neuron_indices=[0, 5, 10]),
     )
 
     save_fig(fig, name="neuron_traces_plain_args")
@@ -80,7 +84,7 @@ def test_plot_neuron_traces_dataclass():
     )
 
     # Plot
-    fig = plot_neuron_traces(states=states, format=format)
+    fig = plot_neuron_traces(states, format)
 
     save_fig(fig, name="neuron_traces_dataclass")
     plt.close(fig)
@@ -96,7 +100,7 @@ def test_plot_neuron_traces_mixed():
     states = SimulationStates(voltage=voltage, psc=psc, dt=dt)
 
     # Use dataclass for states, plain args for selection
-    fig = plot_neuron_traces(states=states, neuron_indices=[0, 3, 7, 12])
+    fig = plot_neuron_traces(states, TracePlotFormat(neuron_indices=[0, 3, 7, 12]))
 
     save_fig(fig, name="neuron_traces_mixed")
     plt.close(fig)
@@ -121,10 +125,11 @@ def test_plot_neuron_traces_with_metadata():
     states = SimulationStates(voltage=voltage, dt=dt)
 
     fig = plot_neuron_traces(
-        states=states,
-        neuron_indices=selected_indices,
-        neurons_df=neurons_df,
-        neuron_labels=lambda idx: f"root_id={root_id_by_simple_id[idx]}",
+        states,
+        TracePlotFormat(
+            neuron_indices=selected_indices,
+            neuron_labels=lambda idx: f"root_id={root_id_by_simple_id[idx]}",
+        ),
     )
 
     labels = [text.get_text() for ax in fig.axes for text in ax.texts]
@@ -144,7 +149,8 @@ def test_plot_neuron_traces_voltage_only():
     voltage = -65 + 15 * np.random.randn(n_time, n_neurons)
 
     fig = plot_neuron_traces(
-        voltage=voltage, dt=0.1, neuron_indices=[0, 5], show_asc=False, show_psc=False
+        SimulationStates(voltage=voltage, dt=0.1),
+        TracePlotFormat(neuron_indices=[0, 5], show_asc=False, show_psc=False),
     )
 
     save_fig(fig, name="neuron_traces_voltage_only")
@@ -152,9 +158,9 @@ def test_plot_neuron_traces_voltage_only():
 
 
 def test_plot_neuron_traces_error_no_voltage():
-    """Test that error is raised when voltage is not provided."""
-    with pytest.raises(ValueError, match="voltage is required"):
-        plot_neuron_traces(dt=0.1)
+    """Voltage is a required field of SimulationStates (no silent default)."""
+    with pytest.raises(TypeError, match="voltage"):
+        SimulationStates(dt=0.1)  # type: ignore[call-arg]
 
 
 def test_plot_neuron_traces_auto_width():
@@ -163,7 +169,8 @@ def test_plot_neuron_traces_auto_width():
     voltage = -65 + 15 * np.random.randn(n_time, n_neurons)
 
     fig = plot_neuron_traces(
-        voltage=voltage, dt=0.1, neuron_indices=[0, 5], show_asc=False, show_psc=False
+        SimulationStates(voltage=voltage, dt=0.1),
+        TracePlotFormat(neuron_indices=[0, 5], show_asc=False, show_psc=False),
     )
 
     # Check auto-width (1000*0.1 = 100ms duration. 100*0.025 = 2.5 < 10. So width 10)
@@ -180,12 +187,8 @@ def test_plot_neuron_traces_separate_figures():
     psc = 50 * np.random.randn(n_time, n_neurons)
 
     figs = plot_neuron_traces(
-        voltage=voltage,
-        psc=psc,
-        dt=0.1,
-        neuron_indices=[0, 1],
-        separate_figures=True,
-        show_asc=False,
+        SimulationStates(voltage=voltage, psc=psc, dt=0.1),
+        TracePlotFormat(neuron_indices=[0, 1], separate_figures=True, show_asc=False),
     )
 
     assert isinstance(figs, dict)
@@ -206,7 +209,8 @@ def test_plot_neuron_traces_missing_data_auto_hide():
 
     # We ask to show ASC but provide no ASC data
     fig = plot_neuron_traces(
-        voltage=voltage, dt=0.1, show_asc=True, asc=None, show_psc=False
+        SimulationStates(voltage=voltage, dt=0.1, asc=None),
+        TracePlotFormat(show_asc=True, show_psc=False),
     )
 
     # Should result in 1 column (voltage), not 2
@@ -223,17 +227,20 @@ def test_plot_neuron_traces_with_specs():
 
     # 1. Scalar Spec (Dict)
     fig1 = plot_neuron_traces(
-        voltage=voltage,
-        neuron_specs={"color": "red", "linestyle": "--"},
-        show_asc=False,
-        show_psc=False,
+        SimulationStates(voltage=voltage),
+        TracePlotFormat(
+            neuron_specs={"color": "red", "linestyle": "--"},
+            show_asc=False,
+            show_psc=False,
+        ),
     )
     assert fig1 is not None
 
     # 2. Scalar Spec (Object)
     spec = NeuronSpec(color="blue", alpha=0.5)
     fig2 = plot_neuron_traces(
-        voltage=voltage, neuron_specs=spec, show_asc=False, show_psc=False
+        SimulationStates(voltage=voltage),
+        TracePlotFormat(neuron_specs=spec, show_asc=False, show_psc=False),
     )
     assert fig2 is not None
 
@@ -244,7 +251,8 @@ def test_plot_neuron_traces_with_specs():
         {"linestyle": ":"},  # N2
     ]
     fig3 = plot_neuron_traces(
-        voltage=voltage, neuron_specs=specs, show_asc=False, show_psc=False
+        SimulationStates(voltage=voltage),
+        TracePlotFormat(neuron_specs=specs, show_asc=False, show_psc=False),
     )
     assert fig3 is not None
 
@@ -258,15 +266,14 @@ def test_plot_neuron_traces_multi_column_neurons():
     psc = 50 * np.random.randn(n_time, n_neurons)
 
     fig = plot_neuron_traces(
-        voltage=voltage,
-        asc=asc,
-        psc=psc,
-        dt=dt,
-        neuron_indices=[0, 1, 2],
-        show_voltage=False,
-        show_asc=True,
-        show_psc=True,
-        neurons_per_row=2,
+        SimulationStates(voltage=voltage, asc=asc, psc=psc, dt=dt),
+        TracePlotFormat(
+            neuron_indices=[0, 1, 2],
+            show_voltage=False,
+            show_asc=True,
+            show_psc=True,
+            neurons_per_row=2,
+        ),
     )
 
     # Fixed grid: 2 rows * (2 neurons_per_row * 2 trace columns) = 8 axes total.
@@ -301,14 +308,13 @@ def test_plot_neuron_traces_custom_side_labels_callable():
     psc = 50 * np.random.randn(n_time, n_neurons)
 
     fig = plot_neuron_traces(
-        voltage=voltage,
-        asc=asc,
-        psc=psc,
-        dt=0.1,
-        neuron_indices=[0, 2],
-        neuron_labels=lambda idx: f"Cell-{idx}",
-        neuron_label_position="top",
-        neurons_per_row=2,
+        SimulationStates(voltage=voltage, asc=asc, psc=psc, dt=0.1),
+        TracePlotFormat(
+            neuron_indices=[0, 2],
+            neuron_labels=lambda idx: f"Cell-{idx}",
+            neuron_label_position="top",
+            neurons_per_row=2,
+        ),
     )
 
     # Top labels are added via ax.text() on label-row axes
@@ -347,14 +353,14 @@ def test_plot_neuron_traces_long_labels_adaptive_width():
 
     # Create baseline figure with short labels to measure default width
     fig_short = plot_neuron_traces(
-        voltage=voltage,
-        psc=psc,
-        dt=0.1,
-        neuron_indices=[0, 1],
-        neuron_labels=lambda idx: f"N{idx}",
-        neuron_label_position="top",
-        neurons_per_row=2,
-        show_asc=False,
+        SimulationStates(voltage=voltage, psc=psc, dt=0.1),
+        TracePlotFormat(
+            neuron_indices=[0, 1],
+            neuron_labels=lambda idx: f"N{idx}",
+            neuron_label_position="top",
+            neurons_per_row=2,
+            show_asc=False,
+        ),
     )
     width_short = fig_short.get_figwidth()
     save_fig(fig_short, name="neuron_traces_short_labels_adaptive_width")
@@ -368,14 +374,14 @@ def test_plot_neuron_traces_long_labels_adaptive_width():
     )
 
     fig = plot_neuron_traces(
-        voltage=voltage,
-        psc=psc,
-        dt=0.1,
-        neuron_indices=[0, 1],
-        neuron_labels=lambda idx: f"{long_label_prefix}|idx={idx}",
-        neuron_label_position="top",
-        neurons_per_row=2,
-        show_asc=False,
+        SimulationStates(voltage=voltage, psc=psc, dt=0.1),
+        TracePlotFormat(
+            neuron_indices=[0, 1],
+            neuron_labels=lambda idx: f"{long_label_prefix}|idx={idx}",
+            neuron_label_position="top",
+            neurons_per_row=2,
+            show_asc=False,
+        ),
     )
     fig_width = fig.get_figwidth()
 
@@ -413,14 +419,15 @@ def test_plot_neuron_traces_long_labels_adaptive_width():
     voltage = -65 + 5 * np.random.randn(n_time, n_neurons)
 
     fig = plot_neuron_traces(
-        voltage=voltage,
-        dt=0.1,
-        neuron_indices=[0, 1, 2, 3],
-        neuron_labels=lambda idx: f"N{idx}",  # Short labels
-        neuron_label_position="top",
-        neurons_per_row=2,
-        show_asc=False,
-        show_psc=False,
+        SimulationStates(voltage=voltage, dt=0.1),
+        TracePlotFormat(
+            neuron_indices=[0, 1, 2, 3],
+            neuron_labels=lambda idx: f"N{idx}",
+            neuron_label_position="top",
+            neurons_per_row=2,
+            show_asc=False,
+            show_psc=False,
+        ),
     )
 
     # With short labels, figure should use default width (~20 inches)
@@ -460,14 +467,10 @@ def test_plot_neuron_traces_thresholds_and_reset_per_neuron():
     )
 
     fig = plot_neuron_traces(
-        voltage=voltage,
-        dt=0.1,
-        neuron_indices=neuron_indices,
-        show_asc=False,
-        show_psc=False,
-        v_threshold=v_threshold,
-        # API parameter is v_reset; pass per-neuron v_rest values here.
-        v_reset=v_rest,
+        SimulationStates(
+            voltage=voltage, dt=0.1, v_threshold=v_threshold, v_reset=v_rest
+        ),
+        TracePlotFormat(neuron_indices=neuron_indices, show_asc=False, show_psc=False),
     )
 
     assert len(fig.axes) == 2
@@ -512,12 +515,10 @@ def test_plot_neuron_traces_threshold_invalid_length():
 
     with pytest.raises(ValueError, match="v_threshold must be a scalar"):
         plot_neuron_traces(
-            voltage=voltage,
-            dt=0.1,
-            neuron_indices=[0, 2],
-            show_asc=False,
-            show_psc=False,
-            v_threshold=[-40.0, -41.0, -42.0],  # not n_neurons nor n_plot
+            SimulationStates(
+                voltage=voltage, dt=0.1, v_threshold=[-40.0, -41.0, -42.0]
+            ),
+            TracePlotFormat(neuron_indices=[0, 2], show_asc=False, show_psc=False),
         )
 
 
@@ -529,14 +530,10 @@ def test_plot_neuron_traces_axis_units_voltage_and_currents():
     psc = 50 * np.random.randn(n_time, n_neurons)
 
     fig = plot_neuron_traces(
-        voltage=voltage,
-        asc=asc,
-        psc=psc,
-        dt=0.1,
-        neuron_indices=[0],
-        show_voltage=True,
-        show_asc=True,
-        show_psc=True,
+        SimulationStates(voltage=voltage, asc=asc, psc=psc, dt=0.1),
+        TracePlotFormat(
+            neuron_indices=[0], show_voltage=True, show_asc=True, show_psc=True
+        ),
     )
 
     assert len(fig.axes) == 3
@@ -613,7 +610,7 @@ def test_plot_neuron_traces_3column_long_labels():
         auto_width=True,
     )
 
-    fig = plot_neuron_traces(states=states, format=format)
+    fig = plot_neuron_traces(states, format)
 
     # Verify combined figure (not separate_figures mode)
     assert not isinstance(fig, dict), "Expected combined Figure, not dict"
@@ -653,13 +650,10 @@ def test_plot_neuron_traces_with_input():
 
     # Test with plain args
     fig = plot_neuron_traces(
-        voltage=voltage,
-        psc=psc,
-        epsc=epsc,
-        ipsc=ipsc,
-        input=input_current,
-        dt=dt,
-        neuron_indices=[0, 5, 10],
+        SimulationStates(
+            voltage=voltage, psc=psc, epsc=epsc, ipsc=ipsc, input=input_current, dt=dt
+        ),
+        TracePlotFormat(neuron_indices=[0, 5, 10]),
     )
     save_fig(fig, name="neuron_traces_with_input")
     plt.close(fig)
@@ -673,7 +667,7 @@ def test_plot_neuron_traces_with_input():
         input=input_current,
         dt=dt,
     )
-    fig = plot_neuron_traces(states=states, neuron_indices=[0, 1])
+    fig = plot_neuron_traces(states, TracePlotFormat(neuron_indices=[0, 1]))
     save_fig(fig, name="neuron_traces_with_input_dataclass")
     plt.close(fig)
 
@@ -702,21 +696,16 @@ def test_plot_neuron_traces_psc_multi_dim():
     # Test with custom labels
     custom_labels = ["Excitatory", "Inhibitory", "Modulatory", "Background"]
     fig = plot_neuron_traces(
-        voltage=voltage,
-        psc=psc,
-        psc_labels=custom_labels,
-        dt=dt,
-        neuron_indices=[0, 5, 10],
+        SimulationStates(voltage=voltage, psc=psc, psc_labels=custom_labels, dt=dt),
+        TracePlotFormat(neuron_indices=[0, 5, 10]),
     )
     save_fig(fig, name="neuron_traces_psc_multi_dim")
     plt.close(fig)
 
     # Test with default labels (no psc_labels provided)
     fig = plot_neuron_traces(
-        voltage=voltage,
-        psc=psc[:, :, :3],  # Use 3 components for brevity
-        dt=dt,
-        neuron_indices=[0, 1],
+        SimulationStates(voltage=voltage, psc=psc[:, :, :3], dt=dt),
+        TracePlotFormat(neuron_indices=[0, 1]),
     )
     save_fig(fig, name="neuron_traces_psc_multi_dim_default_labels")
     plt.close(fig)
@@ -742,31 +731,37 @@ def test_plot_neuron_traces_psc_multi_dim_validation_errors():
     # epsc should raise error
     with pytest.raises(ValueError, match="epsc must be None"):
         plot_neuron_traces(
-            voltage=voltage,
-            psc=psc,
-            epsc=30 * np.random.randn(n_time, n_neurons),
-            dt=0.1,
-            neuron_indices=[0, 1],
+            SimulationStates(
+                voltage=voltage,
+                psc=psc,
+                epsc=30 * np.random.randn(n_time, n_neurons),
+                dt=0.1,
+            ),
+            TracePlotFormat(neuron_indices=[0, 1]),
         )
 
     # ipsc should raise error
     with pytest.raises(ValueError, match="ipsc must be None"):
         plot_neuron_traces(
-            voltage=voltage,
-            psc=psc,
-            ipsc=-20 * np.random.randn(n_time, n_neurons),
-            dt=0.1,
-            neuron_indices=[0, 1],
+            SimulationStates(
+                voltage=voltage,
+                psc=psc,
+                ipsc=-20 * np.random.randn(n_time, n_neurons),
+                dt=0.1,
+            ),
+            TracePlotFormat(neuron_indices=[0, 1]),
         )
 
     # input should raise error
     with pytest.raises(ValueError, match="input must be None"):
         plot_neuron_traces(
-            voltage=voltage,
-            psc=psc,
-            input=100 * np.random.randn(n_time, n_neurons),
-            dt=0.1,
-            neuron_indices=[0, 1],
+            SimulationStates(
+                voltage=voltage,
+                psc=psc,
+                input=100 * np.random.randn(n_time, n_neurons),
+                dt=0.1,
+            ),
+            TracePlotFormat(neuron_indices=[0, 1]),
         )
 
 
@@ -778,13 +773,8 @@ def test_plot_neuron_traces_input_separate_figures():
     input_current = 100 * np.random.randn(n_time, n_neurons)
 
     figs = plot_neuron_traces(
-        voltage=voltage,
-        psc=psc,
-        input=input_current,
-        dt=0.1,
-        neuron_indices=[0, 1],
-        separate_figures=True,
-        show_asc=False,
+        SimulationStates(voltage=voltage, psc=psc, input=input_current, dt=0.1),
+        TracePlotFormat(neuron_indices=[0, 1], separate_figures=True, show_asc=False),
     )
 
     assert isinstance(figs, dict)

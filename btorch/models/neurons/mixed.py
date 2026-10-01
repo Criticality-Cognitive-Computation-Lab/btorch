@@ -10,6 +10,7 @@ from collections.abc import Mapping, Sequence
 import torch
 from torch import Tensor, nn
 
+from ..base import StepMode
 from .two_compartment import TwoCompartmentGLIF
 
 
@@ -41,7 +42,7 @@ class MixedNeuronPopulation(nn.Module):
     def __init__(
         self,
         groups: Sequence[tuple[int, nn.Module]] | Mapping[str, tuple[int, nn.Module]],
-        step_mode: str = "s",
+        step_mode: StepMode = "s",
     ):
         super().__init__()
         if not groups:

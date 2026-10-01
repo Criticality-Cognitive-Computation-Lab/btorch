@@ -65,8 +65,8 @@ class TestSuggestThreshold:
 
         threshold = suggest_threshold(linkage_matrix)
 
-        # Should return the smallest distance
-        assert isinstance(threshold, (float, np.floating))
+        # Without a clear elbow the fallback is the smallest merge distance
+        assert threshold == pytest.approx(1.0)
 
 
 class TestClusterTraces:

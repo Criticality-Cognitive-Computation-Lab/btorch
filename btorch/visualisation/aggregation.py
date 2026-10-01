@@ -123,55 +123,6 @@ def plot_group_distribution(
     return fig, ax
 
 
-def plot_group_violin(
-    values: TensorLike,
-    neurons_df: pd.DataFrame,
-    group_by: str,
-    **kwargs,
-) -> tuple[Figure, Axes]:
-    """Convenience wrapper for `plot_group_distribution(...,
-    kind='violin')`."""
-    return plot_group_distribution(
-        values=values,
-        neurons_df=neurons_df,
-        group_by=group_by,
-        kind="violin",
-        **kwargs,
-    )
-
-
-def plot_group_box(
-    values: TensorLike,
-    neurons_df: pd.DataFrame,
-    group_by: str,
-    **kwargs,
-) -> tuple[Figure, Axes]:
-    """Convenience wrapper for `plot_group_distribution(..., kind='box')`."""
-    return plot_group_distribution(
-        values=values,
-        neurons_df=neurons_df,
-        group_by=group_by,
-        kind="box",
-        **kwargs,
-    )
-
-
-def plot_group_ecdf(
-    values: TensorLike,
-    neurons_df: pd.DataFrame,
-    group_by: str,
-    **kwargs,
-) -> tuple[Figure, Axes]:
-    """Convenience wrapper for `plot_group_distribution(..., kind='ecdf')`."""
-    return plot_group_distribution(
-        values=values,
-        neurons_df=neurons_df,
-        group_by=group_by,
-        kind="ecdf",
-        **kwargs,
-    )
-
-
 def plot_neuropil_timeseries_overview(
     data: TensorLike | Mapping[str, TensorLike],
     *,
@@ -540,9 +491,6 @@ def _resolve_figure_ax(
 __all__ = [
     "GroupPlotKind",
     "plot_group_distribution",
-    "plot_group_violin",
-    "plot_group_box",
-    "plot_group_ecdf",
     "plot_neuropil_timeseries_overview",
     "plot_neuropil_timeseries_panels",
 ]

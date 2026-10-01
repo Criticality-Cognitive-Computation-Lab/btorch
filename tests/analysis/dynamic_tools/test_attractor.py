@@ -75,3 +75,24 @@ def test_structural_outliers():
     assert results_struct["outlier_count"] >= 1
     max_outlier = np.max(np.abs(results_struct["outliers"]))
     assert max_outlier > g * 3.0
+
+
+def test_structural_eigenvalue_outliers_result_keys_and_threshold():
+    """The result documents every key; outliers lie outside the radius.
+
+    ``diag(2, 0.1, 0.1)`` has one eigenvalue (2) outside a given radius of 1.
+    """
+    result = compute_structural_eigenvalue_outliers(
+        np.diag([2.0, 0.1, 0.1]), spectral_radius=1.0
+    )
+    assert set(result) == {
+        "eigenvalues",
+        "max_eigenvalue",
+        "outliers",
+        "outlier_count",
+        "spectral_radius",
+    }
+    assert result["outlier_count"] == 1
+    assert result["max_eigenvalue"] == pytest.approx(2.0)
+    assert result["spectral_radius"] == 1.0
+    np.testing.assert_allclose(np.abs(result["outliers"]), [2.0])

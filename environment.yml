@@ -4,6 +4,7 @@ channels:
 dependencies:
   - python=3.14.6
   - pytorch-gpu
+  # btorch[examples] extra
   - torchvision
   - pytorch_sparse  # optional: btorch falls back to native torch.sparse if unavailable
   - pip
@@ -15,7 +16,7 @@ dependencies:
     - powerlaw
     - fastdtw
     - btorch
-  - tqdm
+  - tqdm  # btorch[examples] extra
   - matplotlib
   - scipy
   # btorch[io] extra
@@ -30,7 +31,7 @@ dependencies:
   - hdf5plugin
   - pandas>=2
   - numba
-  - seaborn
+  - seaborn  # btorch[examples] extra
   # dev
   - ipykernel
   # tensorboard

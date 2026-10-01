@@ -20,9 +20,11 @@ from pathlib import Path
 
 import torch
 
-from btorch.analysis.two_compartment_fit import (
+from btorch.fitting.two_compartment import (
     DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS,
     FitLossConfig,
+    GlobalSearchConfig,
+    TbpttConfig,
     choose_current_clamp_sweeps,
     evaluate_fit_across_sweeps,
     fit_two_compartment_model,
@@ -477,7 +479,7 @@ def main() -> None:
 
     candidate_payloads = []
     search_cells = cells[: max(args.max_cells, args.candidate_cells)]
-    from btorch.analysis.two_compartment_fit import get_cell_types_cache
+    from btorch.fitting.two_compartment import get_cell_types_cache
 
     cache = get_cell_types_cache(args.manifest_file)
     for cell in search_cells:
@@ -581,29 +583,38 @@ def main() -> None:
         spike_match_window_ms=args.spike_match_window_ms,
         sparsity_weight=args.sparsity_weight,
     )
+    # Each method only accepts the option objects it uses.
+    method_options = {}
+    if args.method in ("tbptt", "hybrid"):
+        method_options["tbptt"] = TbpttConfig(
+            lr=args.lr, epochs=args.epochs, chunk_size=args.chunk_size
+        )
+    if args.method in ("global", "hybrid", "staged"):
+        method_options["search"] = GlobalSearchConfig(
+            param_bounds=DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS,
+            maxiter=args.global_maxiter,
+            popsize=args.global_popsize,
+            local_maxiter=args.local_maxiter,
+            seed=args.seed,
+        )
     history = fit_two_compartment_model(
         model,
         train_sweeps,
         method=args.method,
-        lr=args.lr,
-        epochs=args.epochs,
-        chunk_size=args.chunk_size,
         loss=loss_config,
-        global_maxiter=args.global_maxiter,
-        global_popsize=args.global_popsize,
-        local_maxiter=args.local_maxiter,
-        param_bounds=DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS,
-        seed=args.seed,
         device=device,
+        **method_options,
     )
     if args.tbptt_refine_epochs > 0:
         tbptt_history = fit_two_compartment_model(
             model,
             train_sweeps,
             method="tbptt",
-            lr=args.tbptt_refine_lr,
-            epochs=args.tbptt_refine_epochs,
-            chunk_size=args.chunk_size,
+            tbptt=TbpttConfig(
+                lr=args.tbptt_refine_lr,
+                epochs=args.tbptt_refine_epochs,
+                chunk_size=args.chunk_size,
+            ),
             loss=replace(
                 loss_config,
                 voltage_weight=max(args.voltage_weight, 2.0),

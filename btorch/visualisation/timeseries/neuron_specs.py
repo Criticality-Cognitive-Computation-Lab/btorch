@@ -48,6 +48,7 @@ class SimulationStates:
         spikes: Spike trains (time, neurons) or (time, batch, neurons)
         v_threshold: Spike threshold voltage(s), scalar or per-neuron
         v_reset: Reset voltage(s), scalar or per-neuron
+        psc_labels: Labels for multi-component PSC (defaults to ``PSC_<i>``)
     """
 
     voltage: np.ndarray | torch.Tensor
@@ -60,6 +61,7 @@ class SimulationStates:
     spikes: np.ndarray | torch.Tensor | None = None
     v_threshold: float | Sequence[float] | np.ndarray | torch.Tensor | None = None
     v_reset: float | Sequence[float] | np.ndarray | torch.Tensor | None = None
+    psc_labels: Sequence[str] | None = None
 
 
 @dataclass

@@ -266,6 +266,10 @@ def _plot_fano_grouped(
     neuron_type_column,
 ):
     """Plot Fano factor grouped by neuropil or neuron type."""
+    if group_by not in ("neuron_type", "neuropil"):
+        raise ValueError(
+            f"group_by must be 'neuron_type' or 'neuropil', got {group_by!r}"
+        )
     if neurons_df is None and group_by == "neuron_type":
         raise ValueError("neurons_df required for neuron_type grouping")
     if connections_df is None and group_by == "neuropil":
@@ -327,8 +331,6 @@ def _plot_fano_grouped(
         times = np.array(windows) * dt
         for group_name, values in group_data.items():
             ax.plot(times, values, marker="o", label=group_name)
-    else:
-        pass
 
     ax.set_xlabel("Time Window (ms)")
     ax.set_ylabel("Fano Factor (mean)")
@@ -357,7 +359,6 @@ def _plot_fano_distribution(fano_results, windows, dt):
     )
 
     ax.set_xticks(positions)
-    # Format labels: integer if whole number, else 1 decimal
     labels = [f"{w * dt:.1f}" if (w * dt) % 1 else f"{int(w * dt)}" for w in windows]
     ax.set_xticklabels(labels, rotation=45, ha="right")
 
@@ -768,7 +769,6 @@ def plot_lyapunov_spectrum(
     )
 
     spec = to_numpy(spectrum)
-    # Sort descending just in case, though standard is descending
     spec = np.sort(spec)[::-1]
 
     if ax is None:
@@ -873,7 +873,6 @@ def plot_micro_dynamics(
 
     _, fr_stats = plot_firing_rate_distribution(spikes, dt=dt, ax=ax1)
 
-    # reusing logic from plot_isi_cv for consistency but without full overhead
     spikes_np = to_numpy(spikes)
     cv_results = _isi_cv_stats(spikes_np, dt)
     cv_values = cv_results["cv_isi"]

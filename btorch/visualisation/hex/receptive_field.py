@@ -17,6 +17,7 @@ from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
 
 from ...utils.hex.transform import to_pixel
+from .options import HexColorMap
 from .static import scatter
 
 
@@ -86,9 +87,7 @@ def kernel(
         c2,
         values,
         coord_format=coord_format,
-        cmap=cmap,
-        vmin=vmin,
-        vmax=vmax,
+        color=HexColorMap(cmap=cmap, vmin=vmin, vmax=vmax),
         ax=ax,
     )
 

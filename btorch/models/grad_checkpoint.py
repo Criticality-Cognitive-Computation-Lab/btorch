@@ -29,14 +29,12 @@ class CheckpointWrapper(ActivationWrapper):
     ) -> None:
         super().__init__(mod)
         if checkpoint_fn is None:
-            # use torch.utils.checkpoint
             self.checkpoint_fn = partial(
                 torch_utils_checkpoint,
                 use_reentrant=False,
                 **checkpoint_fn_kwargs,
             )
         else:
-            # Construct user-specified checkpoint function.
             self.checkpoint_fn = partial(
                 checkpoint_fn,
                 **checkpoint_fn_kwargs,

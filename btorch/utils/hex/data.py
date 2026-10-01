@@ -401,13 +401,11 @@ class HexGrid:
         self.radius = radius
         self.center = HexCoords(np.array([center_q]), np.array([center_r]))
 
-        # Generate coordinates
         from .coords import disk
 
         q, r = disk(radius, center_q, center_r)
         coords = HexCoords(q, r)
 
-        # Initialize values
         if values is None:
             values = np.full(len(coords), np.nan)
         elif len(values) != len(coords):
@@ -489,12 +487,10 @@ class HexGrid:
         from .coords import ring
         from .transform import round_axial
 
-        # Find line span across the grid
         # Get distant hull points at target angle
         distant_q, distant_r = ring(2 * self.radius)
         distant_coords = HexCoords(distant_q, distant_r)
 
-        # Calculate angles to find matching direction
         px, py = distant_coords.to_pixel()
         angles = np.arctan2(py, px)
 
@@ -502,11 +498,9 @@ class HexGrid:
         angle_diff = np.abs((angles - angle + np.pi) % np.pi - np.pi / 2)
         sorted_idx = np.argsort(angle_diff)
 
-        # Get span points
         span_q = distant_q[sorted_idx[:2]]
         span_r = distant_r[sorted_idx[:2]]
 
-        # Interpolate line between them
         from .distance import distance as hex_distance
 
         d = hex_distance(span_q[0:1], span_r[0:1], span_q[1:2], span_r[1:2])[0]
@@ -515,7 +509,6 @@ class HexGrid:
             t = i / d if d > 0 else 0
             q = span_q[0] + (span_q[1] - span_q[0]) * t
             r = span_r[0] + (span_r[1] - span_r[0]) * t
-            # Round to nearest hex
             rq, rr = round_axial(np.array([q]), np.array([r]))
             line_q.append(rq[0])
             line_r.append(rr[0])

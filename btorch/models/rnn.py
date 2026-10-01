@@ -9,6 +9,7 @@ from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
 from . import base, environ, synapse
+from .base import StepMode
 from .cudagraph import CudaGraphRunner
 from .functional import filter_hidden_states, named_hidden_states, set_hidden_states
 
@@ -73,7 +74,7 @@ class RecurrentNNAbstract(base.MemoryModule):
     def __init__(
         self,
         update_state_names: Sequence[str] | None = None,
-        step_mode: str = "m",
+        step_mode: StepMode = "m",
         unroll: int | bool = 8,
         chunk_size: int | None = None,
         cpu_offload: bool = False,
@@ -163,8 +164,6 @@ class RecurrentNNAbstract(base.MemoryModule):
             - z_seq: list[Tensor]
             - states_seq: dict[str, list[Tensor]]
         """
-        # Determine actual number of steps for this small chunk (might be remainder)
-        # However, args are already sliced to the correct size by caller.
         T = args[loop_args[0]].shape[0]
         z_seq = []
         states_seq = {}
@@ -192,7 +191,6 @@ class RecurrentNNAbstract(base.MemoryModule):
         chunk_states = {}
 
         for sub_args in _split_loop_args(chunk_args, loop_args, unroll_size):
-            # Process small chunk
             z_sub, states_sub = self._run_unroll_block(
                 *sub_args,
                 loop_args=loop_args,
@@ -241,13 +239,11 @@ class RecurrentNNAbstract(base.MemoryModule):
     ) -> tuple[int, Sequence[int], int, int]:
         """Resolve T, the loop args, and the two block sizes the time loop
         uses."""
-        # Detect loop args and time length T
         if loop_args is None:
             T, loop_args = self._detect_loop_args(*args)
         else:
             T = args[loop_args[0]].shape[0]
 
-        # Unroll size (small chunk)
         unroll_size = T if self.unroll is False else int(self.unroll)
 
         # Large chunk size. If chunk_size is None: with grad_checkpoint on, each
@@ -284,7 +280,6 @@ class RecurrentNNAbstract(base.MemoryModule):
         self, *args: Any, loop_args: Sequence[int] | None = None, **kwargs: Any
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """Unified implementation for chunked unrolling and CPU offloading."""
-        # Reset gradient history
         if self.save_grad_history:
             self._grad_history = {}
 
@@ -297,7 +292,6 @@ class RecurrentNNAbstract(base.MemoryModule):
 
         use_checkpoint = bool(self.grad_checkpoint)
 
-        # Accumulators
         all_z_list = []
         all_states_lists = {}
 
@@ -305,7 +299,6 @@ class RecurrentNNAbstract(base.MemoryModule):
         # Outer Loop: Large Chunks (Checkpointing & CPU Offloading)
         # ------------------------------------------------------------------
         for chunk_args in self._iter_large_chunks(args, loop_args, large_chunk_size):
-            # Process Large Chunk
             process = (
                 self._checkpointed_large_chunk
                 if use_checkpoint
@@ -336,7 +329,6 @@ class RecurrentNNAbstract(base.MemoryModule):
                 for t, tensor in enumerate(tensors):
                     self._register_grad_hook(tensor, state_name, t)
 
-        # Stack after registering hooks
         stacked_outputs = torch.stack(all_z_list, dim=0)
         stacked_states = {k: torch.stack(v, dim=0) for k, v in all_states_lists.items()}
 
@@ -425,8 +417,15 @@ class RecurrentNNAbstract(base.MemoryModule):
         return {k: why for k, why in rules.items() if getattr(self, k, False)}
 
     def get_grad_history(self) -> dict[str, list]:
-        """Retrieve saved gradient history."""
-        return self._grad_history
+        """Retrieve saved gradient history.
+
+        Returns:
+            A shallow copy: ``{state name: [grad per timestep]}``. Clearing or
+            reassigning entries of the result does not affect the module; the
+            gradient tensors in the lists are shared with the module (not
+            cloned), and the lists are copied so appends do not leak back.
+        """
+        return {name: list(grads) for name, grads in self._grad_history.items()}
 
     def clear_grad_history(self) -> None:
         """Clear all saved gradient history."""
@@ -531,7 +530,6 @@ class RecurrentNN(RecurrentNNAbstract):
         self.neuron = neuron
         self.synapse = synapse
 
-        # single step modules
         self.neuron_inp_module = neuron_inp_module
         self.syn_inp_module = syn_inp_module
         self.allow_buffer = allow_buffer
@@ -647,7 +645,6 @@ class ApicalRecurrentNN(RecurrentNN):
         if self.syn_inp_module is not None:
             x_syn = self.syn_inp_module(x_syn)
 
-        # Somatic input
         total_input = self.synapse.psc + x
 
         # Apical input = recurrent apical current + external teacher signal

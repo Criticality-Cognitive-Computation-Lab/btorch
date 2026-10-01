@@ -2,7 +2,7 @@ from abc import abstractmethod
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from numbers import Number
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -12,6 +12,10 @@ from torch import Tensor
 from ..types import TensorLike
 from .shape import expand_leading_dims
 from .surrogate import Sigmoid
+
+
+StepMode = Literal["s", "m"]
+Backend = Literal["torch"]
 
 
 class StepModule:
@@ -26,11 +30,11 @@ class StepModule:
         return ("s", "m")
 
     @property
-    def step_mode(self) -> str:
+    def step_mode(self) -> StepMode:
         return self._step_mode
 
     @step_mode.setter
-    def step_mode(self, value: str) -> None:
+    def step_mode(self, value: StepMode) -> None:
         if value not in self.supported_step_mode:
             raise ValueError(
                 f'step_mode can only be {self.supported_step_mode}, but got "{value}"!'
@@ -691,11 +695,11 @@ class MemoryModule(StepModule, torch.nn.Module):
         return ("torch",)
 
     @property
-    def backend(self) -> str:
+    def backend(self) -> Backend:
         return self._backend
 
     @backend.setter
-    def backend(self, value: str) -> None:
+    def backend(self, value: Backend) -> None:
         if value not in self.supported_backends:
             raise NotImplementedError(
                 f"{value} is not a supported backend of {self._get_name()}!"
@@ -1006,11 +1010,16 @@ class MemoryModule(StepModule, torch.nn.Module):
         """Registered reset values, keyed by memory name (read-only view)."""
         return self._memory_reset_values
 
-    def set_memory_reset_values(self, value: dict, strict: bool = False) -> None:
+    def set_memory_reset_values(self, value: dict, strict: bool = True) -> None:
         """Update the reset value of several registered memories.
 
+        For a whole network use
+        :func:`~btorch.models.functional.set_memory_reset_values`, which takes
+        dotted names.
+
         Args:
-            value: Mapping ``memory name -> new reset value``.
+            value: Flat mapping ``memory name -> new reset value`` of this
+                module's own memories.
             strict: Passed through to :meth:`set_reset_value`.
 
         Raises:
@@ -1068,8 +1077,8 @@ class BaseNode(ParamBufferMixin, MemoryModule):
         detach_reset: bool = False,
         hard_reset: bool = False,
         pre_spike_v: bool = False,
-        step_mode: str = "s",
-        backend: str = "torch",
+        step_mode: StepMode = "s",
+        backend: Backend = "torch",
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ):

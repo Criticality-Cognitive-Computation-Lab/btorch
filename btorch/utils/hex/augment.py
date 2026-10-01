@@ -8,7 +8,7 @@ from typing import Literal
 import numpy as np
 import torch
 
-from ..utils.hex.storage import permute, reflect_index
+from .storage import permute, reflect_index
 
 
 _rng = np.random.default_rng()

@@ -19,8 +19,14 @@ Btorch is a brain-inspired Torch library for neuromorphic research. Follow the p
 - Be explicit about device, dtype, and batch/time dimensions.
 - Preserve torch.compile compatibility and ONNX friendliness where applicable.
 - Prefer buffers/register_memory for stateful tensors; validate shapes/dtypes.
-- Keep code and comments within the formatter line length (88 chars); wrap long docstrings and comments.
 - Use English for code, comments, and docstrings; conversation can be in other languages.
+- Analysis naming (`btorch/analysis/`): estimators and pipelines are `compute_*`;
+  bare names are only the `use_stats`-decorated per-neuron statistics in
+  `spiking.py` (`fano`, `isi_cv`, ...), returning `(value, info)`; `get_*` is for
+  cheap lookups only, never computation; `simulate_*` generates data;
+  `suggest_*` returns a heuristic choice.
+- Group related options of wide public signatures (more than ~8 parameters) into
+  frozen option dataclasses; keep core data arguments positional.
 - In tests, include thorough explanatory comments so they are understandable and can serve as examples.
 
 ## Documentation format

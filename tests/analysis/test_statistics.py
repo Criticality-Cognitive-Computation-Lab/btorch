@@ -405,3 +405,15 @@ def test_use_percentiles_dict_format_multiple_returns():
     assert "values_percentiles" in info
     assert "values_levels" in info
     assert info["values_levels"] == (25.0, 75.0)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+def test_compute_stats_empty_input_is_nan_without_warnings(backend, recwarn):
+    """Aggregating an empty array (e.g. no ISIs) gives NaN, not warnings or
+    reduction errors, for every stat including ``max``/``argmax``."""
+    from btorch.analysis.statistics import compute_stats_batch
+
+    empty = np.array([]) if backend == "numpy" else torch.tensor([])
+    out = compute_stats_batch(empty, ["mean", "std", "cv", "max", "argmax"])
+    assert all(np.isnan(v) for v in out.values())
+    assert not [w for w in recwarn if issubclass(w.category, RuntimeWarning)]

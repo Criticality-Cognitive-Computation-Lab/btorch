@@ -105,3 +105,48 @@ def test_fit_helper_failure_shape_is_tuple():
     for out in (_fit_distribution(np.arange(3)), _fit_scaling([1, 2], [1, 2])):
         assert isinstance(out, tuple) and len(out) == 2
         assert np.isnan(out[0]) and out[1] is None
+
+
+def test_fit_scaling_constant_y_gives_nan_r_squared():
+    """A constant ``y`` has zero total variance, so R^2 is NaN (no 0/0
+    warning).
+
+    The exponent itself is still returned; only the goodness-of-fit is
+    undefined.
+    """
+    import warnings
+
+    from btorch.analysis.dynamic_tools.criticality import _fit_scaling
+
+    x = np.arange(1.0, 11.0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        _, stats = _fit_scaling(x, np.full_like(x, 2.0))
+    assert np.isnan(stats["r_squared"])
+
+
+def test_avalanche_extraction_sizes_durations_and_binning():
+    """Hand-checkable avalanche extraction (fewer than 10 -> NaN exponents).
+
+    Population activity per step: [2, 1, 0, 0, 3, 0, 1, 1, 1, 0]. Avalanches
+    are the runs of non-empty bins: sizes (3, 3, 3) with durations (2, 1, 3).
+    With ``bin_size=2`` the activity becomes [3, 0, 3, 2, 1] -> runs (3), (3, 2,
+    1): sizes (3, 6) and durations (1, 3).
+    """
+    spikes = np.zeros((10, 3))
+    for t, n in enumerate([2, 1, 0, 0, 3, 0, 1, 1, 1, 0]):
+        spikes[t, :n] = 1.0
+
+    with pytest.warns(UserWarning, match="Not enough avalanches"):
+        res = compute_avalanche_statistics(spikes)
+    np.testing.assert_array_equal(res["sizes"], [3, 3, 3])
+    np.testing.assert_array_equal(res["durations"], [2, 1, 3])
+    durations, mean_sizes = res["avg_size_by_duration"]
+    np.testing.assert_array_equal(durations, [1, 2, 3])
+    np.testing.assert_allclose(mean_sizes, [3.0, 3.0, 3.0])
+    assert np.isnan(res["tau"]) and np.isnan(res["gamma_pred"])
+
+    with pytest.warns(UserWarning, match="Not enough avalanches"):
+        binned = compute_avalanche_statistics(spikes, bin_size=2)
+    np.testing.assert_array_equal(binned["sizes"], [3, 6])
+    np.testing.assert_array_equal(binned["durations"], [1, 3])

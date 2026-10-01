@@ -4,19 +4,40 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 
+import torch
+
 from ._plots import plot_two_compartment_fit
 from .evaluation import FitEvaluation
 
 
 def save_fit_report(
-    model,
+    model: torch.nn.Module,
     evaluations: Sequence[FitEvaluation],
     aggregate_metrics: dict[str, float],
     history: Sequence[dict[str, float | str]],
     *,
     output_dir: str | Path,
 ) -> dict[str, Path]:
-    """Save fitted parameters, metrics, history, and plots to disk."""
+    """Save fitted parameters, metrics, history, and plots to disk.
+
+    Writes ``fitted_parameters.json`` (every named parameter, flattened),
+    ``fit_metrics.json`` (``aggregate`` plus ``per_sweep`` entries),
+    ``fit_history.json`` and one PNG per evaluation.
+
+    Args:
+        model: Fitted model; its ``named_parameters`` are serialised.
+        evaluations: Per-sweep evaluations to plot and record.
+        aggregate_metrics: Metrics averaged over sweeps.
+        history: Rows returned by ``fit_two_compartment_model``.
+        output_dir: Directory (created if missing).
+
+    Returns:
+        Dict with ``output_dir``, ``parameters``, ``metrics``, ``history``
+        (JSON paths), ``plot`` (the last evaluation's figure) and
+        ``primary_plot`` (the first evaluation with recorded spikes, else the
+        last figure). Both plot entries fall back to ``output_dir`` when
+        ``evaluations`` is empty.
+    """
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 

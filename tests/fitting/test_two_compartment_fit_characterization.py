@@ -9,8 +9,8 @@ splits) can be verified to be behaviour preserving.
 import pytest
 import torch
 
-import btorch.analysis.two_compartment_fit as tcf
-from btorch.analysis.two_compartment_fit import (
+import btorch.fitting.two_compartment as tcf
+from btorch.fitting.two_compartment import (
     AllenSweepBatch,
     evaluate_fit_across_sweeps,
     fit_two_compartment_model,
@@ -157,6 +157,18 @@ def test_fit_sweeps_once_weights_change_total_only():
     assert a["total_loss"] - b["total_loss"] == pytest.approx(a["voltage_loss"])
 
 
+def _options_for(method):
+    """Tiny option objects for the options each back-end consumes."""
+    options = {}
+    if method in ("tbptt", "hybrid"):
+        options["tbptt"] = tcf.TbpttConfig(epochs=1, chunk_size=6)
+    if method in ("global", "hybrid", "staged"):
+        options["search"] = tcf.GlobalSearchConfig(
+            maxiter=1, popsize=4, local_maxiter=1
+        )
+    return options
+
+
 @pytest.mark.parametrize("method", ["tbptt", "global", "hybrid", "staged"])
 def test_fit_entry_point_history_schema(method):
     torch.manual_seed(3)
@@ -165,11 +177,7 @@ def test_fit_entry_point_history_schema(method):
         model,
         [_sweep(0), _sweep(1, spike=True)],
         method=method,
-        epochs=1,
-        chunk_size=6,
-        global_maxiter=1,
-        global_popsize=4,
-        local_maxiter=1,
+        **_options_for(method),
         loss=tcf.FitLossConfig(spike_count_weight=0.1, spike_timing_weight=0.1),
     )
     assert history
@@ -215,9 +223,9 @@ def test_loss_none_equals_default_config():
 
 def test_fit_loss_config_is_public_and_loose_kwargs_are_gone():
     """FitLossConfig is exported; the old loose loss kwargs no longer exist."""
-    import btorch.analysis as analysis
+    import btorch.fitting as fitting
 
-    assert analysis.FitLossConfig is tcf.FitLossConfig
+    assert fitting.two_compartment.FitLossConfig is tcf.FitLossConfig
     model = TwoCompartmentGLIF(n_neuron=1)
     with pytest.raises(TypeError):
         evaluate_fit_across_sweeps(model, [_sweep(0)], spike_count_weight=0.1)
@@ -294,8 +302,45 @@ def test_global_search_objective_uses_full_loss_config(monkeypatch):
         model,
         [_sweep(0, spike=True)],
         loss=cfg,
-        global_maxiter=1,
-        global_popsize=2,
-        local_maxiter=1,
+        config=tcf.GlobalSearchConfig(maxiter=1, popsize=2, local_maxiter=1),
     )
     assert seen and all(c is cfg for c in seen)
+
+
+def test_option_objects_are_validated_against_the_method():
+    """Each back-end gets only its own config; unused ones are rejected.
+
+    ``TbpttConfig`` is meaningless for ``method="global"`` and
+    ``GlobalSearchConfig`` for ``method="tbptt"``: passing them would be
+    silently ignored, so the entry point raises instead.
+    """
+    model = TwoCompartmentGLIF(n_neuron=1)
+    with pytest.raises(ValueError, match="tbptt"):
+        fit_two_compartment_model(
+            model, [_sweep(0)], method="global", tbptt=tcf.TbpttConfig()
+        )
+    with pytest.raises(ValueError, match="search"):
+        fit_two_compartment_model(
+            model, [_sweep(0)], method="tbptt", search=tcf.GlobalSearchConfig()
+        )
+    with pytest.raises(ValueError, match="staged"):
+        fit_two_compartment_model(
+            model, [_sweep(0)], method="hybrid", staged=tcf.StagedConfig()
+        )
+
+
+def test_global_search_config_reaches_the_optimizer():
+    """``GlobalSearchConfig.polish=False`` yields only the global row, and the
+    TBPTT config's epoch count sets the number of TBPTT chunks."""
+    torch.manual_seed(0)
+    model = TwoCompartmentGLIF(n_neuron=1, trainable_param={"tau_s"})
+    history = fit_two_compartment_model(
+        model,
+        [_sweep(0)],
+        method="hybrid",
+        search=tcf.GlobalSearchConfig(maxiter=1, popsize=2, polish=False),
+        tbptt=tcf.TbpttConfig(epochs=2, chunk_size=6),
+    )
+    phases = [row["phase"] for row in history]
+    # 12 steps / chunk 6 = 2 chunks per epoch, 2 epochs.
+    assert phases == ["global"] + ["tbptt"] * 4

@@ -14,14 +14,29 @@ Spike train analysis utilities with dual NumPy/PyTorch backend support.
 | `fano` | Fano factor (variance/mean of spike counts) |
 | `kurtosis` | Kurtosis of spike count distribution |
 | `local_variation` | Local Variation (LV) - rate-independent irregularity |
+| `isi_cv_population` | CV of the ISIs pooled over all neurons (scalar by default) |
 | `compute_raster` | Extract spike times/neuron indices for plotting |
 | `firing_rate` | Convolve spikes to firing rates |
 | `compute_spectrum` | Power spectrum via Welch method |
 
 **Common Parameters:**
 
-- `batch_axis`: Tuple of axis indices to aggregate over (e.g., `(1, 2)` for trials)
-- `percentile`: Compute percentiles over neurons - `float`, `tuple[float, ...]`, or `None`
+- `batch_axis`: `int | tuple[int, ...] | None` (alias `BatchAxis`), axes to aggregate over (e.g., `(1, 2)` for trials)
+- `percentiles`: Compute percentiles over neurons - `float`, `tuple[float, ...]`, or `None`
+
+**Naming rule:** bare names (`isi_cv`, `fano`, `kurtosis`, `local_variation`, ...) are
+per-neuron or population *statistics*. They return `(value, info)` where `value` is
+an array (or the `stat` aggregate); the decorated ones take `stat=`, `stat_info=`,
+`nan_policy=`, `inf_policy=` (and `percentiles=`). `compute_*` names are multi-step
+*pipelines* (smoothing plus an estimator, or a simulation) with their own result
+types, e.g. `compute_lyapunov_exponent_from_spikes` (spike train -> rate -> exponent)
+versus `compute_max_lyapunov_exponent` (a ready-made 1-D series).
+`get_*` is reserved for cheap lookups/accessors (e.g. `get_cell_types_cache`), never
+for computation; `simulate_*` generates data; `suggest_*` returns a heuristic choice.
+
+`isi_cv_population(spikes)` returns the scalar CV of the pooled ISIs (NaN with fewer
+than two spikes); `stat=None` returns the pooled ISIs themselves (an empty array when
+there are fewer than two spikes).
 
 **Examples:**
 
@@ -90,7 +105,8 @@ MR estimation from Wilting & Priesemann (2018).
 |----------|-------------|
 | `simulate_branching` | Simulate branching process |
 | `simulate_binomial_subsampling` | Subsample spike trains |
-| `MR_estimation` | Estimate branching ratio from spike counts |
+| `compute_branching_ratio` | Estimate branching ratio from spike counts (MR estimator) |
+| `compute_lagged_slopes` | Lagged regression slopes `r_k` (returns the `LaggedSlopes` named tuple) |
 
 ---
 
@@ -117,7 +133,7 @@ Voltage trace analysis.
 | Function | Description |
 |----------|-------------|
 | `suggest_skip_timestep` | Suggest burn-in period |
-| `voltage_overshoot` | Quantify voltage stability |
+| `compute_voltage_overshoot` | Quantify voltage stability |
 
 ---
 
@@ -132,7 +148,19 @@ Selection and masking utilities.
 
 ---
 
-### `two_compartment_fit/` (package)
+## Fitting (`btorch.fitting`)
+
+Model-driven fitting and tuning live in `btorch.fitting`, separate from the post-hoc statistics in `btorch.analysis`.
+
+### `tuning.py`
+
+| Function | Description |
+|----------|-------------|
+| `compute_fi_vi_curve` | Simulate a constant-current sweep of a neuron class and return the f-I / V-I curves |
+
+---
+
+### `two_compartment/` (package)
 
 Fitting and evaluation helpers for `TwoCompartmentGLIF` against Allen Cell Types
 sweeps. All loss settings are carried by a single `FitLossConfig` dataclass that
@@ -140,17 +168,36 @@ is passed as `loss=` to `two_compartment_loss`, `evaluate_two_compartment_fit`,
 `evaluate_fit_across_sweeps` and `fit_two_compartment_model` (`None` selects the
 defaults).
 
+The method-specific options of `fit_two_compartment_model` are grouped in frozen
+dataclasses, and each back-end receives only its own: `TbpttConfig` (`lr`, `epochs`,
+`chunk_size`) for `"tbptt"`/`"hybrid"`, `GlobalSearchConfig` (`param_bounds`,
+`maxiter`, `popsize`, `local_maxiter`, `seed`, `polish`) for
+`"global"`/`"hybrid"`/`"staged"`, and `StagedConfig` (`stages`) for `"staged"`.
+Passing a config the chosen `method` does not use raises `ValueError`. The model
+must satisfy the `TwoCompartmentModel` protocol (`TwoCompartmentGLIF` does).
+
 ```python
-from btorch.analysis import (
+from btorch.fitting.two_compartment import (
     FitLossConfig,
+    GlobalSearchConfig,
+    TbpttConfig,
     evaluate_fit_across_sweeps,
     fit_two_compartment_model,
 )
 
 loss = FitLossConfig(spike_count_weight=5.0, spike_match_window_ms=5.0)
-history = fit_two_compartment_model(model, sweeps, method="hybrid", loss=loss)
+history = fit_two_compartment_model(
+    model,
+    sweeps,
+    method="hybrid",
+    loss=loss,
+    search=GlobalSearchConfig(maxiter=20, seed=0),
+    tbptt=TbpttConfig(epochs=5, chunk_size=500),
+)
 evaluations, aggregate = evaluate_fit_across_sweeps(model, sweeps, loss=loss)
 ```
+
+---
 
 ## `dynamic_tools/` Subpackage
 
@@ -160,7 +207,7 @@ Advanced dynamical systems analysis tools.
 |--------|-------------|
 | `micro_scale.py` | Firing rate distribution, SPIKE distance (ISI CV lives in `analysis.spiking.isi_cv`) |
 | `fano.py` | Rate-compensated Fano factors (operational time, mean matching, model based) |
-| `complexity.py` | PCIst, representation alignment, gain-stability |
+| `complexity.py` | PCIst, representation alignment, gain-stability, `compute_lyapunov_exponent_from_spikes` |
 | `criticality.py` | Avalanche analysis, power-law fitting, DFA |
 | `attractor_dynamics.py` | Phase space reconstruction, Kaplan-Yorke dimension |
 | `lyapunov_dynamics.py` | Lyapunov exponent estimation |
