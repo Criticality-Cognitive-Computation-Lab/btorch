@@ -85,7 +85,7 @@ def save_checkpoint(model, optimizer, epoch, path):
         "model_state_dict": model.state_dict(),  # Excludes dynamic buffers
         "optimizer_state_dict": optimizer.state_dict(),
         "epoch": epoch,
-        "memory_reset_values": functional.named_memory_reset_values(model),
+        "memories_rv": functional.named_memory_reset_values(model),
     }
     torch.save(checkpoint, path)
 
@@ -103,8 +103,8 @@ def load_checkpoint(model, optimizer, path):
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     
     # Restore memory reset values
-    if "memory_reset_values" in checkpoint:
-        functional.set_memory_reset_values(model, checkpoint["memory_reset_values"])
+    if "memories_rv" in checkpoint:
+        functional.set_memory_reset_values(model, checkpoint["memories_rv"])
     
     return checkpoint["epoch"]
 ```
@@ -114,5 +114,5 @@ def load_checkpoint(model, optimizer, path):
 1. **init_net_state**: Registers memory buffers (v, psc) and initializes them
 2. **reset_net**: Resets buffers to stored reset values (not re-initializes)
 3. **uniform_v_**: `set_reset_value=True` stores values for deterministic reset
-4. **state_dict**: Excludes dynamic buffers; save/restore `memory_reset_values` separately
+4. **state_dict**: Excludes dynamic buffers; save/restore `memories_rv` separately
 5. **strict=False**: Required when loading since dynamic keys may differ

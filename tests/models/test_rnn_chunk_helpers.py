@@ -156,12 +156,12 @@ def test_functional_set_memory_reset_values_dotted_and_nested():
     assert set(functional.named_memory_reset_values(net)) == {"neuron.v"}
 
     functional.set_memory_reset_values(net, {"neuron.v": 0.7})
-    assert float(net["neuron"].memory_reset_values["v"].value) == 0.7
+    assert float(net["neuron"].memories_rv["v"].value) == 0.7
 
     # Whole-module entry: used to fail because the walker looked the name up in
     # the (nonexistent) reset-value registry of the container.
     functional.set_memory_reset_values(net, {"neuron": {"v": 0.2}})
-    assert float(net["neuron"].memory_reset_values["v"].value) == 0.2
+    assert float(net["neuron"].memories_rv["v"].value) == 0.2
 
     # The keyword is ``reset_values`` (it used to be called ``hidden_states``).
     functional.set_memory_reset_values(net, reset_values={"neuron.v": 0.1})
@@ -180,10 +180,10 @@ def test_set_memory_reset_values_strict_default_is_consistent():
 
     m = LIF(n_neuron=3)
     with pytest.raises(ValueError, match="sizes mismatch"):
-        m.set_memory_reset_values({"v": bad})
+        m.set_memories_rv({"v": bad})
     with pytest.raises(ValueError, match="sizes mismatch"):
         functional.set_memory_reset_values(m, {"v": bad})
 
-    m.set_memory_reset_values({"v": bad}, strict=False)
-    assert m.memory_reset_values["v"].sizes == (5,)
+    m.set_memories_rv({"v": bad}, strict=False)
+    assert m.memories_rv["v"].sizes == (5,)
     functional.set_memory_reset_values(m, {"v": bad}, strict=False)

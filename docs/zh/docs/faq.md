@@ -60,17 +60,17 @@ print(functional.named_hidden_states(model).keys())
 
 **症状：** 加载检查点后，神经元重置为出厂默认值，而非训练后的初始化值。
 
-**修复：** 显式保存和恢复 `_memory_reset_values`：
+**修复：** 显式保存和恢复 `_memories_rv`：
 
 ```python
 checkpoint = {
     "model_state_dict": model.state_dict(),
-    "memory_reset_values": functional.named_memory_reset_values(model),
+    "memories_rv": functional.named_memory_reset_values(model),
 }
 
 # 加载
 model.load_state_dict(ckpt["model_state_dict"], strict=False)
-functional.set_memory_reset_values(model, ckpt["memory_reset_values"])
+functional.set_memory_reset_values(model, ckpt["memories_rv"])
 ```
 
 完整示例请参阅 [教程 2：训练 SNN](tutorials/training.md)。

@@ -371,7 +371,7 @@ def main():
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         net.load_state_dict(checkpoint["net"])
-        functional.set_memory_reset_values(net, checkpoint["memory_reset_values"])
+        functional.set_memory_reset_values(net, checkpoint["memories_rv"])
         functional.init_net_state(net)
         if "memories" in checkpoint:
             functional.set_memory_values(net, checkpoint["memories"])
@@ -498,7 +498,7 @@ def main():
             "net": net.state_dict(),
             # if you wish to store v, and Iasc state,
             # "memories": functional.named_memory_values(net),
-            "memory_reset_values": functional.named_memory_reset_values(net),
+            "memories_rv": functional.named_memory_reset_values(net),
             "optimizer": optimizer.state_dict(),
             "lr_scheduler": lr_scheduler.state_dict(),
             "epoch": epoch,

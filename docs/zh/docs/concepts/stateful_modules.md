@@ -8,7 +8,7 @@ btorch 状态管理的核心是 [`MemoryModule`][btorch.models.base.MemoryModule
 
 - **`register_memory`**：声明一个随时间变化的缓冲区（例如膜电压 `v`）。
 - **`_memories`**：当前状态值的字典。
-- **`_memory_reset_values`**：重置值，用于在新批次或新试验开始时恢复状态。
+- **`_memories_rv`**：重置值，用于在新批次或新试验开始时恢复状态。
 
 当你调用 `functional.init_net_state(model, batch_size=4)` 时，btorch 会遍历模块树，并将每个 `MemoryModule` 的缓冲区初始化为请求的形状。
 
@@ -69,7 +69,7 @@ checkpoint = {
 ```python
 checkpoint = {
     "model_state_dict": model.state_dict(),
-    "memory_reset_values": functional.named_memory_reset_values(model),  # 如果重置值是随机的
+    "memories_rv": functional.named_memory_reset_values(model),  # 如果重置值是随机的
     "hidden_states": functional.named_hidden_states(model),      # 如果你需要神经元状态
 }
 ```

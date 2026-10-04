@@ -34,7 +34,7 @@
 - 具有异构时间常数的 `AlphaPSCBilleh` 突触
 - 用于膜电压正则化的 `VoltageRegularizer`
 - 每批次手动调用 `reset_net` 的训练循环
-- 与 `state_dict()` 一起保存 `memory_reset_values`
+- 与 `state_dict()` 一起保存 `memories_rv`
 
 **另请参阅：**
 - [教程 2：训练 SNN](tutorials/training.md)

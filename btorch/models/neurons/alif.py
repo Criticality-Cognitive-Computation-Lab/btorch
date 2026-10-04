@@ -247,7 +247,7 @@ class ALIF(BaseNode):
             )
 
     def extra_repr(self) -> str:
-        g_k_init = self._memory_reset_values["g_k"].value
+        g_k_init = self._memories_rv["g_k"].value
         parts = [
             f"c_m={self._format_repr_value(self.c_m)}",
             f"g_leak={self._format_repr_value(self.g_leak)}",

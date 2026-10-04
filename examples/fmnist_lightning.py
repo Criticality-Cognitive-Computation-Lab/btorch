@@ -455,16 +455,12 @@ class GLifLightningModule(L.LightningModule):
         functional.init_net_state(self.model)
 
     def on_save_checkpoint(self, checkpoint):
-        checkpoint["memory_reset_values"] = functional.named_memory_reset_values(
-            self.model
-        )
+        checkpoint["memories_rv"] = functional.named_memory_reset_values(self.model)
         checkpoint["memories"] = functional.named_memory_values(self.model)
 
     def on_load_checkpoint(self, checkpoint):
-        if "memory_reset_values" in checkpoint:
-            functional.set_memory_reset_values(
-                self.model, checkpoint["memory_reset_values"]
-            )
+        if "memories_rv" in checkpoint:
+            functional.set_memory_reset_values(self.model, checkpoint["memories_rv"])
         if "memories" in checkpoint:
             functional.set_memory_values(self.model, checkpoint["memories"])
 

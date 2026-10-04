@@ -154,11 +154,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `btorch.models.dlif` moved to `btorch.models.neurons.dlif`
     (`DendriticLIF`, `DLIF`, `DBNN` keep their names; still exported from
     `btorch.models` and `btorch.models.neurons`).
-  - `MemoryModule._memories_rv` -> `_memory_reset_values`; property
-    `memories_rv` -> `memory_reset_values` (now read-only: its setter duplicated
-    the method); `set_memories_rv()` -> `set_memory_reset_values()`.
-    Checkpoints written by the examples use the key `"memory_reset_values"`
-    instead of `"memories_rv"`.
+  - `MemoryModule.memories_rv` is now a read-only property (its setter duplicated
+    `set_memories_rv()`).
   - Removed the deprecated `scale.SupportScaleState` and its wrappers
     `functional.scale_net`, `unscale_net`, `scale_state`, `unscale_state`
     (no users). `scale.scale_state_` is unchanged.
@@ -259,7 +256,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (models/connectome review cleanup):**
   - `btorch.models.functional.set_memory_reset_values(mod, hidden_states, ...)`: the
     argument is now `reset_values` (it sets reset values, not hidden states).
-    `MemoryModule.set_memory_reset_values` now defaults to `strict=True`, like the
+    `MemoryModule.set_memories_rv` now defaults to `strict=True`, like the
     function and `set_reset_value` (was `False`). The function now also accepts a
     whole-module entry such as `{"neuron": {"v": 0.0}}` (it raised `AttributeError`)
     and an unknown name raises `KeyError`.

@@ -13,7 +13,7 @@ btorch 内置了编码规范使用模式的技能。如果你使用 AI 智能体
 - **有状态模块** — `MemoryModule`、`init_net_state`、`reset_net`、检查点保存
 - **`dt` 环境** — `environ.context(dt=...)` 的用法
 - **训练循环** — 纯 PyTorch 和 Lightning 集成
-- **检查点** — 与 `state_dict()` 一起保存/加载 `memory_reset_values`
+- **检查点** — 与 `state_dict()` 一起保存/加载 `memories_rv`
 - **截断时间反向传播** — 用于长序列的 `detach_net`
 - **常见陷阱** — 忘记 `dt`、错误的状态名、缺少重置
 

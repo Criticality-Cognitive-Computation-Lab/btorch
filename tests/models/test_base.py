@@ -124,11 +124,11 @@ def test_register_memory_validates_user_input():
         m.register_memory("z", [], 3)
 
 
-def test_memory_reset_values_setters_reject_unknown_keys():
+def test_memories_rv_setters_reject_unknown_keys():
     """Unknown memory names are a ``KeyError`` for the setter entry points."""
     m = TwoState(3)
     with pytest.raises(KeyError, match="nope"):
-        m.set_memory_reset_values({"nope": 1.0})
+        m.set_memories_rv({"nope": 1.0})
     with pytest.raises(KeyError, match="nope"):
         m._memories = {"nope": torch.zeros(3)}
 
@@ -136,19 +136,19 @@ def test_memory_reset_values_setters_reject_unknown_keys():
 def test_set_reset_value_non_strict_rejects_raw_values():
     """``strict=False`` may store a ``ResetValue`` but never a raw object.
 
-    ``_memory_reset_values`` is ``dict[str, ResetValue]``; a stray value must be
+    ``_memories_rv`` is ``dict[str, ResetValue]``; a stray value must be
     rejected rather than silently stored.
     """
     m = TwoState(3)
     with pytest.raises(TypeError, match="ResetValue"):
         m.set_reset_value("new", "not-a-reset-value", strict=False)
-    assert "new" not in m.memory_reset_values
+    assert "new" not in m.memories_rv
     # A genuine ResetValue is still accepted.
-    m.set_reset_value("new", m.memory_reset_values["v"], strict=False)
+    m.set_reset_value("new", m.memories_rv["v"], strict=False)
     # It goes through the same validation path as a normal registration, which
     # builds a fresh ResetValue (no aliasing with the source entry).
-    assert m.memory_reset_values["new"] == m.memory_reset_values["v"]
-    assert m.memory_reset_values["new"] is not m.memory_reset_values["v"]
+    assert m.memories_rv["new"] == m.memories_rv["v"]
+    assert m.memories_rv["new"] is not m.memories_rv["v"]
 
 
 def test_set_reset_value_non_strict_new_name_is_validated():
@@ -164,18 +164,18 @@ def test_set_reset_value_non_strict_new_name_is_validated():
     bad_sizes = ResetValue(value=torch.zeros(5), sizes=(3,))
     with pytest.raises(ValueError, match="broadcastable"):
         m.set_reset_value("bad_sizes", bad_sizes, strict=False)
-    assert "bad_sizes" not in m.memory_reset_values
+    assert "bad_sizes" not in m.memories_rv
 
     # has_batch=True requires a value with one extra leading batch axis.
     bad_batch = ResetValue(value=torch.zeros(3), sizes=(3,), has_batch=True)
     with pytest.raises(ValueError):
         m.set_reset_value("bad_batch", bad_batch, strict=False)
-    assert "bad_batch" not in m.memory_reset_values
+    assert "bad_batch" not in m.memories_rv
 
     # A valid ResetValue is still accepted for a new name.
     ok = ResetValue(value=torch.zeros(3), sizes=(3,))
     m.set_reset_value("ok", ok, strict=False)
-    assert m.memory_reset_values["ok"].sizes == (3,)
+    assert m.memories_rv["ok"].sizes == (3,)
 
 
 def test_supported_step_mode_and_backends_are_both_properties():
@@ -195,16 +195,16 @@ def test_supported_step_mode_and_backends_are_both_properties():
         m.backend = "cupy"
 
 
-def test_memory_reset_values_read_only_view_and_setter_method():
-    """``memory_reset_values`` is a read-only property; writes go through
-    ``set_memory_reset_values`` (the former property setter duplicated it)."""
+def test_memories_rv_read_only_view_and_setter_method():
+    """``memories_rv`` is a read-only property; writes go through
+    ``set_memories_rv`` (the former property setter duplicated it)."""
     m = TwoState(3)
-    assert set(m.memory_reset_values) == {"v", "w"}
+    assert set(m.memories_rv) == {"v", "w"}
     with pytest.raises(AttributeError):
-        m.memory_reset_values = {"w": 1.0}
+        m.memories_rv = {"w": 1.0}
 
-    m.set_memory_reset_values({"w": 5.0})
-    assert float(m.memory_reset_values["w"].value) == 5.0
+    m.set_memories_rv({"w": 5.0})
+    assert float(m.memories_rv["w"].value) == 5.0
     m.reset()
     assert torch.equal(m.w, torch.full((3,), 5.0))
 

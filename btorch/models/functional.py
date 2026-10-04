@@ -90,7 +90,7 @@ def _strip_self(d: set[str]) -> set[str]:
 
 def _collect_memory_vars(
     mod: nn.Module,
-    target_attr: Literal["_memories", "_memory_reset_values"],
+    target_attr: Literal["_memories", "_memories_rv"],
     names: Sequence[str] | None = None,
     allow_buffer: bool = False,
     clone: bool = False,
@@ -117,7 +117,7 @@ def _collect_memory_vars(
 
 def _walk_memory_targets(
     mod: nn.Module,
-    target_attr: Literal["_memories", "_memory_reset_values"],
+    target_attr: Literal["_memories", "_memories_rv"],
     hidden_states: dict[str, Any] | None,
     allow_buffer: bool = False,
 ):
@@ -155,16 +155,14 @@ def _walk_memory_targets(
             continue
         for p in path[:-1]:
             m = getattr(m, p)
-        if target_attr == "_memory_reset_values" and path[-1] in getattr(
-            m, "_memory_reset_values", {}
-        ):
+        if target_attr == "_memories_rv" and path[-1] in getattr(m, "_memories_rv", {}):
             # reset values are not attributes; look them up in the registry.
             # Anything else (a submodule, for {"m.subm": {...}}) is an attribute.
-            m_leaf = m._memory_reset_values[path[-1]]
-        elif target_attr == "_memory_reset_values" and not hasattr(m, path[-1]):
+            m_leaf = m._memories_rv[path[-1]]
+        elif target_attr == "_memories_rv" and not hasattr(m, path[-1]):
             raise KeyError(
                 f"{name!r} is neither a registered memory nor a submodule; "
-                f"registered: {list(getattr(m, '_memory_reset_values', {}))}"
+                f"registered: {list(getattr(m, '_memories_rv', {}))}"
             )
         else:
             m_leaf = getattr(m, path[-1])
@@ -224,13 +222,12 @@ def _set_memories(
 def _set_reset_values(
     mod: nn.Module, reset_values: dict[str, Any] | None, strict: bool
 ):
-    """Write ``_memory_reset_values`` entries through the MemoryModule
-    setters."""
+    """Write ``_memories_rv`` entries through the MemoryModule setters."""
     for kind, m, key, v in _walk_memory_targets(
-        mod, "_memory_reset_values", reset_values, allow_buffer=False
+        mod, "_memories_rv", reset_values, allow_buffer=False
     ):
         if kind == "whole":
-            m.set_memory_reset_values(v, strict=strict)
+            m.set_memories_rv(v, strict=strict)
         else:
             m.set_reset_value(key, v, strict=strict)
 
@@ -301,7 +298,7 @@ set_memory_values = set_hidden_states
 def named_memory_reset_values(
     mod: nn.Module, names: Sequence[str] | None = None
 ) -> dict[str, Any]:
-    """Collect memory reset values (_memory_reset_values) from a network.
+    """Collect memory reset values (_memories_rv) from a network.
 
     Args:
         mod: Network module to collect from.
@@ -313,15 +310,15 @@ def named_memory_reset_values(
     Example:
         >>> rv = functional.named_memory_reset_values(model)
     """
-    return _collect_memory_vars(mod, "_memory_reset_values", names, allow_buffer=False)
+    return _collect_memory_vars(mod, "_memories_rv", names, allow_buffer=False)
 
 
 def set_memory_reset_values(
     mod: nn.Module, reset_values: dict[str, Any], strict: bool = True
 ) -> None:
-    """Set memory reset values (_memory_reset_values) in a network.
+    """Set memory reset values (_memories_rv) in a network.
 
-    Network-wide counterpart of :meth:`MemoryModule.set_memory_reset_values`.
+    Network-wide counterpart of :meth:`MemoryModule.set_memories_rv`.
     The method takes a flat ``{memory name: value}`` mapping for one module;
     this function takes a dotted dict addressing memories anywhere in the
     tree, in the layout of :func:`named_memory_reset_values`. An entry may also
@@ -342,6 +339,11 @@ def set_memory_reset_values(
     """
 
     _set_reset_values(mod, reset_values, strict=strict)
+
+
+# Short aliases matching the ``memories_rv`` naming of :class:`MemoryModule`.
+named_memories_rv = named_memory_reset_values
+set_memories_rv = set_memory_reset_values
 
 
 def detach_net(net: nn.Module) -> None:

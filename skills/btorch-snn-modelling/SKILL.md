@@ -92,13 +92,13 @@ for t in range(0, T, chunk_size):
 # Save
 checkpoint = {
     "model_state_dict": model.state_dict(),
-    "memory_reset_values": functional.named_memory_reset_values(model),
+    "memories_rv": functional.named_memory_reset_values(model),
     "hidden_states": functional.named_hidden_states(model),
 }
 
 # Load
 model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-functional.set_memory_reset_values(model, checkpoint["memory_reset_values"])
+functional.set_memory_reset_values(model, checkpoint["memories_rv"])
 ```
 
 ## Heterogeneous Modelling

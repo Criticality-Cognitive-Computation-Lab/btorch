@@ -34,7 +34,7 @@ A full training pipeline for Fashion-MNIST classification using a GLIF3-based RS
 - `AlphaPSCBilleh` synapse with heterogeneous time constants
 - `VoltageRegularizer` for membrane-voltage regularization
 - Manual training loop with `reset_net` per batch
-- Checkpointing `memory_reset_values` alongside `state_dict()`
+- Checkpointing `memories_rv` alongside `state_dict()`
 
 **See also:**
 - [Tutorial 2: Training an SNN](tutorials/training.md)

@@ -60,17 +60,17 @@ print(functional.named_hidden_states(model).keys())
 
 **Symptom:** After loading a checkpoint, neurons reset to factory defaults instead of the trained initialization values.
 
-**Fix:** Save and restore `_memory_reset_values` explicitly:
+**Fix:** Save and restore `_memories_rv` explicitly:
 
 ```python
 checkpoint = {
     "model_state_dict": model.state_dict(),
-    "memory_reset_values": functional.named_memory_reset_values(model),
+    "memories_rv": functional.named_memory_reset_values(model),
 }
 
 # Load
 model.load_state_dict(ckpt["model_state_dict"], strict=False)
-functional.set_memory_reset_values(model, ckpt["memory_reset_values"])
+functional.set_memory_reset_values(model, ckpt["memories_rv"])
 ```
 
 See [Tutorial 2: Training an SNN](tutorials/training.md) for a complete example.

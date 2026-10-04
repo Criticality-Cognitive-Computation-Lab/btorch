@@ -103,14 +103,14 @@ def test_torch_save_load(tmp_path, neuron_params, device, dtype):
     _, states_before = run_sim(module, device, dtype)
 
     # Capture states
-    memory_reset_values_before = named_memory_reset_values(module)
+    memories_rv_before = named_memory_reset_values(module)
 
     # Save everything
     model_path = tmp_path / "model.pt"
     torch.save(
         {
             "model_state": module.state_dict(),
-            "memory_reset_values": memory_reset_values_before,
+            "memories_rv": memories_rv_before,
             "hidden_states": hidden_states_before,
         },
         model_path,
@@ -124,17 +124,17 @@ def test_torch_save_load(tmp_path, neuron_params, device, dtype):
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
 
     module_loaded.load_state_dict(checkpoint["model_state"])
-    set_memory_reset_values(module_loaded, checkpoint["memory_reset_values"])
+    set_memory_reset_values(module_loaded, checkpoint["memories_rv"])
     set_hidden_states(module_loaded, checkpoint["hidden_states"])
 
     # Validate internal state restoration
-    memory_reset_values_after = named_memory_reset_values(module_loaded)
+    memories_rv_after = named_memory_reset_values(module_loaded)
     hidden_states_after = named_hidden_states(module_loaded)
 
-    for k in memory_reset_values_before:
+    for k in memories_rv_before:
         assert torch.allclose(
-            torch.as_tensor(memory_reset_values_before[k].value, device=device),
-            torch.as_tensor(memory_reset_values_after[k].value, device=device),
+            torch.as_tensor(memories_rv_before[k].value, device=device),
+            torch.as_tensor(memories_rv_after[k].value, device=device),
         ), f"Memory reset value mismatch for {k}"
 
     for k in hidden_states_before:
