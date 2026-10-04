@@ -168,6 +168,11 @@ class CudaGraphRunner:
             raise RuntimeError(
                 f"cudagraph=True is incompatible with {attr}=True ({why})."
             )
+        # NOTE: value/reduction recording monitors DO compose with cudagraph --
+        # their fold is captured inside the chunk graph (see
+        # RecurrentNNAbstract._stacked_chunk_forward). grad(...) monitors and
+        # multi-chunk recording are refused in _cudagraph_multi_step instead, where
+        # the recorder and chunk count are known.
 
     def _capture(
         self,
