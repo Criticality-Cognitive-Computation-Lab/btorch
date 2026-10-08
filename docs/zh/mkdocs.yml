@@ -14,6 +14,7 @@ nav:
   - tutorials/mixed_neurons.md
 - 指南:
   - guides/configuration.md
+  - guides/sparse_connectivity.md
 - faq.md
 - examples.md
 - skills.md

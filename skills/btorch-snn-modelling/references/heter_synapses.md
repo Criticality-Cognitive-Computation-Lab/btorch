@@ -8,7 +8,7 @@ Use `make_hetersynapse_conn` to expand the **column** dimension of a connection 
 |-----------|------------------|
 | Receptor types are neuron properties (e.g., E/I) | `receptor_type_mode="neuron"` |
 | Receptor types are connection properties (cotransmission) | `receptor_type_mode="connection"` |
-| Group-constrained training (e.g., per-cell-type magnitudes) | `SparseConstrainedConn.from_hetersynapse` |
+| Group-constrained training (e.g., per-cell-type scales) | `SparseConnection.from_hetersynapse(conn, Synapse(weight=ConstrainedWeight(group=constraint)), ...)` |
 | Inspect PSC for one receptor pair/type | `hetero_psc.get_psc(receptor_type=...)` |
 
 ## Neuron-Mode Heterosynapse
@@ -16,7 +16,7 @@ Use `make_hetersynapse_conn` to expand the **column** dimension of a connection 
 ```python
 from btorch.connectome.connection import make_hetersynapse_conn
 from btorch.models.synapse import HeterSynapsePSC, AlphaPSC
-from btorch.models.linear import SparseConn
+from btorch.models.connection import SparseConnection
 from btorch.models import environ, functional
 
 conn, receptor_idx = make_hetersynapse_conn(
@@ -28,7 +28,10 @@ conn, receptor_idx = make_hetersynapse_conn(
 n_receptor = len(receptor_idx)
 n_neuron = len(neurons_df)
 
-linear = SparseConn(conn, enforce_dale=False)
+# Decodes the column expansion into a per-edge receptor attribute.
+# SparseConnection.from_adjacency(conn) gives the same output and keeps the
+# expanded matrix as is.
+linear = SparseConnection.from_hetersynapse(conn, n_receptor=n_receptor)
 
 with environ.context(dt=1.0):
     psc = HeterSynapsePSC(
@@ -58,7 +61,7 @@ psc_conn = psc.get_psc(receptor_type="glutamate", psc=psc.base_psc.psc)
 
 ```python
 from btorch.connectome.connection import make_hetersynapse_constrained_conn
-from btorch.models.linear import SparseConstrainedConn
+from btorch.models.connection import ConstrainedWeight, SparseConnection, Synapse
 
 conn, constraint, receptor_idx = make_hetersynapse_constrained_conn(
     neurons=neurons_df,
@@ -68,13 +71,15 @@ conn, constraint, receptor_idx = make_hetersynapse_constrained_conn(
     receptor_type_mode="neuron",
     constraint_mode="cell_and_receptor",
 )
-linear = SparseConstrainedConn.from_hetersynapse(
-    conn=conn,
-    constraint=constraint,
-    receptor_type_index=receptor_idx,
-    enforce_dale=True,
+linear = SparseConnection.from_hetersynapse(
+    conn,
+    Synapse(weight=ConstrainedWeight(group=constraint, dale=True)),
+    n_receptor=len(receptor_idx),
 )
+linear.weight.group_info()  # one learnable scale per constraint group
 ```
+
+`constraint` uses the same expanded layout as `conn`. The connection does not store `receptor_idx`; keep it next to the model. With `dale=True`, call `btorch.models.constrain.constrain_net(model)` after every optimizer step.
 
 ## Heterosynapse + Heterogeneous Delays
 
@@ -90,7 +95,7 @@ conn, receptor_idx = make_hetersynapse_conn(
     n_delay_bins=5,
 )
 
-linear = SparseConn(conn, enforce_dale=False)
+linear = SparseConnection.from_hetersynapse(conn, n_receptor=len(receptor_idx), n_delay=5)
 
 with environ.context(dt=1.0):
     psc = HeterSynapsePSC(
@@ -108,6 +113,6 @@ with environ.context(dt=1.0):
 ## Common Pitfalls
 
 1. **Wrong `get_psc` argument type** — In neuron mode, `get_psc` expects a tuple `(pre_type, post_type)`. In connection mode, it expects a string. Passing the wrong type raises `ValueError`.
-2. **Mismatched linear output size** — The `linear` layer must map to `n_neurons * n_receptor` (or use the expanded conn directly). `SparseConn` handles this automatically when initialized with the expanded matrix.
+2. **Mismatched linear output size** — The `linear` layer must map to `n_neurons * n_receptor` (or use the expanded conn directly). `SparseConnection.from_hetersynapse` / `from_adjacency` handle this automatically when given the expanded matrix (`out_features == n_neurons * n_receptor`).
 3. **Delay-expanded linear size** — When using `max_delay_steps > 1` in `HeterSynapsePSC`, ensure the linear layer accepts `n_neurons * max_delay_steps` inputs (e.g. via `expand_conn_for_delays`).
 4. **Confusing `return_dict=True`** — `make_hetersynapse_conn(..., return_dict=True)` returns an `OrderedDict` of per-receptor matrices. If you want a single stacked matrix, use `return_dict=False` (default).

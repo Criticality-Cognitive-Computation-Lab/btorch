@@ -84,6 +84,9 @@ nav:
   - tutorials/mixed_neurons.md
 - Guides:
   - guides/configuration.md
+  - guides/sparse_connectivity.md
+- Design notes:
+  - design/sparse_connectivity.md
 - FAQ: faq.md
 - Examples: examples.md
 - Skills: skills.md

@@ -7,7 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `btorch.sparse`: sparse arrays with a SciPy/PyTorch-like API (`Sparse`, `COO`,
+  `CSR`, `CSC`, `sparse.from_edges`, `sparse.asarray`, `A @ x`, `sparse.stack`,
+  `to_torch()` / `to_scipy()`); standard matrix orientation, conversions never
+  transpose or densify.
+- `btorch.models.connection`: `SparseConnection` (`from_adjacency`, `from_edges`,
+  `from_hetersynapse`), `Synapse`, `EdgeWeight`, `ConstantWeight`,
+  `ConstrainedWeight`; receptors and delays as edge attributes; batches of
+  networks.
+- `btorch.sparse.runtime`: execution layer (registered operators, backend
+  registry, planner); not needed to write models.
+- Guide: [Sparse Connectivity](guides/sparse_connectivity.md).
+
 ### Changed
+- **Breaking:** `SparseConn`, `SparseConstrainedConn`, `BaseSparseConn`,
+  `SparseBackend`, `available_sparse_backends` and the `sparse_backend=` argument
+  are removed from `btorch.models.linear` without a compatibility layer. Use
+  `SparseConnection.from_adjacency(conn, Synapse(dale=...))`; Dale's law is now
+  opt-in and the `state_dict` keys changed. See the
+  [migration table](guides/sparse_connectivity.md#migration-from-sparseconn).
 - **Breaking:** a spike delivered at step `t` now affects the PSC returned at step
   `t` for every PSC type (`AlphaPSC`, `AlphaPSCBilleh`, `DualExponentialPSC`
   previously took one extra `dt`).
@@ -51,6 +70,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are unchanged.
 
 ### Fixed
+- Dale signs and constraint structure of sparse connections are saved in the
+  `state_dict`; they were stale after `load_state_dict`.
+- `torch.compile(conn, fullgraph=True)` works for sparse connections without
+  `torch_sparse`.
+- The backward pass of the PyTorch-only sparse path no longer runs out of memory
+  at about 100k neurons.
 - `make_hetersynapse_conn` delay handling.
 - `plot_multiscale_fano` with an unsupported `group_by` now raises `ValueError`
   instead of `NameError`.

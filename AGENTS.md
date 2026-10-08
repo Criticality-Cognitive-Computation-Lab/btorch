@@ -28,6 +28,8 @@ Btorch is a brain-inspired Torch library for neuromorphic research. Follow the p
 - Group related options of wide public signatures (more than ~8 parameters) into
   frozen option dataclasses; keep core data arguments positional.
 - In tests, include thorough explanatory comments so they are understandable and can serve as examples.
+- Tests shall include only intended usage examples and edge cases. Do NOT write superficial tests that
+  only check argument passing, attribute assignment, and trivial things alike.
 
 ## Documentation format
 
