@@ -50,8 +50,8 @@ Repository = "https://github.com/Criticality-Cognitive-Computation-Lab/btorch"
 Documentation = "https://criticality-cognitive-computation-lab.github.io/btorch/"
 
 [project.optional-dependencies]
-# NOTE: torch_scatter/torch_sparse wheels are CUDA-variant-specific and cannot be locked
-# cross-platform. The [tool.uv.sources] below covers CPU (uv/pip CI only).
+# NOTE: torch_scatter/torch_sparse wheels are Torch- and CUDA-variant-specific.
+# They remain outside the `all` extra and the default CI matrix.
 # For CUDA: pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-<ver>+<cuXXX>.html
 # For conda: conda install torch_scatter torch_sparse  -c pyg  (no find-links needed)
 sparse = [
@@ -93,7 +93,7 @@ examples = [
   "tqdm",
 ]
 # Self-referencing extra so ``all`` can never drift from the others.
-all = ["btorch[sparse,viz,io,config,fast,gpu,analysis,examples]"]
+all = ["btorch[viz,io,config,fast,gpu,analysis,examples]"]
 
 [dependency-groups]
 docs = [
@@ -119,8 +119,8 @@ dev = [
 # torch resolved from PyTorch CPU index (uv/pip CI); CUDA users install torch separately
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
-# torch_scatter/sparse are NOT resolved via uv — their wheel URL encodes the torch+CUDA variant.
-# uv locks them as PyPI sdist stubs but CI and end users install from PyG (see sparse extra note).
+# Install the sparse extra only after selecting a matching Torch build; see the
+# note above and the opt-in CI job.
 
 [tool.uv]
 # torch_scatter and torch_sparse need torch as a build dependency
