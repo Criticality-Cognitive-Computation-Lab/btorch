@@ -1,6 +1,10 @@
 # Heterogeneous Synaptic Delays
 
-Use `expand_conn_for_delays` to expand the **row** dimension of a sparse connection matrix so each pre-neuron gets `n_delay_bins` virtual rows. Pair it with `SpikeHistory` to buffer past spikes and `history.get_flattened(n_delays)` to feed the expanded matrix.
+For new models, store `delay` on each semantic edge with
+`Synapse(delay=..., n_delay=...)`. `SparseConnection` derives the flattened
+input layout and `HeterSynapsePSC` owns the required history. Use
+`expand_conn_for_delays` only when importing an already expanded matrix from a
+legacy connectome pipeline.
 
 ## Decision Table
 
@@ -9,7 +13,7 @@ Use `expand_conn_for_delays` to expand the **row** dimension of a sparse connect
 | Simulation only (memory-efficient) | `SpikeHistory(..., use_circular_buffer=True)` |
 | Training with `torch.compile` | `SpikeHistory(..., use_circular_buffer=False)` or `DelayedPSC(..., use_circular_buffer=False)` |
 | Simple scalar delay on any PSC | `DelayedPSC(psc, max_delay_steps=...)` |
-| Delays + receptor split together | `make_hetersynapse_conn(..., delay_col="delay_steps", n_delay_bins=5)` |
+| Delays + receptor split together | `SparseConnection.from_edges(..., Synapse(delay=..., receptor=...))` |
 
 ## Basic Delay Pattern
 
@@ -25,11 +29,10 @@ from btorch.models.connection import SparseConnection
 conn = scipy.sparse.coo_array(([5.0], ([0], [1])), shape=(2, 2))
 delays = np.array([2])  # one delay per non-zero entry
 
-conn_d = expand_conn_for_delays(conn, delays, n_delay_bins=5)
-linear = SparseConnection.from_hetersynapse(conn_d, n_delay=5)
-# Equivalent without the expanded matrix: delays as an edge attribute.
-# from btorch.models.connection import Synapse
-# linear = SparseConnection.from_adjacency(conn, Synapse(delay=torch.from_numpy(delays), n_delay=5))
+linear = SparseConnection.from_adjacency(
+    conn,
+    Synapse(delay=torch.from_numpy(delays), n_delay=5),
+)
 
 history = SpikeHistory(n_neuron=2, max_delay_steps=5)
 history.init_state(batch_size=1)
@@ -61,7 +64,11 @@ history.update(spike)
 psc = linear(history.get_flattened(5))
 ```
 
-## Delays + Heterosynapse Combined
+## Importing Expanded Delay + Receptor Data
+
+For a matrix already expanded by `make_hetersynapse_conn`, decode it with
+`from_hetersynapse` and keep `max_delay_steps` consistent with the decoded
+connection.
 
 ```python
 from btorch.connectome.connection import make_hetersynapse_conn

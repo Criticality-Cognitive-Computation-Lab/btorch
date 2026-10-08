@@ -46,6 +46,7 @@ depend on the GPU, software versions, and network activity.
 **See also:**
 - [Tutorial 1: Building an RSNN](tutorials/building_rsnn.md)
 - [Tutorial 2: Training an SNN](tutorials/training.md)
+- [Tutorial: Heterogeneous Multi-Receptor E/I RSNN](tutorials/heterogeneous_ei_rsnn.md)
 
 ## `rsnn_brain.py` — Brain-Environment Interaction
 
@@ -102,3 +103,9 @@ Many `tests/` files contain concise, validated usage patterns that are ideal for
 - `tests/models/test_compile.py` — `torch.compile` with `dt` context
 - `tests/utils/test_conf.py` — OmegaConf patterns
 - `tests/visualisation/*.py` — Nearly every plotting function
+
+## Heterogeneous E/I Workflow
+
+The [heterogeneous multi-receptor E/I tutorial](tutorials/heterogeneous_ei_rsnn.md)
+builds a complete recurrent network with semantic receptor-labelled edges,
+receptor-specific PSC kinetics, Dale's law, training, and channel inspection.

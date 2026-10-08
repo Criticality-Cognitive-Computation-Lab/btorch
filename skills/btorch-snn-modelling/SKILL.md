@@ -15,7 +15,8 @@ Before writing code, confirm the intended architecture when it is unclear from t
 
 - neuron model (for example: GLIF3, LIF, ALIF)
 - synapse model (for example: AlphaPSC, AlphaPSCBilleh, ExponentialPSC)
-- connection pattern (for example: SparseConnection, DenseConn, E/I split, receptor split)
+- connection pattern (for example: `Linear`, `SparseConnection`, semantic E/I
+  edges, or receptor channels)
 
 If these are already explicit in user requirements/config, proceed without asking.
 
@@ -110,9 +111,13 @@ functional.set_memory_reset_values(model, checkpoint["memories_rv"])
 
 | Topic | Core Idea | Reference |
 |-------|-----------|-----------|
-| **Delays** | Simple delays with `DelayedPSC`; heterogeneous delays with `expand_conn_for_delays` + `SpikeHistory` + `get_flattened` | [references/heter_delays.md](references/heter_delays.md) |
-| **Receptor-split synapses** | Expand columns with `make_hetersynapse_conn`, run dynamics with `HeterSynapsePSC` | [references/heter_synapses.md](references/heter_synapses.md) |
-| **Group-aware weight stacking** | Build per-receptor sparse matrices, stack with `stack_hetersynapse`, map weights with `map_weight_to_conn` | [references/heter_syn_weights.md](references/heter_syn_weights.md) |
+| **Delays** | Store `delay` per edge in `Synapse`; `SparseConnection` derives the history layout used by `HeterSynapsePSC` | [references/heter_delays.md](references/heter_delays.md) |
+| **Multi-receptor synapses** | Store `receptor` per edge in `Synapse`; use `HeterSynapsePSC` for channel dynamics and summation | [references/heter_synapses.md](references/heter_synapses.md) |
+| **Group-aware weights** | Use `ConstrainedWeight(group=...)` on semantic edges; use stacking only when importing legacy expanded data | [references/heter_syn_weights.md](references/heter_syn_weights.md) |
+
+Keep population sizes semantic. Receptor and delay dimensions are edge
+attributes; the flattened dimensions used by a PSC are a derived execution
+layout.
 
 ## RNN Architecture Choices
 
@@ -128,6 +133,9 @@ functional.set_memory_reset_values(model, checkpoint["memories_rv"])
 2. **Not resetting state** - Call `reset_net()` before each training batch
 3. **Wrong state names** - Use dot notation: `"neuron.v"`
 4. **Missing memory reset values** - Dynamic states aren't in `state_dict()`
+5. **Expanding heterogeneous dimensions too early** - Use
+   `Synapse(receptor=..., delay=...)` with `SparseConnection.from_edges` for
+   new models.
 
 ## References
 
@@ -139,3 +147,4 @@ functional.set_memory_reset_values(model, checkpoint["memories_rv"])
 - [references/heter_delays.md](references/heter_delays.md) - Heterogeneous synaptic delays
 - [references/heter_synapses.md](references/heter_synapses.md) - Receptor-split (heterogeneous) synapses
 - [references/heter_syn_weights.md](references/heter_syn_weights.md) - Group-aware weight stacking and assignment
+- [references/heterogeneous_ei_rsnn.md](references/heterogeneous_ei_rsnn.md) - Complete semantic-edge E/I receptor workflow

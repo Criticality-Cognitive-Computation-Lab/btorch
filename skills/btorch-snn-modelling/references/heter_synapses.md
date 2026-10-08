@@ -1,17 +1,56 @@
 # Heterogeneous Synapses
 
-Use `make_hetersynapse_conn` to expand the **column** dimension of a connection matrix so each post-neuron gets a block of columns per receptor type. Use `HeterSynapsePSC` to run synaptic dynamics on the expanded space and sum across receptors per neuron.
+For new models, store the receptor id on each semantic edge with
+`Synapse(receptor=..., n_receptor=...)` and build it with
+`SparseConnection.from_edges`. `HeterSynapsePSC` derives the flattened channel
+layout, runs one PSC state per receptor, and sums channels back to one current
+per target neuron. `make_hetersynapse_conn` and `from_hetersynapse` remain
+compatibility adapters for physically expanded connectome data.
 
 ## Decision Table
 
 | Situation | Mode / Component |
 |-----------|------------------|
-| Receptor types are neuron properties (e.g., E/I) | `receptor_type_mode="neuron"` |
-| Receptor types are connection properties (cotransmission) | `receptor_type_mode="connection"` |
-| Group-constrained training (e.g., per-cell-type scales) | `SparseConnection.from_hetersynapse(conn, Synapse(weight=ConstrainedWeight(group=constraint)), ...)` |
+| Receptor types are neuron properties (e.g., E/I) | Per-edge `receptor` ids plus a neuron-mode index table |
+| Receptor types are connection properties (cotransmission) | Per-edge `receptor` ids plus a connection-mode index table |
+| Group-constrained training (e.g., per-cell-type scales) | `ConstrainedWeight(group=...)` on the semantic edge list |
 | Inspect PSC for one receptor pair/type | `hetero_psc.get_psc(receptor_type=...)` |
 
-## Neuron-Mode Heterosynapse
+## Semantic-Edge Heterosynapse
+
+```python
+connection = SparseConnection.from_edges(
+    pre,
+    post,
+    n_pre=n_neuron,
+    n_post=n_neuron,
+    synapse=Synapse(
+        receptor=receptor_id,
+        n_receptor=4,
+        dale=True,
+    ),
+    values=signed_initial_weight,
+)
+psc = HeterSynapsePSC(
+    n_neuron=n_neuron,
+    n_receptor=4,
+    receptor_type_index=receptor_index,
+    linear=connection,
+    base_psc=AlphaPSC,
+    tau_syn=tau_by_receptor.repeat(n_neuron),
+)
+```
+
+For neuron-mode E/I channels, `receptor_index` has
+`receptor_index`, `pre_receptor_type`, and `post_receptor_type` columns.
+Inspect a channel with `psc.get_psc(("I", "E"))` and enforce Dale's law with
+`constrain_net(model)` after each optimizer step. See the
+[complete E/I tutorial](../../../docs/en/docs/tutorials/heterogeneous_ei_rsnn.md).
+
+## Importing Expanded Connectome Data
+
+Use this path when an external pipeline already produced a physically expanded
+matrix:
 
 ```python
 from btorch.connectome.connection import make_hetersynapse_conn
@@ -28,9 +67,7 @@ conn, receptor_idx = make_hetersynapse_conn(
 n_receptor = len(receptor_idx)
 n_neuron = len(neurons_df)
 
-# Decodes the column expansion into a per-edge receptor attribute.
-# SparseConnection.from_adjacency(conn) gives the same output and keeps the
-# expanded matrix as is.
+# Decode the expansion into semantic per-edge receptor attributes.
 linear = SparseConnection.from_hetersynapse(conn, receptor_type_index=receptor_idx)
 
 with environ.context(dt=1.0):

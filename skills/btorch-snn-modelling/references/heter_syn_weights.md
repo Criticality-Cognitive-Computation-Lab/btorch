@@ -1,6 +1,10 @@
 # Group-Aware Weight Stacking for Heterogeneous Synapses
 
-When weights or delays are generated with different rules per receptor group, build per-group sparse matrices first, then stack them into the single matrix that btorch expects.
+For new models, keep one semantic edge list and attach group ids through
+`ConstrainedWeight(group=...)` or keep per-edge values in `Synapse(weight=...)`.
+Build and train the connection with `SparseConnection.from_edges`. The stacking
+helpers below are for importing legacy per-receptor matrices or preserving an
+existing connectome preprocessing pipeline.
 
 ## Decision Table
 
@@ -11,7 +15,7 @@ When weights or delays are generated with different rules per receptor group, bu
 | No ordering preference | `mode="random"` |
 | Preserve strength topology (largest weights to strongest original positions) | `mode="large_to_large"` |
 
-## Stacking Per-Receptor Matrices
+## Legacy Stacking Per-Receptor Matrices
 
 ```python
 from btorch.connectome.connection import stack_hetersynapse
@@ -23,7 +27,10 @@ conn_stacked, new_receptor_idx = stack_hetersynapse(
 )
 ```
 
-`stack_hetersynapse` produces a single sparse matrix with expanded columns, matching the format expected by `SparseConnection.from_hetersynapse` (or `from_adjacency`) and `HeterSynapsePSC`.
+`stack_hetersynapse` produces a single sparse matrix with expanded columns,
+matching the format expected by `SparseConnection.from_hetersynapse` and
+`HeterSynapsePSC`. It is an import/compatibility operation, not the primary
+semantic model.
 
 ## Mapping Group-Specific Weights Back to Sparse Connectivity
 
