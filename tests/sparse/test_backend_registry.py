@@ -3,14 +3,18 @@
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+import torch
 
 from btorch.sparse import runtime
 from btorch.sparse.runtime.backend import (
     BackendRegistry,
+    KernelCache,
+    RegisteredOperator,
     RouteImplementation,
     RouteKey,
     RouteSpec,
 )
+from btorch.sparse.runtime.planner import PlanningContext
 
 
 def test_registration_generation_and_entry_revision_are_monotonic():
@@ -164,6 +168,103 @@ def test_bound_route_keeps_one_exact_kernel_revision():
     assert events == ["forward-v1", "backward-v1"]
     with pytest.raises(RuntimeError, match="stale"):
         registry.bind_route(snapshot)
+
+
+def test_kernel_cache_clear_rebuilds_derived_artifacts_once():
+    """Clearing a kernel cache invalidates derived artifacts as one unit.
+
+    A prepared sparse layout may be requested by several forwards.  It should
+    be built once until topology invalidation clears the cache, after which the
+    next request must rebuild it rather than returning stale derived tensors.
+    """
+    cache = KernelCache()
+    builds = []
+
+    def build():
+        artifact = object()
+        builds.append(artifact)
+        return artifact
+
+    first = cache.get(("layout", 1), build)
+    assert cache.get(("layout", 1), build) is first
+    assert builds == [first]
+
+    generation = cache.generation
+    cache.clear()
+    second = cache.get(("layout", 1), build)
+    assert second is not first
+    assert builds == [first, second]
+    assert cache.generation == generation + 1
+
+
+def test_route_policy_filters_capabilities_then_ranks_cost_and_override():
+    """Route selection applies capability filters before cost and override.
+
+    The low-cost route cannot participate in CUDA-graph capture.  Capture must
+    therefore choose the safe route; ordinary execution chooses the cheaper
+    route, while an explicit backend override selects the requested complete
+    route without mixing callbacks from another backend.
+    """
+    registry = BackendRegistry()
+    registry.register("matvec", "fast", lambda: "fast", device="cpu")
+    registry.register("matvec", "safe", lambda: "safe", device="cpu")
+
+    def route(name, *, cost, supports_capture):
+        return RouteSpec(
+            key=RouteKey("propagate", "post_pre_csr", "pull", name),
+            kernel_bindings=(("matvec", name),),
+            build=lambda kernels: RouteImplementation(
+                forward=kernels["matvec"], backward=lambda: None
+            ),
+            operator=RegisteredOperator(supports_capture=supports_capture),
+            estimate_cost=lambda context: cost,
+        )
+
+    registry.register_route(
+        route("fast", cost=1.0, supports_capture=False), device="cpu"
+    )
+    registry.register_route(
+        route("safe", cost=5.0, supports_capture=True), device="cpu"
+    )
+    ordinary = PlanningContext("cpu", False, None, False, torch.float32)
+    capture = PlanningContext(
+        "cpu", False, None, False, torch.float32, capture=True
+    )
+
+    assert registry.resolve_route("pull", "cpu", ordinary).backend == "fast"
+    captured = registry.resolve_route("pull", "cpu", capture)
+    assert captured.backend == "safe"
+    assert registry.bind_route(captured).implementation.forward() == "safe"
+
+    registry.set_backend("safe")
+    try:
+        forced = registry.resolve_route("pull", "cpu", ordinary)
+        assert forced.backend == "safe"
+        assert registry.bind_route(forced).implementation.forward() == "safe"
+    finally:
+        registry.set_backend(None)
+
+
+def test_route_availability_change_rejects_prepared_binding():
+    """A route that disappears after planning cannot execute stale callbacks."""
+    available = True
+    registry = BackendRegistry()
+    registry.register("matvec", "demo", lambda: "demo", device="cpu")
+    spec = RouteSpec(
+        key=RouteKey("propagate", "post_pre_csr", "pull", "demo"),
+        kernel_bindings=(("matvec", "demo"),),
+        build=lambda kernels: RouteImplementation(
+            forward=kernels["matvec"], backward=lambda: None
+        ),
+    )
+    registry.register_route(spec, device="cpu", available=lambda: available)
+    snapshot = registry.resolve_route("pull", "cpu")
+    assert registry.bind_route(snapshot).implementation.forward() == "demo"
+
+    available = False
+    with pytest.raises(RuntimeError, match="unavailable"):
+        registry.bind_route(snapshot)
+    assert not registry.has_route("pull", "cpu")
 
 
 @pytest.fixture
