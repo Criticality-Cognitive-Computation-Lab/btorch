@@ -384,6 +384,31 @@ def _first(parts: Sequence[Any], name: str):
     return None
 
 
+def _composite_dtype(parts: Sequence[Any]) -> torch.dtype | None:
+    dtype = _first(parts, "dtype")
+    if dtype is None:
+        return None
+    for part in parts:
+        part_dtype = getattr(part, "dtype", None)
+        if part_dtype is not None:
+            dtype = torch.promote_types(dtype, part_dtype)
+    return dtype
+
+
+def _composite_device(parts: Sequence[Any]) -> torch.device | None:
+    devices = {
+        torch.device(part_device)
+        for part in parts
+        if (part_device := getattr(part, "device", None)) is not None
+    }
+    if len(devices) > 1:
+        raise ValueError(
+            "Composite operators require every operand on one device, got "
+            f"{sorted(map(str, devices))}."
+        )
+    return next(iter(devices), None)
+
+
 # ---------------------------------------------------------------- structured
 class StructuredOperator(LinearOperator):
     """Operator with a closed-form product and no stored matrix.
@@ -641,8 +666,8 @@ class CompositeOperator(LinearOperator):
         self.parts = tuple(_as_part(p) for p in parts)
         if not self.parts:
             raise ValueError(f"{type(self).__name__} needs at least one operand.")
-        self.dtype = _first(self.parts, "dtype")
-        self.device = _first(self.parts, "device")
+        self.dtype = _composite_dtype(self.parts)
+        self.device = _composite_device(self.parts)
 
     def _common(self, allowed: frozenset[str] = _ALL) -> frozenset[str]:
         out = allowed
@@ -724,6 +749,16 @@ class ProductOperator(CompositeOperator):
         for part in parts:
             flat.extend(part.parts if isinstance(part, ProductOperator) else [part])
         self._set_parts(flat)
+        dtypes = {
+            part_dtype
+            for part in self.parts
+            if (part_dtype := getattr(part, "dtype", None)) is not None
+        }
+        if len(dtypes) > 1:
+            raise ValueError(
+                "Product operators require every operand to use one dtype, got "
+                f"{sorted(map(str, dtypes))}."
+            )
         for left, right in zip(self.parts[:-1], self.parts[1:]):
             if left.shape[1] != right.shape[0]:
                 raise ValueError(
@@ -759,6 +794,20 @@ class ScaledOperator(CompositeOperator):
             raise TypeError("ScaledOperator needs a scalar factor.")
         self._set_parts([operator])
         self.alpha = alpha
+        if isinstance(alpha, Tensor):
+            if self.device is not None and alpha.device != self.device:
+                raise ValueError(
+                    "Scaled operators require the factor and operand on one "
+                    f"device, got {alpha.device} and {self.device}."
+                )
+            if self.dtype is not None:
+                self.dtype = torch.promote_types(self.dtype, alpha.dtype)
+            else:
+                self.dtype = alpha.dtype
+            self.device = alpha.device if self.device is None else self.device
+        elif self.dtype is not None:
+            alpha_dtype = torch.tensor(alpha).dtype
+            self.dtype = torch.promote_types(self.dtype, alpha_dtype)
         self._shape = tuple(operator.shape)
         self._capabilities = self._common()
 

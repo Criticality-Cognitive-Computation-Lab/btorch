@@ -442,6 +442,39 @@ def test_composite_shape_checks():
         C + 1.0
 
 
+def test_composite_reports_promoted_dtype_and_rejects_mixed_devices():
+    """Composite metadata matches tensor promotion and device constraints."""
+    left = DiagonalOperator(torch.ones(N, dtype=torch.float32))
+    right = DiagonalOperator(torch.ones(N, dtype=torch.float64))
+    summed = left + right
+
+    assert summed.dtype == torch.float64
+    assert summed.device == torch.device("cpu")
+    assert summed.matvec(torch.ones(N)).dtype == torch.float64
+
+    meta = DiagonalOperator(torch.ones(N, device="meta"))
+    with pytest.raises(ValueError, match="one device"):
+        left + meta
+
+    with pytest.raises(ValueError, match="one dtype"):
+        left @ right
+
+    complex_scaled = (1 + 2j) * left
+    assert complex_scaled.dtype == torch.complex64
+    assert complex_scaled.matvec(torch.ones(N)).dtype == torch.complex64
+
+
+def test_scalar_matmul_reports_invalid_tensor_rank():
+    """A zero-dimensional tensor gives the operator's shape error."""
+    operator = ConstantOperator((M, N), 1.0)
+    scalar = torch.tensor(1.0)
+
+    with pytest.raises(ValueError, match="at least one dimension"):
+        operator @ scalar
+    with pytest.raises(ValueError, match="at least one dimension"):
+        scalar @ operator
+
+
 def test_sparse_is_accepted_wherever_an_operator_is():
     """An explicit ``Sparse`` combines with operators on either side.
 

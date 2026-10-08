@@ -171,7 +171,6 @@ _ENUMERATE_MAX = 1 << 22
 # and with existing edges then dominate the rejection rounds.
 _SCARCE = 16
 # Per-slot optimizer state by role (see ``HardDeepROptions.optimizer_state``).
-_FIRST_MOMENT = frozenset({"exp_avg", "momentum_buffer", "grad_avg"})
 _SECOND_MOMENT = frozenset(
     {"exp_avg_sq", "max_exp_avg_sq", "square_avg", "sum", "exp_inf", "acc_delta"}
 )

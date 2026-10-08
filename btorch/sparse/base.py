@@ -14,6 +14,7 @@ from .properties import Hints, Properties
 if TYPE_CHECKING:
     from .coo import COO
     from .csr import CSC, CSR
+    from .properties import EdgeMap
 
 
 class Sparse:
@@ -112,12 +113,22 @@ class Sparse:
         """Convert to COO (may allocate)."""
         raise NotImplementedError
 
-    def tocsr(self) -> "CSR":
-        """Convert to CSR (may sort and merge duplicates)."""
+    def tocsr(self, return_map: bool = False) -> "CSR | tuple[CSR, EdgeMap]":
+        """Convert to CSR (may sort and merge duplicates).
+
+        Args:
+            return_map: Also return the mapping from stored entries to the
+                converted entries.
+        """
         raise NotImplementedError
 
-    def tocsc(self) -> "CSC":
-        """Convert to CSC (may sort and merge duplicates)."""
+    def tocsc(self, return_map: bool = False) -> "CSC | tuple[CSC, EdgeMap]":
+        """Convert to CSC (may sort and merge duplicates).
+
+        Args:
+            return_map: Also return the mapping from stored entries to the
+                converted entries.
+        """
         raise NotImplementedError
 
     def tobsr(self, blocksize: tuple[int, int]):

@@ -18,6 +18,7 @@ listed under the table.
 
 import argparse
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
 
@@ -53,7 +54,7 @@ def cell(row: dict, key: str, min_key: str, probe_key: str, marks: dict) -> str:
     """``median`` or ``median~ (min)`` of one measurement, ``!`` if
     throttled."""
     value = row.get(key)
-    if value is None or value != value:
+    if value is None or math.isnan(value):
         return "-"
     text = _fmt(value)
     probe, best_probe = row.get(probe_key), marks["best_probe"]

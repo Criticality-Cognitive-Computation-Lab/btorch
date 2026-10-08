@@ -14,6 +14,8 @@ N]``; the logical spike tensor stays dense so surrogate gradients are exact.
 
 from __future__ import annotations
 
+from itertools import count
+
 import torch
 from torch import Tensor
 from torch.library import custom_op
@@ -684,18 +686,16 @@ def _propagate_eager(
 # its table entry is immutable for the lifetime of the process.
 _BOUND_ROUTES: dict[int, RouteBinding] = {}
 _BOUND_ROUTE_TOKENS: dict[tuple, int] = {}
-_NEXT_ROUTE_TOKEN = 1
+_ROUTE_TOKENS = count(1)
 
 
 def bind_route(route: RouteBinding) -> int:
     """Publish a planned route and return its stable execution token."""
-    global _NEXT_ROUTE_TOKEN
     fingerprint = route.snapshot.fingerprint
     existing = _BOUND_ROUTE_TOKENS.get(fingerprint)
     if existing is not None:
         return existing
-    token = _NEXT_ROUTE_TOKEN
-    _NEXT_ROUTE_TOKEN += 1
+    token = next(_ROUTE_TOKENS)
     _BOUND_ROUTES[token] = route
     _BOUND_ROUTE_TOKENS[fingerprint] = token
     return token

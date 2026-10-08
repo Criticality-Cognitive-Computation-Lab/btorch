@@ -66,7 +66,7 @@ def _sparse_run_arguments(loop_tensor: Tensor) -> tuple[int, torch.dtype]:
             "the first loop argument must be a tensor with a time dimension"
         )
     step = loop_tensor[0]
-    batch_size = max(1, step.numel() // step.shape[-1])
+    batch_size = 1 if step.ndim == 0 else max(1, step.numel() // step.shape[-1])
     return batch_size, loop_tensor.dtype
 
 
