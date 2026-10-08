@@ -293,7 +293,12 @@ class LinearOperator(metaclass=ABCMeta):
         """Materialise as CSC (capability ``"materialize_sparse"``)."""
         return self.materialize("csc")
 
-    def to_dense(self, *, dtype: torch.dtype | None = None, device=None) -> Tensor:
+    def to_dense(
+        self,
+        *,
+        dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
+    ) -> Tensor:
         """Dense ``[M, N]`` matrix; an explicit request, never done implicitly.
 
         The default applies the operator to the identity (``N`` right-hand
@@ -448,7 +453,7 @@ class ConstantOperator(StructuredOperator):
         value: Tensor | float = 1.0,
         *,
         dtype: torch.dtype | None = None,
-        device=None,
+        device: torch.device | str | None = None,
     ):
         self._shape = _check_shape(shape)
         if isinstance(value, Tensor):
@@ -610,7 +615,7 @@ class ImplicitOperator(LinearOperator):
         rmatvec: Callable[[Tensor], Tensor] | None = None,
         enumerate_edges: Callable[[], Edges] | None = None,
         dtype: torch.dtype | None = None,
-        device=None,
+        device: torch.device | str | None = None,
         *,
         matmat: Callable[[Tensor], Tensor] | None = None,
     ):

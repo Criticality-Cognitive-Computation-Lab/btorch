@@ -19,6 +19,7 @@ synapses, receptors, delays) live in :mod:`btorch.models.connection`.
 """
 
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 from torch import Tensor
 
@@ -45,10 +46,14 @@ from .ops import matmul, matvec, rmatvec, stack
 from .properties import EdgeMap, Hints, Properties
 
 
+if TYPE_CHECKING:
+    from btorch.models.connection import Connection
+
+
 asarray = as_sparse
 
 
-def explain(connection, x: Tensor | None = None) -> str:
+def explain(connection: "Connection", x: Tensor | None = None) -> str:
     """Describe how a connection is executed (debugging aid).
 
     Reports the input representation, the canonical state, and the

@@ -7,7 +7,7 @@ from scipy.optimize import curve_fit
 from ...utils._optional import require
 
 
-def _fit_distribution(data):
+def _fit_distribution(data: np.ndarray) -> tuple[float, Any | None]:
     """Fit a discrete power law with the ``powerlaw`` package.
 
     Returns:
@@ -26,11 +26,15 @@ def _fit_distribution(data):
         return np.nan, None
 
 
-def _power_law_func(x, a, gamma):
+def _power_law_func(
+    x: np.ndarray, a: float, gamma: float
+) -> np.ndarray:
     return a * np.power(x, gamma)
 
 
-def _fit_scaling(x, y):
+def _fit_scaling(
+    x: np.ndarray, y: np.ndarray
+) -> tuple[float, dict[str, Any] | None]:
     """Fit the power law scaling y = a * x^gamma using curve_fit.
 
     Returns:

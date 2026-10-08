@@ -189,8 +189,8 @@ class CSR(_Compressed):
     over a fixed topology.
 
     Args:
-        crow_indices: ``[n_rows + 1]`` row pointers.
-        col_indices: ``[nnz]`` column of each entry.
+        pointer: ``[n_rows + 1]`` row pointers (``crow_indices``).
+        minor: ``[nnz]`` column of each entry (``col_indices``).
         values: ``[*batch, nnz, *dense]`` stored values.
         shape: Logical shape ``(*batch, n_rows, n_cols, *dense)``.
         dense_dim: Number of trailing dense dimensions of each entry.
@@ -253,8 +253,8 @@ class CSC(_Compressed):
     """Compressed sparse column format (exactly two sparse dimensions).
 
     Args:
-        ccol_indices: ``[n_cols + 1]`` column pointers.
-        row_indices: ``[nnz]`` row of each entry.
+        pointer: ``[n_cols + 1]`` column pointers (``ccol_indices``).
+        minor: ``[nnz]`` row of each entry (``row_indices``).
         values: ``[*batch, nnz, *dense]`` stored values.
         shape: Logical shape ``(*batch, n_rows, n_cols, *dense)``.
         dense_dim: Number of trailing dense dimensions of each entry.

@@ -144,7 +144,12 @@ def from_torch(tensor: Tensor, *, batch_dim: int = 0) -> Sparse:
     )
 
 
-def from_scipy(array: Any, *, device=None, dtype: torch.dtype | None = None) -> Sparse:
+def from_scipy(
+    array: Any,
+    *,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
+) -> Sparse:
     """Convert a SciPy sparse array or matrix.
 
     Both ``scipy.sparse.sparray`` and the legacy ``spmatrix`` are accepted.
@@ -228,7 +233,7 @@ def as_sparse(
     obj: Any,
     *,
     format: str | None = None,
-    device=None,
+    device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
     batch_dim: int = 0,
 ) -> Sparse:

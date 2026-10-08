@@ -188,7 +188,9 @@ class Sparse:
 
         return from_scipy(array, device=device, dtype=dtype)
 
-    def to_torch(self, layout: str | torch.layout | None = None, **kwargs) -> Tensor:
+    def to_torch(
+        self, layout: str | torch.layout | None = None, **kwargs: Any
+    ) -> Tensor:
         """Export as a ``torch`` sparse tensor.
 
         Args:
@@ -201,7 +203,7 @@ class Sparse:
 
         return to_torch(self, layout, **kwargs)
 
-    def to_scipy(self, format: str | None = None, **kwargs):
+    def to_scipy(self, format: str | None = None, **kwargs: Any) -> Any:
         """Export as a ``scipy.sparse`` array (CPU, detached).
 
         Args:

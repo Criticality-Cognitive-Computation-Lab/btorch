@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -207,7 +208,7 @@ def _matmat(A: Sparse, x: Tensor, transpose: bool) -> Tensor:
     return y.permute(*back)
 
 
-def matmul(a, b):
+def matmul(a: Any, b: Any) -> Tensor:
     """Matrix product with one sparse operand; the function behind ``@``.
 
     Shapes follow :func:`torch.matmul`:
