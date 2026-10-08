@@ -24,7 +24,7 @@ A minimal RSNN needs three things:
 import torch
 import torch.nn as nn
 from btorch.models import environ, functional, glif, rnn, synapse
-from btorch.models.linear import DenseConn
+from btorch.models.linear import Linear
 
 
 class MinimalRSNN(nn.Module):
@@ -50,7 +50,7 @@ class MinimalRSNN(nn.Module):
         )
 
         # 3. Recurrent connection
-        conn = DenseConn(num_hidden, num_hidden, bias=None, device=device)
+        conn = Linear(num_hidden, num_hidden, bias=False, device=device)
 
         # 4. Synapse
         psc_module = synapse.AlphaPSC(

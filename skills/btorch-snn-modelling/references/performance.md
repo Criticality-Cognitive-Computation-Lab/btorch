@@ -19,6 +19,10 @@ brain = torch.compile(brain)
 
 **Note**: Requires torch >= 2.8. `SparseConnection` compiles with `torch.compile(..., fullgraph=True)` and does not need `torch_sparse`.
 
+**Do not use `torch.compile(mode="reduce-overhead")` on a model whose sparse connections are rewired (`HardDeepR`, `set_edges_`) or that loads a checkpoint with a different connectivity pattern.** That mode replays CUDA graphs recorded for the old wiring and has no hook to notice the change. Use the default mode there, and call the model once in eager mode before compiling with `reduce-overhead`. A hand-captured CUDA graph must be captured again when `conn.capture_version` changes.
+
+**Sparse activity**: `SparseConnection.from_adjacency(weights, hints=Hints(expected_density=0.01))` (`from btorch.sparse import Hints`) lets the runtime visit only the out-edges of active neurons. On CUDA with Triton this path (`"push"`) is not bitwise reproducible; leave the hint off when exact reproducibility matters. `conn.explain()` prints the chosen algorithm and backend.
+
 **Long sequences**: torch.compile can be slow with very long sequences due to excessive graph unrolling. Use the `unroll` parameter to limit timesteps per compilation unit:
 
 ```python

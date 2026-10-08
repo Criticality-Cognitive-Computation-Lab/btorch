@@ -81,7 +81,7 @@ psc = HeterSynapsePSC(
     n_neuron=n_neurons,
     n_receptor=len(receptor_idx),
     receptor_type_index=receptor_idx,
-    linear=SparseConnection.from_hetersynapse(conn, n_receptor=len(receptor_idx), n_delay=5),
+    linear=SparseConnection.from_hetersynapse(conn, receptor_type_index=receptor_idx, n_delay=5),
     base_psc=AlphaPSC,
     tau_syn=5.0,
     max_delay_steps=5,

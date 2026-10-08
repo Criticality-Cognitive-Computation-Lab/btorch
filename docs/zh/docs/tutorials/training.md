@@ -58,7 +58,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 model = model.to(device)
 ```
 
-`SparseConnection.from_adjacency` 接受行为源神经元、列为目标神经元的矩阵。权重、Dale 定律、受体与延迟的用法见[稀疏连接指南](../guides/sparse_connectivity.md)。
+`SparseConnection.from_adjacency` 接受行为源神经元、列为目标神经元的矩阵（`orientation="pre_post"`，默认值）。权重、Dale 定律、受体与延迟的用法见[稀疏连接指南](../guides/sparse_connectivity.md)。
 
 ## 初始化并随机化状态
 

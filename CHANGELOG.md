@@ -24,7 +24,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the weight modules `EdgeWeight`, `ConstantWeight`, `ConstrainedWeight`, and the
   `Connection` base class with `OperatorConnection`, `StructuredConnection`,
   `ImplicitConnection`, `HybridConnection`. Receptors and delays are per-edge
-  attributes; a batch of networks (ensemble) is supported.
+  attributes; a batch of networks (ensemble) is supported. Matrix orientations
+  are named `"pre_post"` (rows are sources, the default of `from_adjacency` and
+  `FromSparse`) and `"post_pre"` (the operator, what `SparseConnection(A)`
+  takes). `Synapse(weight=...)` accepts a number, a tensor, an `nn.Parameter`, a
+  callable `f(n_edge)`, a `torch.distributions.Distribution` or a `Weight`
+  module; `bias=True` gives a zero-initialised bias.
+- `SparseConnection` accessors: `conn.pre`, `conn.post`,
+  `conn.find_edges(pre, post)`, `conn.orientation`, `conn.capture_version`,
+  `conn.capture_incompatibility()`; `Projection.n_delay`, `n_receptor`,
+  `weight`, `edge_table()`, `to_sparse()`; `Weight.shape` / `dtype` / `device`;
+  `from_hetersynapse(..., receptor_type_index=)`; `from_torch` /
+  `as_sparse(batch_dim=...)` for batched PyTorch COO tensors.
+- **CUDA graph capture protocol** (`btorch.models.cudagraph`): a submodule may
+  expose `capture_version` and `capture_incompatibility()`;
+  `capture_versions(module)` and `capture_incompatibilities(module)` collect
+  them. `SparseConnection` implements both, so a graph captured around a
+  connection can be recognised as stale after rewiring, a checkpoint load, a
+  device move or a change of hints.
 - **`btorch.sparse.runtime`** — execution layer below the connections: registered
   `torch.library` operators (`csr_propagate`, `spike_propagate`), kernel backend
   registry (`registry`, `use_backend`), `Planner`, `RepresentationCache`. Not
@@ -53,15 +70,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`HardDeepR`** (`btorch.models.connection`) — fixed-slot hard Deep Rewiring
   for `SparseConnection`: `HardDeepR(conn, HardDeepROptions(...))`,
   `attach(optimizer)`; dormant edge slots are reused for new connections without
-  changing tensor shapes, so optimizers and compiled graphs stay valid. Adds
-  `SparseConnection.enable_rewiring()`, `set_edges_()` and `topology_version`.
+  changing tensor shapes, so optimizers and modules compiled with the default
+  `torch.compile` mode stay valid (`mode="reduce-overhead"` must not be combined
+  with rewiring). Accepts a `SparseConnection` or a `Projection`. Adds
+  `SparseConnection.enable_rewiring()`,
+  `set_edges_(slots, *, pre, post, receptor=None, delay=None)` and
+  `topology_version`.
+  Rewired slots follow an explicit optimizer-state policy (`"neutral"` by
+  default, also `"reset"` and `"keep"`); when a layer has no free position the
+  update never raises (unplaced slots wait at zero weight, `n_unplaced`); the
+  controller has `state_dict()` / `load_state_dict()` for exact resumption.
   Soft Deep R is not implemented.
 - `ConstantWeight` counts merged parallel edges (new state key
   `weight.multiplicity`); `Synapse(weight=module, dale=True)` switches the
   `dale` flag of the weight module on; `SparseConnection.constrain()`,
   `sparse.explain(conn, x)` and `CSR.coalesce()` / `CSC.coalesce()` added;
   `use_backend` raises on an unknown backend name; `load_state_dict` rejects
-  checkpoints whose edges address neurons or channels outside the module.
+  checkpoints whose edges address neurons or channels outside the module, whose
+  population or routing sizes (new state key `layout`) differ from the module,
+  or that were written by the removed legacy layers (`indices` without
+  `layout`), also with `strict=False`.
 - User guide [`docs/en/docs/guides/sparse_connectivity.md`](docs/en/docs/guides/sparse_connectivity.md).
 - `tests/test_pipeline_e2e.py` — end-to-end example test chaining connectome ->
   sparse conn -> LIF/ExponentialPSC RNN -> spike analysis -> xarray round trip.
@@ -83,6 +111,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (sparse connections, relative to earlier revisions of the
+  unreleased `btorch.models.connection` API; no aliases exist):**
+  - Orientation strings are `"pre_post"` / `"post_pre"` everywhere;
+    `"src_dst"` / `"dst_src"` are gone. `FromSparse(A)` now defaults to
+    `"pre_post"` (was `"post_pre"`), matching `from_adjacency`.
+    `conn.to_sparse()` defaults to the orientation the connection was built
+    from (`conn.orientation`) instead of the operator, and rejects unknown
+    strings.
+  - `set_edges_(slots, *, pre, post, receptor=None, delay=None)`: the index
+    arguments are keyword-only (was positional `post, pre`).
+    `HardDeepROptions.candidate` is called as `candidate(pre, post)` (was
+    `(post, pre)`).
+  - Weights are bound by identity instead of copied: a `Weight` module passed
+    in `Synapse(weight=...)` is `conn.weight` and serves one connection (a
+    second use raises `RuntimeError`); an `nn.Parameter` is adopted as
+    `conn.weight.value` when the connection keeps the edge order and is copied
+    with a warning otherwise.
+  - `Synapse(weight=<number>, dale=True)` raises `ValueError`;
+    `Synapse(plasticity=...)` other than `None` raises `NotImplementedError`;
+    a bias tensor of the wrong shape and edge ids outside the populations in
+    `from_edges` raise at construction; `Hints` validates its fields.
+  - Planner algorithms: `"push"` (device-compacting backend, Triton on CUDA:
+    used for every call once planned, not bitwise reproducible, planned as
+    `"pull"` under `torch.use_deterministic_algorithms(True)`) is now distinct
+    from `"adaptive-push"` (reference backend: host-side packing, per-call
+    fallback to pull, cannot be captured in a CUDA graph).
+  - `conn.value_version` is derived from the in-place version counters of the
+    weight tensors (it changes on optimizer steps); `edge_table()["weight"]` is
+    detached.
+  - An uncoalesced PyTorch COO tensor that does not require grad keeps its
+    stored order and duplicates in `from_torch` / `as_sparse`.
+  - `btorch.sparse.runtime.__all__` no longer lists the modules `ops` and
+    `kernels_aten`; `kernels_aten` no longer installs process-wide warning
+    filters.
+- `DenseConn.constrain()` no longer writes through `.data`.
 - **Breaking (sparse layers):** `SparseConn`, `SparseConstrainedConn`,
   `BaseSparseConn`, `SparseBackend`, `available_sparse_backends` and the
   `sparse_backend=` argument are removed from `btorch.models.linear` without a
@@ -92,8 +155,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SparseConstrainedConn(conn, constraint)` becomes
   `SparseConnection.from_adjacency(conn, Synapse(weight=ConstrainedWeight(group=constraint)))`.
   Dale's law is now opt-in (`dale=False` by default; `enforce_dale` defaulted to
-  `True`), the `state_dict` keys changed (`indices`, `weight.*`, `receptor`,
-  `delay`), and the kernel backend is chosen by the runtime. `torch_sparse` is an
+  `True`), the `state_dict` keys changed (`indices`, `layout`, `weight.*`,
+  `receptor`, `delay`; old checkpoints are refused with a migration message),
+  and the kernel backend is chosen by the runtime. `torch_sparse` is an
   optional, explicitly selected backend only. Full table: the
   [migration section](docs/en/docs/guides/sparse_connectivity.md#migration-from-sparseconn)
   of the sparse connectivity guide. `DenseConn` and the hetersynapse helpers in

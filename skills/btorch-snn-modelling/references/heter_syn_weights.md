@@ -52,7 +52,7 @@ A typical pipeline looks like this:
 2. **Convert each group** to a sparse matrix (e.g., via `make_sparse_mat` or `make_hetersynapse_conn(return_dict=True)`).
 3. **Apply group-specific weight rules** to each sparse matrix (or generate weights separately and map them with `map_weight_to_conn`).
 4. **Stack** the per-group matrices with `stack_hetersynapse` (or use `make_hetersynapse_conn` directly if you started from a single DataFrame).
-5. **Pass the stacked matrix** to `SparseConnection.from_hetersynapse(conn, n_receptor=...)`; for group-constrained training add `Synapse(weight=ConstrainedWeight(group=constraint))`.
+5. **Pass the stacked matrix** to `SparseConnection.from_hetersynapse(conn, receptor_type_index=receptor_idx)`; for group-constrained training add `Synapse(weight=ConstrainedWeight(group=constraint))`.
 
 ## Common Pitfalls
 

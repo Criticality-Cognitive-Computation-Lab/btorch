@@ -75,7 +75,7 @@ from btorch.models.functional import (
     reset_net_state,
     set_hidden_states,
 )
-from btorch.models.linear import DenseConn
+from btorch.models.linear import Linear
 from btorch.models.neurons.lif import LIF
 from btorch.models.rnn import RecurrentNN
 from btorch.models.synapse import ExponentialPSC
@@ -91,7 +91,7 @@ def make_rsnn(**rsnn_kwargs):
     """A recurrent LIF layer: LIF neurons with a dense recurrent synapse. Extra
     kwargs (``cudagraph``, ``cpu_offload``, ``chunk_size``, ...) go to RecurrentNN."""
     neuron = LIF(n_neuron=HIDDEN, v_threshold=1.0, v_reset=0.0, tau=20.0)
-    recurrent = DenseConn(HIDDEN, HIDDEN, bias=None)  # dense recurrent weights
+    recurrent = Linear(HIDDEN, HIDDEN, bias=False)  # dense recurrent weights
     synapse = ExponentialPSC(n_neuron=HIDDEN, tau_syn=5.0, linear=recurrent)
     return RecurrentNN(
         neuron=neuron,
@@ -151,7 +151,7 @@ class SineSNN(nn.Module):
         super().__init__()
         self.fc_in = nn.Linear(1, NEURONS)
         neuron = LIF(n_neuron=NEURONS, v_threshold=1.0, v_reset=0.0, tau=20.0)
-        recurrent = DenseConn(NEURONS, NEURONS, bias=None)
+        recurrent = Linear(NEURONS, NEURONS, bias=False)
         with torch.no_grad():
             recurrent.weight.mul_(REC_GAIN)
         synapse = ExponentialPSC(n_neuron=NEURONS, tau_syn=5.0, linear=recurrent)

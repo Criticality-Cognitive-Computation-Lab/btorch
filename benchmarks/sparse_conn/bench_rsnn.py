@@ -10,7 +10,9 @@ connection differs between implementations:
 - ``new[default]``: :class:`btorch.models.connection.SparseConnection` with
   the default plan;
 - ``new[push-hint]``: the same with ``Hints(expected_density=--rate-hint)``,
-  which lets the planner choose source-driven propagation;
+  which lets the planner choose source-driven propagation (``"push"`` with
+  the Triton backend on CUDA, ``"adaptive-push"`` with the reference
+  backend; the chosen plan is recorded in the row);
 - ``dense``: :class:`btorch.models.linear.DenseConn` (up to 8,192 neurons).
 
 Two phases are timed per configuration and reported **per simulation step**:

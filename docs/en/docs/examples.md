@@ -4,10 +4,41 @@ The `examples/` directory contains production-quality scripts that demonstrate c
 
 ## `rsnn.py` — Minimal RSNN
 
-A self-contained demonstration of a recurrent spiking neural network using `GLIF3`, `AlphaPSC`, and `RecurrentNN`. It includes both a simulation loop (with raster-plot generation) and a dummy training loop.
+A self-contained demonstration of a recurrent spiking neural network using
+`GLIF3`, `AlphaPSC`, and `RecurrentNN`. The recurrent layer now uses
+`SparseConnection` by default and supplies an expected spike-density hint,
+allowing CUDA models to select the source-driven Triton push backend. Dense and
+sparse networks can be constructed from identical weights for numerical and
+performance comparisons.
+
+Run the small plotting and training demo with the default sparse connection:
+
+```bash
+PYTHONPATH=. python examples/rsnn.py
+```
+
+Compare identical dense and sparse GLIF networks on a larger CUDA workload:
+
+```bash
+PYTHONPATH=. python examples/rsnn.py --mode compare --device cuda --benchmark \
+  --num-hidden 16384 --timesteps 20 --batch-size 4 \
+  --recurrent-density 0.001 --expected-spike-density 0.015 --input-scale 6
+```
+
+The comparison checks outputs and spike agreement before timing and prints the
+runtime plan selected for the sparse recurrent connection. Reported timings are
+end-to-end wall-clock latency, including state reset and synchronized CUDA
+execution; they are not isolated sparse-kernel timings.
+
+On October 7, 2026, this command selected the Triton push backend on an RTX
+5090, produced 1.76% spike activity, matched the dense network exactly, and
+measured 23.535 ms dense versus 17.751 ms sparse (1.33x end-to-end). Results
+depend on the GPU, software versions, and network activity.
 
 **Key patterns:**
 - `functional.init_net_state` and `functional.reset_net`
+- `SparseConnection` with `Hints(expected_density=...)`
+- Dense/sparse output-equivalence and benchmark mode
 - `environ.context(dt=1.0)`
 - `update_state_names` for state recording
 - `plot_raster` and `plot_neuron_traces` from `btorch.visualisation`

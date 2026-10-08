@@ -15,7 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `btorch.models.connection`: `SparseConnection` (`from_adjacency`, `from_edges`,
   `from_hetersynapse`), `Synapse`, `EdgeWeight`, `ConstantWeight`,
   `ConstrainedWeight`; receptors and delays as edge attributes; batches of
-  networks.
+  networks. Orientations are named `"pre_post"` (default of `from_adjacency`
+  and `FromSparse`) and `"post_pre"`. Accessors `conn.pre`, `conn.post`,
+  `conn.find_edges(pre, post)`, `conn.orientation`; `Projection.weight`,
+  `edge_table()`, `to_sparse()`, `n_delay`, `n_receptor`.
+- CUDA graph capture protocol: `conn.capture_version`,
+  `conn.capture_incompatibility()`, `btorch.models.cudagraph.capture_versions`
+  / `capture_incompatibilities`.
 - `btorch.sparse.runtime`: execution layer (registered operators, backend
   registry, planner); not needed to write models. Triton pull backend
   (`csr_matvec`, `edge_grad`) as the default on CUDA when Triton is installed.
@@ -33,11 +39,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Guide: [Sparse Connectivity](guides/sparse_connectivity.md).
 
 ### Changed
+- **Breaking** (relative to earlier revisions of the unreleased connection
+  API; no aliases): orientation strings are `"pre_post"` / `"post_pre"`
+  (`"src_dst"` / `"dst_src"` are gone); `FromSparse` defaults to `"pre_post"`;
+  `conn.to_sparse()` defaults to the orientation the connection was built
+  from; `set_edges_(slots, *, pre, post, ...)` is keyword-only;
+  `HardDeepROptions.candidate` is called as `candidate(pre, post)`.
+- **Breaking:** weights are bound by identity: a `Weight` module passed in
+  `Synapse(weight=...)` is `conn.weight` (one module per connection); an
+  `nn.Parameter` is adopted as `conn.weight.value` when the edge order is
+  kept, otherwise copied with a warning. `Synapse(weight=<number>, dale=True)`
+  and `Synapse(plasticity=...)` raise.
+- **Breaking:** the planner distinguishes `"push"` (Triton on CUDA; not
+  bitwise reproducible) from `"adaptive-push"` (reference backend; cannot be
+  captured in a CUDA graph). `conn.value_version` now changes on optimizer
+  steps. `btorch.sparse.runtime.__all__` no longer lists `ops` and
+  `kernels_aten`. See the
+  [guide](guides/sparse_connectivity.md#performance-hints-and-explain).
 - **Breaking:** `SparseConn`, `SparseConstrainedConn`, `BaseSparseConn`,
   `SparseBackend`, `available_sparse_backends` and the `sparse_backend=` argument
   are removed from `btorch.models.linear` without a compatibility layer. Use
   `SparseConnection.from_adjacency(conn, Synapse(dale=...))`; Dale's law is now
-  opt-in and the `state_dict` keys changed. See the
+  opt-in and the `state_dict` keys changed; checkpoints of the removed layers
+  are refused with a migration message. See the
   [migration table](guides/sparse_connectivity.md#migration-from-sparseconn).
 - **Breaking:** a spike delivered at step `t` now affects the PSC returned at step
   `t` for every PSC type (`AlphaPSC`, `AlphaPSCBilleh`, `DualExponentialPSC`
