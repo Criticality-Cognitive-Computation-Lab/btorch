@@ -179,9 +179,12 @@ def wait_for_quiet(device: str, factor: float = 2.0, max_wait: float = 20.0) -> 
 def gpu_state() -> dict:
     """Load of the benchmark GPU as seen by ``nvidia-smi`` and by PyTorch.
 
-    ``other_mb`` is memory held by other processes; ``util`` the device
-    utilisation in percent just before the measurement (it includes other
-    jobs).
+    ``other_mb`` is device memory outside the PyTorch pool of this process
+    (``total - free - memory_reserved``): an upper bound of what other
+    processes hold, because it also contains the CUDA context of this process
+    and anything it allocated outside the PyTorch allocator. ``util`` is the
+    utilisation of the whole device in percent just before the measurement;
+    it includes other jobs and the preceding work of this process.
     """
     if not torch.cuda.is_available():
         return {}
@@ -206,6 +209,7 @@ def gpu_state() -> dict:
             if str(uuid) in gpu_uuid:
                 state["util"] = float(util)
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        # Monitoring is best-effort and must not invalidate benchmark results.
         pass
     return state
 
@@ -391,6 +395,7 @@ def env_info(device: str) -> dict:
                     info["cpu"] = line.split(":", 1)[1].strip()
                     break
     except OSError:
+        # ``/proc/cpuinfo`` is absent on non-Linux benchmark hosts.
         pass
     try:
         import triton
