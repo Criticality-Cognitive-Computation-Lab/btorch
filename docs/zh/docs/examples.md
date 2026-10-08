@@ -62,6 +62,10 @@
 - API: [`btorch.models.history`](api/models.md)
 - 测试: [`tests/connectome/test_delay_expansion.py`](https://github.com/Criticality-Cognitive-Computation-Lab/btorch/blob/main/tests/connectome/test_delay_expansion.py)
 
+## 异构 E/I 完整工作流
+
+[异构多受体 E/I RSNN 教程](tutorials/heterogeneous_ei_rsnn.md)展示语义受体边、受体特异 PSC、Dale 约束、训练循环和通道检查。
+
 ## 测试即示例
 
 许多 `tests/` 文件包含简洁、经过验证的使用模式，非常适合作为文档：

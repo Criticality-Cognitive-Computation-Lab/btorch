@@ -81,6 +81,7 @@ nav:
 - Tutorials:
   - tutorials/building_rsnn.md
   - tutorials/training.md
+  - tutorials/heterogeneous_ei_rsnn.md
   - tutorials/mixed_neurons.md
 - Guides:
   - guides/configuration.md
