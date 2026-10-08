@@ -271,6 +271,10 @@ def compute_gain_stability_sensitivity(
 
     # Assuming model is Brain, model.brain is RecurrentNN, model.brain.synapse
     # is Synapse and model.brain.synapse.linear is the layer.
+    model.eval()
+    model.to(device)
+
+    # Resolved after the device move: moving a module replaces its buffers.
     try:
         weight = model.brain.synapse.linear.weight
     except AttributeError as e:
@@ -283,9 +287,6 @@ def compute_gain_stability_sensitivity(
     if not isinstance(weight, torch.Tensor):
         raise AttributeError("model.brain.synapse.linear has no scalable weight tensor")
     original_weight = weight.detach().clone()
-
-    model.eval()
-    model.to(device)
 
     try:
         batch = next(iter(dataloader))

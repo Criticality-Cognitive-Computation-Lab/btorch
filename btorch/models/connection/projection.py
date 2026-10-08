@@ -7,7 +7,7 @@ from typing import Any, Literal
 import torch
 from torch import Tensor, nn
 
-from ...sparse import Hints
+from ...sparse import Hints, Sparse
 from .base import Connection, StructuredConnection
 from .rule import ConnectionRule
 from .sparse import SparseConnection
@@ -106,6 +106,9 @@ class Projection(nn.Module):
             and fixed_scalar
             and synapse.delay is None
             and synapse.receptor is None
+            and synapse.n_delay in (None, 1)
+            and synapse.n_receptor in (None, 1)
+            and not synapse.dale
         )
         operator = (
             rule.as_operator(self.n_pre, self.n_post, dtype=dtype, device=device)
@@ -130,7 +133,40 @@ class Projection(nn.Module):
             hints=hints,
             device=device,
             dtype=dtype,
+            _scipy_origin=getattr(rule, "from_scipy", False),
         )
+
+    @property
+    def n_delay(self) -> int:
+        """Number of delay bins of the realised connection (1 if none)."""
+        return getattr(self.connection, "n_delay", 1)
+
+    @property
+    def n_receptor(self) -> int:
+        """Number of receptor channels of the realised connection."""
+        return getattr(self.connection, "n_receptor", 1)
+
+    @property
+    def weight(self) -> nn.Module:
+        """Weight module of the realised sparse connection."""
+        return self._sparse("weight").weight
+
+    def edge_table(self) -> dict[str, Tensor]:
+        """Semantic edge list of the realised sparse connection."""
+        return self._sparse("edge_table").edge_table()
+
+    def to_sparse(self, orientation: str | None = None) -> Sparse:
+        """Effective matrix of the realised sparse connection."""
+        return self._sparse("to_sparse").to_sparse(orientation)
+
+    def _sparse(self, what: str) -> SparseConnection:
+        if not isinstance(self.connection, SparseConnection):
+            raise AttributeError(
+                f"`{what}` needs explicit edges, but this projection is realised "
+                f"as a {type(self.connection).__name__}; build it with "
+                "realization='sparse'."
+            )
+        return self.connection
 
     @property
     def in_features(self) -> int:
@@ -144,6 +180,10 @@ class Projection(nn.Module):
         """Map ``[..., in_features]`` activity to ``[..., out_features]``
         input."""
         return self.connection(x)
+
+    def explain(self, x: Tensor | None = None) -> str:
+        """Describe how the realised connection is executed."""
+        return self.connection.explain(x)
 
     def extra_repr(self) -> str:
         return (

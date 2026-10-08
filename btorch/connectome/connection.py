@@ -881,12 +881,17 @@ def make_hetersynapse_constrained_conn(
 
     Returns:
         Tuple of (conn_matrix, constraint_matrix, receptor_type_index).
+        Both matrices are in the ``"pre_post"`` orientation (rows are
+        sources) with columns expanded to ``post * n_receptor + receptor``.
         Can be used directly with
-        ``SparseConnection.from_adjacency(conn,
-        Synapse(weight=ConstrainedWeight(group=constraint)))`` (expanded
-        layout) or ``SparseConnection.from_hetersynapse(conn,
-        Synapse(weight=ConstrainedWeight(group=constraint)),
-        n_receptor=len(receptor_idx))`` (per-edge receptor attributes).
+        ``SparseConnection.from_adjacency(conn_matrix,
+        Synapse(weight=ConstrainedWeight(group=constraint_matrix)))``
+        (expanded layout) or ``SparseConnection.from_hetersynapse(
+        conn_matrix, Synapse(weight=ConstrainedWeight(
+        group=constraint_matrix)),
+        receptor_type_index=receptor_type_index)`` (per-edge receptor
+        attributes). The ``ConstrainedWeight`` module becomes the weight
+        module of that connection; create a new one per connection.
     """
     conn_mat, receptor_idx = make_hetersynapse_conn(
         neurons,

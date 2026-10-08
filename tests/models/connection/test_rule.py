@@ -582,7 +582,8 @@ def test_from_sparse_post_pre_is_the_standard_operator(kind):
     """
     post, pre, weight, (n_post, n_pre) = _asymmetric_matrix()
     A = _as_library(kind, post, pre, weight, (n_post, n_pre))
-    rule = FromSparse(A)  # post_pre is the default
+    # The operator layout has to be named: the default is "pre_post".
+    rule = FromSparse(A, orientation="post_pre")
     got_pre, got_post = rule.edges(n_pre, n_post)
     _check_edge_list(got_pre, got_post, n_pre, n_post)
     assert rule.expected_nnz(n_pre, n_post) == len(weight)
@@ -612,6 +613,12 @@ def test_from_sparse_pre_post_is_the_connectome_convention(kind):
     reference = torch.zeros(n_post, n_pre, dtype=torch.float64)
     reference[post, pre] = torch.tensor(weight)
     torch.testing.assert_close(_weights(rule, n_pre, n_post), reference)
+    # "pre_post" is also the default, the same as
+    # ``SparseConnection.from_adjacency``: a connectome matrix needs no
+    # argument in either place.
+    default = FromSparse(C)
+    assert default.orientation == "pre_post"
+    torch.testing.assert_close(_weights(default, n_pre, n_post), reference)
 
     # The connectome convention in one line: x @ C == W @ x.
     x = torch.arange(1.0, n_pre + 1, dtype=torch.float64)
@@ -676,6 +683,9 @@ def test_from_sparse_square_matrix_orientation_changes_the_result():
     # As a connectome matrix, A[0, 2] is "source 0 -> target 2".
     pre, post = FromSparse(A, orientation="pre_post").edges(3, 3)
     assert (pre.tolist(), post.tolist()) == ([0], [2])
+    # Without the argument the matrix is read as a connectome matrix.
+    pre, post = FromSparse(A).edges(3, 3)
+    assert (pre.tolist(), post.tolist()) == ([0], [2])
 
 
 def test_from_sparse_keeps_values_differentiable_and_validates():
@@ -683,7 +693,7 @@ def test_from_sparse_keeps_values_differentiable_and_validates():
     weights initialised from a matrix can be trained."""
     values = torch.tensor([1.0, 2.0], requires_grad=True)
     A = sparse.from_edges(torch.tensor([0, 1]), torch.tensor([2, 0]), values, (2, 3))
-    rule = FromSparse(A)
+    rule = FromSparse(A, orientation="post_pre")  # A is (n_post=2, n_pre=3)
     (grad,) = torch.autograd.grad(rule.values(3, 2).sum(), values)
     assert grad.tolist() == [1.0, 1.0]
 

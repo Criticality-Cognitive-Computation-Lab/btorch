@@ -26,9 +26,10 @@ References:
 from __future__ import annotations
 
 import math
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 from torch import Tensor, nn
@@ -47,17 +48,48 @@ class HardDeepROptions:
     """Options of :class:`HardDeepR`.
 
     Args:
-        optimizer_state: What happens to the optimizer state of a rewired
-            slot. ``"reset"`` zeroes the slot's entry in every per-parameter
-            state tensor that has the parameter's shape (Adam ``exp_avg``,
-            ``exp_avg_sq``, ``max_exp_avg_sq``, SGD ``momentum_buffer``,
-            RMSprop ``square_avg``, ...), so the new connection does not
-            inherit the moments of the removed one. ``"keep"`` leaves the
-            state untouched (the slot's history is transferred to the new
-            connection). Scalar state such as Adam's ``step`` is never
-            changed, so bias correction of a reset slot follows the global
-            step count. State that is not a tensor of the parameter's shape
-            (e.g. L-BFGS history) is not handled.
+        optimizer_state: What happens to the per-slot optimizer state of a
+            rewired slot, i.e. to its entry in every state tensor of the
+            attached optimizer that has the parameter's shape. Scalar state
+            (Adam's global ``step``) is never changed, which is what makes
+            the choice matter:
+
+            - ``"neutral"`` (default): first-moment-like state (``exp_avg``,
+              ``momentum_buffer``, ``grad_avg``) is zeroed, so the new
+              connection inherits no direction from the removed one;
+              second-moment-like state (``exp_avg_sq``, ``max_exp_avg_sq``,
+              ``square_avg``, Adagrad ``sum``, ``exp_inf``, ``acc_delta``) is
+              set to the mean over the slots that are *not* dormant in this
+              update (over all slots if every slot is), so the per-gradient
+              step size of the new connection equals that of the population.
+              With a gradient of typical magnitude the first step is
+              :math:`\\approx(1-\\beta_1)\\eta` for Adam (the usual momentum
+              ramp) and :math:`\\approx\\eta` for RMSprop. State tensors with
+              another name are zeroed.
+            - ``"reset"``: every per-slot state entry is zeroed. Because
+              ``step`` is global, Adam's bias correction no longer
+              compensates the empty second moment: at step :math:`t` the
+              first update of a reset slot is :math:`\\eta\\,
+              \\frac{1-\\beta_1}{1-\\beta_1^t}\\sqrt{\\frac{1-\\beta_2^t}
+              {1-\\beta_2}}`, which grows to :math:`\\eta(1-\\beta_1) /
+              \\sqrt{1-\\beta_2} \\approx 3.2\\eta` with the default betas
+              (:math:`2.5\\eta` at :math:`t=1000`) against
+              :math:`\\approx\\eta` for an established slot. Optimizers
+              without bias correction are hit harder: RMSprop takes a first
+              step of :math:`\\eta/\\sqrt{1-\\alpha} = 10\\eta`
+              (``alpha=0.99``), and Adagrad a step of the full initial
+              :math:`\\eta`. Exact for plain momentum SGD.
+            - ``"keep"``: the state is left untouched; the new connection
+              inherits the moments (including the momentum direction) of the
+              removed one.
+
+            ``"neutral"`` is the default because it is the only policy under
+            which a new connection neither inherits a stale direction nor
+            takes a larger step than the established connections; a new
+            connection starts at ``init`` close to zero, so an inflated first
+            step in the wrong direction makes it dormant again immediately.
+            State that is not a tensor of the parameter's shape (e.g. L-BFGS
+            history) is not handled.
         every: Run the structural update on every ``every``-th optimizer
             step. ``l1`` and ``noise`` are applied on every step.
         init: Initial :math:`\\theta` of a newly activated connection. The
@@ -83,16 +115,20 @@ class HardDeepROptions:
             law and ``"random"`` without.
         allow_autapses: Allow new connections with ``post == pre`` (only
             meaningful for recurrent connections, ``n_post == n_pre``).
-        candidate: Optional ``candidate(post, pre) -> bool mask`` restricting
+        candidate: Optional ``candidate(pre, post) -> bool mask`` restricting
             where new connections may appear, e.g.
-            ``lambda post, pre: is_excitatory[pre]``. Both arguments are
+            ``lambda pre, post: is_excitatory[pre]``. Both arguments are
             ``long`` tensors of the same (arbitrary) shape on the
-            connection's device. Sampling is by rejection, so a very
-            restrictive mask is slow.
-        max_tries: Rejection-sampling rounds before giving up.
+            connection's device. It is evaluated at every update, so it may
+            depend on training progress.
+        max_tries: Rejection-sampling rounds per update. Only relevant when
+            the candidate universe is too large to enumerate (see
+            :class:`HardDeepR`): dormant slots that found no position within
+            ``max_tries`` rounds stay dormant and are retried at the next
+            update; nothing is raised.
     """
 
-    optimizer_state: Literal["reset", "keep"] = "reset"
+    optimizer_state: Literal["neutral", "reset", "keep"] = "neutral"
     every: int = 1
     init: float = 1e-6
     l1: float = 0.0
@@ -103,13 +139,15 @@ class HardDeepROptions:
     max_tries: int = 100
 
     def __post_init__(self) -> None:
-        if self.optimizer_state not in ("reset", "keep"):
+        if self.optimizer_state not in ("neutral", "reset", "keep"):
             raise ValueError(
-                "optimizer_state must be 'reset' or 'keep', got "
+                "optimizer_state must be 'neutral', 'reset' or 'keep', got "
                 f"{self.optimizer_state!r}."
             )
         if self.every < 1:
             raise ValueError(f"every must be >= 1, got {self.every}.")
+        if self.max_tries < 0:
+            raise ValueError(f"max_tries must be >= 0, got {self.max_tries}.")
         if self.init < 0 or self.l1 < 0 or self.noise < 0:
             raise ValueError("init, l1 and noise must be non-negative.")
         if not isinstance(self.sign, Tensor) and self.sign not in (
@@ -125,6 +163,18 @@ class HardDeepROptions:
 
 # Candidates drawn per vacant slot in one rejection round.
 _OVERSAMPLE = 4
+# Largest candidate universe (n_post * n_receptor * n_pre * n_delay) whose
+# free positions are enumerated exactly: one bool and one long per pair.
+_ENUMERATE_MAX = 1 << 22
+# Enumerate right away (skip rejection sampling) when fewer than
+# ``_SCARCE * n_dormant`` free positions exist: collisions between the slots
+# and with existing edges then dominate the rejection rounds.
+_SCARCE = 16
+# Per-slot optimizer state by role (see ``HardDeepROptions.optimizer_state``).
+_FIRST_MOMENT = frozenset({"exp_avg", "momentum_buffer", "grad_avg"})
+_SECOND_MOMENT = frozenset(
+    {"exp_avg_sq", "max_exp_avg_sq", "square_avg", "sum", "exp_inf", "acc_delta"}
+)
 
 
 class HardDeepR:
@@ -136,9 +186,13 @@ class HardDeepR:
     :math:`\\theta_k \\le 0` are *dormant*: their connection is removed and
     the slot is re-used for a new connection at a random currently
     unconnected position, with :math:`\\theta_k` = ``init``. The number of
-    connections therefore stays exactly ``K = conn.nnz``; no tensor changes
-    shape and the weight parameter object is never replaced, so optimizers,
-    compiled graphs and CUDA graphs stay valid.
+    edge slots therefore stays exactly ``K = conn.nnz``; no tensor changes
+    shape and the weight parameter object is never replaced, so optimizers
+    and ``torch.compile``d modules stay valid. A CUDA graph captured around
+    the connection records the wiring it was captured with and has to be
+    captured again after an update that moved edges
+    (``RecurrentNN(cudagraph=True)`` does this by itself; see
+    ``SparseConnection.capture_version``).
 
     .. math::
         \\theta_k \\leftarrow \\theta_k - \\eta \\frac{\\partial E}{\\partial
@@ -156,12 +210,9 @@ class HardDeepR:
     - Without Dale's law the controller tracks :math:`s_k` itself: the sign
       the weight had when the slot was last (re)activated (at construction:
       the sign of the initial weight). A weight is dormant once it reached or
-      crossed zero relative to that sign. This buffer is not checkpointed;
-      with ``init > 0`` (the default) it is recoverable as ``sign(value)``
-      because every active slot then has :math:`\\theta > 0`. Call
-      :meth:`sync` after loading a checkpoint into the connection. With
-      ``init=0`` slots activated by the last update have a zero weight and
-      are simply re-drawn after such a reload.
+      crossed zero relative to that sign. This buffer is part of the
+      controller's :meth:`state_dict`. :meth:`sync` re-derives it from the
+      current weights after editing weights or edges by hand.
 
     The dormancy test is :math:`\\theta \\le 0` (the paper uses
     :math:`\\theta < 0` with new connections at exactly zero) so that weights
@@ -172,13 +223,55 @@ class HardDeepR:
     wrong sign for up to ``every - 1`` steps unless the training loop also
     applies the Dale projection (``constrain_net``), which is compatible.
 
-    **New positions** are drawn uniformly from the pairs that are not
-    connected when the update starts (the positions being vacated in this
-    update become eligible at the next one, so a rewired slot always moves),
-    without duplicates. With receptors / delays a slot keeps its receptor and
-    delay, and "connected" refers to the full ``(post, pre, receptor,
-    delay)`` tuple. Sampling is by rejection against the sorted keys of the
-    existing edges; no dense ``n_post x n_pre`` structure is built.
+    **New positions** are drawn uniformly, without duplicates, from the
+    admissible pairs (``allow_autapses``, ``candidate``) that are not
+    connected when the update starts. Positions vacated in the same update
+    are deliberately *not* eligible: they become free at the next update.
+    A rewired slot therefore always moves (a connection that was just
+    pruned cannot be re-created in place by the same update), and a slot
+    that could not be placed can simply stay where it is without ever
+    colliding with a new connection. With receptors / delays a slot keeps
+    its receptor and delay, and "connected" refers to the full ``(post,
+    pre, receptor, delay)`` tuple.
+
+    Positions are found by rejection sampling against the sorted keys of the
+    existing edges, without building a dense ``n_post x n_pre`` structure.
+    When unconnected positions are scarce (fewer than 16 per dormant slot, or
+    less than 1/8 of all pairs) or rejection sampling did not finish within
+    ``max_tries`` rounds, the free admissible positions are enumerated
+    exactly instead, provided the universe ``n_post * n_receptor * n_pre *
+    n_delay`` has at most :math:`2^{22}` pairs. Both paths sample exactly
+    uniformly. The shortcut looks at unconnected positions only: a
+    restrictive ``candidate`` on a sparse layer still costs ``max_tries``
+    rejection rounds per update before the enumeration takes over.
+
+    **Unplaced slots.** If there are more dormant slots than free admissible
+    positions (small or nearly dense layers, a restrictive ``candidate``), or
+    the universe is too large to enumerate and rejection sampling ran out of
+    rounds, the update places as many slots as it can and never raises. The
+    remaining slots keep their position, are held at a weight of exactly zero
+    (also against gradient, ``l1`` and ``noise`` updates, on every hooked
+    optimizer step) so they contribute nothing, and are retried at every
+    following update. Their number in the last update is :attr:`n_unplaced`;
+    one :class:`RuntimeWarning` per controller reports the first occurrence.
+
+    **Optimizers.** One controller follows one optimizer. All per-parameter
+    state tensors of the parameter's shape are handled, which covers the
+    single-tensor, ``foreach`` and ``fused`` implementations (they share the
+    state layout). If the weight parameter is held by a second optimizer,
+    that optimizer's state is not touched by the hook (its moments of a
+    rewired slot are kept); a second controller for the same weights cannot
+    be attached to the same optimizer. A step in which the weight has no
+    gradient (``.grad is None``) is skipped by the optimizer and, like weight
+    decay, by ``l1`` and ``noise``; the structural update still runs on
+    schedule.
+
+    **Checkpointing.** Save :meth:`state_dict` together with the state of the
+    connection and of the optimizer. To resume, rebuild the connection, the
+    optimizer and the controller (same options; a generator if one was used),
+    load the connection and the optimizer, then call
+    :meth:`load_state_dict`. With a generator the resumed run reproduces the
+    uninterrupted one exactly.
 
     Construct the controller *before* ``torch.compile(conn)``: it calls
     :meth:`SparseConnection.enable_rewiring`, which makes the traced forward
@@ -191,7 +284,12 @@ class HardDeepR:
         generator: Random generator for reproducible rewiring. Samples are
             drawn on the generator's device and moved to the connection's
             device. ``None`` uses the global generator of the connection's
-            device.
+            device (whose state is then not part of :meth:`state_dict`).
+
+    Attributes:
+        n_steps: Number of hooked optimizer steps so far.
+        n_rewired: Total number of slots moved to a new position.
+        n_unplaced: Dormant slots the last update could not place.
 
     Raises:
         TypeError: The weight is not a trainable ``EdgeWeight``.
@@ -221,6 +319,10 @@ class HardDeepR:
         *,
         generator: torch.Generator | None = None,
     ):
+        # A Projection is a thin front end: rewire the connection it built.
+        conn = (
+            getattr(conn, "connection", conn) if not hasattr(conn, "indices") else conn
+        )
         weight = conn.weight
         if not isinstance(weight, EdgeWeight):
             raise TypeError(
@@ -248,6 +350,8 @@ class HardDeepR:
         self.generator = generator
         self.n_steps = 0
         self.n_rewired = 0
+        self.n_unplaced = 0
+        self._warned = False
         self._optimizer: Optimizer | None = None
         self._handle: RemovableHandle | None = None
 
@@ -255,6 +359,8 @@ class HardDeepR:
         if n_free <= 0:
             raise ValueError("The connection is dense: there is nowhere to rewire to.")
 
+        # [K] slots that are dormant but could not be placed yet.
+        self._unplaced = torch.zeros(conn.nnz, dtype=torch.bool)
         self._slot_sign: Tensor | None = None
         self.sync()
         self._pre_sign = self._make_pre_sign()
@@ -272,8 +378,9 @@ class HardDeepR:
         """Re-derive the reference signs from the current weights.
 
         Only relevant without Dale's law, where the controller tracks the
-        sign of every slot: call it after loading a checkpoint into the
-        connection or after editing its weights or edges by hand.
+        sign of every slot: call it after editing the connection's weights
+        or edges by hand. Not needed after :meth:`load_state_dict`, which
+        restores the tracked signs.
         """
         if not self._dale:
             self._slot_sign = torch.sign(self.conn.weight.value.detach())
@@ -285,6 +392,11 @@ class HardDeepR:
         value = self.conn.weight.value
         self._slot_sign = self._slot_sign.to(device=value.device, dtype=value.dtype)
         return self._slot_sign
+
+    def _unplaced_mask(self) -> Tensor:
+        """``[K]`` bool mask of the unplaced slots (a live buffer)."""
+        self._unplaced = self._unplaced.to(self.conn.weight.value.device)
+        return self._unplaced
 
     def _make_pre_sign(self) -> Tensor | None:
         """``[n_pre]`` sign of every source neuron, or ``None`` (random)."""
@@ -313,6 +425,12 @@ class HardDeepR:
             return torch.randint(high, shape, device=device)
         return torch.randint(high, shape, generator=g, device=g.device).to(device)
 
+    def _randperm(self, n: int, device) -> Tensor:
+        g = self.generator
+        if g is None:
+            return torch.randperm(n, device=device)
+        return torch.randperm(n, generator=g, device=g.device).to(device)
+
     def _randn(self, n: int, like: Tensor) -> Tensor:
         g = self.generator
         if g is None:
@@ -324,48 +442,66 @@ class HardDeepR:
     def _rand_sign(self, n: int, device) -> Tensor:
         return self._randint(2, (n,), device).float() * 2 - 1
 
-    def _sample(self, slots: Tensor) -> tuple[Tensor, Tensor]:
-        """Draw new ``(post, pre)`` for ``slots``.
+    def _sample(self, slots: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Draw new ``(post, pre)`` for the dormant ``slots``.
 
-        Every vacant slot draws i.i.d. uniform pairs and takes the first
-        one that is allowed and not occupied; ties between slots that
-        picked the same position are resolved for one of them and the
-        others redraw. Rejecting occupied / disallowed / already taken
-        positions from uniform draws is uniform sampling without
-        replacement from the allowed unconnected positions.
+        Rejection sampling: every vacant slot draws i.i.d. uniform pairs and
+        takes the first one that is allowed and not occupied; ties between
+        slots that picked the same position are resolved for one of them and
+        the others redraw. Rejecting occupied / disallowed / already taken
+        positions from uniform draws is uniform sampling without replacement
+        from the allowed unconnected positions. Slots still vacant afterwards
+        are served from an exact enumeration of the remaining free positions
+        when the universe is small enough, which preserves uniformity.
+
+        Returns:
+            ``(post, pre, placed)``: new coordinates and a bool mask of the
+            slots that found a position (coordinates of the others are
+            meaningless).
         """
         conn, opt = self.conn, self.options
         device = conn.indices.device
+        n = slots.shape[0]
         n_in = conn._lowered_shape[1]
         n_r, n_d = conn.n_receptor, conn.n_delay
         row, col = conn._lowered_edges()
         # Every current edge is forbidden, including the ones being removed.
-        taken = torch.sort(row * n_in + col).values
+        taken = torch.sort(row.long() * n_in + col.long()).values
 
-        def offset(attr: Tensor | None, n: int) -> Tensor | int:
-            # A slot keeps its receptor / delay; an attribute that is absent
-            # although the axis exists means channel 0 (see _lowered_edges).
-            return attr[slots] if attr is not None and n > 1 else 0
+        # A slot keeps its receptor / delay; an attribute that is absent
+        # although the axis exists means channel 0 (see _lowered_edges).
+        rec = dly = torch.zeros(n, dtype=torch.long, device=device)
+        if conn.receptor is not None and n_r > 1:
+            rec = conn.receptor[slots].long()
+        if conn.delay is not None and n_d > 1:
+            dly = conn.delay[slots].long()
 
-        rec, dly = offset(conn.receptor, n_r), offset(conn.delay, n_d)
-        new_post = torch.empty_like(slots)
-        new_pre = torch.empty_like(slots)
-        pending = torch.arange(slots.shape[0], device=device)
-        for _ in range(opt.max_tries):
+        new_post = torch.zeros(n, dtype=torch.long, device=device)
+        new_pre = torch.zeros(n, dtype=torch.long, device=device)
+        placed = torch.zeros(n, dtype=torch.bool, device=device)
+        pending = torch.arange(n, device=device)
+
+        universe = conn.n_post * conn.n_pre
+        enumerable = universe * n_r * n_d <= _ENUMERATE_MAX
+        # Free positions per (receptor, delay) channel, before restrictions.
+        n_free = (universe * n_r * n_d - taken.shape[0]) // (n_r * n_d)
+        scarce = n_free < _SCARCE * n or n_free * 2 * _OVERSAMPLE < universe
+        rounds = 0 if enumerable and scarce else opt.max_tries
+        for _ in range(rounds):
             m = pending.shape[0]
             if m == 0:
-                return new_post, new_pre
+                break
             post = self._randint(conn.n_post, (m, _OVERSAMPLE), device)
             pre = self._randint(conn.n_pre, (m, _OVERSAMPLE), device)
-            p_rec = rec[pending, None] if isinstance(rec, Tensor) else rec
-            p_dly = dly[pending, None] if isinstance(dly, Tensor) else dly
-            key = (post * n_r + p_rec) * n_in + (pre * n_d + p_dly)
+            key = (post * n_r + rec[pending, None]) * n_in + (
+                pre * n_d + dly[pending, None]
+            )
             pos = torch.searchsorted(taken, key).clamp(max=taken.shape[0] - 1)
             ok = taken[pos] != key
             if not opt.allow_autapses:
                 ok &= post != pre
             if opt.candidate is not None:
-                ok &= opt.candidate(post, pre).to(device=device, dtype=torch.bool)
+                ok &= opt.candidate(pre, post).to(device=device, dtype=torch.bool)
             # First acceptable draw of every slot.
             first = ok.to(torch.uint8).argmax(dim=1, keepdim=True)
             found = ok.any(dim=1)
@@ -380,33 +516,72 @@ class HardDeepR:
             win = found_idx[order[unique]]
             new_post[pending[win]] = post[win]
             new_pre[pending[win]] = pre[win]
+            placed[pending[win]] = True
             taken = torch.sort(torch.cat([taken, key[win]])).values
             keep = torch.ones(m, dtype=torch.bool, device=device)
             keep[win] = False
             pending = pending[keep]
-        if pending.shape[0]:
-            raise RuntimeError(
-                f"HardDeepR could not find unconnected positions for "
-                f"{pending.shape[0]} of {slots.shape[0]} dormant slots in "
-                f"{opt.max_tries} rounds; the connection is (nearly) full or "
-                "the candidate restriction leaves too few free positions."
-            )
-        return new_post, new_pre
+
+        if pending.shape[0] and enumerable:
+            # Exact fallback: list the free admissible positions of every
+            # (receptor, delay) channel that still has vacant slots.
+            flat = torch.arange(universe, device=device)
+            post, pre = flat // conn.n_pre, flat % conn.n_pre
+            allowed = torch.ones(universe, dtype=torch.bool, device=device)
+            if not opt.allow_autapses:
+                allowed &= post != pre
+            if opt.candidate is not None:
+                allowed &= opt.candidate(pre, post).to(device=device, dtype=torch.bool)
+            t_row, t_col = taken // n_in, taken % n_in
+            t_channel = (t_row % n_r) * n_d + t_col % n_d
+            t_flat = (t_row // n_r) * conn.n_pre + t_col // n_d
+            channel = rec[pending] * n_d + dly[pending]
+            for c in channel.unique().tolist():
+                members = pending[channel == c]
+                free = allowed.clone()
+                free[t_flat[t_channel == c]] = False
+                free = free.nonzero()[:, 0]
+                m = min(members.shape[0], free.shape[0])
+                if m == 0:
+                    continue
+                pick = free[self._randperm(free.shape[0], device)[:m]]
+                new_post[members[:m]] = post[pick]
+                new_pre[members[:m]] = pre[pick]
+                placed[members[:m]] = True
+        return new_post, new_pre, placed
 
     # -------------------------------------------------------------- update
     @torch.no_grad()
     def dormant_slots(self) -> Tensor:
-        """Edge slots whose connection is dormant (``theta <= 0``)."""
+        """Edge slots whose connection is dormant.
+
+        These are the slots with ``theta <= 0`` plus the slots a previous
+        update could not place (they stay dormant whatever the optimizer did
+        to their weight in the meantime).
+        """
         theta = self.conn.weight.value * self._signs()
-        return (theta <= 0).nonzero()[:, 0]
+        return ((theta <= 0) | self._unplaced_mask()).nonzero()[:, 0]
 
     @torch.no_grad()
     def step(self, optimizer: Optimizer | None = None) -> int:
         """Run one structural update.
 
         Called automatically after ``optimizer.step()`` once attached; call
-        it manually for custom schedules. ``l1`` and ``noise`` are *not*
-        applied here, only by the optimizer hook.
+        it manually for custom schedules. This is only the structural part of
+        Deep R. ``l1`` and ``noise`` are *not* applied here: they are terms
+        of the per-optimizer-step parameter update, scaled by the learning
+        rate of that step, so tying them to a manual structural schedule
+        would change their strength with the schedule. A manual loop that
+        wants them calls :meth:`regularize` after each ``optimizer.step()``;
+        the optimizer hook is exactly ``regularize(optimizer)`` followed, on
+        every ``every``-th step, by ``step(optimizer)``.
+
+        Dormant slots that cannot be placed are set to zero and retried at
+        the next update (see the class documentation); nothing is raised.
+        Only the optimizer hook re-zeroes them after every optimizer step: in
+        a manual loop without :meth:`attach`, call ``step()`` after every
+        optimizer step while :attr:`n_unplaced` is non-zero, otherwise the
+        gradient moves their weight until the next call.
 
         Args:
             optimizer: Optimizer whose state follows ``optimizer_state``.
@@ -414,15 +589,20 @@ class HardDeepR:
                 state is touched.
 
         Returns:
-            Number of rewired slots.
+            Number of rewired (placed) slots.
         """
         conn, opt = self.conn, self.options
         weight = conn.weight
+        unplaced = self._unplaced_mask()
         slots = self.dormant_slots()
-        n = int(slots.shape[0])
-        if n == 0:
+        if slots.shape[0] == 0:
+            self.n_unplaced = 0
             return 0
-        post, pre = self._sample(slots)
+        post, pre, placed = self._sample(slots)
+        moved, waiting = slots[placed], slots[~placed]
+        post, pre = post[placed], pre[placed]
+        n = int(moved.shape[0])
+
         if self._pre_sign is None:
             sign = self._rand_sign(n, slots.device)
         else:
@@ -430,33 +610,92 @@ class HardDeepR:
             sign = self._pre_sign[pre]
         sign = sign.to(weight.value.dtype)
 
-        conn.set_edges_(slots, post, pre)
-        weight.reset_slots(slots, sign * opt.init, sign)
+        # Both calls are no-ops for an empty slot list.
+        conn.set_edges_(moved, pre=pre, post=post)
+        weight.reset_slots(moved, sign * opt.init, sign)
         if not self._dale:
-            self._signs()[slots] = sign
+            self._signs()[moved] = sign
+        # Slots without a new position stay where they are, with a weight of
+        # exactly zero and their old reference sign.
+        weight.reset_slots(waiting, 0.0)
+        unplaced.fill_(False)
+        unplaced[waiting] = True
 
         if optimizer is None:
             optimizer = self._optimizer
-        if optimizer is not None and opt.optimizer_state == "reset":
-            param = weight.value
-            for state in optimizer.state.get(param, {}).values():
-                if isinstance(state, Tensor) and state.shape == param.shape:
-                    state[slots] = 0
+        if optimizer is not None and n:
+            self._reset_optimizer_state(optimizer, moved, slots)
+
         self.n_rewired += n
+        self.n_unplaced = int(waiting.shape[0])
+        if self.n_unplaced and not self._warned:
+            self._warned = True
+            warnings.warn(
+                f"HardDeepR could not place {self.n_unplaced} of "
+                f"{slots.shape[0]} dormant slots: the connection is (nearly) "
+                "full or the candidate restriction leaves too few free "
+                "positions. They stay dormant (weight zero) and are retried at "
+                "every update; see `n_unplaced`. This warning is shown once "
+                "per controller.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return n
 
+    def _reset_optimizer_state(
+        self, optimizer: Optimizer, moved: Tensor, dormant: Tensor
+    ) -> None:
+        """Apply ``optimizer_state`` to the state of the ``moved`` slots.
+
+        ``dormant`` (a superset of ``moved``) is excluded from the population
+        statistics of the ``"neutral"`` policy.
+        """
+        policy = self.options.optimizer_state
+        if policy == "keep":
+            return
+        param = self.conn.weight.value
+        alive = torch.ones(param.shape[0], dtype=torch.bool, device=param.device)
+        alive[dormant] = False
+        for name, state in optimizer.state.get(param, {}).items():
+            if not isinstance(state, Tensor) or state.shape != param.shape:
+                continue
+            if policy == "neutral" and name in _SECOND_MOMENT:
+                # No established slot left: fall back to all slots.
+                state[moved] = state[alive].mean() if alive.any() else state.mean()
+            else:
+                state[moved] = 0
+
     @torch.no_grad()
-    def _regularize(self, optimizer: Optimizer) -> None:
-        """L1 shrink and random walk of theta (the non-gradient Deep R
-        terms)."""
+    def regularize(self, optimizer: Optimizer | None = None) -> None:
+        """Apply the L1 shrink and the random walk of theta once.
+
+        These are the non-gradient terms of the Deep R update of one
+        optimizer step. The optimizer hook calls this after every
+        ``optimizer.step()`` in which the weight had a gradient; call it
+        yourself only in a manual loop without :meth:`attach`. Unplaced slots
+        are not changed.
+
+        Args:
+            optimizer: Optimizer that provides the learning rate of the
+                weight's parameter group. Defaults to the attached optimizer.
+
+        Raises:
+            ValueError: No optimizer, or it does not hold the weights.
+        """
         opt = self.options
         if opt.l1 == 0 and opt.noise == 0:
             return
+        if optimizer is None:
+            optimizer = self._optimizer
+        if optimizer is None:
+            raise ValueError("regularize() needs an optimizer for the learning rate.")
         value = self.conn.weight.value
         lr = float(self._group(optimizer, value)["lr"])
         delta = torch.full_like(value, -lr * opt.l1)
         if opt.noise > 0:
             delta += math.sqrt(2 * lr * opt.noise) * self._randn(value.shape[0], value)
+        if self.n_unplaced:
+            delta[self._unplaced_mask()] = 0
         value.add_(self._signs() * delta)
 
     @staticmethod
@@ -469,6 +708,15 @@ class HardDeepR:
         )
 
     # ---------------------------------------------------------- optimizer
+    @property
+    def attached(self) -> bool:
+        """Whether the optimizer hook is currently registered."""
+        if self._handle is None or self._optimizer is None:
+            return False
+        # The hook may have been removed through the handle attach() returned.
+        hooks = getattr(self._optimizer, "_optimizer_step_post_hooks", {})
+        return self._handle.id in hooks
+
     def attach(self, optimizer: Optimizer) -> RemovableHandle:
         """Run the update after every ``optimizer.step()``.
 
@@ -482,11 +730,20 @@ class HardDeepR:
 
         Raises:
             ValueError: The optimizer does not hold the weight parameter.
-            RuntimeError: Already attached.
+            RuntimeError: Already attached, or another controller for the
+                same weights is attached to this optimizer.
         """
-        if self._handle is not None:
+        if self.attached:
             raise RuntimeError("HardDeepR is already attached; call detach() first.")
-        self._group(optimizer, self.conn.weight.value)
+        param = self.conn.weight.value
+        self._group(optimizer, param)
+        for hook in getattr(optimizer, "_optimizer_step_post_hooks", {}).values():
+            other = getattr(hook, "__self__", None)
+            if isinstance(other, HardDeepR) and other.conn.weight.value is param:
+                raise RuntimeError(
+                    "Another HardDeepR controller for the same weights is "
+                    "already attached to this optimizer."
+                )
         self._optimizer = optimizer
         self._handle = optimizer.register_step_post_hook(self._hook)
         return self._handle
@@ -498,15 +755,93 @@ class HardDeepR:
         self._handle = None
         self._optimizer = None
 
+    @torch.no_grad()
     def _hook(self, optimizer: Optimizer, args, kwargs) -> None:
         self.n_steps += 1
-        self._regularize(optimizer)
+        value = self.conn.weight.value
+        if value.grad is not None:
+            # Without a gradient the optimizer skipped the parameter (as it
+            # skips weight decay); the prior and the noise are skipped too.
+            self.regularize(optimizer)
+            if self.n_unplaced:
+                # Undo the gradient step on slots that wait for a position.
+                value[self._unplaced_mask()] = 0
         if self.n_steps % self.options.every == 0:
             self.step(optimizer)
+
+    # ------------------------------------------------------- checkpointing
+    def state_dict(self) -> dict[str, Any]:
+        """State needed to resume rewiring exactly (tensors and ints).
+
+        Holds the counters, the mask of unplaced slots, the per-source sign
+        table (it has a random fallback for sources without edges), the
+        per-slot reference signs (without Dale's law) and the state of the
+        generator the controller was given. Tensors are CPU copies. The
+        options, the connection and the optimizer are not included; the
+        global random state used with ``generator=None`` is not either.
+        """
+        state: dict[str, Any] = {
+            "n_steps": self.n_steps,
+            "n_rewired": self.n_rewired,
+            "n_unplaced": self.n_unplaced,
+            "warned": int(self._warned),
+            "unplaced": self._unplaced.detach().cpu().clone(),
+        }
+        if self._pre_sign is not None:
+            state["pre_sign"] = self._pre_sign.detach().cpu().clone()
+        if self._slot_sign is not None:
+            state["slot_sign"] = self._slot_sign.detach().cpu().clone()
+        if self.generator is not None:
+            state["generator"] = self.generator.get_state().clone()
+        return state
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Restore a state saved by :meth:`state_dict`.
+
+        Call it on a controller built with the same options for a connection
+        of the same size, after loading the connection's own ``state_dict``.
+
+        Args:
+            state_dict: Output of :meth:`state_dict`.
+
+        Raises:
+            ValueError: The entries do not match this controller (different
+                sign mode, Dale setting, generator or sizes). Nothing is
+                changed in that case.
+        """
+        expected = set(self.state_dict())
+        if set(state_dict) != expected:
+            raise ValueError(
+                "The rewiring checkpoint does not match this controller: it "
+                f"holds {sorted(state_dict)}, expected {sorted(expected)} "
+                "(different `sign` mode, Dale setting or generator?)."
+            )
+        shapes = {
+            "unplaced": (self.conn.nnz,),
+            "pre_sign": (self.conn.n_pre,),
+            "slot_sign": (self.conn.nnz,),
+        }
+        for name, shape in shapes.items():
+            if name in state_dict and tuple(state_dict[name].shape) != shape:
+                raise ValueError(
+                    f"'{name}' in the rewiring checkpoint has shape "
+                    f"{tuple(state_dict[name].shape)}, expected {shape}."
+                )
+        if self.generator is not None:
+            self.generator.set_state(state_dict["generator"])
+        self.n_steps = int(state_dict["n_steps"])
+        self.n_rewired = int(state_dict["n_rewired"])
+        self.n_unplaced = int(state_dict["n_unplaced"])
+        self._warned = bool(state_dict["warned"])
+        self._unplaced = state_dict["unplaced"].detach().clone().to(torch.bool)
+        if self._pre_sign is not None:
+            self._pre_sign = state_dict["pre_sign"].detach().clone()
+        if self._slot_sign is not None:
+            self._slot_sign = state_dict["slot_sign"].detach().clone()
 
     def __repr__(self) -> str:
         return (
             f"{type(self).__name__}(n_slot={self.conn.nnz}, "
-            f"n_rewired={self.n_rewired}, attached={self._handle is not None}, "
-            f"{self.options})"
+            f"n_rewired={self.n_rewired}, n_unplaced={self.n_unplaced}, "
+            f"attached={self.attached}, {self.options})"
         )

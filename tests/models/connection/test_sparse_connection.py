@@ -95,8 +95,14 @@ def test_invalid_inputs_raise():
         conn(torch.zeros(3, N_POST))  # a post-sized vector is not an input
     with pytest.raises(ValueError, match="two sparse dimensions"):
         SparseConnection(torch.zeros(2, 3, 4).to_sparse_coo())
-    with pytest.raises(ValueError, match="orientation"):
-        SparseConnection.from_adjacency(A_DENSE.to_sparse_coo(), orientation="pre_post")
+    # Only "pre_post" / "post_pre" are orientations; the former names
+    # ("src_dst" / "dst_src") are refused rather than aliased, on the way in
+    # and on the way out.
+    for bad in ("src_dst", "dst_src", "csr"):
+        with pytest.raises(ValueError, match="orientation"):
+            SparseConnection.from_adjacency(A_DENSE.to_sparse_coo(), orientation=bad)
+        with pytest.raises(ValueError, match="orientation"):
+            conn.to_sparse(bad)
 
 
 # -------------------------------------------------------------- orientation
@@ -107,7 +113,7 @@ def test_orientation_contract(fmt):
     - ``SparseConnection(A)``: ``A`` is the operator, ``y = A @ x``.
     - ``from_adjacency(W)``: ``W[src, dst]`` is a connectome matrix,
       ``y = x @ W`` (the only place where a transpose happens).
-    - ``from_adjacency(A, orientation="dst_src")`` is the constructor.
+    - ``from_adjacency(A, orientation="post_pre")`` is the constructor.
     """
     convert = {
         "btorch": sparse.from_dense,
@@ -120,7 +126,7 @@ def test_orientation_contract(fmt):
 
     operator = SparseConnection(convert(A_DENSE))
     adjacency = SparseConnection.from_adjacency(convert(W_DENSE))
-    explicit = SparseConnection.from_adjacency(convert(A_DENSE), orientation="dst_src")
+    explicit = SparseConnection.from_adjacency(convert(A_DENSE), orientation="post_pre")
     for conn in (operator, adjacency, explicit):
         assert (conn.n_pre, conn.n_post) == (N_PRE, N_POST)
         torch.testing.assert_close(conn(x), expected)
@@ -128,11 +134,22 @@ def test_orientation_contract(fmt):
         assert torch.equal(conn.indices, operator.indices)
         assert torch.equal(conn.weight(), operator.weight())
 
-    # Reading the matrix back names the orientation explicitly as well.
+    # Reading the matrix back: without an argument ``to_sparse`` returns the
+    # layout the connection was built from (and ``conn.orientation`` names
+    # it), so ``from_adjacency(W).to_sparse()`` is ``W`` again.
+    assert (operator.orientation, adjacency.orientation, explicit.orientation) == (
+        "post_pre",
+        "pre_post",
+        "post_pre",
+    )
     assert torch.equal(operator.to_sparse().to_dense(), A_DENSE)
-    assert torch.equal(operator.to_sparse("dst_src").to_dense(), A_DENSE)
-    assert torch.equal(adjacency.to_sparse("src_dst").to_dense(), W_DENSE)
-    assert operator.to_sparse("src_dst").shape == (N_PRE, N_POST)
+    assert torch.equal(explicit.to_sparse().to_dense(), A_DENSE)
+    assert torch.equal(adjacency.to_sparse().to_dense(), W_DENSE)
+    # An explicit orientation overrides the default in both directions.
+    assert torch.equal(adjacency.to_sparse("post_pre").to_dense(), A_DENSE)
+    assert torch.equal(operator.to_sparse("post_pre").to_dense(), A_DENSE)
+    assert torch.equal(adjacency.to_sparse("pre_post").to_dense(), W_DENSE)
+    assert operator.to_sparse("pre_post").shape == (N_PRE, N_POST)
 
     # Treating the operator as an adjacency matrix is a different network
     # (here even a different shape): nothing transposes silently.
@@ -254,7 +271,7 @@ def test_weight_module_types_and_group_introspection():
     assert isinstance(SparseConnection(SOURCES["torch_coo"]()).weight, EdgeWeight)
     conn = SparseConnection(SOURCES["torch_coo"](), Synapse(weight=2.0))
     assert isinstance(conn.weight, ConstantWeight)
-    # An adjacency (src_dst) matrix takes its id matrix in the same layout.
+    # An adjacency (pre_post) matrix takes its id matrix in the same layout.
     W = sp.coo_array((VALUE.numpy(), (PRE.numpy(), POST.numpy())), (N_PRE, N_POST))
     weight = ConstrainedWeight(group_matrix(transpose=True), scale=SCALE)
     conn = SparseConnection.from_adjacency(W, Synapse(weight=weight))
@@ -442,3 +459,36 @@ def test_hints_change_the_plan_not_the_result(density):
     plain.set_hints(Hints(expected_density=0.01))
     assert algorithm(plain) == algorithm(hinted)
     torch.testing.assert_close(plain(x), outs[0])
+
+
+def test_hint_assignment_and_batch_update_replan_once(monkeypatch):
+    """Whole-object assignment and update_hints cannot leave a stale plan."""
+    conn = SparseConnection(SOURCES["torch_coo"]())
+    calls = 0
+    replan = conn._replan
+
+    def counted_replan():
+        nonlocal calls
+        calls += 1
+        replan()
+
+    monkeypatch.setattr(conn, "_replan", counted_replan)
+    hints = Hints(expected_density=0.01, expected_batch=8)
+    conn.hints = hints
+    assert calls == 1
+    assert conn.hints == hints
+
+    # Reassigning an equal immutable value is a no-op.
+    conn.hints = Hints(expected_density=0.01, expected_batch=8)
+    assert calls == 1
+
+    conn.update_hints(expected_density=0.001, expected_calls=100)
+    assert calls == 2
+    assert conn.hints == Hints(
+        expected_density=0.001,
+        expected_batch=8,
+        expected_calls=100,
+    )
+
+    with pytest.raises(TypeError, match="Hints instance"):
+        conn.hints = {"expected_density": 0.01}

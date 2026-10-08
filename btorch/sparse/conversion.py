@@ -39,19 +39,25 @@ def _is_scipy_sparse(obj: Any) -> bool:
     return scipy.sparse.issparse(obj)
 
 
-def from_torch(tensor: Tensor) -> Sparse:
+def from_torch(tensor: Tensor, *, batch_dim: int = 0) -> Sparse:
     """Wrap a PyTorch sparse tensor without copying or transposing.
 
     COO, CSR and CSC keep their format. BSR and BSC are converted through
     COO, which is lossless. Values keep their autograd history, so gradients
     flow back to the tensor the sparse tensor was built from.
 
-    An uncoalesced COO tensor is coalesced first (PyTorch does not expose the
-    values of an uncoalesced tensor to autograd). A batched CSR/CSC tensor
-    whose members have different patterns becomes a batched COO.
+    An uncoalesced COO tensor keeps its entries as stored (order and
+    duplicates), unless it requires grad: PyTorch only exposes the values of
+    an uncoalesced tensor to autograd after coalescing, so it is coalesced
+    then. A batched CSR/CSC tensor whose members have different patterns
+    becomes a batched COO.
 
     Args:
         tensor: Tensor with a sparse layout.
+        batch_dim: For a COO tensor, how many leading sparse dimensions are
+            batch coordinates. PyTorch COO has no notion of a batch, so a
+            tensor of shape ``(G, M, N)`` is read as a 3-D sparse array
+            unless ``batch_dim=1`` says it is ``G`` matrices.
 
     Returns:
         ``COO``, ``CSR`` or ``CSC`` with ``shape == tensor.shape``.
@@ -70,16 +76,36 @@ def from_torch(tensor: Tensor) -> Sparse:
         tensor = tensor.to_sparse(layout=torch.sparse_coo)
         layout = torch.sparse_coo
     if layout == torch.sparse_coo:
-        if not tensor.is_coalesced():
+        reordered = False
+        if tensor.is_coalesced():
+            indices, values = tensor.indices(), tensor.values()
+            canonical = True
+        elif tensor.requires_grad:
+            # PyTorch only exposes the values of an uncoalesced tensor to
+            # autograd after coalescing, which merges and reorders entries.
             tensor = tensor.coalesce()
-        return COO(
-            tensor.indices(),
-            tensor.values(),
+            indices, values = tensor.indices(), tensor.values()
+            canonical = reordered = True
+        else:
+            # Keep the entries exactly as stored (order and duplicates), so
+            # arrays aligned with them stay aligned.
+            indices, values = tensor._indices(), tensor._values()
+            canonical = False
+        out = COO(
+            indices,
+            values,
             shape,
-            batch_dim=0,
+            batch_dim=batch_dim,
             dense_dim=tensor.dense_dim(),
-            properties=Properties(sorted=True, unique=True),
+            properties=Properties(sorted=canonical, unique=canonical),
             check=False,
+        )
+        out._reordered = reordered
+        return out
+    if batch_dim:
+        raise ValueError(
+            "batch_dim applies to COO tensors; batched CSR/CSC tensors carry "
+            "their batch dimensions themselves."
         )
     if layout == torch.sparse_csr:
         pointer, minor, cls = tensor.crow_indices(), tensor.col_indices(), CSR
@@ -204,6 +230,7 @@ def as_sparse(
     format: str | None = None,
     device=None,
     dtype: torch.dtype | None = None,
+    batch_dim: int = 0,
 ) -> Sparse:
     """Interpret ``obj`` as a btorch sparse array.
 
@@ -216,6 +243,8 @@ def as_sparse(
         format: Optional target format (``"coo"``, ``"csr"`` or ``"csc"``).
         device: Optional target device.
         dtype: Optional value dtype.
+        batch_dim: Leading batch dimensions of a PyTorch COO tensor (see
+            :func:`from_torch`).
 
     Returns:
         A :class:`Sparse` (the same object if nothing had to change).
@@ -227,7 +256,7 @@ def as_sparse(
     if isinstance(obj, Sparse):
         out = obj
     elif isinstance(obj, Tensor):
-        out = from_torch(obj)
+        out = from_torch(obj, batch_dim=batch_dim)
     elif _is_scipy_sparse(obj):
         out = from_scipy(obj)
     else:

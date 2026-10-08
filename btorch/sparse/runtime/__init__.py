@@ -5,10 +5,9 @@ Nothing in this package is needed to define a model. It is the layer below
 executed kernels, and the place where additional backends are registered.
 """
 
-from . import kernels_aten, ops
 from .backend import BackendRegistry, KernelCache, registry, use_backend
 from .cache import RepresentationCache
-from .ops import csr_propagate, pack_spikes, spike_propagate
+from .ops import csr_propagate, pack_spikes, propagate, spike_propagate
 from .planner import Planner, planner
 
 
@@ -18,10 +17,9 @@ __all__ = [
     "Planner",
     "RepresentationCache",
     "csr_propagate",
-    "kernels_aten",
-    "ops",
     "pack_spikes",
     "planner",
+    "propagate",
     "registry",
     "spike_propagate",
     "use_backend",

@@ -50,15 +50,39 @@ class Properties:
 class Hints:
     """Performance expectations; advisory only.
 
+    Only ``expected_density`` is consulted by the planner today; the other
+    two are accepted and reserved.
+
     Args:
-        expected_calls: How many products the object will take part in.
-        expected_density: Expected fraction of non-zero input entries.
-        expected_batch: Expected number of right-hand sides per call.
+        expected_calls: How many products the object will take part in
+            (reserved).
+        expected_density: Expected fraction of non-zero input entries, in
+            ``[0, 1]``.
+        expected_batch: Expected number of right-hand sides per call
+            (reserved).
+
+    Raises:
+        ValueError: If a value is out of range.
     """
 
     expected_calls: int | None = None
     expected_density: float | None = None
     expected_batch: int | None = None
+
+    def __post_init__(self) -> None:
+        density = self.expected_density
+        if density is not None and not (
+            isinstance(density, (int, float)) and 0.0 <= density <= 1.0
+        ):
+            raise ValueError(f"expected_density must be in [0, 1], got {density!r}.")
+        for name in ("expected_calls", "expected_batch"):
+            value = getattr(self, name)
+            if value is not None and not (isinstance(value, int) and value > 0):
+                raise ValueError(f"{name} must be a positive int, got {value!r}.")
+
+    def replace(self, **changes) -> "Hints":
+        """Return a copy with selected expectations changed."""
+        return replace(self, **changes)
 
 
 @dataclass(frozen=True)

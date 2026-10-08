@@ -169,6 +169,8 @@ def matvec(A: Sparse, x: Tensor) -> Tensor:
         ValueError: On a shape mismatch, or if ``x`` has fewer leading
             dimensions than ``A`` has batch dimensions.
     """
+    if not isinstance(A, Sparse):
+        return A.matvec(x)
     return _matvec(A, x, transpose=False)
 
 
@@ -179,6 +181,8 @@ def rmatvec(A: Sparse, x: Tensor) -> Tensor:
     without building the transpose. ``x`` has shape ``(*batch, ..., M)`` and
     the result ``(*batch, ..., N, *dense)``.
     """
+    if not isinstance(A, Sparse):
+        return A.rmatvec(x)
     return _matvec(A, x, transpose=True)
 
 
@@ -224,6 +228,11 @@ def matmul(a, b):
     Returns:
         Dense tensor.
     """
+    # Non-sparse linear operators implement the product themselves.
+    for operand, method in ((a, "__matmul__"), (b, "__rmatmul__")):
+        if not isinstance(operand, (Sparse, Tensor)) and hasattr(operand, "matvec"):
+            other = b if operand is a else a
+            return getattr(operand, method)(other)
     a_sparse, b_sparse = isinstance(a, Sparse), isinstance(b, Sparse)
     if a_sparse and b_sparse:
         raise NotImplementedError(

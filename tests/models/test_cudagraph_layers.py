@@ -8,7 +8,7 @@ import torch
 
 from btorch.models import environ, functional
 from btorch.models.connection import ConstrainedWeight, SparseConnection, Synapse
-from btorch.models.linear import DenseConn
+from btorch.models.linear import Linear
 from btorch.models.neurons.alif import ALIF, ELIF
 from btorch.models.neurons.glif import GLIF3
 from tests.utils.compile import compile_or_skip
@@ -38,7 +38,7 @@ def test_cudagraph_linear(use_compile: bool):
     x_batch = torch.stack([x, x + 1.0], dim=0)
 
     # 1. Dense connection
-    dense = DenseConn(3, 3, weight=W, bias=None).to(device)
+    dense = Linear(3, 3, weight=W.T, bias=False).to(device)
 
     # 2. Sparse COO connection (convert dense to sparse)
     W_sparse = scipy.sparse.coo_array(W.numpy())

@@ -44,23 +44,74 @@ class Connection(nn.Module):
         raise NotImplementedError
 
 
+def _operator_tensors(operator: Any, found: list, seen: set) -> None:
+    """Collect ``(owner, attribute)`` of every tensor inside an operator."""
+    if id(operator) in seen or not hasattr(operator, "__dict__"):
+        return
+    seen.add(id(operator))
+    for name, value in vars(operator).items():
+        if isinstance(value, Tensor):
+            found.append((operator, name))
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                if hasattr(item, "matvec"):
+                    _operator_tensors(item, found, seen)
+        elif hasattr(value, "matvec"):
+            _operator_tensors(value, found, seen)
+
+
 class OperatorConnection(Connection):
     """Connection that applies a linear operator along the last axis.
+
+    The tensors inside the operator (and inside the parts of a composite
+    operator) are registered on the module: ``nn.Parameter`` s as parameters,
+    everything else as buffers. They therefore follow ``.to()``, appear in
+    ``parameters()`` and are saved in the ``state_dict``.
 
     Args:
         operator: Object with ``shape == (n_post, n_pre)`` and a ``matvec``
             method (a :class:`~btorch.sparse.operator.LinearOperator` or a
-            :class:`~btorch.sparse.Sparse`). If it is an ``nn.Module`` its
-            parameters are registered.
+            :class:`~btorch.sparse.Sparse`).
     """
 
     def __init__(self, operator: Any):
         super().__init__()
         self.n_post, self.n_pre = (int(s) for s in operator.shape[-2:])
         self.operator = operator
+        self._slots: list[tuple[Any, str, str]] = []
+        found: list = []
+        _operator_tensors(operator, found, set())
+        for i, (owner, attr) in enumerate(found):
+            tensor = getattr(owner, attr)
+            name = f"operator_{i}_{attr.lstrip('_')}"
+            if isinstance(tensor, nn.Parameter):
+                self.register_parameter(name, tensor)
+            else:
+                self.register_buffer(name, tensor)
+            self._slots.append((owner, attr, name))
+
+    def _apply(self, fn, recurse: bool = True):
+        out = super()._apply(fn, recurse)
+        # Hand the (possibly replaced) tensors back to the operator objects.
+        for owner, attr, name in self._slots:
+            tensor = getattr(self, name)
+            setattr(owner, attr, tensor)
+            # Operators cache their device; sparse arrays derive it.
+            if "device" in vars(owner):
+                owner.device = tensor.device
+        return out
 
     def forward(self, x: Tensor) -> Tensor:
         return self.operator.matvec(x)
+
+    def explain(self, x: Tensor | None = None) -> str:
+        """Describe how this connection is executed (debugging aid)."""
+        return (
+            "Connection:\n"
+            f"    logical shape = [{self.n_post}, {self.n_pre}]\n"
+            f"    realisation = {type(self).__name__} "
+            f"({type(self.operator).__name__}, applied without a stored matrix)"
+        )
 
     def extra_repr(self) -> str:
         return f"n_pre={self.n_pre}, n_post={self.n_post}"

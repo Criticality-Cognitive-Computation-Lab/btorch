@@ -10,7 +10,11 @@ btorch 的所有重要变更都将记录在此文件中。
 ### 新增
 - `btorch.sparse`：SciPy/PyTorch 风格的稀疏数组 API（`Sparse`、`COO`、`CSR`、`CSC`、`sparse.from_edges`、`sparse.asarray`、`A @ x`、`sparse.stack`、`to_torch()` / `to_scipy()`）；采用标准矩阵方向，转换从不转置、也不稠密化。
 - `btorch.models.connection`：`SparseConnection`（`from_adjacency`、`from_edges`、`from_hetersynapse`）、`Synapse`、`EdgeWeight`、`ConstantWeight`、`ConstrainedWeight`；受体与延迟作为边属性；支持网络批。
-- `btorch.sparse.runtime`：执行层（注册算子、后端注册表、规划器）；编写模型时无需使用。
+- `btorch.sparse.runtime`：执行层（注册算子、后端注册表、规划器）；编写模型时无需使用。Triton pull 后端（`csr_matvec`、`edge_grad`）在安装了 Triton 的 CUDA 上为默认后端。
+- 连接规则与 `Projection`：NEST 风格的构建方式（`Projection(pre, post, rule, synapse)`；`OneToOne`、`AllToAll`、`FixedIndegree`、`FixedOutdegree`、`PairwiseBernoulli`、`DistanceDependent`、`FromEdges`、`FromSparse`）。
+- `btorch.sparse.operator`：无需存储矩阵的线性算子（`ConstantOperator`、`DiagonalOperator`、`LowRankOperator`、`ImplicitOperator`、惰性组合），以及 `StructuredConnection` / `ImplicitConnection` / `HybridConnection`。
+- `sparse.einsum`（实验性）：一个 N 维稀疏操作数与稠密张量缩并，输出为稠密张量。
+- `HardDeepR`：面向 `SparseConnection` 的固定槽位硬 Deep Rewiring（`attach(optimizer)`）；未实现软 Deep R。
 - 指南：[稀疏连接](guides/sparse_connectivity.md)。
 
 ### 变更

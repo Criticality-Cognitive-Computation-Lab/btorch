@@ -8,6 +8,8 @@ with every connection realisation.
 
 from __future__ import annotations
 
+import warnings
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -15,6 +17,13 @@ from torch import Tensor, nn
 
 from ...sparse import EdgeMap, Sparse, as_sparse
 from ..constrain import HasConstraint
+
+
+_BOUND = (
+    "This weight module is already bound to a connection. Weight modules hold "
+    "the parameters of one connection: create one per connection (a Synapse "
+    "with weight=None, a number, a tensor or a callable can be reused)."
+)
 
 
 class Weight(nn.Module, HasConstraint):
@@ -26,8 +35,27 @@ class Weight(nn.Module, HasConstraint):
     aligned with the connection's edge slots.
     """
 
+    _bound: bool = False
+
     def forward(self) -> Tensor:
         raise NotImplementedError
+
+    def _check_unbound(self) -> None:
+        if self._bound:
+            raise RuntimeError(_BOUND)
+
+    @property
+    def shape(self) -> torch.Size:
+        """Shape ``[*batch, n_edge]`` of the effective weights."""
+        return self.forward().shape
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.forward().dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self.forward().device
 
     def bind(self, base: Tensor, edge_map: EdgeMap, adjacency: Sparse) -> None:
         """Align with a connection's canonical edges.
@@ -71,7 +99,12 @@ class EdgeWeight(Weight):
 
     Args:
         value: ``[*batch, n_edge]`` initial weights aligned with the input
-            edges, or ``None`` to take them from the connection matrix.
+            edges; ``None`` to take them from the connection matrix; or a
+            callable ``value(n_edge) -> Tensor`` (for example
+            ``lambda n: 0.1 * torch.randn(n)``), called once the connection
+            knows its edges. An ``nn.Parameter`` is adopted as the trained
+            parameter itself when the connection keeps the edges in the
+            given order (see :meth:`bind`).
         trainable: Store the weights as a parameter (else a buffer).
         dale: Enforce Dale's law: every weight keeps the sign it had at
             construction. :meth:`constrain` clamps weights that crossed zero
@@ -87,7 +120,7 @@ class EdgeWeight(Weight):
 
     def __init__(
         self,
-        value: Tensor | None = None,
+        value: Tensor | Callable[[int], Tensor] | None = None,
         *,
         trainable: bool = True,
         dale: bool = False,
@@ -95,28 +128,73 @@ class EdgeWeight(Weight):
         super().__init__()
         self.trainable = trainable
         self.dale = dale
+        self._bound = False
+        self._init = None  # callable or user parameter, resolved in ``bind``
         self._given = value is not None
-        if value is not None:
+        if callable(value) and not isinstance(value, Tensor):
+            self._init = value
+        elif isinstance(value, nn.Parameter):
+            self._init = value
+            self._set(value.detach().clone())
+        elif value is not None:
             self._set(torch.as_tensor(value).detach().clone())
 
     def _set(self, value: Tensor) -> None:
+        for name in ("value", "sign"):
+            self._parameters.pop(name, None)
+            self._buffers.pop(name, None)
         if not value.is_floating_point():
             value = value.to(torch.get_default_dtype())
-        if self.trainable:
+        if isinstance(value, nn.Parameter):
+            self.value = value
+        elif self.trainable:
             self.value = nn.Parameter(value)
         else:
             self.register_buffer("value", value)
         if self.dale:
-            self.register_buffer("sign", torch.sign(value))
+            self.register_buffer("sign", torch.sign(value.detach()))
 
     def bind(self, base: Tensor, edge_map: EdgeMap, adjacency: Sparse) -> None:
-        value = self.value.detach() if self._given else base
-        value = value.to(device=edge_map.target.device)
-        for name in ("value", "sign"):
-            self._parameters.pop(name, None)
-            self._buffers.pop(name, None)
-        self._set(edge_map.sum(value, dim=-1).detach().clone())
+        """Align with the connection's edge slots.
+
+        A user ``nn.Parameter`` stays the trained parameter (same object) if
+        the connection did not have to reorder or merge the edges and it
+        already has a floating dtype on the right device. Otherwise the
+        weights are moved into a new parameter and a warning says so; use
+        ``conn.weight.value`` for the optimizer in that case.
+        """
+        self._check_unbound()
+        device = edge_map.target.device
+        init, self._init = self._init, None
+        if callable(init) and not isinstance(init, Tensor):
+            value = torch.as_tensor(init(edge_map.n_old))
+        elif self._given:
+            value = self.value.detach()
+        else:
+            value = base
+        if value.shape[-1] != edge_map.n_old:
+            raise ValueError(
+                f"The weight has {value.shape[-1]} entries but the connection "
+                f"has {edge_map.n_old} input edges."
+            )
+        identity = edge_map.is_permutation and bool(
+            (edge_map.target == torch.arange(edge_map.n_old, device=device)).all()
+        )
+        if isinstance(init, nn.Parameter):
+            if identity and init.is_floating_point() and init.device == device:
+                self.trainable = init.requires_grad
+                self._set(init)
+                self._bound = True
+                return
+            warnings.warn(
+                "The nn.Parameter passed as synaptic weight could not be adopted "
+                "(the connection reordered or merged edges, or moved device or "
+                "dtype); its values were copied. Optimise conn.weight.value.",
+                stacklevel=3,
+            )
+        self._set(edge_map.sum(value.to(device=device), dim=-1).detach().clone())
         self._given = True
+        self._bound = True
 
     def forward(self) -> Tensor:
         return self.value
@@ -163,8 +241,11 @@ class ConstantWeight(Weight):
         super().__init__()
         self.register_buffer("value", torch.as_tensor(float(value)))
         self.register_buffer("multiplicity", torch.zeros(0))
+        self._bound = False
 
     def bind(self, base: Tensor, edge_map: EdgeMap, adjacency: Sparse) -> None:
+        self._check_unbound()
+        self._bound = True
         ones = torch.ones(edge_map.n_old, device=edge_map.target.device)
         self.multiplicity = edge_map.sum(ones, dim=-1)
 
@@ -223,9 +304,18 @@ class ConstrainedWeight(Weight):
     ):
         super().__init__()
         self.dale = dale
+        self._bound = False
         self._group_matrix = None
         self._base_given = base is not None
         if isinstance(group, Tensor) and group.layout == torch.strided:
+            if group.is_floating_point() or group.ndim != 1:
+                raise TypeError(
+                    "group must be a 1-D integer tensor of 0-based group ids "
+                    "(one per edge), or a sparse matrix of 1-based ids; got "
+                    f"dtype {group.dtype} with shape {tuple(group.shape)}."
+                )
+            if group.numel() and int(group.min()) < 0:
+                raise ValueError("group ids must be non-negative.")
             group = group.to(torch.long)
         else:
             # Coordinate-matched in ``bind``; ids in a matrix are 1-based
@@ -256,6 +346,8 @@ class ConstrainedWeight(Weight):
             )
 
     def bind(self, base: Tensor, edge_map: EdgeMap, adjacency: Sparse) -> None:
+        self._check_unbound()
+        self._bound = True
         device = edge_map.target.device
         if self._group_matrix is not None:
             group = _match_by_coordinate(adjacency, self._group_matrix).to(device)
@@ -362,5 +454,10 @@ def _match_by_coordinate(adjacency: Sparse, labels: Sparse) -> Tensor:
     key = (row * n_col + col).to(lab_key.device)
     pos = torch.searchsorted(lab_key, key).clamp(max=max(lab_key.shape[0] - 1, 0))
     if lab_key.shape[0] == 0 or not bool((lab_key[pos] == key).all()):
-        raise ValueError("Constraint missing for some connections.")
+        raise ValueError(
+            "Constraint missing for some connections: every stored entry of "
+            "the connection matrix needs a group. Group matrices use 1-based "
+            "ids (0 means no entry) and the same orientation as the matrix "
+            "the connection was built from."
+        )
     return lab_val[pos] - 1

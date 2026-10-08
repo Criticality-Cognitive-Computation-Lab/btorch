@@ -170,7 +170,7 @@ def test_checkpoint_of_another_pattern_determines_the_forward(kind):
     assert not result.missing_keys and not result.unexpected_keys
     check_is_network(target, kind, NET_A)
     # ... and reading the model back gives A as well, not a stale B.
-    lowered = target.to_sparse().to_dense()
+    lowered = target.to_sparse("post_pre").to_dense()
     torch.testing.assert_close(lowered, dense_of(kind, NET_A))
 
 
@@ -272,7 +272,9 @@ def test_version_counters():
 
     loading a checkpoint and rewiring increment it, a weight update does
     not. The derived layouts always carry the version they were built
-    for.
+    for. ``value_version`` is the complementary counter: it is derived from
+    the in-place version counters of the weight tensors, so it moves on every
+    weight write (and cannot be assigned).
     """
     conn = build("routed", NET_B)
     assert conn.topology_version == conn.cache.topology_version == 0
@@ -280,10 +282,15 @@ def test_version_counters():
     # 1. An optimizer step changes values, not topology.
     optimizer = torch.optim.SGD(conn.parameters(), lr=0.1)
     layouts = {n: b.clone() for n, b in conn.cache.named_buffers()}
+    values_before = conn.value_version
     conn(torch.ones(N_PRE * N_DELAY)).sum().backward()
+    assert conn.value_version == values_before  # forward/backward write nothing
     optimizer.step()
     assert conn.topology_version == conn.routing_version == 0
+    assert conn.value_version > values_before
     assert all(torch.equal(b, layouts[n]) for n, b in conn.cache.named_buffers())
+    with pytest.raises(AttributeError):
+        conn.value_version = 0  # a read-only property, not a counter to bump
 
     # 2. Loading a checkpoint may change the edges: version + rebuild.
     conn.load_state_dict(build("routed", NET_A).state_dict())
@@ -300,7 +307,9 @@ def test_version_counters():
     weight = conn.weight().detach().clone()
     post, pre = conn.indices.clone()
     receptor, delay = conn.receptor.clone(), conn.delay.clone()
-    conn.set_edges_(slots, new_post, new_pre, new_receptor, new_delay)
+    conn.set_edges_(
+        slots, pre=new_pre, post=new_post, receptor=new_receptor, delay=new_delay
+    )
     assert conn.topology_version == conn.cache.topology_version == 2
     assert conn.routing_version > 1 and conn.nnz == N_EDGE
     post[slots], pre[slots] = new_post, new_pre

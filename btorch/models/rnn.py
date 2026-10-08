@@ -1,5 +1,7 @@
 from abc import abstractmethod
 from collections.abc import Callable, Sequence
+from contextlib import ExitStack, contextmanager, nullcontext
+from contextvars import ContextVar
 from functools import partial
 from typing import Any, overload
 
@@ -12,6 +14,11 @@ from . import base, environ, synapse
 from .base import StepMode
 from .cudagraph import CudaGraphRunner
 from .functional import filter_hidden_states, named_hidden_states, set_hidden_states
+
+
+_sparse_scope_states: ContextVar[dict[int, tuple[int, tuple[int, torch.dtype]]]] = (
+    ContextVar("btorch_sparse_run_scopes", default={})
+)
 
 
 def _split_loop_args(args: Sequence, loop_args: Sequence[int], size: int):
@@ -52,6 +59,109 @@ def _chunk_to_cpu(z, states: dict):
     return to_cpu(z), {k: to_cpu(v) for k, v in states.items()}
 
 
+def _sparse_run_arguments(loop_tensor: Tensor) -> tuple[int, torch.dtype]:
+    """Infer the sample batch size and dtype for one recurrent trajectory."""
+    if not torch.is_tensor(loop_tensor) or loop_tensor.ndim == 0:
+        raise ValueError(
+            "the first loop argument must be a tensor with a time dimension"
+        )
+    step = loop_tensor[0]
+    batch_size = max(1, step.numel() // step.shape[-1])
+    return batch_size, loop_tensor.dtype
+
+
+@contextmanager
+def _sparse_checkpoint_recompute_context(
+    sparse_states: list[tuple[nn.Module, Any]],
+    batch_size: int,
+    dtype: torch.dtype,
+):
+    """Restore sparse runtime bindings while checkpointing recomputes a
+    chunk."""
+    scope_states = dict(_sparse_scope_states.get())
+    previous = []
+    for submodule, state in sparse_states:
+        restore = submodule._install_checkpoint_binding
+        previous.append((submodule, restore(state)))
+        scope_states[id(submodule)] = (1, (batch_size, dtype))
+    token = _sparse_scope_states.set(scope_states)
+    try:
+        yield
+    finally:
+        _sparse_scope_states.reset(token)
+        for submodule, state in reversed(previous):
+            submodule._restore_checkpoint_run_state(state)
+
+
+def _sparse_checkpoint_contexts(
+    sparse_states: list[tuple[nn.Module, Any]],
+    batch_size: int,
+    dtype: torch.dtype,
+):
+    """Create forward and recompute contexts accepted by TorchDynamo."""
+    return nullcontext(), _sparse_checkpoint_recompute_context(
+        sparse_states, batch_size, dtype
+    )
+
+
+@contextmanager
+def _sparse_run_scope(
+    module: nn.Module,
+    loop_tensor: Tensor,
+    *,
+    stable_addresses: bool = False,
+):
+    """Notify sparse-runtime participants once for one nested recurrent run."""
+    batch_size, dtype = _sparse_run_arguments(loop_tensor)
+
+    def leave(submodule: nn.Module, end: Callable[[], None]) -> None:
+        states = dict(_sparse_scope_states.get())
+        depth, signature = states[id(submodule)]
+        depth -= 1
+        if depth:
+            states[id(submodule)] = (depth, signature)
+            _sparse_scope_states.set(states)
+            return
+        states.pop(id(submodule))
+        _sparse_scope_states.set(states)
+        end()
+
+    with ExitStack() as stack:
+        for submodule in module.modules():
+            begin = getattr(submodule, "_begin_sparse_run", None)
+            end = getattr(submodule, "_end_sparse_run", None)
+            if begin is None and end is None:
+                continue
+            if not callable(begin) or not callable(end):
+                raise TypeError(
+                    f"{type(submodule).__name__} must define both "
+                    "_begin_sparse_run() and _end_sparse_run()."
+                )
+            signature = (batch_size, dtype)
+            states = dict(_sparse_scope_states.get())
+            current = states.get(id(submodule))
+            depth = 0 if current is None else current[0]
+            if depth:
+                if current[1] != signature:
+                    raise RuntimeError(
+                        "nested sparse runs must use the same batch size and dtype"
+                    )
+            else:
+                try:
+                    begin(
+                        batch_size,
+                        dtype,
+                        stable_addresses=stable_addresses,
+                    )
+                except Exception:
+                    end()
+                    raise
+            states[id(submodule)] = (depth + 1, signature)
+            _sparse_scope_states.set(states)
+            stack.callback(leave, submodule, end)
+        yield
+
+
 class RecurrentNNAbstract(base.MemoryModule):
     """Base class for the time-unrolled recurrent loop.
 
@@ -69,6 +179,13 @@ class RecurrentNNAbstract(base.MemoryModule):
       ``cpu_offload`` -- call ``torch.compiler.cudagraph_mark_step_begin()`` once
       per iteration. ``cudagraph=True`` refuses grad-recording calls and points
       here.
+
+    A captured graph is tied to the structure it was recorded for. Submodules
+    whose structure can change in place (a sparse connection that is rewired
+    or loads another pattern) expose ``capture_version``; when it changes, the
+    next ``cudagraph=True`` call captures again instead of replaying. A
+    submodule whose ``capture_incompatibility()`` returns a reason makes
+    ``cudagraph=True`` raise with it. See ``cudagraph.py`` for the protocol.
     """
 
     def __init__(
@@ -187,21 +304,22 @@ class RecurrentNNAbstract(base.MemoryModule):
         This function is NOT checkpointed itself, but is the body of the
         checkpoint.
         """
-        chunk_z = []
-        chunk_states = {}
+        with _sparse_run_scope(self, chunk_args[loop_args[0]]):
+            chunk_z = []
+            chunk_states = {}
 
-        for sub_args in _split_loop_args(chunk_args, loop_args, unroll_size):
-            z_sub, states_sub = self._run_unroll_block(
-                *sub_args,
-                loop_args=loop_args,
-                **kwargs,
-            )
+            for sub_args in _split_loop_args(chunk_args, loop_args, unroll_size):
+                z_sub, states_sub = self._run_unroll_block(
+                    *sub_args,
+                    loop_args=loop_args,
+                    **kwargs,
+                )
 
-            chunk_z.extend(z_sub)
-            for k, v in states_sub.items():
-                chunk_states.setdefault(k, []).extend(v)
+                chunk_z.extend(z_sub)
+                for k, v in states_sub.items():
+                    chunk_states.setdefault(k, []).extend(v)
 
-        return chunk_z, chunk_states
+            return chunk_z, chunk_states
 
     def _checkpointed_large_chunk(
         self,
@@ -212,6 +330,12 @@ class RecurrentNNAbstract(base.MemoryModule):
     ) -> None:
         memories = named_hidden_states(self)
         env = environ.all()
+        batch_size, dtype = _sparse_run_arguments(chunk_args[loop_args[0]])
+        sparse_states = []
+        for submodule in self.modules():
+            snapshot = getattr(submodule, "_capture_checkpoint_binding", None)
+            if callable(snapshot):
+                sparse_states.append((submodule, snapshot()))
 
         def _pure(env, memories, *inner_args):
             set_hidden_states(self, memories)
@@ -223,16 +347,37 @@ class RecurrentNNAbstract(base.MemoryModule):
                     **kwargs,
                 )
 
-        return checkpoint(_pure, env, memories, *chunk_args, use_reentrant=False)
+        return checkpoint(
+            _pure,
+            env,
+            memories,
+            *chunk_args,
+            use_reentrant=False,
+            context_fn=partial(
+                _sparse_checkpoint_contexts,
+                sparse_states,
+                batch_size,
+                dtype,
+            ),
+        )
 
     @partial(torch.compiler.disable, recursive=False)
     def multi_step_forward(
         self, *args: Any, loop_args: Sequence[int] | None = None, **kwargs: Any
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """Run the multi-step loop, optionally as replayed CUDA graphs."""
-        if self.cudagraph:
-            return self._cudagraph_multi_step(*args, loop_args=loop_args, **kwargs)
-        return self._multi_step_forward_impl(*args, loop_args=loop_args, **kwargs)
+        if loop_args is None:
+            _, scoped_loop_args = self._detect_loop_args(*args)
+        else:
+            scoped_loop_args = loop_args
+        with _sparse_run_scope(
+            self,
+            args[scoped_loop_args[0]],
+            stable_addresses=self.cudagraph,
+        ):
+            if self.cudagraph:
+                return self._cudagraph_multi_step(*args, loop_args=loop_args, **kwargs)
+            return self._multi_step_forward_impl(*args, loop_args=loop_args, **kwargs)
 
     def _chunk_plan(
         self, *args: Any, loop_args: Sequence[int] | None = None
@@ -405,7 +550,9 @@ class RecurrentNNAbstract(base.MemoryModule):
         """Enabled options the CUDA-graph path cannot honour, with the reason.
 
         This is the single home of the RNN-side compatibility rule; the
-        runner only reports what it is handed.
+        runner only reports what it is handed. Submodules report their own
+        limits through ``capture_incompatibility()``, which the runner
+        collects itself (see ``cudagraph.py``).
         """
         rules = {
             # Not merely unsupported: the capture path never routes through
