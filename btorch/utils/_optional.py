@@ -16,7 +16,7 @@ patterns:
     numerical precision) without the library, only slower
     (``numba`` in :mod:`btorch.config`, ``polars`` in
     :func:`btorch.analysis.aggregation.aggregate_by_neuropil`,
-    ``torch_sparse`` in :mod:`btorch.models.linear`). Use a try-import
+    ``torch_sparse`` in :mod:`btorch.sparse.runtime`). Use a try-import
     (module scope or lazy), document the fallback where it happens and never
     produce a silently different result. These libraries are still declared
     in an extra (``fast``, ``sparse``) so users can opt in.

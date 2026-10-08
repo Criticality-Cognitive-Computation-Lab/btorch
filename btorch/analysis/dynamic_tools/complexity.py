@@ -234,8 +234,11 @@ def compute_gain_stability_sensitivity(
     Definition: The slope of the curve of the Maximum Lyapunov Exponent (lambda_max)
     as a function of global synaptic gain scaling (g).
 
-    The model must expose ``model.brain.synapse.linear.magnitude`` (the weight
-    magnitude being scaled) and ``model.brain.neuron``. The model weights are
+    The model must expose ``model.brain.synapse.linear`` (the recurrent
+    connection whose weights are scaled) and ``model.brain.neuron``. The scaled
+    tensor is ``linear.weight`` for dense layers, and ``linear.weight.value``
+    (per-edge weights) or ``linear.weight.scale`` (grouped weights) for a
+    :class:`~btorch.models.connection.SparseConnection`. The model weights are
     always restored, even if the sweep raises.
 
     Args:
@@ -255,7 +258,8 @@ def compute_gain_stability_sensitivity(
               where the estimate failed.
 
     Raises:
-        AttributeError: If the model lacks ``brain.synapse.linear.magnitude``.
+        AttributeError: If the model lacks ``brain.synapse.linear`` or the
+            layer has no scalable weight tensor.
         ValueError: If the dataloader is empty.
     """
     # Local import: btorch.models is heavy and only needed for this routine.
@@ -268,12 +272,17 @@ def compute_gain_stability_sensitivity(
     # Assuming model is Brain, model.brain is RecurrentNN, model.brain.synapse
     # is Synapse and model.brain.synapse.linear is the layer.
     try:
-        linear_layer = model.brain.synapse.linear
-        original_magnitude = linear_layer.magnitude.data.clone()
+        weight = model.brain.synapse.linear.weight
     except AttributeError as e:
         raise AttributeError(
-            "model must expose model.brain.synapse.linear.magnitude"
+            "model must expose model.brain.synapse.linear with a weight"
         ) from e
+    if not isinstance(weight, torch.Tensor):
+        # Weight module of a SparseConnection: per-edge values or group scales.
+        weight = getattr(weight, "value", getattr(weight, "scale", None))
+    if not isinstance(weight, torch.Tensor):
+        raise AttributeError("model.brain.synapse.linear has no scalable weight tensor")
+    original_weight = weight.detach().clone()
 
     model.eval()
     model.to(device)
@@ -293,7 +302,8 @@ def compute_gain_stability_sensitivity(
     lambda_values = []
     try:
         for g in g_values:
-            linear_layer.magnitude.data = original_magnitude * g
+            with torch.no_grad():
+                weight.copy_(original_weight * g)
 
             functional.reset_net(model, batch_size=1, device=device)
             init.uniform_v_(model.brain.neuron, set_reset_value=True)
@@ -321,7 +331,8 @@ def compute_gain_stability_sensitivity(
             lambda_values.append(le)
     finally:
         # Restore weights even if the sweep raised
-        linear_layer.magnitude.data = original_magnitude
+        with torch.no_grad():
+            weight.copy_(original_weight)
 
     lambda_arr = np.asarray(lambda_values, dtype=float)
 

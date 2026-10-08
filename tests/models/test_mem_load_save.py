@@ -1,7 +1,8 @@
 import pytest
 import torch
 
-from btorch.models import environ, linear, rnn, synapse
+from btorch.models import environ, rnn, synapse
+from btorch.models.connection import SparseConnection, Synapse
 from btorch.models.functional import (
     init_net_state,
     named_hidden_states,
@@ -54,7 +55,11 @@ def def_model(neuron_params, device, dtype):
     )
 
     rec_weights, _, _ = build_sparse_mat(n_e_neurons, n_i_neurons, i_e_ratio=1)
-    conn = linear.SparseConn(conn=rec_weights, device=device)
+    # Dale's law is opt-in for ``SparseConnection``; the reference sign is
+    # then part of the ``state_dict`` and round-trips with the checkpoint.
+    conn = SparseConnection.from_adjacency(
+        rec_weights, Synapse(dale=True), device=device
+    )
 
     tau_syn = torch.cat([torch.ones(n_e_neurons) * 5.8, torch.ones(n_i_neurons) * 6.5])
 

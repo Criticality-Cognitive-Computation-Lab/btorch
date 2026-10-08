@@ -6,7 +6,7 @@ workflow of the library:
 1. ``btorch.connectome``: a synthetic connectome table (pandas DataFrame with
    ``pre_simple_id`` / ``post_simple_id`` / ``syn_count``) is turned into a
    scipy sparse weight matrix with :func:`make_sparse_mat`.
-2. ``btorch.models``: the matrix becomes a :class:`SparseConn`, which is used
+2. ``btorch.models``: the matrix becomes a :class:`SparseConnection`, which is used
    as the recurrent weight of an :class:`ExponentialPSC` synapse. A
    :class:`LIF` population and the synapse are wrapped in a
    :class:`RecurrentNN`, which unrolls the network over time.
@@ -28,8 +28,8 @@ from btorch.analysis import firing_rate, isi_cv
 from btorch.analysis.spiking import fano
 from btorch.connectome.connection import make_sparse_mat
 from btorch.models import environ
+from btorch.models.connection import SparseConnection
 from btorch.models.functional import init_net_state, reset_net
-from btorch.models.linear import SparseConn
 from btorch.models.neurons.lif import LIF
 from btorch.models.rnn import RecurrentNN
 from btorch.models.synapse import ExponentialPSC
@@ -71,9 +71,11 @@ def build_network(connectome: pd.DataFrame) -> RecurrentNN:
     sign[n_exc:] = -3.0  # stronger inhibition balances the excitation
     weight = weight.multiply(sign[:, None]).tocoo()
 
-    # (2) sparse matrix -> SparseConn (fixed topology, optional Dale's law
-    # which we disable because signs are already encoded in the weights).
-    conn = SparseConn(weight, enforce_dale=False, dtype=torch.float32)
+    # (2) sparse matrix -> SparseConnection. ``from_adjacency`` takes the
+    # connectome layout (rows = pre, columns = post). Dale's law is opt-in
+    # (``Synapse(dale=True)``); we leave it off because nothing is trained
+    # here and the signs are already encoded in the weights.
+    conn = SparseConnection.from_adjacency(weight, dtype=torch.float32)
 
     # (3) neuron + synapse, wrapped into a recurrent network. The neuron sees
     # the synaptic current of the *previous* step plus the external input.

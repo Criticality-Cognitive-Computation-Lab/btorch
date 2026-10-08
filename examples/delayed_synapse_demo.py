@@ -12,8 +12,8 @@ import scipy.sparse
 import torch
 
 from btorch.connectome.connection import expand_conn_for_delays
+from btorch.models.connection import SparseConnection, Synapse
 from btorch.models.history import SpikeHistory
-from btorch.models.linear import SparseConn
 
 
 def simple_delay_demo():
@@ -42,7 +42,7 @@ def simple_delay_demo():
     print(f"Original: (2, 2), Expanded: (2*5, 2) = {conn_d.shape}")
 
     # Create linear layer
-    linear = SparseConn(conn_d, enforce_dale=False)
+    linear = SparseConnection.from_adjacency(conn_d)
 
     # Create spike history buffer
     history = SpikeHistory(n_neurons, max_delay_steps=5)
@@ -103,7 +103,7 @@ def multiple_delays_demo():
     print(f"Connection shape: {conn_d.shape}")
 
     # Create components
-    linear = SparseConn(conn_d, enforce_dale=False)
+    linear = SparseConnection.from_adjacency(conn_d)
     history = SpikeHistory(n_neurons, max_delay_steps=5)
     history.init_state(batch_size=1)  # Initialize with batch_size=1
 
@@ -160,8 +160,8 @@ def delay_with_dale_demo():
 
     conn_d = expand_conn_for_delays(conn, delays, n_delay_bins=5)
 
-    # With enforce_dale=True, signs are preserved
-    linear = SparseConn(conn_d, enforce_dale=True)
+    # With Synapse(dale=True), signs are preserved
+    linear = SparseConnection.from_adjacency(conn_d, Synapse(dale=True))
 
     history = SpikeHistory(n_neurons, max_delay_steps=5)
     history.init_state(batch_size=1)  # Initialize with batch_size=1

@@ -1,6 +1,7 @@
 from . import (
     base,
     bilinear,
+    connection,
     constrain,
     conv,
     cudagraph,
@@ -36,6 +37,7 @@ from .neurons.dlif import DBNN, DLIF, DendriticLIF
 __all__ = [
     "base",
     "bilinear",
+    "connection",
     "constrain",
     "conv",
     "cudagraph",

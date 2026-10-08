@@ -105,7 +105,7 @@ def test_save_yaml_fallback_and_explicit_failure(tmp_path):
 class _Linear(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.magnitude = torch.nn.Parameter(torch.ones(2))
+        self.weight = torch.nn.Parameter(torch.ones(2))
 
 
 def test_gain_stability_missing_layer_raises():
@@ -159,7 +159,7 @@ def test_gain_stability_restores_weights_and_returns_nan(monkeypatch):
         complexity.compute_gain_stability_sensitivity(
             model, loader, g_values=np.array([5.0]), device="cpu"
         )
-    assert torch.equal(model.brain.synapse.linear.magnitude.data, torch.ones(2))
+    assert torch.equal(model.brain.synapse.linear.weight.data, torch.ones(2))
 
 
 def test_compute_pcist_svd_failure_is_nan_with_warning(monkeypatch):

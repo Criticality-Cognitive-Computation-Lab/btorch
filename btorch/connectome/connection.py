@@ -861,7 +861,8 @@ def make_hetersynapse_constrained_conn(
     """Create both hetersynaptic connection and constraint matrices.
 
     This is a convenience function that combines make_hetersynapse_conn and
-    make_hetersynapse_constraint to produce outputs ready for SparseConstrainedConn.
+    make_hetersynapse_constraint to produce outputs ready for a constrained
+    :class:`~btorch.models.connection.SparseConnection`.
 
     Args:
         neurons (pd.DataFrame): Must contain 'root_id', cell_type_col,
@@ -880,9 +881,12 @@ def make_hetersynapse_constrained_conn(
 
     Returns:
         Tuple of (conn_matrix, constraint_matrix, receptor_type_index).
-        Can be used directly with SparseConstrainedConn.from_hetersynapse(
-            conn, constraint, receptor_idx
-        ).
+        Can be used directly with
+        ``SparseConnection.from_adjacency(conn,
+        Synapse(weight=ConstrainedWeight(group=constraint)))`` (expanded
+        layout) or ``SparseConnection.from_hetersynapse(conn,
+        Synapse(weight=ConstrainedWeight(group=constraint)),
+        n_receptor=len(receptor_idx))`` (per-edge receptor attributes).
     """
     conn_mat, receptor_idx = make_hetersynapse_conn(
         neurons,
