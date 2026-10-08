@@ -8,7 +8,7 @@ from torch import nn
 from btorch.models.base import MemoryModule
 from btorch.models.connection import SparseConnection
 from btorch.models.functional import reset_net_state
-from btorch.models.linear import DenseConn
+from btorch.models.linear import Linear
 from btorch.models.rnn import make_rnn
 from tests.utils.compile import compile_or_skip
 
@@ -30,10 +30,10 @@ class SparseConnRNNCell(MemoryModule):
         self.input_size = input_size
         self.hidden_size = hidden_size
 
-        self.W_x = DenseConn(
+        self.W_x = Linear(
             input_size,
             hidden_size,
-            weight=W_x,
+            weight=W_x.T,
             bias=None,
             device=W_x.device,
             dtype=W_x.dtype,
@@ -49,10 +49,10 @@ class SparseConnRNNCell(MemoryModule):
             # Dale's law (the weights are free to change sign).
             self.W_h = SparseConnection.from_adjacency(W_h_sparse)
         else:
-            self.W_h = DenseConn(
+            self.W_h = Linear(
                 hidden_size,
                 hidden_size,
-                weight=W_h_dense,
+                weight=W_h_dense.T,
                 bias=None,
                 device=W_h_dense.device,
                 dtype=W_h_dense.dtype,

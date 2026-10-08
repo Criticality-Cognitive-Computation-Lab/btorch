@@ -66,10 +66,10 @@ def test_orientation_is_source_rows_destination_columns():
     out = layer(torch.tensor([0.0, 1.0]))
     torch.testing.assert_close(out, torch.tensor([5.0, 0.0, 0.0]))
 
-    # ``orientation="dst_src"`` (and the bare constructor) take the operator
+    # ``orientation="post_pre"`` (and the bare constructor) take the operator
     # ``(n_post, n_pre)`` instead; the same edges need the transposed matrix.
     for other in (
-        SparseConnection.from_adjacency(conn.T, orientation="dst_src"),
+        SparseConnection.from_adjacency(conn.T, orientation="post_pre"),
         SparseConnection(conn.T),
     ):
         assert (other.in_features, other.out_features) == (2, 3)
@@ -104,12 +104,20 @@ def test_stored_indices_are_destination_major_and_sorted():
     assert bool((key[1:] > key[:-1]).all())
     # The weight of slot ``k`` belongs to edge ``src[k] -> dst[k]``.
     torch.testing.assert_close(layer.weight.value.detach(), dense[src, dst])
-    # Without Dale's law the checkpoint is exactly edges + weights.
-    assert set(layer.state_dict()) == {"indices", "weight.value"}
+    # Without Dale's law the checkpoint is exactly edges + weights, plus the
+    # ``layout`` buffer ([n_post, n_pre, n_receptor, n_delay]) that says which
+    # populations the edge ids refer to.
+    assert set(layer.state_dict()) == {"indices", "layout", "weight.value"}
+    assert layer.layout.tolist() == [conn.shape[1], conn.shape[0], 1, 1]
     # With Dale's law the reference sign is persistent as well (the legacy
     # layer kept it out of the checkpoint, which broke cross-matrix loading).
     dale = SparseConnection.from_adjacency(conn, Synapse(dale=True))
-    assert set(dale.state_dict()) == {"indices", "weight.value", "weight.sign"}
+    assert set(dale.state_dict()) == {
+        "indices",
+        "layout",
+        "weight.value",
+        "weight.sign",
+    }
 
 
 @pytest.mark.parametrize("lead", [(), (4,), (3, 4), (2, 3, 4)])
@@ -158,18 +166,22 @@ def test_gradients_match_dense_reference():
 
 
 def test_to_sparse_exposes_effective_matrix_with_gradients():
-    """``to_sparse("src_dst")`` is the connectome-oriented weight matrix.
+    """``to_sparse("pre_post")`` is the connectome-oriented weight matrix.
 
     Replacement of the legacy ``get_sparse_matrix()``: the values are the
     effective weights, so a loss on them reaches the weight parameter.
     """
     conn, dense = _random_conn()
     layer = SparseConnection.from_adjacency(conn)
-    mat = layer.to_sparse("src_dst")
+    mat = layer.to_sparse("pre_post")
     assert tuple(mat.shape) == conn.shape
     torch.testing.assert_close(mat.to_dense(), dense)
-    # The default orientation is the linear-algebra operator ``(dst, src)``.
-    torch.testing.assert_close(layer.to_sparse().to_dense(), dense.T)
+    # Without an argument the matrix comes back in the layout it was given
+    # in (``from_adjacency`` -> ``pre_post``); the linear-algebra operator
+    # ``(dst, src)`` is its transpose and has to be asked for by name.
+    assert layer.orientation == "pre_post"
+    torch.testing.assert_close(layer.to_sparse().to_dense(), dense)
+    torch.testing.assert_close(layer.to_sparse("post_pre").to_dense(), dense.T)
 
     mat.values().sum().backward()
     torch.testing.assert_close(
@@ -243,6 +255,7 @@ def test_constrained_effective_weight_is_base_times_group_scale():
     # saved ``magnitude`` unless ``persist_initial_weight`` was set).
     assert set(layer.state_dict()) == {
         "indices",
+        "layout",
         "weight.scale",
         "weight.group",
         "weight.base",
@@ -265,7 +278,7 @@ def test_constrained_effective_weight_is_base_times_group_scale():
     dense[0, 0] *= 2
     dense[1, 1] *= 2
     torch.testing.assert_close(layer(x), x @ dense)
-    torch.testing.assert_close(layer.to_sparse("src_dst").to_dense(), dense)
+    torch.testing.assert_close(layer.to_sparse("pre_post").to_dense(), dense)
 
 
 def test_constrained_group_gradient_matches_dense_reference():

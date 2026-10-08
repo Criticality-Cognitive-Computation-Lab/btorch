@@ -21,7 +21,7 @@ import torch
 from btorch.models import environ
 from btorch.models.connection import SparseConnection
 from btorch.models.functional import init_net_state
-from btorch.models.linear import DenseConn
+from btorch.models.linear import Linear
 from btorch.models.neurons import GLIF3, LIF
 from btorch.models.synapse import (
     AlphaPSC,
@@ -89,8 +89,12 @@ PSC_CASES = {
 def _psc_pair(name: str, weight: np.ndarray):
     """Build the torch PSC and its numpy twin sharing the same weight."""
     make_torch, make_np = PSC_CASES[name]
-    linear = DenseConn(
-        N_PRE, N_POST, weight=torch.as_tensor(weight), dtype=torch.float64
+    linear = Linear(
+        N_PRE,
+        N_POST,
+        weight=torch.as_tensor(weight).T,
+        bias=False,
+        dtype=torch.float64,
     )
     psc = make_torch(linear)
     init_net_state(psc, dtype=torch.float64)
@@ -343,7 +347,13 @@ def test_recurrent_ei_network_parity():
     syn_i = AlphaPSCBilleh(
         n,
         tau_syn=tau_i,
-        linear=DenseConn(n, n, weight=torch.as_tensor(w_i), dtype=torch.float64),
+        linear=Linear(
+            n,
+            n,
+            weight=torch.as_tensor(w_i).T,
+            bias=False,
+            dtype=torch.float64,
+        ),
     )
     init_net_state(syn_e, dtype=torch.float64)
     init_net_state(syn_i, dtype=torch.float64)

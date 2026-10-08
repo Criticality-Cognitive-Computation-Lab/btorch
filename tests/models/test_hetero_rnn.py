@@ -3,7 +3,7 @@ import torch
 
 from btorch.models import environ
 from btorch.models.functional import init_net_state, reset_net_state
-from btorch.models.linear import DenseConn
+from btorch.models.linear import Linear
 from btorch.models.neurons import GLIF3, TwoCompartmentGLIF
 from btorch.models.neurons.mixed import MixedNeuronPopulation
 from btorch.models.rnn import ApicalRecurrentNN, RecurrentNN, SomaApicalRecurrentNN
@@ -27,7 +27,7 @@ def test_apical_rnn_matches_standard_rnn_without_apical():
     tc = TwoCompartmentGLIF(n_neuron=n_tc, step_mode="s")
     mixed = MixedNeuronPopulation([(n_glif, glif), (n_tc, tc)], step_mode="s")
 
-    conn = DenseConn(n, n, bias=None)
+    conn = Linear(n, n, bias=False)
     psc = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn, step_mode="s")
 
     brain_apical = ApicalRecurrentNN(neuron=mixed, synapse=psc, step_mode="m", unroll=2)
@@ -53,8 +53,8 @@ def test_apical_rnn_without_apical_equivalent_to_standard():
 
     mixed_a = MixedNeuronPopulation([(n, glif_a)], step_mode="s")
 
-    conn_a = DenseConn(n, n, bias=None)
-    conn_b = DenseConn(n, n, bias=None)
+    conn_a = Linear(n, n, bias=False)
+    conn_b = Linear(n, n, bias=False)
     psc_a = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn_a, step_mode="s")
     psc_b = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn_b, step_mode="s")
 
@@ -93,7 +93,7 @@ def test_apical_rnn_changes_tc_state():
     tc = TwoCompartmentGLIF(n_neuron=n_tc, step_mode="s")
     mixed = MixedNeuronPopulation([(n_glif, glif), (n_tc, tc)], step_mode="s")
 
-    conn = DenseConn(n, n, bias=None)
+    conn = Linear(n, n, bias=False)
     psc = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn, step_mode="s")
 
     brain = ApicalRecurrentNN(neuron=mixed, synapse=psc, step_mode="m", unroll=2)
@@ -130,7 +130,7 @@ def test_apical_rnn_gradient_flows():
     tc = TwoCompartmentGLIF(n_neuron=n_tc, step_mode="s", trainable_param={"tau_s"})
     mixed = MixedNeuronPopulation([(n_glif, glif), (n_tc, tc)], step_mode="s")
 
-    conn = DenseConn(n, n, bias=None)
+    conn = Linear(n, n, bias=False)
     psc = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn, step_mode="s")
 
     brain = ApicalRecurrentNN(neuron=mixed, synapse=psc, step_mode="m", unroll=2)
@@ -155,7 +155,7 @@ def test_apical_rnn_gradient_matches_standard_rnn():
     T, batch_size, n = 4, 2, 6
 
     baseline_neuron = GLIF3(n_neuron=n, step_mode="s", trainable_param={"tau"})
-    baseline_conn = DenseConn(n, n, bias=None)
+    baseline_conn = Linear(n, n, bias=False)
     baseline_psc = AlphaPSC(
         n_neuron=n, tau_syn=5.0, linear=baseline_conn, step_mode="s"
     )
@@ -170,7 +170,7 @@ def test_apical_rnn_gradient_matches_standard_rnn():
         [(n, GLIF3(n_neuron=n, step_mode="s", trainable_param={"tau"}))],
         step_mode="s",
     )
-    mixed_conn = DenseConn(n, n, bias=None)
+    mixed_conn = Linear(n, n, bias=False)
     mixed_psc = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=mixed_conn, step_mode="s")
     mixed_rnn = ApicalRecurrentNN(
         neuron=mixed_neuron,
@@ -228,7 +228,7 @@ def test_apical_rnn_configs(cfg):
     tc = TwoCompartmentGLIF(n_neuron=n_tc, step_mode="s")
     mixed = MixedNeuronPopulation([(n_glif, glif), (n_tc, tc)], step_mode="s")
 
-    conn = DenseConn(n, n, bias=None)
+    conn = Linear(n, n, bias=False)
     psc = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn, step_mode="s")
 
     brain = ApicalRecurrentNN(
@@ -260,7 +260,7 @@ def test_apical_rnn_state_consistent_across_resets():
 
     glif = GLIF3(n_neuron=n, step_mode="s")
     mixed = MixedNeuronPopulation([(n, glif)], step_mode="s")
-    conn = DenseConn(n, n, bias=None)
+    conn = Linear(n, n, bias=False)
     psc = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn, step_mode="s")
 
     brain = ApicalRecurrentNN(neuron=mixed, synapse=psc, step_mode="m", unroll=2)
@@ -291,8 +291,8 @@ def test_som_apical_rnn_basic():
     tc = TwoCompartmentGLIF(n_neuron=n_tc, step_mode="s")
     mixed = MixedNeuronPopulation([(n_glif, glif), (n_tc, tc)], step_mode="s")
 
-    conn_soma = DenseConn(n, n, bias=None)
-    conn_apical = DenseConn(n, n, bias=None)
+    conn_soma = Linear(n, n, bias=False)
+    conn_apical = Linear(n, n, bias=False)
     psc_soma = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn_soma, step_mode="s")
     psc_apical = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn_apical, step_mode="s")
 
@@ -330,8 +330,8 @@ def test_som_apical_rnn_equivalent_to_apical_rnn_with_synapse_apical():
     mixed_a = _build_neurons()
     mixed_b = _build_neurons()
 
-    conn_soma = DenseConn(n, n, bias=None)
-    conn_apical = DenseConn(n, n, bias=None)
+    conn_soma = Linear(n, n, bias=False)
+    conn_apical = Linear(n, n, bias=False)
     psc_soma_a = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn_soma, step_mode="s")
     psc_apical_a = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn_apical, step_mode="s")
     psc_soma_b = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn_soma, step_mode="s")
@@ -374,8 +374,8 @@ def test_som_apical_rnn_gradient_flows():
     tc = TwoCompartmentGLIF(n_neuron=n_tc, step_mode="s", trainable_param={"tau_s"})
     mixed = MixedNeuronPopulation([(n_glif, glif), (n_tc, tc)], step_mode="s")
 
-    conn_soma = DenseConn(n, n, bias=None)
-    conn_apical = DenseConn(n, n, bias=None)
+    conn_soma = Linear(n, n, bias=False)
+    conn_apical = Linear(n, n, bias=False)
     psc_soma = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn_soma, step_mode="s")
     psc_apical = AlphaPSC(n_neuron=n, tau_syn=5.0, linear=conn_apical, step_mode="s")
 

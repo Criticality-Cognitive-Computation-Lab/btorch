@@ -25,6 +25,32 @@ from torch import Tensor
 from .base import MemoryModule, flatten_neuron, normalize_n_neuron
 
 
+def expand_delay_sequence(z_seq: Tensor, n_delays: int) -> Tensor:
+    """Delay-expand a whole spike sequence that starts from an empty history.
+
+    Stateless, vectorised counterpart of stepping
+    ``history.update(z_seq[t]); history.get_flattened(n_delays)`` from a freshly
+    reset :class:`SpikeHistory`: entry ``n * n_delays + d`` of step ``t`` is
+    ``z_seq[t - d, ..., n]`` (zero for ``t < d``).
+
+    Args:
+        z_seq: Spike sequence of shape ``(T, *batch, size)``.
+        n_delays: Number of delay bins.
+
+    Returns:
+        Tensor of shape ``(T, *batch, size * n_delays)``.
+    """
+    n_step = z_seq.shape[0]
+    if n_delays > 1:
+        pad = z_seq.new_zeros((n_delays - 1, *z_seq.shape[1:]))
+        z_seq = torch.cat([pad, z_seq], dim=0)
+    # Column d holds the sequence shifted d steps into the future.
+    shifted = [
+        z_seq[n_delays - 1 - d : n_delays - 1 - d + n_step] for d in range(n_delays)
+    ]
+    return torch.stack(shifted, dim=-1).flatten(-2)
+
+
 class SpikeHistory(MemoryModule):
     """Rolling spike history buffer for delayed synaptic connections.
 
@@ -125,6 +151,7 @@ class SpikeHistory(MemoryModule):
         dtype: torch.dtype | None = None,
         device: torch.device | None = None,
         skip_mem_name: tuple[str, ...] = (),
+        inplace: bool = False,
     ) -> None:
         """Reset the history buffer to initial state.
 
@@ -133,10 +160,26 @@ class SpikeHistory(MemoryModule):
             dtype: Data type for buffer.
             device: Device to place buffer on.
             skip_mem_name: Names of memories to skip reset.
+            inplace: If True, zero the existing buffer (and cursor) instead of
+                rebinding them; see :meth:`MemoryModule.reset`.
         """
-        super().reset(batch_size, dtype, device, skip_mem_name)
+        super().reset(batch_size, dtype, device, skip_mem_name, inplace=inplace)
         if self.use_circular_buffer:
-            self._cursor = torch.tensor(0, dtype=torch.long, device=self._cursor.device)
+            if inplace:
+                self._cursor.zero_()
+            else:
+                self._cursor = torch.tensor(
+                    0, dtype=torch.long, device=self._cursor.device
+                )
+
+    def detach(self) -> None:
+        """Detach the buffered spikes from the autograd graph.
+
+        With batch dimensions the stored buffer is a permuted view (see
+        :meth:`_set_history_with_delay_first`), which cannot be detached in
+        place, so the buffer is rebound to a detached tensor instead.
+        """
+        self.history = self.history.detach()
 
     def _get_history_with_delay_first(self) -> Tensor:
         """Get history tensor with delay dimension moved to front.

@@ -727,9 +727,10 @@ class FromSparse(ConnectionRule):
     transposes. Which matrix axis is the source population is stated only by
     ``orientation``:
 
-    - ``"post_pre"`` (default): the standard operator, shape
+    - ``"post_pre"``: the standard operator, shape
       ``(n_post, n_pre)``, ``A[post, pre]``, used as ``y = A @ x``.
-    - ``"pre_post"``: rows are sources, shape ``(n_pre, n_post)``,
+    - ``"pre_post"`` (default, as in ``SparseConnection.from_adjacency``):
+      rows are sources, shape ``(n_pre, n_post)``,
       ``A[pre, post]``, the connectome convention ``y = x @ A``.
 
     Every stored entry is one edge (explicit zeros and duplicate coordinates
@@ -745,7 +746,7 @@ class FromSparse(ConnectionRule):
     """
 
     def __init__(
-        self, A: Any, orientation: Literal["post_pre", "pre_post"] = "post_pre"
+        self, A: Any, orientation: Literal["pre_post", "post_pre"] = "pre_post"
     ):
         if orientation not in ("post_pre", "pre_post"):
             raise ValueError(
@@ -753,6 +754,9 @@ class FromSparse(ConnectionRule):
                 "y = A @ x) or 'pre_post' (matrix is (n_pre, n_post), "
                 f"y = x @ A), got {orientation!r}."
             )
+        # SciPy data is float64 by NumPy convention; connections built from
+        # it use the default dtype unless one is requested.
+        self.from_scipy = not isinstance(A, Tensor) and not hasattr(A, "sparse_shape")
         matrix = as_sparse(A)
         if matrix.batch_dim() != 0 or matrix.sparse_dim() != 2:
             raise ValueError(

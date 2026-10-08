@@ -18,11 +18,24 @@ import torch
 from torch import Tensor
 
 
-# The CSR layout is used as a plain kernel input here, never handed to users.
-warnings.filterwarnings("ignore", message="Sparse CSR tensor support is in beta")
-warnings.filterwarnings(
-    "ignore", message="Sparse invariant checks are implicitly disabled"
-)
+def _consume_csr_warnings() -> None:
+    """Trigger PyTorch's once-per-process CSR notices with nobody listening.
+
+    The CSR layout is a plain kernel input here and never handed to users, so
+    its "beta" and "invariant checks" notices would only be noise attributed
+    to user code. They are emitted once per process; emitting them here under
+    ``catch_warnings`` avoids installing a process-wide warning filter.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        crow = torch.tensor([0, 1])
+        mat = torch.sparse_csr_tensor(
+            crow, torch.tensor([0]), torch.ones(1), size=(1, 1), check_invariants=False
+        )
+        mat @ torch.ones(1, 1)
+
+
+_consume_csr_warnings()
 
 
 # Entry-times-sample budget for temporaries of the gather-based kernels.

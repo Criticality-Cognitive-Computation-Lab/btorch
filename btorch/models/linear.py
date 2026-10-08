@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from ..sparse.operator import LinearOperator
 from .base import ParamBufferMixin
 from .constrain import HasConstraint
 
@@ -97,68 +98,139 @@ class LearnableScale(ParamBufferMixin, nn.Module):
         return nn.functional.softplus(self.bias)
 
 
-class DenseConn(nn.Linear, HasConstraint):
-    # Matrix product using y = x @ A.
+class Linear(nn.Linear, LinearOperator, HasConstraint):
+    """Apply a PyTorch-compatible dense linear transformation.
+
+    ``Linear`` is both a standard :class:`torch.nn.Linear` module and a
+    :class:`~btorch.sparse.LinearOperator`. Its weight always follows the
+    PyTorch ``[out_features, in_features]`` convention. Receptor, delay, group,
+    and Dale-law semantics belong to :class:`~btorch.models.connection.Synapse`
+    and :class:`~btorch.models.connection.SparseConnection`, not this class.
+
+    Args:
+        in_features: Number of input features.
+        out_features: Number of output features.
+        weight: Optional initial weight with shape
+            ``[out_features, in_features]``.
+        bias: ``True`` to initialize a bias, ``False`` or ``None`` for no bias,
+            or an initial tensor with shape ``[out_features]``.
+        mask: Optional dense mask with shape ``[out_features, in_features]``.
+        device: Torch device.
+        dtype: Torch dtype.
+    """
+
     mask: Tensor | None
-    initial_sign: Tensor | None
+    _capabilities = frozenset({"matvec", "matmat", "rmatvec"})
 
     def __init__(
         self,
         in_features: int,
         out_features: int,
         weight: Tensor | None = None,
-        bias: Tensor | None = None,
+        bias: bool | Tensor | None = True,
         mask: float | Tensor | None = None,
-        enforce_dale: bool = False,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
-        """Dense connection layer with optional weight masking and Dale's Law
-        enforcement.
-
-        Args:
-            in_features: Number of input features.
-            out_features: Number of output features.
-            weight: Initial weight matrix (in_features, out_features).
-                Note: internally it is stored as (out_features, in_features)
-                and transposed.
-            bias: Initial bias vector (out_features,).
-            mask: If float, a random binary mask with this density is generated.
-                If Tensor, it must have shape (out_features, in_features).
-            enforce_dale: If True, enforces weights to maintain their initial sign
-                via ReLU in the `constrain()` method.
-            device: Torch device.
-            dtype: Torch dtype.
-        """
-        # if weight is given, in_features and out_features are ignored
-        super().__init__(
-            in_features, out_features, bias=bias is not None, device=device, dtype=dtype
-        )
+        """Initialize the dense operator."""
         if weight is not None:
-            self.weight.data = weight.T
-        if bias is not None:
-            self.bias.data = bias
+            weight = torch.as_tensor(weight)
+            if device is None:
+                device = weight.device
+            if dtype is None:
+                dtype = (
+                    weight.dtype
+                    if weight.is_floating_point() or weight.is_complex()
+                    else torch.get_default_dtype()
+                )
+        elif isinstance(bias, Tensor):
+            if device is None:
+                device = bias.device
+            if dtype is None:
+                dtype = (
+                    bias.dtype
+                    if bias.is_floating_point() or bias.is_complex()
+                    else torch.get_default_dtype()
+                )
+        super().__init__(
+            in_features,
+            out_features,
+            bias=bias is not False and bias is not None,
+            device=device,
+            dtype=dtype,
+        )
+        self._shape = (out_features, in_features)
+        if weight is not None:
+            weight = torch.as_tensor(weight, device=self.weight.device)
+            if weight.shape != (out_features, in_features):
+                raise ValueError(
+                    "weight must have shape "
+                    f"({out_features}, {in_features}), got {tuple(weight.shape)}."
+                )
+            with torch.no_grad():
+                self.weight.copy_(weight.to(dtype=self.weight.dtype))
+        if isinstance(bias, Tensor):
+            bias = torch.as_tensor(
+                bias,
+                device=self.weight.device,
+                dtype=self.weight.dtype,
+            )
+            if bias.shape != (out_features,):
+                raise ValueError(
+                    f"bias must have shape ({out_features},), got {tuple(bias.shape)}."
+                )
+            with torch.no_grad():
+                self.bias.copy_(bias)
 
         if mask is not None:
             if isinstance(mask, (int, float)):
-                mask = (
-                    torch.rand(self.weight.shape, device=device, dtype=dtype) < mask
-                ).to(dtype=self.weight.dtype)
+                mask = (torch.rand_like(self.weight) < mask).to(dtype=self.weight.dtype)
+            else:
+                mask = torch.as_tensor(
+                    mask,
+                    device=self.weight.device,
+                    dtype=self.weight.dtype,
+                )
+                if mask.shape != self.weight.shape:
+                    raise ValueError(
+                        "mask must have shape "
+                        f"{tuple(self.weight.shape)}, got {tuple(mask.shape)}."
+                    )
             self.register_buffer("mask", mask)
         else:
             self.mask = None
 
-        if enforce_dale:
-            self.register_buffer("initial_sign", torch.sign(self.weight.data))
-        else:
-            self.initial_sign = None
+    @property
+    def shape(self) -> tuple[int, int]:
+        """Return ``(out_features, in_features)``."""
+        return self.out_features, self.in_features
+
+    def _matvec(self, x: Tensor) -> Tensor:
+        return self.forward(x)
+
+    def _rmatvec(self, x: Tensor) -> Tensor:
+        return nn.functional.linear(x, self.weight.T)
+
+    def _matmat(self, x: Tensor) -> Tensor:
+        return torch.matmul(self.weight, x)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Apply the standard ``nn.Linear`` path along the last input axis."""
+        return super().forward(x)
 
     def constrain(self, *args: Any, **kwargs: Any) -> None:
-        """Apply the weight mask and Dale's Law constraints to the weight
-        matrix."""
-        if self.mask is not None:
-            self.weight.data *= self.mask
-        if self.initial_sign is not None:
-            self.weight.data = (
-                self.weight.data * self.initial_sign
-            ).relu() * self.initial_sign
+        """Apply the weight mask to the weight matrix."""
+        if self.mask is not None and (
+            hasattr(self, "weight_orig") or hasattr(self, "parametrizations")
+        ):
+            raise RuntimeError(
+                "Linear mask constraints cannot be applied after an "
+                "external weight parametrization or pruning transform. Apply "
+                "btorch constraints before preparing pruning or quantization."
+            )
+        with torch.no_grad():
+            if self.mask is not None:
+                self.weight.mul_(self.mask)
+
+
+__all__ = ["LearnableScale", "Linear"]

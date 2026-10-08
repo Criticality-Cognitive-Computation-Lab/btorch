@@ -16,7 +16,7 @@ from btorch.fitting.two_compartment import (
 )
 from btorch.models import environ
 from btorch.models.functional import init_net_state, reset_net
-from btorch.models.linear import DenseConn
+from btorch.models.linear import Linear
 from btorch.models.neurons.glif import GLIF3
 from btorch.models.neurons.mixed import MixedNeuronPopulation
 from btorch.models.neurons.two_compartment import TwoCompartmentGLIF
@@ -533,7 +533,7 @@ def test_draw_glif3_vs_two_compartment():
         device=DEVICE,
     )
     mixed = MixedNeuronPopulation({"glif": (1, glif), "tc": (1, tc)}, step_mode="s")
-    conn = DenseConn(n_total, n_total, bias=None, device=DEVICE)
+    conn = Linear(n_total, n_total, bias=False, device=DEVICE)
     psc = AlphaPSC(n_neuron=n_total, tau_syn=5.0, linear=conn, step_mode="s")
     with torch.no_grad():
         conn.weight.zero_()

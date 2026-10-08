@@ -17,7 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ConstrainedWeight`; receptors and delays as edge attributes; batches of
   networks.
 - `btorch.sparse.runtime`: execution layer (registered operators, backend
-  registry, planner); not needed to write models.
+  registry, planner); not needed to write models. Triton pull backend
+  (`csr_matvec`, `edge_grad`) as the default on CUDA when Triton is installed.
+- Connection rules and `Projection`: NEST-style construction
+  (`Projection(pre, post, rule, synapse)`; `OneToOne`, `AllToAll`,
+  `FixedIndegree`, `FixedOutdegree`, `PairwiseBernoulli`, `DistanceDependent`,
+  `FromEdges`, `FromSparse`).
+- `btorch.sparse.operator`: matrix-free linear operators (`ConstantOperator`,
+  `DiagonalOperator`, `LowRankOperator`, `ImplicitOperator`, lazy composites)
+  and `StructuredConnection` / `ImplicitConnection` / `HybridConnection`.
+- `sparse.einsum` (experimental): one N-D sparse operand with dense tensors,
+  dense output.
+- `HardDeepR`: fixed-slot hard Deep Rewiring for `SparseConnection`
+  (`attach(optimizer)`); soft Deep R is not implemented.
 - Guide: [Sparse Connectivity](guides/sparse_connectivity.md).
 
 ### Changed

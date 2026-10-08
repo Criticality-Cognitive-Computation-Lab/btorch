@@ -23,7 +23,7 @@ import torch
 
 from btorch.models.connection import ConstrainedWeight, SparseConnection, Synapse
 from btorch.models.constrain import constrain_net
-from btorch.models.linear import DenseConn
+from btorch.models.linear import Linear
 from btorch.sparse import runtime
 
 
@@ -58,7 +58,7 @@ def _dense_sparse_constrained(W: torch.Tensor):
     """The same ``(in, out)`` weights as dense, sparse and constrained
     layers."""
     W_sparse = scipy.sparse.coo_array(W.numpy())
-    dense = DenseConn(W.shape[0], W.shape[1], weight=W, bias=None)
+    dense = Linear(W.shape[0], W.shape[1], weight=W.T, bias=False)
     sparse = SparseConnection.from_adjacency(W_sparse)
     constrained = SparseConnection.from_adjacency(
         W_sparse, Synapse(weight=ConstrainedWeight(group=_one_group_per_edge(W)))
@@ -249,7 +249,7 @@ def test_non_square_matrix():
 
 
 def test_sparse_conn_get_sparse_matrix():
-    """``to_sparse("src_dst")`` (formerly ``get_sparse_matrix``) returns a
+    """``to_sparse("pre_post")`` (formerly ``get_sparse_matrix``) returns a
     usable sparse matrix with gradients."""
     torch.manual_seed(42)
 
@@ -257,7 +257,7 @@ def test_sparse_conn_get_sparse_matrix():
     W_sparse = scipy.sparse.coo_array(W.numpy())
 
     model = SparseConnection.from_adjacency(W_sparse)
-    sp_mat = model.to_sparse("src_dst")
+    sp_mat = model.to_sparse("pre_post")
 
     # Shape should match the original dense orientation.
     assert tuple(sp_mat.shape) == (3, 3)
@@ -295,7 +295,7 @@ def test_sparse_constrained_conn_get_sparse_matrix():
     # Non-trivial scales, so the check below cannot pass with base weights.
     model.weight.set_scale(0, 2.0)
     model.weight.set_scale(2, -0.5)
-    sp_mat = model.to_sparse("src_dst")
+    sp_mat = model.to_sparse("pre_post")
 
     assert tuple(sp_mat.shape) == (2, 2)
 
@@ -322,12 +322,15 @@ def test_get_sparse_matrix_non_square():
     W_sparse = scipy.sparse.coo_array(W.numpy())
 
     model = SparseConnection.from_adjacency(W_sparse)
-    sp_mat = model.to_sparse("src_dst")
+    sp_mat = model.to_sparse("pre_post")
 
     assert tuple(sp_mat.shape) == (4, 2)
     torch.testing.assert_close(sp_mat.to_dense(), W, atol=1e-6, rtol=0.0)
-    # The default orientation is the operator (out_features, in_features).
-    assert tuple(model.to_sparse().shape) == (2, 4)
+    # The default is the layout the connection was built from (here the
+    # adjacency matrix); the operator (out_features, in_features) is
+    # ``"post_pre"``.
+    assert tuple(model.to_sparse().shape) == (4, 2)
+    assert tuple(model.to_sparse("post_pre").shape) == (2, 4)
 
     # Gradient should flow through the returned matrix.
     loss = sp_mat.values().sum()
@@ -372,7 +375,7 @@ def test_sparse_conn_state_dict_roundtrip_loads_new_pattern():
     torch.testing.assert_close(fresh(x), saved(x))
     torch.testing.assert_close(fresh(x), x @ w_b.double())
     # The introspection view follows the loaded wiring as well.
-    torch.testing.assert_close(fresh.to_sparse("src_dst").to_dense(), w_b.double())
+    torch.testing.assert_close(fresh.to_sparse("pre_post").to_dense(), w_b.double())
 
 
 @pytest.mark.skipif(

@@ -121,22 +121,18 @@ request `fullgraph`.
 
 ### 1.8 Baseline measurements
 
-`benchmarks/sparse_conn/bench_sparse_conn.py`, random recurrent graphs, median
-of 20 calls. RTX 5090 (shared with another job; note the ~2.2 ms floor on every
-cell, which is launch/synchronisation latency, not kernel time):
+The legacy layers were measured before the refactor and are kept as a frozen
+copy in `benchmarks/sparse_conn/_legacy_baseline.py`, so they can be timed
+side by side with the new path. Two properties of the old implementation
+matter for the comparison:
 
-| Workload | Implementation | B | forward (ms) | forward+backward (ms) | peak (MB) |
-|---|---|---:|---:|---:|---:|
-| 4,096 neurons, 0.4M edges | `native` | 32 | 2.3 | 11.7 | 98 |
-| | `torch_sparse` | 32 | 4.6 | 5.1 | 226 |
-| | dense | 32 | 2.3 | 2.4 | 146 |
-| 100k neurons, 10M edges | `native` | 1 / 32 | out of memory | out of memory | – |
-| | `torch_sparse` | 1 | 4.7 | 5.0 | 360 |
-| | `torch_sparse` | 32 | 19.1 | 58.2 | 5,138 |
-| 1M neurons, 50M edges | `torch_sparse` | 1 | 6.0 | 8–12 | 1,738 |
-| | `torch_sparse` | 32 | 159 | 300 | 25,699 |
+- Latency did not depend on spike density (1% and 50% gave the same numbers).
+- The `native` backend could not train at scale: at 100k neurons and 10M
+  edges its backward failed with an out-of-memory error asking for 37 GiB,
+  and `torch_sparse` needed 5.1 GB of peak memory at batch 32.
 
-Latency does not depend on spike density (1% and 50% give the same numbers).
+Current numbers for both paths are in
+`benchmarks/sparse_conn/RESULTS.md`.
 
 ### 1.9 Prior kernel work consulted
 
@@ -326,7 +322,108 @@ Structural plasticity is an update policy, not a format. A connection has a
 fixed number of edge slots; `set_edges_` changes which edge a slot represents
 without changing any tensor shape or parameter identity, increments
 `topology_version`, and rebuilds the derived layouts in place. Value updates
-do not touch topology-derived state. The version counters
+do not touch topology-derived state. `HardDeepR` is the provided policy: it
+runs from an optimizer post-step hook, samples new positions uniformly among
+unconnected pairs without building a dense mask, applies an explicit policy to
+the optimizer state of rewired slots, never raises when a layer is full
+(unplaced slots wait at zero weight) and has its own checkpoint state. The
+version counters
 (`topology_version`, `routing_version`, `value_version`) are bookkeeping for
 caches and are not read in `forward`, so rewiring does not retrace a compiled
 module.
+
+## 9. Runtime backends
+
+| Kernel | ATen (reference, all devices) | Triton (CUDA) |
+|---|---|---|
+| `csr_matvec` (pull, also the transposed product of the input gradient) | `torch.sparse` CSR product; gather / `index_add` for dtypes without one | row-block tiles over `(rows, samples)`, hub rows cut into segments, one writer per output: deterministic |
+| `edge_grad` (value gradient) | chunked gather-multiply | one launch over entry blocks, no `[B, E]` temporary |
+| `spike_push` (packed events) | expand active sources into out-edges, `index_add` | thread per delivered edge with a binary search over the prefix sum of active degrees, float atomics |
+| `spike_push_dense` (device compaction) | – | fixed grid of 64-source tiles, silent tiles exit after one load; long out-edge lists as static chunks; no host sync |
+
+The Triton kernels reuse ideas from the earlier experiments listed in 1.9
+(row-block and CSR-vector pull, nnz-balanced handling of hubs, tiled and
+per-edge atomic push). Sort-based and hash-based push variants were not ported
+because they never won in the measured regime. Push results depend on the
+arrival order of float atomics (relative error up to about `4e-7`); pull
+results are bitwise reproducible.
+
+The planner uses destination-driven propagation unless the connection carries
+an `expected_density` hint at or below the measured crossover (2% on CUDA,
+0.2% on CPU). `optional torch_sparse` remains selectable with
+`runtime.use_backend("torch_sparse")` and nothing depends on it.
+
+Eager and compiled execution take different routes to the same kernels:
+compiled code calls the registered operators, eager code a plain
+`autograd.Function`, because the operator dispatch costs tens of microseconds
+per call and dominates for networks of a few thousand neurons.
+
+## 10. Migration
+
+| Removed | Replacement |
+|---|---|
+| `BaseSparseConn` | `SparseConnection` over `btorch.sparse.Sparse` |
+| `SparseConn(conn, bias=b, enforce_dale=E)` | `SparseConnection.from_adjacency(conn, Synapse(dale=E), bias=b)`; Dale's law is now off by default |
+| `SparseConstrainedConn(conn, constraint, enforce_dale=E)` | `SparseConnection.from_adjacency(conn, Synapse(weight=ConstrainedWeight(group=constraint, dale=E)))` |
+| `SparseConstrainedConn.from_hetersynapse`, `constraint_info`, `persist_initial_weight` | `SparseConnection.from_hetersynapse(conn, synapse, n_receptor=, n_delay=)`; base weights and groups are always persistent |
+| SciPy-only constructor input | anything `btorch.sparse.as_sparse` accepts (btorch, PyTorch, SciPy) |
+| `magnitude`, `initial_sign`, `initial_weight`, `_constraint_scatter_indices` | `weight.value`, `weight.sign`, `weight.base`, `weight.group` (`weight.scale` for group scales) |
+| `get_sparse_matrix()` | `to_sparse("src_dst")` |
+| `get_group_info`, `set_group_magnitude`, `get_weights_by_group` | `weight.group_info`, `weight.set_scale`, `weight.weights_by_group` |
+| `sparse_backend=`, `available_sparse_backends()`, `SparseBackend` | internal backend selection; `btorch.sparse.runtime.use_backend(...)` for experts |
+| `make_hetersynapse_conn`, `make_hetersynapse_constraint`, `make_hetersynapse_constrained_conn`, `stack_hetersynapse`, `expand_conn_for_delays` | unchanged; their expanded matrices are one lowering, decoded by `from_hetersynapse` |
+| `state_dict` keys `magnitude`, `indices` | `indices`, `layout`, `weight.*` (and `receptor`, `delay`); old checkpoints do not load |
+
+`DenseConn` is unchanged.
+
+## 11. Known limitations
+
+- **N-D sparse.** COO carries N-D metadata and `sparse.einsum` handles one
+  sparse operand against dense operands with a dense output. There is no
+  CSF format, no sparse-sparse contraction, no sparse output and no ellipsis.
+  See [the einsum notes](sparse_einsum_notes.md) for what a Scorch/TACO-style
+  compiler would add.
+- **BSR / BSC** are imported and exported through COO; they are not native
+  formats and there is no block kernel.
+- **Different-pattern network batches** are a reference fallback: stored as
+  batched COO and executed as one block-diagonal operator. There is no ragged
+  CSR, and they cannot be combined with a shared-pattern value batch, with
+  receptor/delay routing, or with rewiring.
+- **Receptors and delays** execute through the expanded reference lowering.
+  There is no routed kernel, delay ring buffer or event queue.
+- **Push propagation** is opt-in through a density hint, is not bitwise
+  deterministic, and is not used for value-batched weights. On CPU, and on
+  CUDA without Triton, it packs spikes on the host, which synchronises and
+  cannot be captured in a CUDA graph.
+- **CUDA graphs and rewiring.** The Triton pull kernels rebuild their derived
+  index copies when the pattern changes, so a CUDA graph captured before a
+  rewiring step must be captured again; replaying the old one is invalid.
+  Compiled modules are unaffected.
+- **Kernel inputs are trusted.** The registered operators check the shapes of
+  what a connection passes them, not arbitrary hand-built buffers: an index
+  permutation or column index outside its range is undefined behaviour on
+  the Triton backend where the ATen reference raises.
+- **Sparse event input** (`propagate_events`) uses the ATen kernel directly:
+  it is not behind a registered operator, has no CUDA kernel, and does not
+  support network batches.
+- **Double backward** through the propagation operators is not supported and
+  raises.
+- **Complex dtypes** are rejected by the propagation operators.
+- **`A @ x` inside `torch.compile`** fails in PyTorch 2.11 because Dynamo
+  does not dispatch `@` to user objects. `A.matvec(x)` and
+  `sparse.matmul(A, x)` compile, as does every connection module.
+- **Checkpoints** require the same number of edge slots as the module they
+  are loaded into. A stochastic rule with a different seed can therefore
+  produce a module that refuses the checkpoint; build with the same seed or
+  with a rule of fixed edge count.
+- **Soft Deep R** is not implemented. Exact soft rewiring keeps a latent
+  parameter for every candidate edge, which is dense memory; a pooled
+  approximation would need a distinct name.
+- **`value_version`** is bumped on checkpoint load and rewiring only;
+  optimizers do not notify the connection and nothing consumes the counter
+  yet.
+- **Hints** `expected_calls` and `expected_batch` are accepted and not yet
+  used by the planner.
+- **Distributed / offloaded execution** is not implemented. Storage,
+  the logical sparse object and connection semantics are separate layers so
+  that placement can be added below the connection.

@@ -22,7 +22,11 @@ class RepresentationCache(nn.Module):
     owning module, never enter a ``state_dict``, and are rebuilt from the
     canonical buffers whenever the topology changes. Rebuilding writes into
     the existing tensors when the number of edges is unchanged, so compiled
-    graphs and CUDA graphs that captured them stay valid.
+    graphs that captured them stay valid. A backend may keep derived copies of
+    its own (the Triton pull kernels rebuild theirs when the pattern
+    changes), so a CUDA graph captured before rewiring must be captured
+    again. Rebuild at the optimizer boundary, never between a forward pass
+    and its backward.
     """
 
     crow: Tensor

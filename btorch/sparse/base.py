@@ -162,12 +162,12 @@ class Sparse:
 
     # -------------------------------------------------------------- interop
     @classmethod
-    def from_torch(cls, tensor: Tensor) -> "Sparse":
+    def from_torch(cls, tensor: Tensor, *, batch_dim: int = 0) -> "Sparse":
         """Wrap a ``torch`` sparse tensor (see
         :func:`btorch.sparse.from_torch`)."""
         from .conversion import from_torch
 
-        return from_torch(tensor)
+        return from_torch(tensor, batch_dim=batch_dim)
 
     @classmethod
     def from_scipy(cls, array: Any, *, device=None, dtype=None) -> "Sparse":

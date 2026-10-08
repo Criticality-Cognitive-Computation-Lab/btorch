@@ -1,6 +1,6 @@
 """Receptors and delays as edge attributes (spec sections 17, 18 and 43).
 
-The legacy helpers encode receptors and delays *physically*: a ``src_dst``
+The legacy helpers encode receptors and delays *physically*: a ``pre_post``
 matrix with rows ``pre * n_delay + delay`` and columns
 ``post * n_receptor + receptor``. The connection layer stores the semantic
 edge list ``(pre, post, weight, receptor, delay)`` instead and treats that
@@ -76,7 +76,7 @@ def scenario(name):
     """One reference network: the legacy expanded matrix and, written down
     independently, its semantic edge list.
 
-    Returns a dict with ``expanded`` (SciPy, ``src_dst``), ``n_receptor``,
+    Returns a dict with ``expanded`` (SciPy, ``pre_post``), ``n_receptor``,
     ``n_delay``, the per-edge arrays ``pre``, ``post``, ``weight``,
     ``receptor``, ``delay`` and the receptor index frame ``index``.
     """
@@ -192,7 +192,15 @@ def test_three_pathways_give_identical_currents(name):
         assert (conn.in_features, conn.out_features) == (n_in, n_out), label
         torch.testing.assert_close(conn(x), expected, msg=label)
         # Every pathway lowers to the same expanded operator.
-        assert torch.equal(conn.to_sparse().to_dense(), dense), label
+        assert torch.equal(conn.to_sparse("post_pre").to_dense(), dense), label
+    # Without an argument ``to_sparse`` returns the layout a connection was
+    # built from. The adapter was built from the legacy ``pre_post`` expansion,
+    # so it hands exactly that matrix back; an edge list has no layout of its
+    # own and reads back in the connectome (``pre_post``) convention too.
+    assert conns["adapter"].orientation == conns["semantic"].orientation == "pre_post"
+    for label in ("adapter", "semantic"):
+        round_trip = conns[label].to_sparse().to_scipy().toarray()
+        assert np.array_equal(round_trip, s["expanded"].toarray()), label
     assert torch.equal(conns["adapter"](x), conns["semantic"](x))
 
 

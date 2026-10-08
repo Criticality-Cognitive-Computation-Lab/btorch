@@ -29,6 +29,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `torch.library` operators (`csr_propagate`, `spike_propagate`), kernel backend
   registry (`registry`, `use_backend`), `Planner`, `RepresentationCache`. Not
   needed to write models.
+- **Triton pull backend** (`btorch.sparse.runtime.kernels_triton`) — CUDA
+  kernels for the destination-driven product (`csr_matvec`) and the edge-weight
+  gradient (`edge_grad`), registered as backend `"triton"`. Default on CUDA when
+  Triton is installed; `"aten"` stays the fallback and the reference
+  (`runtime.use_backend("aten")` forces it).
+- **Connection rules and `Projection`** (`btorch.models.connection`) —
+  NEST-style construction from two populations: `Projection(pre, post, rule,
+  synapse)` with the rules `OneToOne`, `AllToAll`, `FixedIndegree`,
+  `FixedOutdegree`, `PairwiseBernoulli`, `DistanceDependent`, `FromEdges`,
+  `FromSparse`. Per-edge `Synapse` arrays align with the rule's edge list;
+  parallel edges are merged. Rules do not decide the execution format: a
+  projection builds a `StructuredConnection` for `OneToOne` / `AllToAll` with one
+  fixed weight and a `SparseConnection` otherwise.
+- **Linear operators** (`btorch.sparse.operator`) — `LinearOperator` and the
+  matrix-free `ConstantOperator`, `DiagonalOperator`, `LowRankOperator`,
+  `ImplicitOperator`; lazy composites through `+`, `-`, `@`, scaling and `.T`;
+  capabilities queried with `supports(name)`. Used by `OperatorConnection` /
+  `StructuredConnection` / `ImplicitConnection`.
+- **`sparse.einsum`** (experimental) — contraction of one N-D sparse array with
+  dense tensors into a dense result; no ellipsis, no second sparse operand. See
+  [`docs/en/docs/design/sparse_einsum_notes.md`](docs/en/docs/design/sparse_einsum_notes.md).
+- **`HardDeepR`** (`btorch.models.connection`) — fixed-slot hard Deep Rewiring
+  for `SparseConnection`: `HardDeepR(conn, HardDeepROptions(...))`,
+  `attach(optimizer)`; dormant edge slots are reused for new connections without
+  changing tensor shapes, so optimizers and compiled graphs stay valid. Adds
+  `SparseConnection.enable_rewiring()`, `set_edges_()` and `topology_version`.
+  Soft Deep R is not implemented.
+- `ConstantWeight` counts merged parallel edges (new state key
+  `weight.multiplicity`); `Synapse(weight=module, dale=True)` switches the
+  `dale` flag of the weight module on; `SparseConnection.constrain()`,
+  `sparse.explain(conn, x)` and `CSR.coalesce()` / `CSC.coalesce()` added;
+  `use_backend` raises on an unknown backend name; `load_state_dict` rejects
+  checkpoints whose edges address neurons or channels outside the module.
 - User guide [`docs/en/docs/guides/sparse_connectivity.md`](docs/en/docs/guides/sparse_connectivity.md).
 - `tests/test_pipeline_e2e.py` — end-to-end example test chaining connectome ->
   sparse conn -> LIF/ExponentialPSC RNN -> spike analysis -> xarray round trip.

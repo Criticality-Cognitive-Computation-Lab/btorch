@@ -37,6 +37,9 @@ from .synapse import Synapse
 from .weight import ConstantWeight, ConstrainedWeight, EdgeWeight, Weight
 
 
+SparseLinear = SparseConnection
+
+
 __all__ = [
     "AllToAll",
     "Connection",
@@ -58,6 +61,7 @@ __all__ = [
     "PairwiseBernoulli",
     "Projection",
     "SparseConnection",
+    "SparseLinear",
     "StructuredConnection",
     "Synapse",
     "Weight",

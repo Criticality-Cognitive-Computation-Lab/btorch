@@ -87,6 +87,7 @@ nav:
   - guides/sparse_connectivity.md
 - Design notes:
   - design/sparse_connectivity.md
+  - design/sparse_einsum_notes.md
 - FAQ: faq.md
 - Examples: examples.md
 - Skills: skills.md

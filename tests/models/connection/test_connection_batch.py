@@ -191,7 +191,7 @@ def test_shared_pattern_constructors_are_equivalent():
         assert conn.indices.shape == (2, E)  # one pattern, not G copies
         assert conn.weight().shape == (G, E)
         torch.testing.assert_close(conn(x), expected)
-    # An adjacency (src_dst) batch is transposed per network.
+    # An adjacency (pre_post) batch is transposed per network.
     adjacency = sparse.stack(
         [sparse.from_edges(PRE, POST, VALUES[g], (N, M)) for g in range(G)]
     )
@@ -227,7 +227,10 @@ def test_batched_weights_with_per_edge_group_ids():
     assert conn.weight().shape == (G, E)
     assert [n for n, _ in conn.named_parameters()] == ["weight.scale"]
     assert conn.weight.scale.shape == (G, 3)
-    dense = conn.to_sparse().to_dense()
+    # ``DENSE`` holds operators ``[G, n_post, n_pre]``; name that orientation
+    # (the default of ``to_sparse`` is the layout the connection was built
+    # from, which is ``pre_post`` for an edge list).
+    dense = conn.to_sparse("post_pre").to_dense()
     torch.testing.assert_close(dense, DENSE["constrained"])
 
 
