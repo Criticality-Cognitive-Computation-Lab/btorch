@@ -150,6 +150,14 @@ include = [
 ]
 allow-direct-references = true
 
+[tool.coverage.report]
+# Triton compiles these function bodies into device code, so coverage.py cannot
+# trace their source lines even when CUDA tests launch the kernels.  Keep the
+# surrounding Python preparation, dispatch and fallback paths measurable.
+exclude_also = [
+  "@triton\\.jit",
+]
+
 # Docs: uv sync --only-group docs
 # Tests: uv sync --only-group test
 # Dev: uv sync --group dev --all-extras
