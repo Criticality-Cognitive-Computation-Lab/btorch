@@ -22,7 +22,7 @@ btorch provides several surrogate gradient functions in `btorch.models.surrogate
 | `SuperSpike` | `(1 + (√2−1)·α·\|v\|)⁻²` | 2.0 |
 
 All default values correspond to a half-width of 0.5 (see
-[Alpha convention](#alpha-convention-hwhm--1alpha) below), except `Erf` whose
+[Alpha convention](#convention-2-alpha-convention-hwhm-1alpha) below), except `Erf` whose
 default alpha=4 (HWHM=0.25) is calibrated to match the V1 model of
 Chen et al. (2022).
 

@@ -17,7 +17,7 @@ btorch 在 `btorch.models.surrogate` 中提供了多种代理梯度函数：
 | `Triangle` | `(1 − \|α v\| / 2)₊` | 2.0 |
 | `SuperSpike` | `(1 + (√2−1)·α·\|v\|)⁻²` | 2.0 |
 
-所有默认值对应半宽度为 0.5（见下方 [alpha 约定](#约定二--alpha-约定hwhm--1alpha)），`Erf` 例外，其默认 alpha=4（HWHM=0.25）是为了匹配 Chen 等人（2022）的 V1 模型而校准的。
+所有默认值对应半宽度为 0.5（见下方 [alpha 约定](#alpha-hwhm-1alpha)），`Erf` 例外，其默认 alpha=4（HWHM=0.25）是为了匹配 Chen 等人（2022）的 V1 模型而校准的。
 
 ## 约定一 — 峰值归一化：`g(0) = 1`
 
