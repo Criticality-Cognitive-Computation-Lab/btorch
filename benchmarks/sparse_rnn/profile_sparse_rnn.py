@@ -9,8 +9,9 @@ from torch import nn
 from torch.profiler import ProfilerActivity, profile, schedule
 
 from btorch.models.base import MemoryModule
+from btorch.models.connection import SparseConnection
 from btorch.models.functional import reset_net_state
-from btorch.models.linear import DenseConn, SparseConn, available_sparse_backends
+from btorch.models.linear import DenseConn
 from btorch.models.rnn import make_rnn
 from btorch.utils.file import fig_path
 
@@ -25,7 +26,6 @@ class SparseRNNCell(MemoryModule):
         W_x: torch.Tensor,
         W_h_sparse: scipy.sparse.sparray,
         b: torch.Tensor,
-        sparse_backend: str,
     ):
         super().__init__()
         self.input_size = input_size
@@ -39,12 +39,9 @@ class SparseRNNCell(MemoryModule):
             device=W_x.device,
             dtype=W_x.dtype,
         )
-        self.W_h = SparseConn(
-            W_h_sparse,
-            bias=None,
-            enforce_dale=False,
-            sparse_backend=sparse_backend,
-        )
+        # (source, destination) matrix -> ``h @ W_h``. The execution backend
+        # is chosen by the sparse runtime (see ``self.W_h.explain()``).
+        self.W_h = SparseConnection.from_adjacency(W_h_sparse)
         self.b = nn.Parameter(b.clone())
 
         self.register_memory("h", torch.zeros(1), hidden_size)
@@ -58,7 +55,6 @@ class SparseRNNCell(MemoryModule):
 @dataclass(frozen=True)
 class ProfileConfig:
     device: torch.device
-    backend: str
     seq_len: int
     batch_size: int
     input_size: int
@@ -122,10 +118,8 @@ def _write_summary(prof, output_dir: Path, device: torch.device, row_limit: int 
 
 
 def _parse_args() -> ProfileConfig:
-    backends = available_sparse_backends()
     parser = argparse.ArgumentParser(description="Profile a sparse RNN.")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
-    parser.add_argument("--backend", default=backends[0], choices=backends)
     parser.add_argument("--seq-len", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--input-size", type=int, default=32)
@@ -153,7 +147,6 @@ def _parse_args() -> ProfileConfig:
 
     return ProfileConfig(
         device=device,
-        backend=args.backend,
         seq_len=args.seq_len,
         batch_size=args.batch_size,
         input_size=args.input_size,
@@ -188,7 +181,6 @@ def _run_profile(cfg: ProfileConfig) -> None:
         W_x,
         W_h_sparse,
         b,
-        sparse_backend=cfg.backend,
     )
     rnn.to(device=cfg.device)
 

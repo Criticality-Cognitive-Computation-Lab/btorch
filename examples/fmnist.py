@@ -443,7 +443,8 @@ def main():
                 loss = F.mse_loss(out_fr, label_onehot)
                 loss.backward()
                 optimizer.step()
-            # if you use SparseConn from models.linear, and enforce Dale's law
+            # if you use SparseConnection from models.connection with
+            # Synapse(dale=True) (or DenseConn(enforce_dale=True))
             # constrain_net(net)
 
             train_samples += label.numel()

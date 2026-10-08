@@ -15,7 +15,9 @@ By default, outputs land in `fig/benchmark/...` with a timestamped folder.
 Optional flags:
 
 - `--device cpu|cuda`
-- `--backend native|torch_sparse`
+- the sparse execution backend is chosen by the `btorch.sparse` runtime (the
+  former `--backend` flag is gone); wrap the run in
+  `btorch.sparse.runtime.use_backend("torch_sparse")` to force one
 - `--grad-checkpoint`
 - `--seq-len`, `--batch-size`, `--input-size`, `--hidden-size`
 - `--density` (sparsity of the recurrent weight)

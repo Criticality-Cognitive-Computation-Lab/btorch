@@ -7,12 +7,8 @@ import scipy.sparse
 import torch
 
 from btorch.models import environ, functional
-from btorch.models.linear import (
-    DenseConn,
-    SparseConn,
-    SparseConstrainedConn,
-    available_sparse_backends,
-)
+from btorch.models.connection import ConstrainedWeight, SparseConnection, Synapse
+from btorch.models.linear import DenseConn
 from btorch.models.neurons.alif import ALIF, ELIF
 from btorch.models.neurons.glif import GLIF3
 from tests.utils.compile import compile_or_skip
@@ -22,15 +18,14 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA not available - skipping entire module", allow_module_level=True)
 
 
-@pytest.mark.parametrize("backend", available_sparse_backends())
 @pytest.mark.parametrize("use_compile", [False, True])
-def test_cudagraph_linear(backend: str, use_compile: bool):
-    """All connection classes match dense behavior with CUDA graphs."""
-    if backend == "native":
-        pytest.xfail(
-            "Native sparse backward pass is currently incompatible with CUDA graphs."
-        )
+def test_cudagraph_linear(use_compile: bool):
+    """All connection classes match dense behavior with CUDA graphs.
 
+    The sparse connections run on whichever kernel backend the runtime
+    selects; forward *and* backward must be capturable (the legacy
+    ``torch.sparse`` COO path was not, and needed ``torch_sparse``).
+    """
     torch.manual_seed(42)
 
     device = torch.device("cuda")
@@ -67,11 +62,9 @@ def test_cudagraph_linear(backend: str, use_compile: bool):
         (constraint_data, (constraint_rows, constraint_cols)), shape=W.shape
     )
 
-    sparse_coo = SparseConn(
-        W_sparse, bias=None, enforce_dale=False, sparse_backend=backend
-    ).to(device)
-    constrained = SparseConstrainedConn(
-        W_sparse, constraint, enforce_dale=False, bias=None, sparse_backend=backend
+    sparse_coo = SparseConnection.from_adjacency(W_sparse).to(device)
+    constrained = SparseConnection.from_adjacency(
+        W_sparse, Synapse(weight=ConstrainedWeight(group=constraint))
     ).to(device)
 
     x = x.to(device)

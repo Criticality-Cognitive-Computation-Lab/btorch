@@ -5,7 +5,8 @@ This test module covers:
 2. make_hetersynapse_constraint with different constraint modes
 3. make_hetersynapse_constrained_conn integration
 4. HeterSynapsePSC.get_psc with autodetection
-5. SparseConstrainedConn enhancements (from_hetersynapse, helper methods)
+5. Constrained SparseConnection built from hetersynapse matrices
+   (expanded layout vs. decoded receptor attributes, group helper methods)
 
 Tests also serve as examples and documentation for how to use these features.
 """
@@ -25,9 +26,10 @@ from btorch.connectome.connection import (
     make_hetersynapse_constraint,
 )
 from btorch.models import environ
+from btorch.models.connection import ConstrainedWeight, SparseConnection, Synapse
+from btorch.models.constrain import constrain_net
 from btorch.models.functional import init_net_state, reset_net
 from btorch.models.history import SpikeHistory
-from btorch.models.linear import SparseConstrainedConn
 from btorch.models.synapse import AlphaPSC, ExponentialPSC, HeterSynapsePSC
 from tests.utils.file import save_fig
 
@@ -276,8 +278,8 @@ def test_make_hetersynapse_constrained_conn():
     """Test the convenience function that creates both conn and constraint.
 
     This demonstrates the recommended workflow for creating
-    hetersynaptic connections with constraints ready for
-    SparseConstrainedConn.
+    hetersynaptic connections with constraints ready for a constrained
+    SparseConnection.
     """
     neurons = create_test_neurons(n_neurons=40)
     connections = create_test_connections(neurons, density=0.2)
@@ -378,10 +380,18 @@ def test_hetersynapse_psc_get_psc_autodetection():
 
 
 def test_sparse_constrained_conn_from_hetersynapse():
-    """Test SparseConstrainedConn.from_hetersynapse class method.
+    """Build a constrained SparseConnection from hetersynapse matrices.
 
-    This demonstrates the clean workflow for creating constrained
-    connections from hetersynapse data.
+    ``make_hetersynapse_constrained_conn`` returns a physically expanded
+    matrix: rows are pre-neurons, columns are ``post * n_receptor +
+    receptor``. There are two ways to turn it into a connection, and they
+    produce identical currents:
+
+    - ``from_adjacency`` keeps the expanded layout as is (``n_post`` is the
+      number of expanded columns);
+    - ``from_hetersynapse`` decodes the expansion into a semantic edge list
+      with a per-edge ``receptor`` attribute (``n_post`` is the number of
+      neurons, ``out_features`` is still ``n_post * n_receptor``).
     """
     neurons = create_test_neurons(n_neurons=50)
     connections = create_test_connections(neurons, density=0.15)
@@ -396,33 +406,83 @@ def test_sparse_constrained_conn_from_hetersynapse():
         constraint_mode="full",
     )
 
-    # Use the class method
-    linear = SparseConstrainedConn.from_hetersynapse(
-        conn=conn,
-        constraint=constraint,
-        receptor_type_index=receptor_idx,
-        enforce_dale=True,
+    n_neurons = len(neurons)
+    n_receptor = len(receptor_idx)
+    n_group = int(constraint.data.max())
+
+    # (a) Expanded layout. Dale's law of grouped weights is a flag of the
+    # weight module: group scales are kept non-negative.
+    expanded = SparseConnection.from_adjacency(
+        conn, Synapse(weight=ConstrainedWeight(group=constraint, dale=True))
+    )
+    # (b) Decoded layout: the constraint matrix uses the same expanded layout
+    # as ``conn`` and is matched to the edges by coordinate.
+    decoded = SparseConnection.from_hetersynapse(
+        conn,
+        Synapse(weight=ConstrainedWeight(group=constraint, dale=True)),
+        n_receptor=n_receptor,
     )
 
-    # Verify constraint_info is populated
-    assert linear.constraint_info is not None
-    assert "receptor_type_index" in linear.constraint_info
-    pd.testing.assert_frame_equal(
-        linear.constraint_info["receptor_type_index"], receptor_idx
+    # Same interface towards the PSC: n_neurons in, n_neurons * n_receptor out.
+    for linear in (expanded, decoded):
+        assert linear.in_features == n_neurons
+        assert linear.out_features == n_neurons * n_receptor
+        assert linear.weight.scale.shape == (n_group,)
+        assert linear.nnz == conn.nnz
+    # ... but the stored edge list differs: semantic targets + receptor ids
+    # versus expanded column indices.
+    assert (expanded.n_post, expanded.n_receptor) == (n_neurons * n_receptor, 1)
+    assert (decoded.n_post, decoded.n_receptor) == (n_neurons, n_receptor)
+    assert expanded.receptor is None and "receptor" not in expanded.state_dict()
+    assert decoded.receptor is not None and "receptor" in decoded.state_dict()
+    # Decoding is lossless: post * n_receptor + receptor is the expanded column.
+    assert torch.equal(
+        decoded.indices[0] * n_receptor + decoded.receptor, expanded.indices[0]
+    )
+    assert torch.equal(decoded.indices[1], expanded.indices[1])
+    assert torch.equal(decoded.weight.group, expanded.weight.group)
+
+    # Non-trivial scales (one negative, to be clamped by Dale's law), set
+    # identically on both layers.
+    torch.manual_seed(0)
+    scale = torch.rand(n_group) + 0.5
+    scale[0] = -1.0
+    x = torch.randn(4, n_neurons)
+    dense = torch.tensor(conn.toarray(), dtype=torch.float32)
+    for linear in (expanded, decoded):
+        with torch.no_grad():
+            linear.weight.scale.copy_(scale)
+        constrain_net(linear)
+        assert linear.weight.scale[0] == 0  # Dale: scales stay non-negative
+    out_expanded, out_decoded = expanded(x), decoded(x)
+    assert out_expanded.shape == (4, n_neurons * n_receptor)
+    torch.testing.assert_close(out_decoded, out_expanded, atol=1e-5, rtol=1e-5)
+    # Dense reference: every expanded entry scaled by its group's scale.
+    group_dense = torch.tensor(constraint.toarray(), dtype=torch.long) - 1
+    scale_dense = expanded.weight.scale.detach()[group_dense.clamp(min=0)]
+    torch.testing.assert_close(
+        out_expanded, x @ (dense * scale_dense), atol=1e-4, rtol=1e-4
     )
 
-    print("✓ from_hetersynapse class method works correctly")
-    print(f"  Magnitude shape: {linear.magnitude.shape}")
+    # Gradients of the group scales agree as well.
+    out_expanded.square().sum().backward()
+    out_decoded.square().sum().backward()
+    torch.testing.assert_close(
+        decoded.weight.scale.grad, expanded.weight.scale.grad, atol=1e-3, rtol=1e-4
+    )
+
+    print("✓ from_adjacency and from_hetersynapse give identical currents")
+    print(f"  Scale shape: {decoded.weight.scale.shape}")
 
 
 def test_sparse_constrained_conn_helper_methods():
-    """Test SparseConstrainedConn helper methods for inspection and
-    manipulation.
+    """Test ConstrainedWeight helper methods for inspection and manipulation.
 
-    This demonstrates:
-    1. get_group_info() for inspecting constraint groups
-    2. set_group_magnitude() for programmatic weight manipulation
-    3. get_weights_by_group() for analysis
+    The helpers live on the weight module of the connection
+    (``linear.weight``). This demonstrates:
+    1. group_info() for inspecting constraint groups
+    2. set_scale() for programmatic weight manipulation
+    3. weights_by_group() for analysis
     """
     neurons = create_test_neurons(n_neurons=40)
     connections = create_test_connections(neurons, density=0.2)
@@ -436,29 +496,42 @@ def test_sparse_constrained_conn_helper_methods():
         constraint_mode="cell_and_receptor",
     )
 
-    linear = SparseConstrainedConn.from_hetersynapse(
-        conn, constraint, receptor_idx, enforce_dale=True
+    linear = SparseConnection.from_hetersynapse(
+        conn,
+        Synapse(weight=ConstrainedWeight(group=constraint, dale=True)),
+        n_receptor=len(receptor_idx),
     )
 
-    # Test get_group_info
-    group_info = linear.get_group_info(include_weights=True)
+    # Test group_info
+    group_info = linear.weight.group_info(include_weights=True)
     assert isinstance(group_info, pd.DataFrame)
     assert "group_id" in group_info.columns
     assert "num_connections" in group_info.columns
-    assert "current_magnitude" in group_info.columns
-    assert "mean_initial_weight" in group_info.columns
+    assert "scale" in group_info.columns
+    assert "mean_base_weight" in group_info.columns
+    assert "std_base_weight" in group_info.columns
+    # One row per group of the constraint matrix; every edge is in one group.
+    assert len(group_info) == int(constraint.data.max())
+    assert group_info["num_connections"].sum() == conn.nnz
+    assert (group_info["scale"] == 1.0).all()
 
-    print("✓ get_group_info works correctly")
+    print("✓ group_info works correctly")
     print(f"  Found {len(group_info)} constraint groups")
 
-    # Test set_group_magnitude by group_id
-    linear.set_group_magnitude(group_id=0, value=2.5)
-    assert torch.isclose(linear.magnitude[0], torch.tensor(2.5))
+    # Test set_scale by (0-based) group id
+    linear.weight.set_scale(0, 2.5)
+    assert torch.isclose(linear.weight.scale[0], torch.tensor(2.5))
+    group_info = linear.weight.group_info(include_weights=True)
+    assert group_info["scale"][0] == 2.5
 
-    # Test get_weights_by_group
-    weights_by_group = linear.get_weights_by_group()
+    # Test weights_by_group: effective weights (base * scale) of every group
+    weights_by_group = linear.weight.weights_by_group()
     assert isinstance(weights_by_group, dict)
-    assert len(weights_by_group) == len(linear.magnitude)
+    assert len(weights_by_group) == len(linear.weight.scale)
+    in_group_0 = linear.weight.group == 0
+    torch.testing.assert_close(
+        weights_by_group[0], linear.weight.base[in_group_0] * 2.5
+    )
 
     # Visualize group sizes
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
@@ -472,13 +545,13 @@ def test_sparse_constrained_conn_helper_methods():
     ax.set_ylabel("Number of Connections")
     ax.set_title("Connections per Constraint Group")
 
-    # Plot 2: Current magnitudes
+    # Plot 2: Current scales
     ax = axes[1]
-    magnitudes = group_info["current_magnitude"].values
-    ax.bar(group_ids, magnitudes, color="#e74c3c")
+    scales = group_info["scale"].values
+    ax.bar(group_ids, scales, color="#e74c3c")
     ax.set_xlabel("Group ID")
-    ax.set_ylabel("Magnitude")
-    ax.set_title("Current Magnitude per Group")
+    ax.set_ylabel("Scale")
+    ax.set_title("Current Scale per Group")
     ax.axhline(y=1.0, color="k", linestyle="--", alpha=0.5, label="Initial (1.0)")
     ax.legend()
 
@@ -508,18 +581,22 @@ def test_hetersynapse_workflow_example():
         constraint_mode="cell_only",  # Share weights across receptor types
     )
 
-    # Step 3: Initialize constrained connection
-    linear = SparseConstrainedConn.from_hetersynapse(
-        conn, constraint, receptor_idx, enforce_dale=True
+    # Step 3: Initialize constrained connection. One learnable scale per
+    # constraint group; ``dale=True`` keeps the scales non-negative. The
+    # receptor expansion of ``conn`` is decoded into per-edge receptor ids.
+    linear = SparseConnection.from_hetersynapse(
+        conn,
+        Synapse(weight=ConstrainedWeight(group=constraint, dale=True)),
+        n_receptor=len(receptor_idx),
     )
 
     # Step 4: Inspect constraint groups
-    group_info = linear.get_group_info()
+    group_info = linear.weight.group_info()
     print(f"Created {len(group_info)} constraint groups")
 
-    # Step 5: (Optional) Manually adjust magnitudes
-    # For example, boost E→I connections
-    linear.set_group_magnitude(group_id=0, value=1.5)
+    # Step 5: (Optional) Manually adjust scales
+    # For example, boost the first group
+    linear.weight.set_scale(0, 1.5)
 
     # Step 6: Use in forward pass
     n_neurons = len(neurons)
@@ -819,7 +896,6 @@ def test_hetersynapse_psc_with_max_delay_steps_matches_manual():
     pipeline when using a delay-expanded connection matrix.
     """
     from btorch.connectome.connection import expand_conn_for_delays
-    from btorch.models.linear import SparseConn
 
     neurons = create_test_neurons(n_neurons=20)
     connections = create_test_connections(neurons, density=0.2)
@@ -846,7 +922,23 @@ def test_hetersynapse_psc_with_max_delay_steps_matches_manual():
         delays=delays,
         n_delay_bins=n_delay_bins,
     )
-    linear = SparseConn(conn_d, enforce_dale=False)
+    # ``conn_d`` is expanded twice: rows are ``pre * n_delay + delay`` and
+    # columns are ``post * n_receptor + receptor``. ``from_adjacency`` keeps
+    # that physical layout, which is what the PSC below indexes into.
+    linear = SparseConnection.from_adjacency(conn_d)
+    # ``from_hetersynapse`` decodes both expansions into per-edge receptor
+    # and delay attributes instead; it is a drop-in replacement with the same
+    # in/out layout and the same currents.
+    decoded = SparseConnection.from_hetersynapse(
+        conn_d, n_receptor=n_receptor, n_delay=n_delay_bins
+    )
+    assert (decoded.n_pre, decoded.n_post) == (n_neurons, n_neurons)
+    assert (decoded.in_features, decoded.out_features) == (
+        linear.in_features,
+        linear.out_features,
+    )
+    probe = torch.randn(3, n_neurons * n_delay_bins)
+    torch.testing.assert_close(decoded(probe), linear(probe), atol=1e-6, rtol=0.0)
 
     with environ.context(dt=1.0):
         hetersynapse_psc = HeterSynapsePSC(

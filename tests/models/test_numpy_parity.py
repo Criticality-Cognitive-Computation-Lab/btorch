@@ -19,8 +19,9 @@ import scipy.sparse
 import torch
 
 from btorch.models import environ
+from btorch.models.connection import SparseConnection
 from btorch.models.functional import init_net_state
-from btorch.models.linear import DenseConn, SparseConn
+from btorch.models.linear import DenseConn
 from btorch.models.neurons import GLIF3, LIF
 from btorch.models.synapse import (
     AlphaPSC,
@@ -145,7 +146,7 @@ def test_psc_sparse_weight_and_dt(name):
     sparse = scipy.sparse.coo_array(dense)
 
     make_torch, make_np = PSC_CASES[name]
-    linear = SparseConn(sparse, enforce_dale=False, dtype=torch.float64)
+    linear = SparseConnection.from_adjacency(sparse, dtype=torch.float64)
     psc = make_torch(linear)
     init_net_state(psc, dtype=torch.float64)
     psc_ref = make_np(sparse)  # the reference accepts scipy sparse directly
@@ -335,8 +336,8 @@ def test_recurrent_ei_network_parity():
     syn_e = AlphaPSCBilleh(
         n,
         tau_syn=tau_e,
-        linear=SparseConn(
-            scipy.sparse.coo_array(w_e), enforce_dale=False, dtype=torch.float64
+        linear=SparseConnection.from_adjacency(
+            scipy.sparse.coo_array(w_e), dtype=torch.float64
         ),
     )
     syn_i = AlphaPSCBilleh(

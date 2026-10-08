@@ -2,8 +2,18 @@
 
 Times ``y = conn(x)`` (forward) and forward+backward for every available
 implementation on synthetic recurrent graphs, so that changes to the sparse
-runtime can be compared against the legacy ``torch.sparse`` / ``torch_sparse``
-paths and a dense reference.
+runtime can be compared against a dense reference and against the pre-refactor
+``SparseConn`` forward (``legacy[native]`` / ``legacy[torch_sparse]``, a frozen
+copy kept in ``_legacy_baseline.py``).
+
+Implementations of :class:`btorch.models.connection.SparseConnection`:
+
+- ``new[eager]``: default plan (destination-driven "pull" product);
+- ``new[compile]`` (``--compile``): the same under
+  ``torch.compile(fullgraph=True)``;
+- ``new[push-hint]``: built with ``Hints(expected_density=<density>)`` for
+  the spike density being timed, so the planner may pick source-driven
+  propagation for sparse activity.
 
 Run::
 
@@ -24,6 +34,11 @@ from pathlib import Path
 import numpy as np
 import scipy.sparse
 import torch
+from _legacy_baseline import LegacySparseConn, available_legacy_backends
+
+from btorch.models.connection import SparseConnection
+from btorch.models.linear import DenseConn
+from btorch.sparse import Hints
 
 
 WORKLOADS = {
@@ -46,32 +61,44 @@ def make_graph(n: int, indegree: int, seed: int = 0) -> scipy.sparse.coo_array:
     return mat
 
 
-def _builders(n: int, device: str, compile_modes: bool) -> dict[str, Callable]:
-    """Map implementation name -> ``f(scipy matrix) -> module``."""
-    from btorch.models import linear
+# Implementations whose execution plan depends on the spike density: their
+# hints are refreshed for every density that is timed (see ``_bench_module``).
+PUSH_HINT = "new[push-hint]"
 
+
+def _builders(
+    n: int, device: str, compile_modes: bool, density: float
+) -> dict[str, Callable]:
+    """Map implementation name -> ``f(scipy matrix) -> module``.
+
+    Args:
+        n: Number of neurons.
+        device: Device the modules are built on.
+        compile_modes: Also build the ``torch.compile`` variant.
+        density: Spike density the ``new[push-hint]`` module is first planned
+            for.
+    """
     out: dict[str, Callable] = {}
-    for backend in linear.available_sparse_backends():
-        out[f"legacy[{backend}]"] = lambda m, b=backend: linear.SparseConn(
-            m, enforce_dale=False, sparse_backend=b, device=device
+    # Pre-refactor baseline (frozen copy of the removed ``SparseConn``).
+    for backend in available_legacy_backends():
+        out[f"legacy[{backend}]"] = lambda m, b=backend: LegacySparseConn(
+            m, backend=b, device=device
         )
     if n <= 8192:
-        out["dense"] = lambda m: linear.DenseConn(
+        out["dense"] = lambda m: DenseConn(
             n,
             n,
             weight=torch.tensor(m.toarray(), device=device),
             device=device,
         )
-    try:  # new runtime (absent before the sparse refactor)
-        from btorch.models.connection import SparseConnection
-    except ImportError:
-        SparseConnection = None
-    if SparseConnection is not None:
-        out["new[eager]"] = lambda m: SparseConnection.from_adjacency(m).to(device)
-        if compile_modes:
-            out["new[compile]"] = lambda m: torch.compile(
-                SparseConnection.from_adjacency(m).to(device), fullgraph=True
-            )
+    out["new[eager]"] = lambda m: SparseConnection.from_adjacency(m).to(device)
+    if compile_modes:
+        out["new[compile]"] = lambda m: torch.compile(
+            SparseConnection.from_adjacency(m).to(device), fullgraph=True
+        )
+    out[PUSH_HINT] = lambda m: SparseConnection.from_adjacency(
+        m, hints=Hints(expected_density=density)
+    ).to(device)
     return out
 
 
@@ -103,6 +130,11 @@ def _bench_module(mod, name, wl, n, nnz, build_ms, args) -> list[dict]:
             g = torch.Generator(device="cpu").manual_seed(0)
             x = (torch.rand(batch, n, generator=g) < density).float()
             x = x.to(device).requires_grad_(True)
+            if name == PUSH_HINT:
+                # One module serves every density: tell the planner which
+                # density is about to be timed, exactly as if the module had
+                # been built with ``hints=Hints(expected_density=density)``.
+                mod.set_hints(Hints(expected_density=density))
 
             def fwd():
                 with torch.no_grad():
@@ -151,7 +183,8 @@ def run(args: argparse.Namespace) -> list[dict]:
     for wl in args.workloads:
         n, indegree = WORKLOADS[wl]
         mat = make_graph(n, indegree)
-        for name, build in _builders(n, device, args.compile).items():
+        builders = _builders(n, device, args.compile, args.density[0])
+        for name, build in builders.items():
             if args.impl and not any(k in name for k in args.impl):
                 continue
             try:
