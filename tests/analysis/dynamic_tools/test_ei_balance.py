@@ -40,26 +40,31 @@ def generate_almost_perfect_balance_signal(
     freq_hz: float = 5.0,
     amp_e: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Generate nearly balanced E/I currents (I_e + I_i ≈ 0).
+    """Generate deterministic nearly balanced E/I currents.
 
-    I_i ≈ -I_e, so ECI should be close to 0 (good cancellation).
+    The inhibitory current is constructed from an independent negative copy of
+    the excitatory current plus a small analytic residual.  Avoiding the global
+    random-number generator makes the expected ECI and tracking correlation
+    stable across Python and NumPy versions.
     """
     t = np.arange(0, duration_ms, dt_ms)
-    T = len(t)
+    neuron_phase = np.linspace(0.0, 2.0 * np.pi, n_neurons, endpoint=False)
 
-    # Generate base excitatory signal (offset sine to ensure positive)
-    base_signal = np.sin(2 * np.pi * freq_hz * t / 1000.0)
-    # Shift to ensure strictly positive values
-    I_e = (
-        amp_e
-        * (base_signal - base_signal.min() + 0.1).reshape(-1, 1)
-        * np.ones((1, n_neurons))
+    # The offset keeps excitation positive, while the per-neuron scale prevents
+    # every channel from being an identical copy of the same waveform.
+    base_signal = np.sin(2.0 * np.pi * freq_hz * t / 1000.0)
+    positive_signal = base_signal - base_signal.min() + 0.1
+    neuron_scale = 1.0 + 0.05 * np.cos(neuron_phase)
+    I_e = amp_e * positive_signal[:, None] * neuron_scale[None, :]
+
+    # A bounded residual keeps the fixture "almost" rather than exactly
+    # balanced without relying on sampling variance.  ``copy`` makes the lack
+    # of aliasing explicit for future NumPy implementations.
+    residual = 0.01 * amp_e * np.sin(
+        2.0 * np.pi * (1.7 * freq_hz) * t[:, None] / 1000.0
+        + neuron_phase[None, :]
     )
-    I_e += 0.05 * np.random.rand(T, n_neurons)  # Add small positive noise only
-
-    # Near-perfect inhibition: I_i ≈ -I_e
-    I_i = -I_e
-    I_i += 0.05 * np.random.rand(T, n_neurons)
+    I_i = -I_e.copy() + residual
 
     return I_e.astype(np.float32), I_i.astype(np.float32)
 
