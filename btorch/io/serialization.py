@@ -739,8 +739,11 @@ def save_memories_to_xarray(
     for v_name in ds.variables:
         v_encoding: dict[str, Any] = {compressor_key: compressor_value}
         if store.chunks:
-            v_chunks = [store.chunks.get(d, -1) for d in ds[v_name].dims]
-            if any(c != -1 for c in v_chunks):
+            v_chunks = [
+                store.chunks.get(dim, max(1, ds.sizes[dim]))
+                for dim in ds[v_name].dims
+            ]
+            if any(dim in store.chunks for dim in ds[v_name].dims):
                 v_encoding["chunks"] = v_chunks
         encoding[v_name] = v_encoding
 

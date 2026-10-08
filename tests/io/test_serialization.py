@@ -15,7 +15,7 @@ from btorch.io.serialization import (
 
 # Optional extra [io]: skip this module when xarray/zarr are not installed.
 xr = pytest.importorskip("xarray")
-pytest.importorskip("zarr")
+zarr = pytest.importorskip("zarr")
 
 
 def test_save_load_roundtrip(tmp_path):
@@ -357,7 +357,10 @@ def test_store_and_sparse_options_roundtrip(tmp_path):
 
     ds = xr.open_zarr(path)
     assert ds["spike"].attrs.get("_btorch_sparse")
-    assert ds["v"].chunks[0] == (10, 10)  # time split in chunks of 10
+    # Inspect the physical store rather than xarray's Dask chunks. Without
+    # Dask, ``DataArray.chunks`` is ``None`` even though Zarr stored the
+    # requested chunk layout.
+    assert zarr.open_group(path)["v"].chunks[0] == 10
 
     loaded = load_memories_from_xarray(path)
     np.testing.assert_allclose(loaded["v"], data["v"])
