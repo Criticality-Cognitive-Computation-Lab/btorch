@@ -11,7 +11,7 @@ it. For usage see the [sparse connectivity guide](../guides/sparse_connectivity.
 
 | Path | Names |
 |---|---|
-| `btorch/models/linear.py` | `BaseSparseConn`, `SparseConn`, `SparseConstrainedConn`, `DenseConn`, `SparseBackend`, `_resolve_sparse_backend`, `available_sparse_backends` |
+| `btorch/models/linear.py` | `Linear` |
 | `btorch/models/constrain.py` | `HasConstraint`, `constrain_net` (runs `constrain()` under `torch.no_grad`) |
 | `btorch/connectome/connection.py` | `make_sparse_mat`, `make_constraint_by_neuron_type`, `make_hetersynapse_conn`, `make_hetersynapse_constraint`, `make_hetersynapse_constrained_conn`, `stack_hetersynapse`, `expand_conn_for_delays` |
 | `btorch/models/synapse.py` | `BasePSC` and subclasses call `self.linear(z)`; `HeterSynapsePSC`, `DelayedPSC`, `BilinearMixingSynapse` consume the physically expanded receptor / delay axes |
@@ -61,8 +61,8 @@ All eight characteristics listed in the task specification hold:
 - `get_sparse_matrix()` swaps the index rows back and returns the user
   orientation `(n_src, n_dst)`. It passes `is_coalesced=True` although the
   swapped indices are no longer sorted.
-- `DenseConn(weight=W)` takes `W` as `(in, out)` and stores `W.T` in
-  `nn.Linear.weight`.
+- `Linear(weight=W)` follows PyTorch directly: `W` has shape `(out, in)` and
+  is stored unchanged in `nn.Linear.weight`.
 
 ### 1.4 Autograd path
 
@@ -198,8 +198,10 @@ btorch.sparse.runtime         execution
 
 - A `ConnectionRule` says which pairs are connected. It is not a sparse array
   and does not choose a storage format.
-- A `Synapse` says what the edges do (weight, receptor, delay, plasticity).
-  These are orthogonal edge attributes, not matrix formats and not subclasses.
+- A `Synapse` says what the edges do (weight, receptor, delay). These are
+  orthogonal edge attributes, not matrix formats and not subclasses. The
+  `plasticity` field is reserved: any value other than `None` raises
+  `NotImplementedError`.
 - A `Sparse` is a format-agnostic numerical array; `COO`, `CSR`, `CSC` are
   representations of it. Procedural operators are `LinearOperator`s, not
   `Sparse`.
@@ -224,7 +226,15 @@ no `conn.compile()` and no public execution-plan object.
   is rejected.
 - `A @ x` follows `torch.matmul`. `matvec(A, x)` applies `A` along the last
   axis of `x [..., N]`. Both are standard orientation: `A.shape == (M, N)`
-  maps length-`N` to length-`M`.
+  maps length-`N` to length-`M`. For a square `A` and a square batch the two
+  accept the same input and return different results. The function forms
+  `matvec`, `matmul` and `rmatvec` accept linear operators as well as sparse
+  arrays.
+- `from_torch(t, batch_dim=k)` and `as_sparse(t, batch_dim=k)` read the first
+  `k` sparse dimensions of a PyTorch COO tensor as batch coordinates (PyTorch
+  COO has no notion of a batch). An uncoalesced COO tensor that does not
+  require grad keeps its stored order and duplicates; one that requires grad
+  is coalesced, because PyTorch exposes its values to autograd only then.
 - Representation changes that reorder or merge entries return an `EdgeMap`.
   Every edge-aligned array (weights, group ids, receptors, delays) is moved
   with the same map: weights are summed over merged duplicates, categorical
@@ -252,22 +262,43 @@ implicitly.
 
 ## 4. Orientation
 
-| Object | Shape | Product |
-|---|---|---|
-| `btorch.sparse` arrays, `SparseConnection(A)` | `(n_post, n_pre)` | `y = A @ x` |
-| Connectome matrices, hetersynapse helpers, `from_adjacency(W)` | `(n_pre, n_post)` | `y = x @ W` |
+Two strings name the two orientations everywhere: `"post_pre"` (the operator)
+and `"pre_post"` (the adjacency matrix of connectome tables).
 
-`SparseConnection.from_adjacency(W, orientation="src_dst")` is the only place
-a transpose is expressed. The canonical edge buffer `indices` holds
-`[post, pre]` per edge.
+| Orientation | Shape | Product | Objects |
+|---|---|---|---|
+| `"post_pre"` | `(n_post, n_pre)` | `y = A @ x` | `btorch.sparse` arrays, `SparseConnection(A)`, `from_adjacency(A, orientation="post_pre")`, `FromSparse(A, orientation="post_pre")` |
+| `"pre_post"` | `(n_pre, n_post)` | `y = x @ W` | connectome matrices, hetersynapse helpers, `from_adjacency(W)` and `FromSparse(W)` (their default), `from_hetersynapse` |
+
+- `SparseConnection.from_adjacency` and `FromSparse` are the places where a
+  transpose is expressed, and both default to `"pre_post"`. The bare
+  constructor `SparseConnection(A)` takes the operator.
+- Functions that take index tensors or populations take the source first:
+  `from_edges(pre, post, ...)`, `FromEdges(pre, post)`, `find_edges(pre,
+  post)`, `Projection(pre, post, ...)`, `candidate(pre, post)`.
+  `set_edges_(slots, *, pre, post)` is keyword-only.
+- The canonical edge buffer `indices` holds `[post, pre]` per edge;
+  `conn.pre` and `conn.post` are the named accessors.
+- A connection remembers the orientation it was built from in
+  `conn.orientation`; `conn.to_sparse(orientation=None)` defaults to it and
+  validates its argument.
+- For a square matrix a wrong orientation is a valid input. Nothing can detect
+  it.
 
 ## 5. Connections
 
 `SparseConnection` state:
 
-- Persistent (in the `state_dict`): `indices [2, E]`, optional `receptor [E]`
-  and `delay [E]`, and the weight module's state (`weight.value` and, with
-  Dale's law, `weight.sign`; or `weight.base`, `weight.group`, `weight.scale`).
+- Persistent (in the `state_dict`): `indices [2, E]`, `layout`
+  (`[n_post, n_pre, n_receptor, n_delay]`, followed by the batch shape of a
+  batch of different patterns), optional `receptor [E]` and `delay [E]`, an
+  optional `bias [out_features]`, and the weight module's state
+  (`weight.value` and, with Dale's law, `weight.sign`; or `weight.base`,
+  `weight.group`, `weight.scale`). `load_state_dict` compares `layout` with
+  the module, checks that the ids lie inside the populations, and refuses a
+  checkpoint with `indices` but without `layout` (written by the removed
+  layers) with a migration message. These checks raise also with
+  `strict=False`.
 - Derived (non-persistent buffers of `conn.cache`): destination-major CSR
   (`crow`, `col`, `perm`) and source-major CSR (`t_crow`, `t_col`, `t_perm`) of
   the same edges. They are rebuilt from the persistent buffers after
@@ -280,22 +311,47 @@ Weights are modules returning one effective value per edge: `EdgeWeight`
 scale[group[e]]`). Dale's law is a constraint of the weight module, applied by
 `constrain_net` under `torch.no_grad()`; its reference sign is persistent.
 
+Weights are bound by identity, not by copy:
+
+- A `Weight` module passed in `Synapse(weight=...)` is `conn.weight` itself.
+  It holds the parameters of one connection; binding it a second time raises.
+- An `nn.Parameter` is adopted as `conn.weight.value` (same object) when the
+  connection keeps the edge order, that is when the input entries are already
+  sorted by target and then source and nothing is merged. Otherwise the values
+  are copied into a new parameter and a warning is emitted.
+- A callable `f(n_edge)` or a `torch.distributions.Distribution` creates
+  trainable per-edge weights once the edges are known.
+- `Synapse(weight=<number>, dale=True)` raises: one fixed number cannot change
+  sign.
+- Every weight module exposes `shape`, `dtype` and `device` of its effective
+  weights. `edge_table()["weight"]` is a detached snapshot.
+
+`bias=True` creates a zero-initialised `[out_features]` bias; a tensor is
+validated against that shape at construction.
+
 Receptors and delays are per-edge attributes. The executed operator is the
 expanded reference lowering `(n_post * n_receptor, n_pre * n_delay)`, which is
 the layout `HeterSynapsePSC` and `SpikeHistory` already use; the lowering is
 derived state, the semantic edge list is the model. The hetersynapse helpers
-are unchanged and `SparseConnection.from_hetersynapse` decodes their expanded
-matrices into edge attributes.
+are unchanged and `SparseConnection.from_hetersynapse(matrix, synapse,
+n_receptor=None, n_delay=1, receptor_type_index=None)` decodes their expanded
+matrices into edge attributes; the number of receptor channels is given
+directly or as the receptor index table of the helper. `from_edges` validates
+that the ids lie inside the populations.
+
+`Projection` forwards `n_delay`, `n_receptor`, `weight`, `edge_table()` and
+`to_sparse()` to the connection it built.
 
 ## 6. Spikes during training
 
 The spike tensor produced by a neuron model stays an ordinary dense tensor
 `[..., N]`. Its forward values are sparse, its surrogate gradient is not, so
 the logical object and the autograd object are dense. Sparse execution is
-derived from it inside the operator: `spike_propagate` packs the non-zero
-entries, visits only the out-edges of active sources, and returns the same
-dense gradient as the destination-driven product, including for silent
-neurons. Genuinely sparse input (event data) can be passed as a `Sparse`
+derived from it inside the operator: `spike_propagate` finds the non-zero
+entries (on the device with the Triton backend, on the host with the
+reference backend), visits only the out-edges of active sources, and returns
+the same dense gradient as the destination-driven product, including for
+silent neurons. Genuinely sparse input (event data) can be passed as a `Sparse`
 array to `SparseConnection.propagate_events`.
 
 ## 7. `torch.compile` boundary
@@ -326,11 +382,44 @@ do not touch topology-derived state. `HardDeepR` is the provided policy: it
 runs from an optimizer post-step hook, samples new positions uniformly among
 unconnected pairs without building a dense mask, applies an explicit policy to
 the optimizer state of rewired slots, never raises when a layer is full
-(unplaced slots wait at zero weight) and has its own checkpoint state. The
-version counters
-(`topology_version`, `routing_version`, `value_version`) are bookkeeping for
-caches and are not read in `forward`, so rewiring does not retrace a compiled
-module.
+(unplaced slots wait at zero weight) and has its own checkpoint state. It
+accepts a `SparseConnection` or a `Projection` realised as one, and calls
+`candidate(pre, post)` to restrict new positions.
+
+`set_edges_(slots, *, pre, post, receptor=None, delay=None)` takes its index
+arguments by keyword only.
+
+Four counters describe what changed. None of them is read in `forward`, so
+rewiring does not retrace a module compiled with the default mode.
+
+| Counter | Changes when | Consumer |
+|---|---|---|
+| `topology_version` | `set_edges_`, `load_state_dict` | derived layouts |
+| `routing_version` | `set_edges_` with receptors or delays, `load_state_dict` | derived layouts |
+| `value_version` | a weight tensor is written in place (optimizer step, `constrain`, checkpoint load); derived from the tensors' in-place version counters | none yet |
+| `capture_version` | a CUDA graph captured around the connection became invalid: `set_edges_`, `load_state_dict`, `.to()`, a `set_hints` that changes the plan, a reallocation of backend layouts. Not on weight updates. | `CudaGraphRunner` |
+
+### CUDA graphs
+
+A CUDA graph replays recorded kernel launches and does not run Python again,
+so the wiring, the execution path and the device buffers of a connection are
+frozen at capture time. Weights are read at replay time and may change.
+
+- `conn.capture_version` changes whenever a captured graph is no longer valid
+  (table above). `conn.capture_incompatibility()` returns the reason why a
+  connection cannot be captured at all, or `None`; the one reason today is
+  the host-side packing of `"adaptive-push"`.
+- `btorch.models.cudagraph` defines the protocol for any submodule:
+  `capture_versions(module)` and `capture_incompatibilities(module)` collect
+  the two over a module tree.
+- `RecurrentNN(cudagraph=True)` reads the versions on every call and captures
+  again when one changed, and refuses a module that reports an
+  incompatibility.
+  <!-- verify: cudagraph re-capture -->
+- `torch.compile(mode="reduce-overhead")` uses CUDA graphs internally and has
+  no such hook. It must not be combined with rewiring or with loading a
+  different pattern, and a connection should be called once in eager mode
+  before it is compiled in that mode.
 
 ## 9. Runtime backends
 
@@ -348,15 +437,73 @@ because they never won in the measured regime. Push results depend on the
 arrival order of float atomics (relative error up to about `4e-7`); pull
 results are bitwise reproducible.
 
-The planner uses destination-driven propagation unless the connection carries
-an `expected_density` hint at or below the measured crossover (2% on CUDA,
-0.2% on CPU). `optional torch_sparse` remains selectable with
+The planner chooses one of three algorithms when a connection is built,
+moved or given new hints. Without an `expected_density` hint, with a hint
+above the measured crossover (2% on CUDA, 0.2% on CPU), and for a
+shared-pattern batch of weights it plans `"pull"`. With a hint at or below
+the crossover it plans a source-driven algorithm, and which one depends on
+the backend:
+
+| Algorithm | Backend | Behaviour |
+|---|---|---|
+| `"pull"` | all | destination-driven product over every edge; deterministic |
+| `"push"` | device-compacting (`spike_push_dense`, Triton on CUDA) | taken for every call once planned, whatever the density of an individual input; one launch, no host synchronisation; float atomics, so not bitwise reproducible; can be captured in a CUDA graph |
+| `"adaptive-push"` | reference (`spike_push`, ATen) | packs the active sources on the host; each call falls back to pull when its input is denser than the limit; cannot be captured in a CUDA graph |
+
+Two consequences of `"push"` differ from `"pull"`. Under
+`torch.use_deterministic_algorithms(True)` the planner plans `"pull"` instead
+of `"push"` (the flag is read when the plan is made). And `"push"` never
+visits the edges of a silent source, so a non-finite weight on such an edge
+does not reach the output, whereas `"pull"` propagates it (`inf * 0`).
+
+`Hints` validates its fields: `expected_density` must lie in `[0, 1]`, and the
+reserved `expected_calls` and `expected_batch` must be positive integers.
+
+The optional `torch_sparse` backend remains selectable with
 `runtime.use_backend("torch_sparse")` and nothing depends on it.
+`btorch.sparse.runtime.__all__` lists the registry, planner, cache and
+operator names only; the kernel modules (`ops`, `kernels_aten`,
+`kernels_triton`, `kernels_triton_push`) are internal. Importing
+`kernels_aten` no longer installs process-wide warning filters.
 
 Eager and compiled execution take different routes to the same kernels:
 compiled code calls the registered operators, eager code a plain
 `autograd.Function`, because the operator dispatch costs tens of microseconds
 per call and dominates for networks of a few thousand neurons.
+
+### Measured behaviour
+
+Full tables are in `benchmarks/sparse_conn/RESULTS.md`, together with the
+recorded state of the GPU. The numbers below are from an RTX 5090 that had no
+other compute process when the run was launched, synthetic graphs with
+uniform in-degree, medians per call.
+
+| Neurons (edges) | Batch | Forward (ms) | Forward + backward (ms) | Legacy `native` forward / forward + backward |
+|---|---:|---:|---:|---|
+| 4,096 (0.4M) | 1 | 0.016 | 0.17 | 0.068 / 1.4 |
+| 4,096 (0.4M) | 32 | 0.033 | 0.19-0.23 | 0.093 / 0.55 |
+| 100,000 (10M) | 1 | 0.105 | 0.42 | 0.235 / cannot run |
+| 100,000 (10M) | 32 | 0.28 | 1.03 | 3.04 / cannot run |
+| 1,000,000 (50M) | 1 | 0.54 | 2.4 | 1.39 / cannot run |
+| 1,000,000 (50M) | 32 | 2.1 | 9.8 | cannot run |
+
+- A dense layer is still faster at 4,096 neurons (0.13-0.14 ms forward +
+  backward).
+- With a density hint at 1 % spikes, the push path brings the forward to
+  0.030 ms at 100,000 neurons and 0.031 ms at one million (batch 1), and to
+  0.10 ms and 1.29 ms at batch 32. It makes no useful difference at 4,096
+  neurons.
+- `torch.compile` of a single connection equals eager from 100,000 neurons
+  up and is slower below (0.052 against 0.016 ms forward at 4,096 neurons):
+  the registered-operator boundary costs more per call than the eager
+  autograd node.
+- In a 200-step recurrent network of 4,096 neurons the connection is not the
+  bottleneck: the new path, dense and legacy are within 0.23-0.29 ms per
+  inference step. At 100,000 neurons and batch 32 a step takes 0.47 ms
+  (inference) and 1.37 ms (training) against 3.26 ms and "cannot run".
+- The comparison against the legacy `torch_sparse` path exists only from a
+  shared GPU: at 100,000 neurons and batch 32, 1.06 ms and 0.76 GB against
+  17.4 ms and 5.1 GB for forward + backward.
 
 ## 10. Migration
 
@@ -365,16 +512,30 @@ per call and dominates for networks of a few thousand neurons.
 | `BaseSparseConn` | `SparseConnection` over `btorch.sparse.Sparse` |
 | `SparseConn(conn, bias=b, enforce_dale=E)` | `SparseConnection.from_adjacency(conn, Synapse(dale=E), bias=b)`; Dale's law is now off by default |
 | `SparseConstrainedConn(conn, constraint, enforce_dale=E)` | `SparseConnection.from_adjacency(conn, Synapse(weight=ConstrainedWeight(group=constraint, dale=E)))` |
-| `SparseConstrainedConn.from_hetersynapse`, `constraint_info`, `persist_initial_weight` | `SparseConnection.from_hetersynapse(conn, synapse, n_receptor=, n_delay=)`; base weights and groups are always persistent |
+| `SparseConstrainedConn.from_hetersynapse`, `constraint_info`, `persist_initial_weight` | `SparseConnection.from_hetersynapse(conn, synapse, n_receptor=, n_delay=, receptor_type_index=)`; base weights and groups are always persistent |
 | SciPy-only constructor input | anything `btorch.sparse.as_sparse` accepts (btorch, PyTorch, SciPy) |
 | `magnitude`, `initial_sign`, `initial_weight`, `_constraint_scatter_indices` | `weight.value`, `weight.sign`, `weight.base`, `weight.group` (`weight.scale` for group scales) |
-| `get_sparse_matrix()` | `to_sparse("src_dst")` |
+| `get_sparse_matrix()` | `to_sparse()` after `from_adjacency` (the orientation of the input), or `to_sparse("pre_post")` explicitly |
 | `get_group_info`, `set_group_magnitude`, `get_weights_by_group` | `weight.group_info`, `weight.set_scale`, `weight.weights_by_group` |
 | `sparse_backend=`, `available_sparse_backends()`, `SparseBackend` | internal backend selection; `btorch.sparse.runtime.use_backend(...)` for experts |
 | `make_hetersynapse_conn`, `make_hetersynapse_constraint`, `make_hetersynapse_constrained_conn`, `stack_hetersynapse`, `expand_conn_for_delays` | unchanged; their expanded matrices are one lowering, decoded by `from_hetersynapse` |
-| `state_dict` keys `magnitude`, `indices` | `indices`, `layout`, `weight.*` (and `receptor`, `delay`); old checkpoints do not load |
+| `state_dict` keys `magnitude`, `indices` | `indices`, `layout`, `weight.*` (and `receptor`, `delay`); old checkpoints are refused with a migration message, also with `strict=False` |
 
-`DenseConn` is unchanged.
+`Linear` follows the standard PyTorch interface; its `constrain()` does not write through
+`.data`.
+
+Names that changed during the development of this subsystem (no aliases
+exist):
+
+| Earlier | Now |
+|---|---|
+| `orientation="src_dst"` / `"dst_src"` | `"pre_post"` / `"post_pre"` |
+| `FromSparse(A)` defaulting to `"post_pre"` | defaults to `"pre_post"`, like `from_adjacency` |
+| `conn.to_sparse()` defaulting to the operator | defaults to `conn.orientation` |
+| `set_edges_(slots, post, pre)` | `set_edges_(slots, *, pre, post, receptor=None, delay=None)` |
+| `candidate(post, pre)` | `candidate(pre, post)` |
+| weights passed in a `Synapse` were copied | a `Weight` module is `conn.weight`; an `nn.Parameter` is adopted when the edge order is kept |
+| planner algorithm `"adaptive-push"` on every backend | `"push"` on a device-compacting backend, `"adaptive-push"` on the reference backend |
 
 ## 11. Known limitations
 
@@ -391,14 +552,35 @@ per call and dominates for networks of a few thousand neurons.
   receptor/delay routing, or with rewiring.
 - **Receptors and delays** execute through the expanded reference lowering.
   There is no routed kernel, delay ring buffer or event queue.
-- **Push propagation** is opt-in through a density hint, is not bitwise
-  deterministic, and is not used for value-batched weights. On CPU, and on
-  CUDA without Triton, it packs spikes on the host, which synchronises and
-  cannot be captured in a CUDA graph.
-- **CUDA graphs and rewiring.** The Triton pull kernels rebuild their derived
-  index copies when the pattern changes, so a CUDA graph captured before a
-  rewiring step must be captured again; replaying the old one is invalid.
-  Compiled modules are unaffected.
+- **Source-driven propagation** is opt-in through a density hint and is not
+  used for value-batched weights. `"push"` (Triton on CUDA) is not bitwise
+  deterministic, is used for every input once planned even when that input is
+  dense, and does not propagate a non-finite weight of a silent source.
+  `"adaptive-push"` (CPU, and CUDA without Triton) packs spikes on the host,
+  which synchronises and cannot be captured in a CUDA graph.
+- **CUDA graphs.** A graph captured around a connection is invalid after
+  `set_edges_`, `load_state_dict` with different edges, `.to()` and a
+  `set_hints` that changes the plan; replaying it computes with the old
+  structure and raises nothing. `conn.capture_version` reports these events
+  and `RecurrentNN(cudagraph=True)` acts on it. `torch.compile(mode=
+  "reduce-overhead")` has no such hook and must not be combined with rewiring
+  or with loading a different pattern. Modules compiled with the default mode
+  are unaffected.
+- **Triton kernels are `float32` only.** For any other dtype they call the
+  reference backend themselves, without a message, and `explain()` still
+  names `triton`.
+- **A shared-pattern batch on the reference backend** is executed as a Python
+  loop over the batch members.
+- **`A @ x` and `A.matvec(x)` on a `Sparse`** use the gather reference path of
+  `btorch.sparse` and never a backend kernel. Only `SparseConnection` reaches
+  the kernels.
+- **`torch.func` transforms** (`vmap`, `func.grad`, forward-mode
+  differentiation) are not supported through a connection.
+- **Index memory.** All index buffers are `int64` and both CSR layouts are
+  always built, which costs 52 bytes per edge on CPU in addition to the
+  weights.
+- **Import time.** Importing `btorch.models` also imports `torch._dynamo`
+  through the registration of the custom operators, which takes roughly 2 s.
 - **Kernel inputs are trusted.** The registered operators check the shapes of
   what a connection passes them, not arbitrary hand-built buffers: an index
   permutation or column index outside its range is undefined behaviour on
@@ -419,11 +601,41 @@ per call and dominates for networks of a few thousand neurons.
 - **Soft Deep R** is not implemented. Exact soft rewiring keeps a latent
   parameter for every candidate edge, which is dense memory; a pooled
   approximation would need a distinct name.
-- **`value_version`** is bumped on checkpoint load and rewiring only;
-  optimizers do not notify the connection and nothing consumes the counter
+- **`HardDeepR`** supports only an unbatched, trainable `EdgeWeight`.
+  `ConstantWeight`, `ConstrainedWeight`, fixed weights and network batches
+  are refused.
+- **Parameter adoption depends on the edge order.** An `nn.Parameter` passed
+  as weight stays the trained object only when the input entries are already
+  sorted by target and then source. A CSR adjacency matrix and the edges of a
+  random rule are not, so the common case is a copy with a warning.
+- **`Synapse(plasticity=...)`** is reserved; any value other than `None`
+  raises `NotImplementedError`.
+- **`value_version`** is derived from the in-place version counters of the
+  weight tensors, so it changes on optimizer steps, but nothing consumes it
   yet.
 - **Hints** `expected_calls` and `expected_batch` are accepted and not yet
   used by the planner.
 - **Distributed / offloaded execution** is not implemented. Storage,
   the logical sparse object and connection semantics are separate layers so
   that placement can be added below the connection.
+
+## 12. Test status
+
+`pytest tests/sparse tests/models tests/connectome tests/test_pipeline_e2e.py`
+passes with four expected failures, all the Dynamo `@` limitation listed
+above. What the new tests cover:
+
+| Area | Files |
+|---|---|
+| Conversion round trips (SciPy COO/CSR/CSC/BSR/LIL/DOK/DIA, torch COO/CSR/CSC/BSR/BSC), `as_sparse`, `EdgeMap` | `tests/sparse/test_conversion.py`, `test_as_sparse.py`, `test_edge_map.py` |
+| Products against dense references, batches, gradients, closures under `torch.compile` | `tests/sparse/test_matmul.py`, `test_batch.py`, `test_grad.py` |
+| `einsum`, linear operators | `tests/sparse/test_einsum.py`, `test_operator.py` |
+| Registered operators (`opcheck`, `gradcheck`), caches, backends, eager/compiled parity | `tests/sparse/test_runtime_ops.py`, `test_runtime_propagate.py` |
+| Triton kernels against the ATen reference | `tests/sparse/test_kernels_triton_pull.py`, `test_kernels_triton_push.py` |
+| `SparseConnection`: construction, orientation, weights, Dale's law, gradients, `fullgraph` compile, checkpoints, batches, receptor/delay routing against the hetersynapse helpers | `tests/models/connection/test_sparse_connection*.py`, `test_connection_*.py` |
+| Rules, `Projection`, `HardDeepR` | `tests/models/connection/test_rule.py`, `test_projection.py`, `test_rewire.py` |
+| Regression tests for both code reviews | `tests/models/connection/test_review_regressions.py` |
+
+The Triton tests run only where CUDA and Triton are available; they pass on
+an RTX 5090 and on a small local GPU with the current kernels. Tests that
+need the optional `torch_sparse` package are skipped where it is missing.

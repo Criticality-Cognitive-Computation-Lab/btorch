@@ -9,7 +9,8 @@ btorch 的所有重要变更都将记录在此文件中。
 
 ### 新增
 - `btorch.sparse`：SciPy/PyTorch 风格的稀疏数组 API（`Sparse`、`COO`、`CSR`、`CSC`、`sparse.from_edges`、`sparse.asarray`、`A @ x`、`sparse.stack`、`to_torch()` / `to_scipy()`）；采用标准矩阵方向，转换从不转置、也不稠密化。
-- `btorch.models.connection`：`SparseConnection`（`from_adjacency`、`from_edges`、`from_hetersynapse`）、`Synapse`、`EdgeWeight`、`ConstantWeight`、`ConstrainedWeight`；受体与延迟作为边属性；支持网络批。
+- `btorch.models.connection`：`SparseConnection`（`from_adjacency`、`from_edges`、`from_hetersynapse`）、`Synapse`、`EdgeWeight`、`ConstantWeight`、`ConstrainedWeight`；受体与延迟作为边属性；支持网络批。矩阵方向统一命名为 `"pre_post"`（行为源神经元，`from_adjacency` 与 `FromSparse` 的默认值）和 `"post_pre"`（算子）。新增访问器 `conn.pre`、`conn.post`、`conn.find_edges(pre, post)`、`conn.orientation`；`Projection.weight`、`edge_table()`、`to_sparse()`、`n_delay`、`n_receptor`。
+- CUDA graph 捕获协议：`conn.capture_version`、`conn.capture_incompatibility()`，以及 `btorch.models.cudagraph.capture_versions` / `capture_incompatibilities`。
 - `btorch.sparse.runtime`：执行层（注册算子、后端注册表、规划器）；编写模型时无需使用。Triton pull 后端（`csr_matvec`、`edge_grad`）在安装了 Triton 的 CUDA 上为默认后端。
 - 连接规则与 `Projection`：NEST 风格的构建方式（`Projection(pre, post, rule, synapse)`；`OneToOne`、`AllToAll`、`FixedIndegree`、`FixedOutdegree`、`PairwiseBernoulli`、`DistanceDependent`、`FromEdges`、`FromSparse`）。
 - `btorch.sparse.operator`：无需存储矩阵的线性算子（`ConstantOperator`、`DiagonalOperator`、`LowRankOperator`、`ImplicitOperator`、惰性组合），以及 `StructuredConnection` / `ImplicitConnection` / `HybridConnection`。
@@ -18,7 +19,10 @@ btorch 的所有重要变更都将记录在此文件中。
 - 指南：[稀疏连接](guides/sparse_connectivity.md)。
 
 ### 变更
-- **破坏性变更：** `btorch.models.linear` 中的 `SparseConn`、`SparseConstrainedConn`、`BaseSparseConn`、`SparseBackend`、`available_sparse_backends` 以及 `sparse_backend=` 参数已移除，没有兼容层。请改用 `SparseConnection.from_adjacency(conn, Synapse(dale=...))`；Dale 定律现需显式开启，`state_dict` 的键也已改变。迁移对照表见[稀疏连接指南](guides/sparse_connectivity.md)。
+- **破坏性变更**（相对于尚未发布的连接 API 的早期版本；没有别名）：方向字符串统一为 `"pre_post"` / `"post_pre"`（`"src_dst"` / `"dst_src"` 已移除）；`FromSparse` 默认 `"pre_post"`；`conn.to_sparse()` 默认返回构建连接时所用的方向；`set_edges_(slots, *, pre, post, ...)` 的索引参数仅限关键字；`HardDeepROptions.candidate` 以 `candidate(pre, post)` 调用。
+- **破坏性变更：** 权重按对象身份绑定：传入 `Synapse(weight=...)` 的 `Weight` 模块就是 `conn.weight`（每个连接一个模块）；`nn.Parameter` 在边顺序保持不变时直接成为 `conn.weight.value`，否则复制并给出警告。`Synapse(weight=<数值>, dale=True)` 与 `Synapse(plasticity=...)` 会抛出异常。
+- **破坏性变更：** 规划器区分 `"push"`（CUDA 上的 Triton；结果不保证逐位可复现）与 `"adaptive-push"`（参考后端；无法被 CUDA graph 捕获）。`conn.value_version` 现在会随优化器更新而变化。`btorch.sparse.runtime.__all__` 不再列出 `ops` 与 `kernels_aten`。
+- **破坏性变更：** `btorch.models.linear` 中的 `SparseConn`、`SparseConstrainedConn`、`BaseSparseConn`、`SparseBackend`、`available_sparse_backends` 以及 `sparse_backend=` 参数已移除，没有兼容层。请改用 `SparseConnection.from_adjacency(conn, Synapse(dale=...))`；Dale 定律现需显式开启，`state_dict` 的键也已改变；旧层写出的检查点会被拒绝并给出迁移提示。迁移对照表见[稀疏连接指南](guides/sparse_connectivity.md)。
 - **破坏性变更：** `memories_to_xarray` / `save_memories_to_xarray` 的选项归入 `DimLayout`、`SparseOptions` 与 `ZarrStoreOptions`（`btorch.io`）；`neuron_ids` 与 `partial_map` 变为仅关键字参数。
 - **破坏性变更：** 在第 `t` 步送达的脉冲现在会影响第 `t` 步返回的 PSC，所有 PSC 类型一致（此前 `AlphaPSC`、`AlphaPSCBilleh`、`DualExponentialPSC` 多花一个 `dt`）。
 - **破坏性变更：** `GLIF3.forward_exact_no_spike(x, t=None, v0=None, Iasc0=None, t_mode="homo")` 现为纯函数（不再更新状态）；逐元素原语 `exact_no_spike_at(x, t, v0, Iasc0)` 支持批量的异质时间与状态，例如用于迭代求根。`t_mode="heter"` 表示逐元素时间。

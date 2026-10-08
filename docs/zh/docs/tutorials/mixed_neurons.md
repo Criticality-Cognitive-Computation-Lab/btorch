@@ -25,7 +25,7 @@
 ```python
 from btorch.models.neurons import GLIF3, TwoCompartmentGLIF
 from btorch.models.neurons.mixed import MixedNeuronPopulation
-from btorch.models.linear import DenseConn
+from btorch.models.linear import Linear
 from btorch.models.synapse import AlphaPSC
 from btorch.models.rnn import ApicalRecurrentNN
 
@@ -49,7 +49,7 @@ mixed = MixedNeuronPopulation(
 突触看到的是**拼接后**的脉冲，因此连接矩阵必须为 `n_neuron x n_neuron`：
 
 ```python
-conn = DenseConn(n_neuron, n_neuron, bias=None)
+conn = Linear(n_neuron, n_neuron, bias=False)
 psc  = AlphaPSC(
     n_neuron=n_neuron,
     tau_syn=5.0,

@@ -113,8 +113,9 @@ def _write_summary(prof, output_dir: Path, device: torch.device, row_limit: int 
         f"time ({time_key})\n{table_time}\n\nmemory ({mem_key})\n{table_mem}\n"
     )
 
-    stacks_path = output_dir / f"stacks_{device.type}_memory.txt"
-    prof.export_stacks(str(stacks_path), mem_key)
+    # ``export_stacks`` only accepts time metrics (no memory metric).
+    stacks_path = output_dir / f"stacks_{device.type}_time.txt"
+    prof.export_stacks(str(stacks_path), time_key)
 
 
 def _parse_args() -> ProfileConfig:

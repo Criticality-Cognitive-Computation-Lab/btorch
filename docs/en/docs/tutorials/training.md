@@ -58,7 +58,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 model = model.to(device)
 ```
 
-`SparseConnection.from_adjacency` takes a matrix whose rows are source neurons and whose columns are target neurons. See the [sparse connectivity guide](../guides/sparse_connectivity.md) for weights, Dale's law, receptors and delays.
+`SparseConnection.from_adjacency` takes a matrix whose rows are source neurons and whose columns are target neurons (`orientation="pre_post"`, the default). See the [sparse connectivity guide](../guides/sparse_connectivity.md) for weights, Dale's law, receptors and delays.
 
 ## Initialize and Randomize State
 

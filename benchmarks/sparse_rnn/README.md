@@ -1,13 +1,13 @@
 # Sparse RNN Profiling
 
 This folder contains a simple profiler entry point for sparse recurrent
-connections. The script records a Chrome trace, memory stacks for a flamegraph,
-and summary tables.
+connections. The script records a Chrome trace, collapsed stacks for a
+flamegraph, and summary tables of time and memory.
 
 ## Usage
 
 ```bash
-python benchmark/sparse_rnn/profile_sparse_rnn.py
+python benchmarks/sparse_rnn/profile_sparse_rnn.py
 ```
 
 By default, outputs land in `fig/benchmark/...` with a timestamped folder.
@@ -26,5 +26,6 @@ Optional flags:
 ## Outputs
 
 - `trace_*.json`: Chrome trace for the profiler UI (Chrome tracing or TensorBoard).
-- `stacks_*_memory.txt`: collapsed stacks for memory flamegraphs.
+- `stacks_*_time.txt`: collapsed stacks for flamegraphs of self time
+  (`torch.profiler` exports stacks for time metrics only).
 - `summary.txt`: time and memory tables from `torch.profiler`.

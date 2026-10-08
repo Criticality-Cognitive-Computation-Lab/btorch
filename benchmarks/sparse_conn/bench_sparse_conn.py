@@ -14,8 +14,11 @@ for every available implementation on synthetic recurrent graphs:
   ``torch.compile(fullgraph=True)``;
 - ``new[push-hint]``: built with ``Hints(expected_density=<density>)`` for
   the spike density being timed, so the planner may pick source-driven
-  propagation for sparse activity. The plan that was actually chosen is
-  recorded in the row (``plan``).
+  propagation for sparse activity: ``"push"`` with a device-compacting
+  backend (Triton on CUDA), ``"adaptive-push"`` with the reference backend,
+  and ``"pull"`` when the density is above the planner's limit. The plan
+  that was actually chosen is recorded in the row (``plan``, as
+  ``algorithm/backend``).
 
 Run::
 

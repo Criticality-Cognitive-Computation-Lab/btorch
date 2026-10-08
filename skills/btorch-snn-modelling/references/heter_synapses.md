@@ -31,7 +31,7 @@ n_neuron = len(neurons_df)
 # Decodes the column expansion into a per-edge receptor attribute.
 # SparseConnection.from_adjacency(conn) gives the same output and keeps the
 # expanded matrix as is.
-linear = SparseConnection.from_hetersynapse(conn, n_receptor=n_receptor)
+linear = SparseConnection.from_hetersynapse(conn, receptor_type_index=receptor_idx)
 
 with environ.context(dt=1.0):
     psc = HeterSynapsePSC(
@@ -74,12 +74,12 @@ conn, constraint, receptor_idx = make_hetersynapse_constrained_conn(
 linear = SparseConnection.from_hetersynapse(
     conn,
     Synapse(weight=ConstrainedWeight(group=constraint, dale=True)),
-    n_receptor=len(receptor_idx),
+    receptor_type_index=receptor_idx,
 )
 linear.weight.group_info()  # one learnable scale per constraint group
 ```
 
-`constraint` uses the same expanded layout as `conn`. The connection does not store `receptor_idx`; keep it next to the model. With `dale=True`, call `btorch.models.constrain.constrain_net(model)` after every optimizer step.
+`constraint` uses the same expanded layout as `conn`. The `ConstrainedWeight` module passed in the `Synapse` becomes `linear.weight` itself and serves this one connection; build a new module for every connection. `from_hetersynapse` reads only the length of `receptor_idx` (pass `n_receptor=` instead if you have no table); the connection does not store it, so keep it next to the model. With `dale=True`, call `btorch.models.constrain.constrain_net(model)` after every optimizer step.
 
 ## Heterosynapse + Heterogeneous Delays
 
@@ -95,7 +95,7 @@ conn, receptor_idx = make_hetersynapse_conn(
     n_delay_bins=5,
 )
 
-linear = SparseConnection.from_hetersynapse(conn, n_receptor=len(receptor_idx), n_delay=5)
+linear = SparseConnection.from_hetersynapse(conn, receptor_type_index=receptor_idx, n_delay=5)
 
 with environ.context(dt=1.0):
     psc = HeterSynapsePSC(

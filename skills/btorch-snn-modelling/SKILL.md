@@ -31,6 +31,10 @@ from btorch.models.init import uniform_v_
 
 # Build RSNN
 # weights: sparse matrix, rows = source neurons, columns = target neurons
+# (orientation="pre_post", the default of from_adjacency; pass
+# orientation="post_pre" for an (n_post, n_pre) operator). For a square
+# matrix a wrong orientation is not an error: check one known edge with
+# conn.find_edges(pre=i, post=j).
 conn = SparseConnection.from_adjacency(weights)
 
 neuron = GLIF3(n_neuron=100, ...)
