@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`btorch.sparse`** — sparse arrays with a SciPy/PyTorch-like API: `Sparse`,
+  `COO`, `CSR`, `CSC`; constructors `sparse.coo/csr/csc/from_edges/from_dense`;
+  conversion `sparse.asarray` (`as_sparse`), `from_torch`, `from_scipy`,
+  `to_torch()`, `to_scipy()`, `tocoo()/tocsr()/tocsc()` (convert) versus
+  `as_coo()/as_csr()/as_csc()` (assert, never convert); products `A @ x`,
+  `sparse.matmul/matvec/rmatvec`; `sparse.stack` and shared-pattern batches
+  (shape model `[*batch, *sparse, *dense]`); `Properties`, `Hints`, `EdgeMap`.
+  Matrices use the standard orientation (`(M, N)` maps length `N` to length `M`);
+  conversions never transpose or densify.
+- **`btorch.models.connection`** — `SparseConnection` (with `from_adjacency`,
+  `from_edges`, `from_hetersynapse`, `to_sparse`, `edge_table`, `explain`,
+  `set_hints`), the `Synapse` description (weight, receptor, delay, Dale's law),
+  the weight modules `EdgeWeight`, `ConstantWeight`, `ConstrainedWeight`, and the
+  `Connection` base class with `OperatorConnection`, `StructuredConnection`,
+  `ImplicitConnection`, `HybridConnection`. Receptors and delays are per-edge
+  attributes; a batch of networks (ensemble) is supported.
+- **`btorch.sparse.runtime`** — execution layer below the connections: registered
+  `torch.library` operators (`csr_propagate`, `spike_propagate`), kernel backend
+  registry (`registry`, `use_backend`), `Planner`, `RepresentationCache`. Not
+  needed to write models.
+- User guide [`docs/en/docs/guides/sparse_connectivity.md`](docs/en/docs/guides/sparse_connectivity.md).
 - `tests/test_pipeline_e2e.py` — end-to-end example test chaining connectome ->
   sparse conn -> LIF/ExponentialPSC RNN -> spike analysis -> xarray round trip.
 - **CUDA graph capture for RNNs** (`RecurrentNN(cudagraph=True)`) — collapses the
@@ -29,6 +50,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (sparse layers):** `SparseConn`, `SparseConstrainedConn`,
+  `BaseSparseConn`, `SparseBackend`, `available_sparse_backends` and the
+  `sparse_backend=` argument are removed from `btorch.models.linear` without a
+  compatibility layer. Use `btorch.models.connection.SparseConnection`:
+  `SparseConn(conn, enforce_dale=E)` becomes
+  `SparseConnection.from_adjacency(conn, Synapse(dale=E))`, and
+  `SparseConstrainedConn(conn, constraint)` becomes
+  `SparseConnection.from_adjacency(conn, Synapse(weight=ConstrainedWeight(group=constraint)))`.
+  Dale's law is now opt-in (`dale=False` by default; `enforce_dale` defaulted to
+  `True`), the `state_dict` keys changed (`indices`, `weight.*`, `receptor`,
+  `delay`), and the kernel backend is chosen by the runtime. `torch_sparse` is an
+  optional, explicitly selected backend only. Full table: the
+  [migration section](docs/en/docs/guides/sparse_connectivity.md#migration-from-sparseconn)
+  of the sparse connectivity guide. `DenseConn` and the hetersynapse helpers in
+  `btorch.connectome.connection` are unchanged.
 - **Breaking (visualisation):** `plot_raster` and `plot_neuron_traces` no longer
   take dozens of flat keyword arguments.
   - `plot_raster(spikes, *, dt, times, ax, title, xlabel, ylabel, style, grouping,
@@ -269,6 +305,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `tests/benchmark/test_ode.py` -> `tests/benchmark/test_ode_bench.py`.
 
 ### Fixed
+- Sparse connections: Dale reference signs and the constraint structure (group
+  ids, base weights) are now part of the `state_dict`. Previously the signs were
+  derived from the construction-time matrix, so they were stale after
+  `load_state_dict` restored different weights.
+- `torch.compile(conn, fullgraph=True)` works for sparse connections on CPU and
+  GPU without `torch_sparse`.
+- The backward pass of the PyTorch-only sparse path no longer runs out of memory
+  at about 100k neurons; gradients are computed per edge without an `N x N`
+  intermediate.
 - `import btorch` no longer fails when the package is not installed (e.g. imported from a
   source checkout): `__version__` falls back to `"9999"` (same convention as xarray) instead
   of raising `PackageNotFoundError`.

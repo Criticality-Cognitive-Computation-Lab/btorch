@@ -17,7 +17,7 @@ brain = RecurrentNN(
 brain = torch.compile(brain)
 ```
 
-**Note**: Requires torch >= 2.8. torch.compile 2.7 has known segfault issues with torch_sparse.
+**Note**: Requires torch >= 2.8. `SparseConnection` compiles with `torch.compile(..., fullgraph=True)` and does not need `torch_sparse`.
 
 **Long sequences**: torch.compile can be slow with very long sequences due to excessive graph unrolling. Use the `unroll` parameter to limit timesteps per compilation unit:
 

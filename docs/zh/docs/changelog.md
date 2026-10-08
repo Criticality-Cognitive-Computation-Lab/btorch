@@ -7,7 +7,14 @@ btorch 的所有重要变更都将记录在此文件中。
 
 ## [Unreleased]
 
+### 新增
+- `btorch.sparse`：SciPy/PyTorch 风格的稀疏数组 API（`Sparse`、`COO`、`CSR`、`CSC`、`sparse.from_edges`、`sparse.asarray`、`A @ x`、`sparse.stack`、`to_torch()` / `to_scipy()`）；采用标准矩阵方向，转换从不转置、也不稠密化。
+- `btorch.models.connection`：`SparseConnection`（`from_adjacency`、`from_edges`、`from_hetersynapse`）、`Synapse`、`EdgeWeight`、`ConstantWeight`、`ConstrainedWeight`；受体与延迟作为边属性；支持网络批。
+- `btorch.sparse.runtime`：执行层（注册算子、后端注册表、规划器）；编写模型时无需使用。
+- 指南：[稀疏连接](guides/sparse_connectivity.md)。
+
 ### 变更
+- **破坏性变更：** `btorch.models.linear` 中的 `SparseConn`、`SparseConstrainedConn`、`BaseSparseConn`、`SparseBackend`、`available_sparse_backends` 以及 `sparse_backend=` 参数已移除，没有兼容层。请改用 `SparseConnection.from_adjacency(conn, Synapse(dale=...))`；Dale 定律现需显式开启，`state_dict` 的键也已改变。迁移对照表见[稀疏连接指南](guides/sparse_connectivity.md)。
 - **破坏性变更：** `memories_to_xarray` / `save_memories_to_xarray` 的选项归入 `DimLayout`、`SparseOptions` 与 `ZarrStoreOptions`（`btorch.io`）；`neuron_ids` 与 `partial_map` 变为仅关键字参数。
 - **破坏性变更：** 在第 `t` 步送达的脉冲现在会影响第 `t` 步返回的 PSC，所有 PSC 类型一致（此前 `AlphaPSC`、`AlphaPSCBilleh`、`DualExponentialPSC` 多花一个 `dt`）。
 - **破坏性变更：** `GLIF3.forward_exact_no_spike(x, t=None, v0=None, Iasc0=None, t_mode="homo")` 现为纯函数（不再更新状态）；逐元素原语 `exact_no_spike_at(x, t, v0, Iasc0)` 支持批量的异质时间与状态，例如用于迭代求根。`t_mode="heter"` 表示逐元素时间。
@@ -21,6 +28,9 @@ btorch 的所有重要变更都将记录在此文件中。
 - `make_hetersynapse_constraint` 在同一处构造约束键；结果不变。
 
 ### 修复
+- 稀疏连接的 Dale 符号与约束结构现保存在 `state_dict` 中；此前在 `load_state_dict` 之后会过期。
+- 稀疏连接无需 `torch_sparse` 即可通过 `torch.compile(conn, fullgraph=True)` 编译。
+- 纯 PyTorch 稀疏路径的反向传播在约 10 万神经元规模下不再内存不足。
 - `make_hetersynapse_conn` 的延迟处理。
 - `plot_multiscale_fano` 使用不支持的 `group_by` 时现抛出 `ValueError`，而非 `NameError`。
 - 幂律缩放拟合在输入为常数时 `r_squared` 返回 `NaN`，不再除以零。

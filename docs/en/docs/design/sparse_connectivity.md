@@ -1,8 +1,9 @@
 # Sparse and connectivity subsystem
 
 Design note for the PyTorch-first sparse / connectivity system. Part 1 is the
-audit of the implementation this work started from; later parts describe the
-target architecture and are filled in as the phases land.
+audit of the implementation this work started from (kept as a record; the
+classes it describes no longer exist). Parts 2 onwards describe what replaced
+it. For usage see the [sparse connectivity guide](../guides/sparse_connectivity.md).
 
 ## 1. Audit of the starting point
 
@@ -136,7 +137,6 @@ cell, which is launch/synchronisation latency, not kernel time):
 | | `torch_sparse` | 32 | 159 | 300 | 25,699 |
 
 Latency does not depend on spike density (1% and 50% give the same numbers).
-Raw results: `benchmarks/sparse_conn/results/phase0_*.json`.
 
 ### 1.9 Prior kernel work consulted
 
@@ -168,11 +168,13 @@ values are a gather-multiply (SDDMM) and never build an `N × N` intermediate.
 
 ### 1.10 Contradictions with the specification or earlier decisions
 
-- **Compatibility.** An earlier project decision was "no backward
-  compatibility, rename in place". The specification asks to preserve
-  behaviour and allows legacy wrappers. This work follows the specification:
-  `SparseConn`, `SparseConstrainedConn` and the hetersynapse helpers keep
-  their names, signatures, orientation and `state_dict` keys.
+- **Compatibility.** The specification asks to preserve behaviour through
+  legacy wrappers and deprecation paths. The project decision is the opposite:
+  no backward compatibility. `SparseConn`, `SparseConstrainedConn`,
+  `BaseSparseConn` and the `sparse_backend=` argument are removed and every
+  caller moves to `SparseConnection`. Numerical behaviour (orientation,
+  duplicate summing, Dale's law, grouped weights) is preserved and pinned by
+  the contract tests; names and `state_dict` keys are not.
 - **Package layout.** The specification suggests `btorch/nn/connection` and
   `btorch/sparse_runtime`. The repository has no `btorch.nn`; modules live in
   `btorch.models`. The new code is placed in `btorch/sparse/` (numerical),
@@ -183,5 +185,148 @@ values are a gather-multiply (SDDMM) and never build an `N × N` intermediate.
   `btorch.models.connection.Synapse`.
 - **`connection_conversion.py`** is referenced by an earlier decision but does
   not exist on this branch; nothing here depends on it.
-- **`sparse_backend=`.** The specification wants backend choice to be an
-  advanced runtime option. The legacy constructors keep the argument.
+
+## 2. Architecture
+
+Three layers, kept separate on purpose:
+
+```text
+btorch.models.connection      modelling semantics
+    Projection, ConnectionRule, Synapse, Weight
+    Connection: SparseConnection | StructuredConnection | ImplicitConnection | HybridConnection
+btorch.sparse                 numerical objects
+    Sparse: COO | CSR | CSC          LinearOperator: Structured | Implicit | Composite
+btorch.sparse.runtime         execution
+    Planner, RepresentationCache, BackendRegistry, KernelCache, registered ops
+```
+
+- A `ConnectionRule` says which pairs are connected. It is not a sparse array
+  and does not choose a storage format.
+- A `Synapse` says what the edges do (weight, receptor, delay, plasticity).
+  These are orthogonal edge attributes, not matrix formats and not subclasses.
+- A `Sparse` is a format-agnostic numerical array; `COO`, `CSR`, `CSC` are
+  representations of it. Procedural operators are `LinearOperator`s, not
+  `Sparse`.
+- The runtime picks representation, algorithm and backend independently.
+  None of them appears in a model definition.
+
+`torch.compile(model)` is the only compilation step a user performs. There is
+no `conn.compile()` and no public execution-plan object.
+
+## 3. Numerical API (`btorch.sparse`)
+
+- Shape model `[*batch, *sparse, *dense]` with `batch_shape`, `sparse_shape`,
+  `dense_shape`. Stored values are `[*value_batch, nnz, *dense]`.
+- `COO` supports any number of sparse dimensions; `CSR` / `CSC` exactly two.
+  BSR / BSC are read and written through COO and are not native formats.
+- `tocsr()` / `tocoo()` / `tocsc()` convert; `as_csr()` / `as_coo()` /
+  `as_csc()` return the object only if it already has that format and raise
+  otherwise.
+- `as_sparse` (alias `asarray`) is the single conversion entry point for
+  btorch, PyTorch and SciPy sparse objects. Everything that accepts "a sparse
+  matrix" calls it. Conversions never transpose and never densify; dense input
+  is rejected.
+- `A @ x` follows `torch.matmul`. `matvec(A, x)` applies `A` along the last
+  axis of `x [..., N]`. Both are standard orientation: `A.shape == (M, N)`
+  maps length-`N` to length-`M`.
+- Representation changes that reorder or merge entries return an `EdgeMap`.
+  Every edge-aligned array (weights, group ids, receptors, delays) is moved
+  with the same map: weights are summed over merged duplicates, categorical
+  metadata must agree or the merge is refused.
+
+### Batches
+
+Two kinds of batch exist and are not the same thing.
+
+| | Meaning | Where it lives |
+|---|---|---|
+| Sample batch | independent inputs / trajectories of one network | leading dimensions of `x` |
+| Network batch | different networks | `batch_shape` of the sparse array |
+
+A network batch with a **shared pattern** stores the indices once and values
+`[G, nnz]`. A batch of **different patterns** (`sparse.stack`) is a COO whose
+first index row is the network id; members may have different `nnz` and
+nothing is padded. A connection executes it as one block-diagonal operator.
+
+The network dimensions of `x` are its leading dimensions and broadcast against
+`batch_shape`: `A [G, M, N]` with `x [G, B, N]` gives `[G, B, M]`, and
+`x.unsqueeze(0)` shares `B` samples across all networks. An input without the
+network dimensions is an error; networks are never combined with samples
+implicitly.
+
+## 4. Orientation
+
+| Object | Shape | Product |
+|---|---|---|
+| `btorch.sparse` arrays, `SparseConnection(A)` | `(n_post, n_pre)` | `y = A @ x` |
+| Connectome matrices, hetersynapse helpers, `from_adjacency(W)` | `(n_pre, n_post)` | `y = x @ W` |
+
+`SparseConnection.from_adjacency(W, orientation="src_dst")` is the only place
+a transpose is expressed. The canonical edge buffer `indices` holds
+`[post, pre]` per edge.
+
+## 5. Connections
+
+`SparseConnection` state:
+
+- Persistent (in the `state_dict`): `indices [2, E]`, optional `receptor [E]`
+  and `delay [E]`, and the weight module's state (`weight.value` and, with
+  Dale's law, `weight.sign`; or `weight.base`, `weight.group`, `weight.scale`).
+- Derived (non-persistent buffers of `conn.cache`): destination-major CSR
+  (`crow`, `col`, `perm`) and source-major CSR (`t_crow`, `t_col`, `t_perm`) of
+  the same edges. They are rebuilt from the persistent buffers after
+  `load_state_dict` and after rewiring, into the existing tensors when the
+  number of edges is unchanged. Nothing derived can outlive the state it was
+  derived from.
+
+Weights are modules returning one effective value per edge: `EdgeWeight`
+(per edge), `ConstantWeight`, `ConstrainedWeight` (`w[e] = base[e] *
+scale[group[e]]`). Dale's law is a constraint of the weight module, applied by
+`constrain_net` under `torch.no_grad()`; its reference sign is persistent.
+
+Receptors and delays are per-edge attributes. The executed operator is the
+expanded reference lowering `(n_post * n_receptor, n_pre * n_delay)`, which is
+the layout `HeterSynapsePSC` and `SpikeHistory` already use; the lowering is
+derived state, the semantic edge list is the model. The hetersynapse helpers
+are unchanged and `SparseConnection.from_hetersynapse` decodes their expanded
+matrices into edge attributes.
+
+## 6. Spikes during training
+
+The spike tensor produced by a neuron model stays an ordinary dense tensor
+`[..., N]`. Its forward values are sparse, its surrogate gradient is not, so
+the logical object and the autograd object are dense. Sparse execution is
+derived from it inside the operator: `spike_propagate` packs the non-zero
+entries, visits only the out-edges of active sources, and returns the same
+dense gradient as the destination-driven product, including for silent
+neurons. Genuinely sparse input (event data) can be passed as a `Sparse`
+array to `SparseConnection.propagate_events`.
+
+## 7. `torch.compile` boundary
+
+```text
+SparseConnection.forward            Python, traced by Dynamo
+    weight()                        ordinary tensor ops
+    torch.ops.btorch.csr_propagate  one opaque node: raw buffers in, tensor out
+        kernel from BackendRegistry (ATen reference, Triton, ...)
+```
+
+The registered operators (`btorch::csr_propagate`, `btorch::spike_propagate`,
+and the non-differentiable building blocks `btorch::csr_matvec`,
+`btorch::csr_edge_grad`) have fake implementations and an explicit backward:
+the value gradient is a sampled product over the edges, the input gradient a
+destination-driven product over the source-major CSR. No dense `M x N`
+intermediate exists in either direction. PyTorch sparse tensors never reach
+the tracer, and `forward` contains no planning: the plan is fixed when the
+connection is built or its hints change.
+
+## 8. Dynamic topology
+
+Structural plasticity is an update policy, not a format. A connection has a
+fixed number of edge slots; `set_edges_` changes which edge a slot represents
+without changing any tensor shape or parameter identity, increments
+`topology_version`, and rebuilds the derived layouts in place. Value updates
+do not touch topology-derived state. The version counters
+(`topology_version`, `routing_version`, `value_version`) are bookkeeping for
+caches and are not read in `forward`, so rewiring does not retrace a compiled
+module.

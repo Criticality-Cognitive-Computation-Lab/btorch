@@ -14,15 +14,15 @@ import torch
 from btorch.models import environ, functional
 from btorch.models.neurons import GLIF3
 from btorch.models.synapse import AlphaPSCBilleh
-from btorch.models.linear import SparseConn
+from btorch.models.connection import SparseConnection
 from btorch.models.rnn import RecurrentNN
 from btorch.models.init import uniform_v_
 from btorch.models.regularizer import VoltageRegularizer
 
 # 创建一个任意稀疏矩阵作为示例
 from tests.utils.conn import build_sparse_mat  # 来自测试套件的辅助函数
-weights, _, _ = build_sparse_mat(n_e=80, n_i=20, i_e_ratio=1.0)
-conn = SparseConn(conn=weights)
+weights, _, _ = build_sparse_mat(n_e_neurons=80, n_i_neurons=20, i_e_ratio=1.0)
+conn = SparseConnection.from_adjacency(weights)
 
 neuron = GLIF3(
     n_neuron=100,
@@ -57,6 +57,8 @@ model = RecurrentNN(
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = model.to(device)
 ```
+
+`SparseConnection.from_adjacency` 接受行为源神经元、列为目标神经元的矩阵。权重、Dale 定律、受体与延迟的用法见[稀疏连接指南](../guides/sparse_connectivity.md)。
 
 ## 初始化并随机化状态
 

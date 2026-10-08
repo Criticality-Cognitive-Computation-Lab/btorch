@@ -27,7 +27,7 @@ uv pip install btorch
 | `btorch[gpu]` | triton | `btorch.utils.bench.do_bench` 中的 GPU 事件计时 |
 | `btorch[analysis]` | powerlaw, nolds, fastdtw | 雪崩/DFA 临界性、Lyapunov 与熵估计、DTW 轨迹聚类 |
 | `btorch[viz]` | networkx, plotly | 交互式六边形绘图（`btorch.visualisation.hex.interactive`）、图绘制 |
-| `btorch[sparse]` | torch_scatter, torch_sparse | 更快的稀疏后端（见下文；需要 PyG wheel） |
+| `btorch[sparse]` | torch_scatter, torch_sparse | 可选、需显式选择的稀疏内核后端（见下文；需要 PyG wheel） |
 | `btorch[examples]` | torchvision, seaborn, tqdm | `examples/` 中的脚本 |
 | `btorch[all]` | 以上所有扩展 | 全部功能 |
 
@@ -114,7 +114,9 @@ uv pip install -e . --python .venv-cuda/bin/python
 
 ## 可选：`torch_sparse` 后端
 
-稀疏线性层默认使用 PyTorch 原生 `torch.sparse` 后端。安装 `torch_sparse` 可在大型稀疏网络上获得更好性能。
+稀疏连接（`btorch.models.connection.SparseConnection`）只依赖 PyTorch：无需 `torch_sparse` 即可训练、在 CPU 和 GPU 上运行，并通过 `torch.compile(..., fullgraph=True)` 编译。
+
+若已安装 `torch_sparse`，btorch 会将其注册为额外的内核后端。它不会被自动选用；需通过 `btorch.sparse.runtime.use_backend("torch_sparse")` 显式选择（见[稀疏连接指南](guides/sparse_connectivity.md)）。
 使用与 PyTorch 和 CUDA 版本匹配的 [PyG 仓库](https://data.pyg.org/whl/) 预编译 wheel：
 
 ```bash
@@ -122,7 +124,7 @@ uv pip install -e . --python .venv-cuda/bin/python
 pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-2.7.0+cu126.html
 ```
 
-若未安装 `torch_sparse`，层将静默回退到原生后端。
+若未安装 `torch_sparse`，行为不变：使用默认后端。
 
 ## 验证安装
 

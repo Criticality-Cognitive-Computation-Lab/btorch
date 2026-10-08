@@ -23,7 +23,7 @@ conn_stacked, new_receptor_idx = stack_hetersynapse(
 )
 ```
 
-`stack_hetersynapse` produces a single sparse matrix with expanded columns, matching the format expected by `SparseConn` and `HeterSynapsePSC`.
+`stack_hetersynapse` produces a single sparse matrix with expanded columns, matching the format expected by `SparseConnection.from_hetersynapse` (or `from_adjacency`) and `HeterSynapsePSC`.
 
 ## Mapping Group-Specific Weights Back to Sparse Connectivity
 
@@ -52,10 +52,10 @@ A typical pipeline looks like this:
 2. **Convert each group** to a sparse matrix (e.g., via `make_sparse_mat` or `make_hetersynapse_conn(return_dict=True)`).
 3. **Apply group-specific weight rules** to each sparse matrix (or generate weights separately and map them with `map_weight_to_conn`).
 4. **Stack** the per-group matrices with `stack_hetersynapse` (or use `make_hetersynapse_conn` directly if you started from a single DataFrame).
-5. **Pass the stacked matrix** to `SparseConn` or `SparseConstrainedConn.from_hetersynapse`.
+5. **Pass the stacked matrix** to `SparseConnection.from_hetersynapse(conn, n_receptor=...)`; for group-constrained training add `Synapse(weight=ConstrainedWeight(group=constraint))`.
 
 ## Common Pitfalls
 
-1. **Double expansion** — `stack_hetersynapse` and `make_hetersynapse_conn` both produce column-expanded matrices. Do not apply column expansion twice. If you already used `make_hetersynapse_conn`, pass the resulting matrix directly to `SparseConn`; do not stack again.
+1. **Double expansion** — `stack_hetersynapse` and `make_hetersynapse_conn` both produce column-expanded matrices. Do not apply column expansion twice. If you already used `make_hetersynapse_conn`, pass the resulting matrix directly to `SparseConnection.from_hetersynapse`; do not stack again.
 2. **Misaligned weight lists** — When using `map_weight_to_conn` with a list of per-post-neuron arrays, the length of the list must match the number of post-synaptic columns (`conn_mat.shape[1]`). Each array's length must match the in-degree of that column.
 3. **Forgetting `receptor_type_index`** — `stack_hetersynapse` requires the `receptor_type_index` DataFrame to know the ordering of receptor groups. Keep it alongside the stacked matrix so `HeterSynapsePSC` can resolve receptor indices correctly.

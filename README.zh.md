@@ -61,7 +61,7 @@ uv pip install btorch
 
 可选功能以 extras 形式安装（`btorch[io]`：xarray/Zarr/HDF5 序列化；`btorch[config]`：OmegaConf/YAML 工具；`btorch[fast]`：numba/polars 加速；`btorch[gpu]`：Triton 计时；`btorch[analysis]`：
 临界性/Lyapunov/DTW 分析工具；`btorch[viz]`：plotly 交互式绘图；`btorch[sparse]`：
-`torch_sparse`；`btorch[examples]`：`examples/` 脚本的依赖；`btorch[all]`：全部）：
+可选的 `torch_sparse` 内核后端；`btorch[examples]`：`examples/` 脚本的依赖；`btorch[all]`：全部）：
 
 ```bash
 pip install "btorch[all]"

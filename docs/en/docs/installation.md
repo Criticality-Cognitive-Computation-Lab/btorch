@@ -29,7 +29,7 @@ imported lazily; calling a feature whose library is missing raises an
 | `btorch[gpu]` | triton | GPU event timing in `btorch.utils.bench.do_bench` |
 | `btorch[analysis]` | powerlaw, nolds, fastdtw | avalanche/DFA criticality, Lyapunov and entropy estimates, DTW trace clustering |
 | `btorch[viz]` | networkx, plotly | interactive hex plots (`btorch.visualisation.hex.interactive`), graph plots |
-| `btorch[sparse]` | torch_scatter, torch_sparse | faster sparse backend (see below; needs PyG wheels) |
+| `btorch[sparse]` | torch_scatter, torch_sparse | optional, selectable sparse kernel backend (see below; needs PyG wheels) |
 | `btorch[examples]` | torchvision, seaborn, tqdm | scripts in `examples/` |
 | `btorch[all]` | every extra above | everything |
 
@@ -120,8 +120,14 @@ uv pip install -e . --python .venv-cuda/bin/python
 
 ## Optional: `torch_sparse` backend
 
-Sparse linear layers default to PyTorch's native `torch.sparse` backend.
-Install `torch_sparse` for better performance on large sparse networks.
+Sparse connections (`btorch.models.connection.SparseConnection`) need only
+PyTorch. They train, run on CPU and GPU, and compile with
+`torch.compile(..., fullgraph=True)` without `torch_sparse`.
+
+If `torch_sparse` is installed, btorch registers it as an additional kernel
+backend. It is never selected automatically; choose it explicitly with
+`btorch.sparse.runtime.use_backend("torch_sparse")` (see the
+[sparse connectivity guide](guides/sparse_connectivity.md#runtime-advanced)).
 Use prebuilt wheels from the [PyG repository](https://data.pyg.org/whl/)
 matching your PyTorch and CUDA version:
 
@@ -130,7 +136,7 @@ matching your PyTorch and CUDA version:
 pip install torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-2.7.0+cu126.html
 ```
 
-If `torch_sparse` is absent, layers fall back to the native backend silently.
+If `torch_sparse` is absent, nothing changes: the default backend is used.
 
 ## Verify
 
