@@ -9,6 +9,7 @@ import pytest
 tomllib = pytest.importorskip("tomllib", reason="tomllib needs Python 3.11+")
 
 PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
+EXTRAS_REQUIRING_EXTERNAL_BINARY_COMPATIBILITY = {"sparse"}
 
 
 def _extras() -> dict[str, list[str]]:
@@ -27,7 +28,9 @@ def test_all_extra_references_every_other_extra():
     match = re.fullmatch(r"btorch\[([\w,\- ]+)\]", spec)
     assert match, f"'all' should be one self-extra requirement, got {spec!r}"
     referenced = {name.strip() for name in match.group(1).split(",")}
-    assert referenced == set(extras) - {"all"}
+    assert referenced == (
+        set(extras) - {"all"} - EXTRAS_REQUIRING_EXTERNAL_BINARY_COMPATIBILITY
+    )
 
 
 def test_examples_extra_covers_example_imports():

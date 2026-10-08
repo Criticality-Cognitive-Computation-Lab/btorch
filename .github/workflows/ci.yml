@@ -44,7 +44,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -64,11 +64,10 @@ jobs:
         env:
           UV_SYSTEM_PYTHON: "1"
         run: |
-          # uv sync handles torch (pytorch-cpu index) via lockfile
-          uv sync --group dev --all-extras --no-install-package torch-scatter --no-install-package torch-sparse --frozen
-          # sparse packages are CUDA-variant-specific; install from PyG after torch is resolved
-          TORCH_VER=$(uv run python -c "import torch; print(torch.__version__.split('+')[0])")
-          uv pip install torch-scatter torch-sparse -f "https://data.pyg.org/whl/torch-${TORCH_VER}+cpu.html"
+          # torch-sparse/torch-scatter are optional and have wheels tied to
+          # specific Torch builds. The default matrix exercises the native
+          # sparse runtime; the opt-in job below covers the PyG backend.
+          uv sync --group dev --extra all --frozen
 
       - name: Lint
         run: uv run ruff check .
@@ -128,14 +127,15 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Install dependencies
         shell: bash
         env:
           UV_SYSTEM_PYTHON: "1"
         run: |
-          uv sync --group test --all-extras --no-install-package torch-scatter --no-install-package torch-sparse --frozen
-          TORCH_VER=$(uv run python -c "import torch; print(torch.__version__.split('+')[0])")
-          uv pip install torch-scatter torch-sparse -f "https://data.pyg.org/whl/torch-${TORCH_VER}+cpu.html"
+          uv sync --group test --extra all --frozen
 
       - name: Tests (CPU)
         run: uv run pytest tests --cov=btorch --cov-report=xml
@@ -148,3 +148,44 @@ jobs:
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  test-torch-sparse:
+    permissions:
+      contents: read
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event_name == 'pull_request' &&
+          contains(github.event.pull_request.labels.*.name, 'test-torch-sparse')
+        )
+      }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install optional torch-sparse backend
+        env:
+          UV_SYSTEM_PYTHON: "1"
+        run: |
+          uv sync --group test --extra all --frozen
+          uv pip install --reinstall torch==2.8.0+cpu torchvision==0.23.0+cpu --index-url https://download.pytorch.org/whl/cpu
+          uv pip install torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-2.8.0+cpu.html
+
+      - name: Tests (torch-sparse backend)
+        run: |
+          uv run pytest -q \
+            tests/sparse/test_runtime_ops.py \
+            tests/models/connection/test_sparse_connection_legacy_cases.py
