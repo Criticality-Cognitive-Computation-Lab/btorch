@@ -23,15 +23,3 @@ updates:
         patterns: ["*"]
     commit-message:
       prefix: "deps"
-
-  - package-ecosystem: "conda"
-    directory: "/"
-    schedule:
-      interval: "monthly"
-    cooldown:
-      default-days: 30
-    groups:
-      conda-deps:
-        patterns: ["*"]
-    commit-message:
-      prefix: "deps(conda)"

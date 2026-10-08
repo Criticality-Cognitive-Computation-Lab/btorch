@@ -137,6 +137,7 @@ dev = [
     { name = "matplotlib" },
     { name = "mkdocs-gen-files" },
     { name = "mkdocstrings-python" },
+    { name = "omegaconf" },
     { name = "openai" },
     { name = "pre-commit" },
     { name = "pytest" },
@@ -147,6 +148,7 @@ dev = [
 docs = [
     { name = "mkdocs-gen-files" },
     { name = "mkdocstrings-python" },
+    { name = "omegaconf" },
     { name = "openai" },
     { name = "zensical" },
 ]
@@ -212,6 +214,7 @@ dev = [
     { name = "matplotlib", specifier = ">=3.7" },
     { name = "mkdocs-gen-files", specifier = ">=0.5" },
     { name = "mkdocstrings-python", specifier = ">=0.24" },
+    { name = "omegaconf" },
     { name = "openai", specifier = ">=1.0" },
     { name = "pre-commit", specifier = ">=3.7" },
     { name = "pytest", specifier = ">=8.2" },
@@ -222,6 +225,7 @@ dev = [
 docs = [
     { name = "mkdocs-gen-files", specifier = ">=0.5" },
     { name = "mkdocstrings-python", specifier = ">=0.24" },
+    { name = "omegaconf" },
     { name = "openai", specifier = ">=1.0" },
     { name = "zensical", specifier = ">=0.0.32" },
 ]
