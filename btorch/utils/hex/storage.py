@@ -185,8 +185,8 @@ def axial_to_rect_index(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Convert axial to rectangular array indices.
 
-    For pointy-top: store at array[r][q + floor(r/2)]
-    For flat-top: store at array[q][r + floor(q/2)]
+    For pointy-top: store at `array[r][q + floor(r/2)]`
+    For flat-top: store at `array[q][r + floor(q/2)]`
 
     Args:
         q: Axial q coordinates.
@@ -250,7 +250,7 @@ def axial_to_hex_index(
     """Convert axial to array indices for hexagon-shaped map.
 
     Row r (relative to center) has size 2*N+1 - abs(N-r) columns.
-    Store at array[r + N][q - max(0, N-r) + N]
+    Store at `array[r + N][q - max(0, N-r) + N]`
 
     Args:
         q: Axial q coordinates.
@@ -296,8 +296,8 @@ def axial_to_triangle_index(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Convert axial to array indices for triangle-shaped map.
 
-    Down-pointing: store at array[r][q], row r has size N+1-r
-    Up-pointing: store at array[r][q - N+1+r], row r has size 1+r
+    Down-pointing: store at `array[r][q]`, row r has size N+1-r
+    Up-pointing: store at `array[r][q - N+1+r]`, row r has size 1+r
 
     Args:
         q: Axial q coordinates.
@@ -357,7 +357,7 @@ def axial_to_rhombus_index(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Convert axial to array indices for rhombus-shaped map.
 
-    Rhombus maps store axial directly: array[r][q]
+    Rhombus maps store axial directly: `array[r][q]`
 
     Args:
         q: Axial q coordinates.

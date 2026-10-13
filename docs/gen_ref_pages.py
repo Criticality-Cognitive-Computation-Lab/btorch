@@ -89,6 +89,15 @@ for mod in all_modules:
         parent = ".".join(parts[:2])
         grouped.setdefault(parent, []).append(mod)
 
+# Keep package docs and submodule docs on the same page.
+standalone_only = []
+for mod in standalone:
+    if mod in grouped:
+        grouped[mod].insert(0, mod)
+    else:
+        standalone_only.append(mod)
+standalone = standalone_only
+
 nav = mkdocs_gen_files.Nav()
 
 

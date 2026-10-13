@@ -161,7 +161,7 @@ def plot_multiscale_fano(
         ValueError: If spikes are not provided through either `data` or
             `spikes` argument.
 
-    Example:
+    Examples:
         >>> # Plain args interface
         >>> fig = plot_multiscale_fano(spikes, dt=1.0, mode="distribution")
         >>>
@@ -414,7 +414,7 @@ def plot_dfa_analysis(
     Raises:
         ValueError: If spikes are not provided.
 
-    Example:
+    Examples:
         >>> fig = plot_dfa_analysis(spikes, bin_size=10)
     """
     if data is not None:
@@ -502,7 +502,7 @@ def plot_isi_cv(
         ValueError: If spikes are not provided, or if grouped mode is
             requested without required metadata.
 
-    Example:
+    Examples:
         >>> fig = plot_isi_cv(spikes, dt=1.0, mode="distribution")
         >>>
         >>> # Grouped by cell type
@@ -590,7 +590,7 @@ def plot_avalanche_analysis(
         (tau, alpha, gamma), CCC (criticality consistency check), and
         power-law fit objects.
 
-    Example:
+    Examples:
         >>> fig, results = plot_avalanche_analysis(spikes, bin_size=5)
         >>> print(f"Tau: {results['tau']:.2f}, CCC: {results['CCC']:.2f}")
     """
@@ -691,7 +691,7 @@ def plot_eigenvalue_spectrum(
         - "spectral_radius": Radius of spectral bulk
         - "outliers": Array of outlier eigenvalues
 
-    Example:
+    Examples:
         >>> fig, ax, results = plot_eigenvalue_spectrum(W)
         >>> print(f"Spectral radius: {results['spectral_radius']:.2f}")
     """
@@ -760,7 +760,7 @@ def plot_lyapunov_spectrum(
     Returns:
         Tuple of (figure, axes) with the spectrum plot.
 
-    Example:
+    Examples:
         >>> fig, ax = plot_lyapunov_spectrum(lyap_spectrum)
         >>> # Positive exponents indicate chaotic dynamics
     """
@@ -812,7 +812,7 @@ def plot_firing_rate_distribution(
         - "rates": Array of firing rates per neuron (Hz)
         - "mean", "std", "median": Summary statistics
 
-    Example:
+    Examples:
         >>> fig, stats = plot_firing_rate_distribution(spikes, dt=1.0)
         >>> print(f"Mean rate: {stats['mean']:.1f} Hz")
     """
@@ -865,7 +865,7 @@ def plot_micro_dynamics(
         - "fr": Firing rate statistics
         - "cv": ISI CV statistics
 
-    Example:
+    Examples:
         >>> fig, stats = plot_micro_dynamics(spikes, dt=1.0)
         >>> print(f"Rate: {stats['fr']['mean']:.1f} Hz, CV: {stats['cv']['mean']:.2f}")
     """
@@ -914,7 +914,7 @@ def plot_gain_stability(data: tuple) -> tuple[Figure, Axes]:
     Returns:
         Tuple of (figure, axes) with scatter plot and fit line.
 
-    Example:
+    Examples:
         >>> data = (slope, intercept, g_vals, lyap_vals)
         >>> fig, ax = plot_gain_stability(data)
     """

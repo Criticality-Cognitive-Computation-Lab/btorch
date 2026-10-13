@@ -105,6 +105,15 @@ def generate(lang: str = "en"):
             parent = ".".join(parts[:2])
             grouped.setdefault(parent, []).append(mod)
 
+    # Keep package docs and submodule docs on the same page.
+    standalone_only = []
+    for mod in standalone:
+        if mod in grouped:
+            grouped[mod].insert(0, mod)
+        else:
+            standalone_only.append(mod)
+    standalone = standalone_only
+
     # Package-level grouped pages
     for parent, mods in sorted(grouped.items()):
         slug = parent.replace("btorch.", "") + ".md"
