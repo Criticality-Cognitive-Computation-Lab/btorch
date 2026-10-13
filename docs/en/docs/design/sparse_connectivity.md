@@ -15,7 +15,7 @@ it. For usage see the [sparse connectivity guide](../guides/sparse_connectivity.
 | `btorch/models/constrain.py` | `HasConstraint`, `constrain_net` (runs `constrain()` under `torch.no_grad`) |
 | `btorch/connectome/connection.py` | `make_sparse_mat`, `make_constraint_by_neuron_type`, `make_hetersynapse_conn`, `make_hetersynapse_constraint`, `make_hetersynapse_constrained_conn`, `stack_hetersynapse`, `expand_conn_for_delays` |
 | `btorch/models/synapse.py` | `BasePSC` and subclasses call `self.linear(z)`; `HeterSynapsePSC`, `DelayedPSC`, `BilinearMixingSynapse` consume the physically expanded receptor / delay axes |
-| `btorch/models/history.py` | `SpikeHistory` produces the `[..., n_neuron * n_delay_bins]` input of a delay-expanded matrix |
+| `btorch/models/history.py` | `Delay` produces the `[..., n_neuron * n_delay_bins]` input of a delay-expanded matrix |
 
 Tests: `tests/models/test_linear.py`, `tests/models/test_hetersynapse_conn.py`,
 `tests/connectome/` (`test_hetersynapse_conn_modes.py`, `test_delay_expansion.py`,
@@ -331,7 +331,7 @@ validated against that shape at construction.
 
 Receptors and delays are per-edge attributes. The executed operator is the
 expanded reference lowering `(n_post * n_receptor, n_pre * n_delay)`, which is
-the layout `HeterSynapsePSC` and `SpikeHistory` already use; the lowering is
+the layout `HeterSynapsePSC` and `Delay` already use; the lowering is
 derived state, the semantic edge list is the model. The hetersynapse helpers
 are unchanged and `SparseConnection.from_hetersynapse(matrix, synapse,
 n_receptor=None, n_delay=1, receptor_type_index=None)` decodes their expanded

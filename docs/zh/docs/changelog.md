@@ -19,6 +19,11 @@ btorch 的所有重要变更都将记录在此文件中。
 - 指南：[稀疏连接](guides/sparse_connectivity.md)。
 
 ### 变更
+
+- `SpikeHistory` 改名为 `Delay`，PSC 延迟状态路径改为
+  `synapse.delayed_spike.history`。环形 cursor 纳入 functional memory 快照，
+  持久化设置与 history 一致；记录配置与旧 checkpoint 中的状态路径需要迁移。
+
 - **破坏性变更**（相对于尚未发布的连接 API 的早期版本；没有别名）：方向字符串统一为 `"pre_post"` / `"post_pre"`（`"src_dst"` / `"dst_src"` 已移除）；`FromSparse` 默认 `"pre_post"`；`conn.to_sparse()` 默认返回构建连接时所用的方向；`set_edges_(slots, *, pre, post, ...)` 的索引参数仅限关键字；`HardDeepROptions.candidate` 以 `candidate(pre, post)` 调用。
 - **破坏性变更：** 权重按对象身份绑定：传入 `Synapse(weight=...)` 的 `Weight` 模块就是 `conn.weight`（每个连接一个模块）；`nn.Parameter` 在边顺序保持不变时直接成为 `conn.weight.value`，否则复制并给出警告。`Synapse(weight=<数值>, dale=True)` 与 `Synapse(plasticity=...)` 会抛出异常。
 - **破坏性变更：** 规划器区分 `"push"`（CUDA 上的 Triton；结果不保证逐位可复现）与 `"adaptive-push"`（参考后端；无法被 CUDA graph 捕获）。`conn.value_version` 现在会随优化器更新而变化。`btorch.sparse.runtime.__all__` 不再列出 `ops` 与 `kernels_aten`。

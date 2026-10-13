@@ -1,17 +1,17 @@
-"""Tests for SpikeHistory buffer."""
+"""Tests for Delay buffer."""
 
 import pytest
 import torch
 
-from btorch.models.history import SpikeHistory
+from btorch.models.history import Delay
 
 
-class TestSpikeHistoryCircular:
-    """Test SpikeHistory with circular buffer mode (default)."""
+class TestDelayCircular:
+    """Test Delay with circular buffer mode (default)."""
 
     def test_basic_initialization(self):
         """Test basic initialization without state."""
-        history = SpikeHistory(n_neuron=10, max_delay_steps=5)
+        history = Delay(n_neuron=10, max_delay_steps=5)
         assert history.n_neuron == (10,)
         assert history.size == 10
         assert history.max_delay == 5
@@ -20,7 +20,7 @@ class TestSpikeHistoryCircular:
 
     def test_init_state_creates_buffer(self):
         """Test that init_state creates the history buffer."""
-        history = SpikeHistory(n_neuron=10, max_delay_steps=5)
+        history = Delay(n_neuron=10, max_delay_steps=5)
         history.init_state(batch_size=2, dtype=torch.float32)
 
         assert hasattr(history, "history")
@@ -31,7 +31,7 @@ class TestSpikeHistoryCircular:
 
     def test_update_requires_init(self):
         """Test that update requires init_state first."""
-        history = SpikeHistory(n_neuron=10, max_delay_steps=5)
+        history = Delay(n_neuron=10, max_delay_steps=5)
         spike = torch.randn(2, 10, dtype=torch.float32)
 
         # Should raise RuntimeError if not initialized
@@ -46,7 +46,7 @@ class TestSpikeHistoryCircular:
 
     def test_circular_buffer_behavior(self):
         """Test that circular buffer wraps around correctly."""
-        history = SpikeHistory(n_neuron=3, max_delay_steps=3)
+        history = Delay(n_neuron=3, max_delay_steps=3)
         history.init_state(batch_size=1, dtype=torch.float32)
 
         # Push 5 spikes (more than max_delay)
@@ -72,7 +72,7 @@ class TestSpikeHistoryCircular:
 
     def test_get_delay_returns_correct_spike(self):
         """Test get_delay returns spike from correct timestep."""
-        history = SpikeHistory(n_neuron=3, max_delay_steps=5)
+        history = Delay(n_neuron=3, max_delay_steps=5)
         history.init_state(batch_size=1, dtype=torch.float32)
 
         # Push distinct spikes
@@ -89,7 +89,7 @@ class TestSpikeHistoryCircular:
 
     def test_get_delay_bounds_check(self):
         """Test that get_delay raises error for out-of-bounds delays."""
-        history = SpikeHistory(n_neuron=3, max_delay_steps=5)
+        history = Delay(n_neuron=3, max_delay_steps=5)
         history.init_state(batch_size=1, dtype=torch.float32)
         history.update(torch.randn(1, 3, dtype=torch.float32))
 
@@ -101,7 +101,7 @@ class TestSpikeHistoryCircular:
 
     def test_get_recent_returns_list(self):
         """Test get_recent returns list of recent spikes."""
-        history = SpikeHistory(n_neuron=3, max_delay_steps=5)
+        history = Delay(n_neuron=3, max_delay_steps=5)
         history.init_state(batch_size=1, dtype=torch.float32)
 
         for i in range(5):
@@ -116,7 +116,7 @@ class TestSpikeHistoryCircular:
 
     def test_get_recent_bounds_check(self):
         """Test that get_recent raises error for too many steps."""
-        history = SpikeHistory(n_neuron=3, max_delay_steps=5)
+        history = Delay(n_neuron=3, max_delay_steps=5)
         history.init_state(batch_size=1, dtype=torch.float32)
 
         with pytest.raises(IndexError, match="n_steps .* > max_delay"):
@@ -124,7 +124,7 @@ class TestSpikeHistoryCircular:
 
     def test_get_flattened_format(self):
         """Test get_flattened returns correct interleaved format."""
-        history = SpikeHistory(n_neuron=2, max_delay_steps=3)
+        history = Delay(n_neuron=2, max_delay_steps=3)
         history.init_state(batch_size=1, dtype=torch.float32)
 
         # Push 3 spikes with distinct patterns
@@ -145,7 +145,7 @@ class TestSpikeHistoryCircular:
 
     def test_get_flattened_batch_handling(self):
         """Test get_flattened handles batch dimensions correctly."""
-        history = SpikeHistory(n_neuron=2, max_delay_steps=3)
+        history = Delay(n_neuron=2, max_delay_steps=3)
         history.init_state(batch_size=(2, 3), dtype=torch.float32)
 
         spike = torch.randn(2, 3, 2, dtype=torch.float32)
@@ -156,8 +156,8 @@ class TestSpikeHistoryCircular:
         assert flat.shape == (2, 3, 6)
 
     def test_no_batch_dimension(self):
-        """Test SpikeHistory works without batch dimension."""
-        history = SpikeHistory(n_neuron=3, max_delay_steps=3)
+        """Test Delay works without batch dimension."""
+        history = Delay(n_neuron=3, max_delay_steps=3)
         history.init_state(dtype=torch.float32)
 
         spike = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
@@ -170,7 +170,7 @@ class TestSpikeHistoryCircular:
 
     def test_chaining_support(self):
         """Test that update returns self for method chaining."""
-        history = SpikeHistory(n_neuron=3, max_delay_steps=3)
+        history = Delay(n_neuron=3, max_delay_steps=3)
         history.init_state(dtype=torch.float32)
 
         result = history.update(torch.randn(3, dtype=torch.float32))
@@ -186,7 +186,7 @@ class TestSpikeHistoryCircular:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
 
-        history = SpikeHistory(n_neuron=3, max_delay_steps=3)
+        history = Delay(n_neuron=3, max_delay_steps=3)
         history.init_state(batch_size=2, device="cuda")
 
         spike = torch.randn(2, 3, device="cuda")
@@ -198,7 +198,7 @@ class TestSpikeHistoryCircular:
 
     def test_dtype_preservation(self):
         """Test that dtype is preserved through operations."""
-        history = SpikeHistory(n_neuron=3, max_delay_steps=3)
+        history = Delay(n_neuron=3, max_delay_steps=3)
         history.init_state(batch_size=2, dtype=torch.float64)
 
         # Test with float64
@@ -207,7 +207,7 @@ class TestSpikeHistoryCircular:
         assert history.history.dtype == torch.float64
 
         # Test with float32
-        history2 = SpikeHistory(n_neuron=3, max_delay_steps=3)
+        history2 = Delay(n_neuron=3, max_delay_steps=3)
         history2.init_state(batch_size=2, dtype=torch.float32)
         spike2 = torch.randn(2, 3, dtype=torch.float32)
         history2.update(spike2)
@@ -215,7 +215,7 @@ class TestSpikeHistoryCircular:
 
     def test_reset_clears_buffer(self):
         """Test that reset clears the buffer and cursor."""
-        history = SpikeHistory(n_neuron=3, max_delay_steps=3)
+        history = Delay(n_neuron=3, max_delay_steps=3)
         history.init_state(batch_size=1, dtype=torch.float32)
 
         # Add some data
@@ -230,8 +230,8 @@ class TestSpikeHistoryCircular:
         assert history._cursor.item() == 0
 
     def test_tuple_n_neuron(self):
-        """Test SpikeHistory with multi-dimensional neuron shape."""
-        history = SpikeHistory(n_neuron=(4, 5), max_delay_steps=3)
+        """Test Delay with multi-dimensional neuron shape."""
+        history = Delay(n_neuron=(4, 5), max_delay_steps=3)
         assert history.n_neuron == (4, 5)
         assert history.size == 20
 
@@ -251,14 +251,12 @@ class TestSpikeHistoryCircular:
         assert flat.shape == (2, 60)
 
 
-class TestSpikeHistoryCat:
-    """Test SpikeHistory with torch.cat mode (for torch.compile)."""
+class TestDelayCat:
+    """Test Delay with torch.cat mode (for torch.compile)."""
 
     def test_initialization_cat_mode(self):
         """Test initialization in cat mode."""
-        history = SpikeHistory(
-            n_neuron=10, max_delay_steps=5, use_circular_buffer=False
-        )
+        history = Delay(n_neuron=10, max_delay_steps=5, use_circular_buffer=False)
         assert history.n_neuron == (10,)
         assert history.max_delay == 5
         assert history.use_circular_buffer is False
@@ -266,7 +264,7 @@ class TestSpikeHistoryCat:
 
     def test_cat_buffer_behavior(self):
         """Test that cat mode shifts correctly."""
-        history = SpikeHistory(n_neuron=3, max_delay_steps=3, use_circular_buffer=False)
+        history = Delay(n_neuron=3, max_delay_steps=3, use_circular_buffer=False)
         history.init_state(batch_size=1, dtype=torch.float32)
 
         # Push 5 spikes (more than max_delay)
@@ -297,7 +295,7 @@ class TestSpikeHistoryCat:
 
     def test_cat_get_flattened(self):
         """Test get_flattened in cat mode."""
-        history = SpikeHistory(n_neuron=2, max_delay_steps=3, use_circular_buffer=False)
+        history = Delay(n_neuron=2, max_delay_steps=3, use_circular_buffer=False)
         history.init_state(batch_size=1, dtype=torch.float32)
 
         # Push 3 spikes
@@ -315,3 +313,74 @@ class TestSpikeHistoryCat:
             [[3.0, 2.0, 1.0, 30.0, 20.0, 10.0]], dtype=torch.float32
         )
         assert torch.allclose(flat, expected)
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_circular_delay_continuation_state(persistent):
+    """Restore the ring ordering, not just its stored tensor values.
+
+    Wrapping a three-slot ring five times leaves a nonzero cursor.
+    Restoring history without that cursor produces different delayed
+    inputs; both the functional state interface and persistent
+    checkpoints must preserve it.
+    """
+    from btorch.models.functional import named_hidden_states, set_hidden_states
+
+    delay = Delay(2, max_delay_steps=3)
+    delay.init_state(batch_size=2, dtype=torch.float64, persistent=persistent)
+    for step in range(5):
+        delay.update(torch.full((2, 2), float(step), dtype=torch.float64))
+    snapshot = named_hidden_states(delay, clone=True)
+    assert set(snapshot) == {"history", "_cursor"}
+    assert snapshot["_cursor"].shape == ()
+    assert snapshot["_cursor"].dtype == torch.long
+    checkpoint = delay.state_dict()
+    assert ("history" in checkpoint) == persistent
+    assert ("_cursor" in checkpoint) == persistent
+
+    restored = Delay(2, max_delay_steps=3)
+    restored.init_state(batch_size=2, dtype=torch.float64, persistent=persistent)
+    if persistent:
+        restored.load_state_dict(checkpoint)
+    else:
+        set_hidden_states(restored, snapshot)
+    for step in range(5, 9):
+        value = torch.full((2, 2), float(step), dtype=torch.float64)
+        delay.update(value)
+        restored.update(value)
+        torch.testing.assert_close(restored.get_flattened(3), delay.get_flattened(3))
+    restored.reset(inplace=True)
+    assert restored._cursor.item() == 0
+    torch.testing.assert_close(
+        restored.get_flattened(3), torch.zeros((2, 6), dtype=torch.float64)
+    )
+
+
+def test_circular_delay_reset_preserves_cursor_type_and_skipped_state():
+    """Selective initialization and reset retain a scalar integer cursor.
+
+    Float dtype changes apply to tensor history only. A caller
+    preserving cursor/history retains their checkpoint persistence too,
+    so checkpoints never contain only one half of the ring state.
+    """
+    delay = Delay(2, max_delay_steps=3)
+    delay.init_state(batch_size=2)
+    delay.update(torch.ones(2, 2))
+    history, cursor = delay.history.clone(), delay._cursor.clone()
+    delay.init_state(
+        batch_size=2,
+        dtype=torch.float64,
+        persistent=True,
+        skip_mem_name=("history", "_cursor"),
+    )
+    torch.testing.assert_close(delay.history, history)
+    torch.testing.assert_close(delay._cursor, cursor)
+    assert "_cursor" not in delay.state_dict()
+    assert "history" not in delay.state_dict()
+    delay.reset(dtype=torch.float64, skip_mem_name=("_cursor",))
+    torch.testing.assert_close(delay._cursor, cursor)
+    assert delay.history.dtype == torch.float64
+    delay.reset(dtype=torch.float32)
+    assert delay._cursor.dtype == torch.long and delay._cursor.shape == ()
+    assert delay._cursor.device == delay.history.device
+    assert delay._cursor.item() == 0

@@ -18,7 +18,7 @@ from .base import (
     unflatten_neuron,
 )
 from .bilinear import SymmetricBilinear
-from .history import SpikeHistory, expand_delay_sequence
+from .history import Delay, expand_delay_sequence
 from .ode import exp_euler_step
 
 
@@ -53,16 +53,16 @@ class BasePSC(MemoryModule):
     :class:`~btorch.models.connection.SparseConnection` or
     :class:`~btorch.models.connection.Projection` built with
     ``Synapse(delay=...)``), the PSC owns a
-    :class:`~btorch.models.history.SpikeHistory` of that depth in
-    ``self.history``: every step pushes the incoming spikes and feeds
+    :class:`~btorch.models.history.Delay` of that depth in
+    ``self.delayed_spike``: every step pushes the incoming spikes and feeds
     ``history.get_flattened(n_delay)`` to ``linear``. A spike delivered at
     step ``t`` on an edge with delay ``d`` first changes the PSC returned at
     step ``t + d`` (delay 0 = the delivery step). The history is a registered
-    memory (``history.history``, shape ``(*batch, n_delay, n_source)``), so it
+    memory (``delayed_spike.history``, shape ``(*batch, n_delay, n_source)``), so it
     follows ``init_net_state`` / ``reset_net`` / ``detach_net``, gradient
     checkpointing and ``named_hidden_states``. It uses the ``torch.cat`` update
     (autograd and ``torch.compile`` safe). With ``n_delay == 1`` nothing is
-    allocated and ``self.history`` is ``None``. A uniform extra delay can be
+    allocated and ``self.delayed_spike`` is ``None``. A uniform extra delay can be
     stacked on top with :class:`DelayedPSC`; the two add up.
 
     Timing convention: a spike delivered to :meth:`single_step_forward` at
@@ -85,7 +85,7 @@ class BasePSC(MemoryModule):
             ``linear.in_features`` when delays are used). Default: inferred
             as ``linear.in_features // n_delay``.
         use_circular_buffer: Update mode of the delay history; see
-            :class:`~btorch.models.history.SpikeHistory`. Default: False.
+            :class:`~btorch.models.history.Delay`. Default: False.
 
     Raises:
         ValueError: If ``n_delay`` disagrees with a ``linear.n_delay > 1``, or
@@ -96,7 +96,7 @@ class BasePSC(MemoryModule):
     size: int
     psc: torch.Tensor
     n_delay: int
-    history: SpikeHistory | None
+    delayed_spike: Delay | None
 
     def __init__(
         self,
@@ -126,13 +126,13 @@ class BasePSC(MemoryModule):
         # constant (torch.compile friendly) and ``n_delay == 1`` allocates
         # nothing: same memories and state dict as a delay-free PSC.
         if self.n_delay > 1:
-            self.history = SpikeHistory(
+            self.delayed_spike = Delay(
                 n_neuron=self._n_source,
                 max_delay_steps=self.n_delay,
                 use_circular_buffer=use_circular_buffer,
             )
         else:
-            self.history = None
+            self.delayed_spike = None
 
     def _resolve_delay_layout(
         self,
@@ -185,12 +185,12 @@ class BasePSC(MemoryModule):
 
         For a PSC whose owner already buffers the spikes and passes
         ``[..., n_source * n_delay]`` itself (:class:`HeterSynapsePSC` does this
-        for its ``base_psc``; a hand-written ``SpikeHistory`` loop can too).
+        for its ``base_psc``; a hand-written ``Delay`` loop can too).
 
         Returns:
             Self for method chaining.
         """
-        self.history = None
+        self.delayed_spike = None
         self.n_delay = 1
         return self
 
@@ -202,6 +202,8 @@ class BasePSC(MemoryModule):
         persistent: bool = False,
         skip_mem_name: Iterable[str] = (),
     ) -> None:
+        self._kernel_merge_active = False
+        self._kernel_sequence_started = False
         super().init_state(
             batch_size,
             dtype,
@@ -211,8 +213,8 @@ class BasePSC(MemoryModule):
         )
         # ``init_net_state`` reaches the history as a submodule anyway; this
         # keeps a direct ``psc.init_state()`` complete.
-        if self.history is not None:
-            self.history.init_state(batch_size, dtype, device, persistent)
+        if self.delayed_spike is not None:
+            self.delayed_spike.init_state(batch_size, dtype, device, persistent)
 
     def reset(
         self,
@@ -222,6 +224,9 @@ class BasePSC(MemoryModule):
         skip_mem_name: Iterable[str] = (),
         inplace: bool = False,
     ) -> None:
+        if not inplace:
+            self._kernel_merge_active = False
+            self._kernel_sequence_started = False
         super().reset(
             batch_size,
             dtype,
@@ -229,13 +234,13 @@ class BasePSC(MemoryModule):
             skip_mem_name=skip_mem_name,
             inplace=inplace,
         )
-        if self.history is not None:
-            self.history.reset(batch_size, dtype, device, inplace=inplace)
+        if self.delayed_spike is not None:
+            self.delayed_spike.reset(batch_size, dtype, device, inplace=inplace)
 
     def detach(self) -> None:
         super().detach()
-        if self.history is not None:
-            self.history.detach()
+        if self.delayed_spike is not None:
+            self.delayed_spike.detach()
 
     def extra_repr(self) -> str:
         delay = f", n_delay={self.n_delay}" if self.n_delay > 1 else ""
@@ -252,7 +257,7 @@ class BasePSC(MemoryModule):
         the delay-expanded ``[..., n_source * n_delay]`` (index
         ``source * n_delay + delay``, delay 0 = this step) is returned.
         """
-        if self.history is None:
+        if self.delayed_spike is None:
             return z_flat
         if z_flat.shape[-1] != self._n_source:
             raise ValueError(
@@ -261,12 +266,12 @@ class BasePSC(MemoryModule):
                 f"got {tuple(z_flat.shape)}. To feed an already delay-expanded "
                 "input, call expect_expanded_input() first."
             )
-        self.history.update(z_flat)
-        return self.history.get_flattened(self.n_delay)
+        self.delayed_spike.update(z_flat)
+        return self.delayed_spike.get_flattened(self.n_delay)
 
     def _delay_expand_sequence(self, z_flat: torch.Tensor) -> torch.Tensor:
         """Whole-sequence, stateless counterpart of :meth:`_delay_expand`."""
-        if self.history is None:
+        if self.delayed_spike is None:
             return z_flat
         if z_flat.shape[-1] != self._n_source:
             raise ValueError(
@@ -306,6 +311,10 @@ class BasePSC(MemoryModule):
             return self.psc
 
     def single_step_forward(self, z: torch.Tensor) -> torch.Tensor:
+        if self.backend != "torch":
+            from .kernels.adapters import psc_sequence
+
+            return psc_sequence(self, z.unsqueeze(0))[0]
         self.conductance_charge()
         self.adaptation_charge(z)
         current = self.current_charge()
@@ -335,6 +344,10 @@ class BasePSC(MemoryModule):
             history, which equals stepping :meth:`single_step_forward` after a
             reset.
         """
+        if self.backend != "torch":
+            from .kernels.adapters import psc_sequence
+
+            return psc_sequence(self, z_seq)
         dt = environ.get("dt")
 
         z_flat, leading = flatten_neuron(z_seq, self.n_neuron, self.size)
@@ -756,15 +769,15 @@ class BilinearMixingSynapse(MemoryModule):
 class DelayedPSC(MemoryModule):
     """Wrapper that adds delay buffering to any BasePSC subclass.
 
-    Delays are managed orthogonally to synaptic dynamics via SpikeHistory.
+    Delays are managed orthogonally to synaptic dynamics via Delay.
     The uniform delay is configured here via ``max_delay_steps``.
 
     It composes with per-edge delays: if the wrapped PSC has a delayed
     connection (``linear.n_delay > 1``, see :class:`BasePSC`), the wrapper
     delays the spikes by ``max_delay_steps`` *before* the PSC buffers them, so
     an edge with delay ``d`` acts ``max_delay_steps + d`` steps after the
-    spike. The two histories are independent memories (``history.history`` of
-    the wrapper and ``psc_module.history.history``).
+    spike. The two histories are independent memories (``delayed_spike.history`` of
+    the wrapper and ``psc_module.delayed_spike.history``).
 
     Args:
         psc: BasePSC subclass instance (e.g. ExponentialPSC, AlphaPSC).
@@ -790,13 +803,13 @@ class DelayedPSC(MemoryModule):
         self.use_circular_buffer = use_circular_buffer
 
         if max_delay_steps > 1:
-            self.history = SpikeHistory(
+            self.delayed_spike = Delay(
                 n_neuron=psc.n_neuron,
                 max_delay_steps=max_delay_steps + 1,
                 use_circular_buffer=use_circular_buffer,
             )
         else:
-            self.history = None
+            self.delayed_spike = None
 
     @property
     def n_neuron(self) -> tuple[int, ...]:
@@ -827,9 +840,9 @@ class DelayedPSC(MemoryModule):
         return self.psc_module.psc
 
     def single_step_forward(self, z: torch.Tensor) -> torch.Tensor:
-        if self.history is not None:
-            self.history.update(z)
-            z_delayed = self.history.get_delay(self.max_delay_steps)
+        if self.delayed_spike is not None:
+            self.delayed_spike.update(z)
+            z_delayed = self.delayed_spike.get_delay(self.max_delay_steps)
         else:
             z_delayed = z
         return self.psc_module.single_step_forward(z_delayed)
@@ -860,8 +873,8 @@ class HeterSynapsePSC(BasePSC):
     ``make_hetersynapse_conn(..., delay_col=..., n_delay_bins=...)`` and with
     connections built from semantic edges
     (``Synapse(delay=..., receptor=...)``). It uses the delay code path of
-    :class:`BasePSC`: the history lives in ``self.history`` (memory
-    ``history.history``) and the inner ``base_psc`` receives the expanded
+    :class:`BasePSC`: the history lives in ``self.delayed_spike`` (memory
+    ``delayed_spike.history``) and the inner ``base_psc`` receives the expanded
     input, so it holds no history of its own.
 
     Args:
@@ -989,9 +1002,13 @@ class HeterSynapsePSC(BasePSC):
         return psc_flat.reshape(*leading, *self.n_neuron, self.n_receptor).sum(-1)
 
     def single_step_forward(self, z: torch.Tensor) -> torch.Tensor:
+        if self.backend != "torch":
+            from .kernels.adapters import psc_sequence
+
+            return psc_sequence(self, z.unsqueeze(0))[0]
         z_flat, leading, has_receptor_axis = self._flatten_input(z)
 
-        if self.history is not None:
+        if self.delayed_spike is not None:
             self._validate_delayed_input(has_receptor_axis, z.shape)
             z_flat = self._delay_expand(z_flat)
 
@@ -1036,6 +1053,10 @@ class HeterSynapsePSC(BasePSC):
                 ``validate_nan`` is True.
             KeyError: If the receptor type is not in ``receptor_type_index``.
         """
+        if getattr(self, "_kernel_merge_active", False):
+            raise ValueError(
+                "Merged PSC states cannot provide independent receptor currents"
+            )
         psc = psc if psc is not None else self.base_psc.psc
 
         if receptor_type is None:
@@ -1086,7 +1107,11 @@ class HeterSynapsePSC(BasePSC):
         ``kernel_len`` only applies on the history-free path (convolution);
         with delays the PSC is stepped sequentially and it is ignored.
         """
-        if self.history is not None:
+        if self.backend != "torch":
+            from .kernels.adapters import psc_sequence
+
+            return psc_sequence(self, z_seq)
+        if self.delayed_spike is not None:
             _, _, has_receptor_axis = self._flatten_input(z_seq)
             self._validate_delayed_input(has_receptor_axis, z_seq.shape)
 

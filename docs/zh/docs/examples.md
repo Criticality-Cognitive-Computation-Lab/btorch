@@ -51,10 +51,10 @@
 
 ## `delayed_synapse_demo.py` — 突触延迟
 
-演示使用 `SpikeHistory` 和 `DelayedSynapse` 实现异构突触延迟。
+演示使用 `Delay` 和 `DelayedSynapse` 实现异构突触延迟。
 
 **关键模式：**
-- 作为滚动脉冲缓冲区的 `SpikeHistory`
+- 作为滚动脉冲缓冲区的 `Delay`
 - 用于历史记录 + 线性变换的 `DelayedSynapse`
 - 用于延迟感知连接矩阵的 `expand_conn_for_delays`
 

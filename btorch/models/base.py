@@ -10,12 +10,31 @@ from jaxtyping import Float
 from torch import Tensor
 
 from ..types import TensorLike
+from .kernels.options import KernelOptions, normalize_backend
 from .shape import expand_leading_dims
 from .surrogate import Sigmoid
 
 
 StepMode = Literal["s", "m"]
-Backend = Literal["torch"]
+Backend = str | KernelOptions
+
+
+def _single_step_call(module, *args, **kwargs):
+    """Call one scheduler step through Module dispatch and preserve hooks.
+
+    The scheduler has already removed the time axis. Temporarily select
+    the child's single-step entry while preserving its public default
+    and custom forward implementation, including restoration after
+    failed execution.
+    """
+    mode = getattr(module, "step_mode", None)
+    if mode is None or mode == "s":
+        return module(*args, **kwargs)
+    try:
+        module.step_mode = "s"
+        return module(*args, **kwargs)
+    finally:
+        module.step_mode = mode
 
 
 class StepModule:
@@ -700,10 +719,12 @@ class MemoryModule(StepModule, torch.nn.Module):
 
     @backend.setter
     def backend(self, value: Backend) -> None:
-        if value not in self.supported_backends:
-            raise NotImplementedError(
-                f"{value} is not a supported backend of {self._get_name()}!"
-            )
+        options = normalize_backend(value)
+        if options.cell != "torch" or isinstance(value, KernelOptions):
+            # Only models with named equation templates may select a cell kernel.
+            from .kernels.adapters import validate_module
+
+            validate_module(self, options)
         self._backend = value
 
     @abstractmethod
@@ -1188,6 +1209,10 @@ class BaseNode(ParamBufferMixin, MemoryModule):
         """
         * :ref:`API in English <BaseNode.single_step_forward-en>`
         """
+        if self.backend != "torch":
+            from .kernels.adapters import neuron_sequence
+
+            return neuron_sequence(self, x.unsqueeze(0))[0]
         self.neuronal_charge(x)
         self.neuronal_adaptation()
         spike = self.neuronal_fire()
@@ -1197,6 +1222,10 @@ class BaseNode(ParamBufferMixin, MemoryModule):
     def multi_step_forward(
         self, x_seq: Float[Tensor, "T *batch n_neuron"]
     ) -> Float[Tensor, "T *batch n_neuron"]:
+        if self.backend != "torch":
+            from .kernels.adapters import neuron_sequence
+
+            return neuron_sequence(self, x_seq)
         s_seq = []
         for t, x in enumerate(x_seq):
             s = self.single_step_forward(x)

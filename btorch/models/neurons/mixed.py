@@ -10,7 +10,7 @@ from collections.abc import Mapping, Sequence
 import torch
 from torch import Tensor, nn
 
-from ..base import StepMode
+from ..base import StepMode, _single_step_call
 from .two_compartment import TwoCompartmentGLIF
 
 
@@ -144,9 +144,9 @@ class MixedNeuronPopulation(nn.Module):
 
             if isinstance(neuron, TwoCompartmentGLIF):
                 apical = self._slice(i_apical, idx) if i_apical is not None else None
-                out = neuron(soma, apical)
+                out = _single_step_call(neuron, soma, apical)
             else:
-                out = neuron(soma)
+                out = _single_step_call(neuron, soma)
 
             # Normalise return value to spikes only.
             spikes.append(out[0] if isinstance(out, tuple) else out)

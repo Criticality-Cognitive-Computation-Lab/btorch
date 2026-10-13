@@ -1,11 +1,10 @@
-"""Spike history buffer for delayed synapse models.
+"""Tensor history for delayed stateful models.
 
-This module provides a rolling buffer for spike history to support
-heterogeneous synaptic delays. The buffer maintains the last N timesteps
-of spike activity, allowing delayed connections to access past spikes.
+The generic Delay container retains recent tensors; synapses use it for
+source spikes, but the stored values need not be spikes or binary values.
 
 Example:
-    >>> history = SpikeHistory(n_neuron=100, max_delay_steps=5)
+    >>> history = Delay(n_neuron=100, max_delay_steps=5)
     >>> history.init_state(batch_size=2)
     >>> for t in range(T):
     ...     z = neuron(v)  # current spikes
@@ -30,7 +29,7 @@ def expand_delay_sequence(z_seq: Tensor, n_delays: int) -> Tensor:
 
     Stateless, vectorised counterpart of stepping
     ``history.update(z_seq[t]); history.get_flattened(n_delays)`` from a freshly
-    reset :class:`SpikeHistory`: entry ``n * n_delays + d`` of step ``t`` is
+    reset :class:`Delay`: entry ``n * n_delays + d`` of step ``t`` is
     ``z_seq[t - d, ..., n]`` (zero for ``t < d``).
 
     Args:
@@ -51,10 +50,10 @@ def expand_delay_sequence(z_seq: Tensor, n_delays: int) -> Tensor:
     return torch.stack(shifted, dim=-1).flatten(-2)
 
 
-class SpikeHistory(MemoryModule):
-    """Rolling spike history buffer for delayed synaptic connections.
+class Delay(MemoryModule):
+    """Maintain delayed tensor history with optional circular storage.
 
-    Maintains a buffer of the last `max_delay_steps` spike patterns.
+    Maintain the last `max_delay_steps` tensor values.
     Supports batch dimensions and provides flattened output for matrix
     multiplication with delay-expanded connection matrices.
 
@@ -83,11 +82,11 @@ class SpikeHistory(MemoryModule):
 
     Example:
         >>> # For simulation (efficient, default)
-        >>> history = SpikeHistory(n_neuron=10, max_delay_steps=3)
+        >>> history = Delay(n_neuron=10, max_delay_steps=3)
         >>> history.init_state(batch_size=2)
         >>>
         >>> # For training with torch.compile
-        >>> history = SpikeHistory(n_neuron=10, max_delay_steps=3,
+        >>> history = Delay(n_neuron=10, max_delay_steps=3,
         ...                        use_circular_buffer=False)
         >>> history.init_state(batch_size=2)
     """
@@ -101,6 +100,8 @@ class SpikeHistory(MemoryModule):
         super().__init__()
         self.n_neuron, self.size = normalize_n_neuron(n_neuron)
         self.max_delay = max_delay_steps
+        if max_delay_steps < 1:
+            raise ValueError("max_delay_steps must be positive")
         self.use_circular_buffer = use_circular_buffer
 
         # Register history buffer with shape (max_delay_steps, *n_neuron)
@@ -119,6 +120,24 @@ class SpikeHistory(MemoryModule):
                 torch.tensor(0, dtype=torch.long),
                 persistent=False,
             )
+
+    @property
+    def _memories(self) -> dict[str, Tensor]:
+        memories = super()._memories
+        if self.use_circular_buffer:
+            memories["_cursor"] = self._cursor
+        return memories
+
+    @_memories.setter
+    def _memories(self, values: dict[str, Tensor]) -> None:
+        for name, value in values.items():
+            if name == "_cursor" and self.use_circular_buffer:
+                if value.shape != torch.Size([]) or value.dtype != torch.long:
+                    raise ValueError("Delay cursor must be a scalar torch.long tensor")
+                self._cursor = value
+            else:
+                self._check_memory_key(name)
+                setattr(self, name, value)
 
     def init_state(
         self,
@@ -141,7 +160,18 @@ class SpikeHistory(MemoryModule):
             super().init_state(
                 batch_size, dtype, device, persistent, skip_mem_name + ("_cursor",)
             )
-            self._cursor = torch.tensor(0, dtype=torch.long, device=device)
+            cursor = (
+                self._cursor
+                if "_cursor" in skip_mem_name
+                else torch.zeros((), dtype=torch.long, device=self.history.device)
+            )
+            # A skipped history keeps its existing persistence, so its cursor
+            # must follow that value as well: a checkpoint needs both or neither.
+            self.register_buffer(
+                "_cursor",
+                cursor,
+                persistent="history" not in self._non_persistent_buffers_set,
+            )
         else:
             super().init_state(batch_size, dtype, device, persistent, skip_mem_name)
 
@@ -164,12 +194,12 @@ class SpikeHistory(MemoryModule):
                 rebinding them; see :meth:`MemoryModule.reset`.
         """
         super().reset(batch_size, dtype, device, skip_mem_name, inplace=inplace)
-        if self.use_circular_buffer:
+        if self.use_circular_buffer and "_cursor" not in skip_mem_name:
             if inplace:
                 self._cursor.zero_()
             else:
                 self._cursor = torch.tensor(
-                    0, dtype=torch.long, device=self._cursor.device
+                    0, dtype=torch.long, device=device or self._cursor.device
                 )
 
     def detach(self) -> None:
@@ -219,7 +249,7 @@ class SpikeHistory(MemoryModule):
         )
         self.history = value.permute(*perm)
 
-    def update(self, spike: Tensor) -> "SpikeHistory":
+    def update(self, spike: Tensor) -> "Delay":
         """Push new spike pattern into history buffer.
 
         Args:
@@ -233,8 +263,7 @@ class SpikeHistory(MemoryModule):
         """
         if not hasattr(self, "history") or self.history is None:
             raise RuntimeError(
-                "SpikeHistory buffer not initialized. "
-                "Call init_state() before first update()."
+                "Delay buffer not initialized. Call init_state() before first update()."
             )
 
         if spike.dtype != self.history.dtype:
@@ -284,7 +313,7 @@ class SpikeHistory(MemoryModule):
         Raises:
             IndexError: If delay_steps >= max_delay.
         """
-        if delay_steps >= self.max_delay:
+        if delay_steps < 0 or delay_steps >= self.max_delay:
             raise IndexError(
                 f"delay_steps ({delay_steps}) >= max_delay ({self.max_delay}). "
                 "Increase max_delay_steps or use smaller delays."
@@ -334,7 +363,7 @@ class SpikeHistory(MemoryModule):
             Flattened tensor of shape (*batch, size * n_delays).
 
         Example:
-            >>> history = SpikeHistory(n_neuron=3, max_delay_steps=5)
+            >>> history = Delay(n_neuron=3, max_delay_steps=5)
             >>> history.init_state(batch_size=1)
             >>> # After some updates...
             >>> flat = history.get_flattened(3)

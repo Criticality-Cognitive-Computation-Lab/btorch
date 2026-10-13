@@ -57,7 +57,7 @@ def exp_euler_step(
     is_zero = linear == 0
     safe_linear = torch.where(is_zero, torch.ones_like(linear), linear)
     phi = torch.where(
-        is_zero, torch.full_like(linear, dt), torch.expm1(dt * linear) / safe_linear
+        is_zero, torch.ones_like(linear) * dt, torch.expm1(dt * linear) / safe_linear
     )
     return args[0] + phi * derivative
 

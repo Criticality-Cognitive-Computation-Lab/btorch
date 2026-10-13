@@ -124,3 +124,7 @@ nested["neuron"]["v"][:, 0, :]   # voltage of batch 0
 ## What Comes Next
 
 In [Tutorial 2: Training an SNN](training.md), we add a loss function, a training loop, and checkpointing.
+
+See [cell backend training](kernel_training.md) for independent cell/connection
+selection, state-record losses and contiguous BPTT, and [OOT kernels](oot_kernels.md)
+for registration, source generation and parity validation.

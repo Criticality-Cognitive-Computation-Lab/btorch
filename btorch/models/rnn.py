@@ -293,7 +293,10 @@ class RecurrentNNAbstract(base.MemoryModule):
             z, states = self.single_step_forward(*static_args, **kwargs)
             z_seq.append(z)
             for k, v in states.items():
-                states_seq.setdefault(k, []).append(v)
+                # Records are snapshots of this logical timestep. Memories
+                # such as a circular delay cursor can be updated in place on
+                # the next step; retaining a reference would rewrite history.
+                states_seq.setdefault(k, []).append(v.clone())
 
         return z_seq, states_seq
 
@@ -621,7 +624,7 @@ def make_rnn(
             def single_step_forward(
                 self, *args: Any, **kwargs: Any
             ) -> tuple[Any, dict[str, Tensor]]:
-                out = self.rnn_cell(*args, **kwargs)
+                out = base._single_step_call(self.rnn_cell, *args, **kwargs)
                 states = filter_hidden_states(
                     self.rnn_cell, self.update_state_names, allow_buffer=allow_buffer
                 )
@@ -664,6 +667,7 @@ class RecurrentNN(RecurrentNNAbstract):
         cpu_offload: bool = False,
         grad_checkpoint: bool = False,
         allow_buffer: bool = False,
+        backend: base.Backend = "torch",
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -680,6 +684,139 @@ class RecurrentNN(RecurrentNNAbstract):
         self.neuron_inp_module = neuron_inp_module
         self.syn_inp_module = syn_inp_module
         self.allow_buffer = allow_buffer
+        self.backend = backend
+        self.register_load_state_dict_post_hook(self._refresh_merge_validation)
+
+    def _refresh_merge_validation(self, module, incompatible_keys):
+        from .kernels.options import normalize_backend
+
+        if normalize_backend(self.backend).merge_synapse:
+            from .kernels.recurrent import validate_merge_module
+
+            validate_merge_module(self)
+
+    def _apply(self, fn):
+        result = super()._apply(fn)
+        if hasattr(self, "_backend"):
+            self._refresh_merge_validation(self, None)
+        return result
+
+    @property
+    def backend(self) -> base.Backend:
+        return self._backend
+
+    @backend.setter
+    def backend(self, value: base.Backend) -> None:
+        from .kernels.options import normalize_backend
+
+        options = normalize_backend(value)
+        previous = getattr(self, "_backend", "torch")
+        if normalize_backend(
+            previous
+        ).merge_synapse != options.merge_synapse and getattr(
+            self.synapse, "_kernel_sequence_started", False
+        ):
+            raise RuntimeError("Reset synapse states before switching merge_synapse")
+        if options.merge_synapse:
+            from .kernels.recurrent import validate_merge_module
+
+            validate_merge_module(self)
+        self._backend = value
+
+    @property
+    def capture_version(self) -> tuple:
+        """Invalidate captured trajectories when implementation choices
+        change."""
+        from .kernels.options import normalize_backend
+        from .kernels.registry import cell_backend_revision
+
+        options = normalize_backend(self.backend)
+        return (
+            options.cell,
+            options.connection,
+            options.merge_synapse,
+            cell_backend_revision(options.cell),
+        )
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        if getattr(self.synapse, "_kernel_merge_active", False):
+            destination[prefix + "_kernel_merge_mode"] = torch.tensor(1)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        from .kernels.options import normalize_backend
+
+        key = prefix + "_kernel_merge_mode"
+        if key in state_dict:
+            if not normalize_backend(self.backend).merge_synapse:
+                error_msgs.append(
+                    "Merged recurrent checkpoint requires merge_synapse=True"
+                )
+            else:
+                cell = self.synapse.base_psc
+                for name in cell._memories_rv:
+                    state_key = prefix + "synapse.base_psc." + name
+                    if state_key in state_dict:
+                        cell._buffers[name] = torch.empty_like(state_dict[state_key])
+                self.synapse._kernel_merge_active = True
+                # Restoring a merged trajectory also restores its mode lock:
+                # independent receptor states cannot be recovered without reset.
+                self.synapse._kernel_sequence_started = True
+            state_dict.pop(key)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def multi_step_forward(self, *args, loop_args=None, **kwargs):
+        if self.backend == "torch":
+            return super().multi_step_forward(*args, loop_args=loop_args, **kwargs)
+        if self.cudagraph:
+            from .kernels.options import normalize_backend
+
+            if normalize_backend(self.backend).merge_synapse and not getattr(
+                self.synapse, "_kernel_merge_active", False
+            ):
+                from .kernels.recurrent import prepare_merged_state
+
+                prepare_merged_state(self)
+        if self.cudagraph or self.save_grad_history or self.grad_state_names:
+            from .kernels.adapters import connection_scope
+            from .kernels.options import normalize_backend
+
+            with connection_scope(normalize_backend(self.backend)):
+                return super().multi_step_forward(*args, loop_args=loop_args, **kwargs)
+        from .kernels.recurrent import recurrent_sequence
+
+        return recurrent_sequence(self, *args, loop_args=loop_args, **kwargs)
+
+    def _run_chunk_steps(self, *chunk_args, loop_args=(0,), unroll_size=1, **kwargs):
+        if self.backend == "torch":
+            return super()._run_chunk_steps(
+                *chunk_args, loop_args=loop_args, unroll_size=unroll_size, **kwargs
+            )
+        from .kernels.recurrent import recurrent_sequence
+
+        output, states = recurrent_sequence(
+            self, *chunk_args, loop_args=loop_args, _chunk=True, **kwargs
+        )
+        return list(output.unbind(0)), {
+            name: list(value.unbind(0)) for name, value in states.items()
+        }
 
     def single_step_forward(
         self, x: Tensor, x_syn: Tensor | None = None
@@ -688,8 +825,8 @@ class RecurrentNN(RecurrentNNAbstract):
             x = self.neuron_inp_module(x)
         if self.syn_inp_module is not None:
             x_syn = self.syn_inp_module(x_syn)
-        z = self.neuron(self.synapse.psc + x)
-        _ = self.synapse(z if x_syn is None else z + x_syn)
+        z = base._single_step_call(self.neuron, self.synapse.psc + x)
+        _ = base._single_step_call(self.synapse, z if x_syn is None else z + x_syn)
         states = filter_hidden_states(
             self, self.update_state_names, allow_buffer=self.allow_buffer
         )
@@ -803,13 +940,15 @@ class ApicalRecurrentNN(RecurrentNN):
                 apical_input = self.synapse_apical.psc + apical_input
 
         if apical_input is None:
-            z = self.neuron(total_input)
+            z = base._single_step_call(self.neuron, total_input)
         else:
-            z = self.neuron(total_input, apical_input)
+            z = base._single_step_call(self.neuron, total_input, apical_input)
 
-        _ = self.synapse(z if x_syn is None else z + x_syn)
+        _ = base._single_step_call(self.synapse, z if x_syn is None else z + x_syn)
         if self.synapse_apical is not None:
-            _ = self.synapse_apical(z if x_syn is None else z + x_syn)
+            _ = base._single_step_call(
+                self.synapse_apical, z if x_syn is None else z + x_syn
+            )
 
         states = filter_hidden_states(
             self, self.update_state_names, allow_buffer=self.allow_buffer

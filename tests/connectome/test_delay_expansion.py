@@ -343,7 +343,7 @@ class TestDelayExpansionRoundTrip:
         """Test matrix multiply simulates correct delay behavior."""
         import torch
 
-        from btorch.models.history import SpikeHistory
+        from btorch.models.history import Delay
 
         # Create simple 2-neuron network:
         # Neuron 0 -> Neuron 1 with weight 2.0, delay=2
@@ -356,7 +356,7 @@ class TestDelayExpansionRoundTrip:
         # conn_d shape: (2*3, 2) = (6, 2)
 
         # Create history with specific pattern
-        history = SpikeHistory(n_neuron=2, max_delay_steps=n_delays)
+        history = Delay(n_neuron=2, max_delay_steps=n_delays)
         history.init_state(batch_size=1, dtype=torch.float32)
 
         # t=0: spike at neuron 0

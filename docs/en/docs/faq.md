@@ -97,7 +97,7 @@ See the [Configuration Guide](guides/configuration.md) for the full pattern.
 
 **Symptom:** `torch.compile` fails on models with circular-buffer-based history.
 
-**Fix:** Set `use_circular_buffer=False` in `SpikeHistory`, `DelayedPSC`, or `HeterSynapsePSC` when compiling for training:
+**Fix:** Set `use_circular_buffer=False` in `Delay`, `DelayedPSC`, or `HeterSynapsePSC` when compiling for training:
 
 ```python
 from btorch.models.synapse import DelayedPSC, ExponentialPSC

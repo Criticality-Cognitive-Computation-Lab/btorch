@@ -11,6 +11,7 @@ from . import (
     hex,
     history,
     init,
+    kernels,
     linear,
     neurons,
     noise,
@@ -22,6 +23,7 @@ from . import (
     surrogate,
     synapse,
 )
+from .kernels.options import KernelOptions
 from .neurons import (
     alif,
     dlif,
@@ -35,6 +37,7 @@ from .neurons.dlif import DBNN, DLIF, DendriticLIF
 
 
 __all__ = [
+    "KernelOptions",
     "base",
     "bilinear",
     "connection",
@@ -47,6 +50,7 @@ __all__ = [
     "hex",
     "history",
     "init",
+    "kernels",
     "linear",
     "neurons",
     "noise",

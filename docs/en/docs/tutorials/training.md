@@ -161,3 +161,7 @@ for t in range(0, T, chunk_size):
 4. **Use `detach_net`** for truncated BPTT on long sequences.
 
 See the [FAQ](../faq.md) for common errors and troubleshooting.
+
+See [cell backend training](kernel_training.md) for independent cell/connection
+selection, state-record losses and contiguous BPTT, and [OOT kernels](oot_kernels.md)
+for registration, source generation and parity validation.

@@ -83,10 +83,10 @@ The same Fashion-MNIST model factored into a PyTorch Lightning `LightningModule`
 
 ## `delayed_synapse_demo.py` — Synaptic Delays
 
-Demonstrates synaptic delays using `SpikeHistory`, `DelayedPSC`, and `HeterSynapsePSC`.
+Demonstrates synaptic delays using `Delay`, `DelayedPSC`, and `HeterSynapsePSC`.
 
 **Key patterns:**
-- `SpikeHistory` as a rolling spike buffer
+- `Delay` as a rolling spike buffer
 - `DelayedPSC` for adding scalar delays to any PSC model
 - `HeterSynapsePSC(..., max_delay_steps=...)` for delay + receptor combinations
 - `expand_conn_for_delays` for delay-aware connection matrices

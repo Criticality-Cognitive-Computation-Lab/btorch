@@ -86,6 +86,8 @@ Key patterns:
 - Update `docs/en/docs/` for user-facing changes.
 - Never touch the auto generated `docs/en/docs/api`.
 - Update `README.md` for installation or workflow changes.
+- Label only computational model behavior changes (equations, dynamics, event
+  timing) **Breaking**. API renames and code-interface changes are ordinary changes.
 
 ## Contribution workflow
 

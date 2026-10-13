@@ -6,7 +6,7 @@ import torch
 from btorch.models import environ
 from btorch.models.base import MemoryModule
 from btorch.models.functional import init_net_state
-from btorch.models.history import SpikeHistory
+from btorch.models.history import Delay
 from btorch.models.synapse import (
     AlphaPSC,
     AlphaPSCBilleh,
@@ -295,8 +295,9 @@ def test_heter_synapse_psc_multistep_conv_parity_raw_input():
     Why this matters:
     - There are two supported input layouts for non-delayed heter synapses:
       raw ``n_neuron`` spikes and receptor-expanded ``n_neuron x n_receptor``.
-    - The convolution-based ``multi_step_forward`` must match the reference
-      single-step rollout for both layouts.
+    - From rest and with kernel_len covering this sequence, convolution outputs
+      match the reference single-step rollout for both layouts. This test does
+      not compare final state or chunk-continuation semantics.
     """
 
     n_neuron = 5
@@ -343,7 +344,7 @@ def test_heter_synapse_psc_delay_multistep_matches_manual(use_circular_buffer):
 
     This test verifies the full delayed execution path used by
     ``HeterSynapsePSC.multi_step_forward``:
-    1) push raw spikes into SpikeHistory,
+    1) push raw spikes into Delay,
     2) flatten delayed spikes,
     3) apply base PSC dynamics and linear map,
     4) sum receptor channels per neuron.
@@ -377,7 +378,7 @@ def test_heter_synapse_psc_delay_multistep_matches_manual(use_circular_buffer):
         tau_syn=3.0,
     )
 
-    manual_history = SpikeHistory(
+    manual_history = Delay(
         n_neuron=n_neuron,
         max_delay_steps=max_delay_steps,
         use_circular_buffer=use_circular_buffer,
@@ -413,7 +414,7 @@ def test_heter_synapse_psc_delay_multistep_matches_manual(use_circular_buffer):
         # Path under test: class-provided multi-step API.
         out_multi = hetero_psc.multi_step_forward(z_seq, kernel_len=64)
 
-        # Reference path: explicit step-by-step SpikeHistory + BasePSC.
+        # Reference path: explicit step-by-step Delay + BasePSC.
         out_manual = []
         for t in range(T):
             manual_history.update(z_seq[t])
@@ -429,7 +430,7 @@ def test_heter_synapse_psc_delay_multistep_matches_manual(use_circular_buffer):
 def test_heter_synapse_psc_delay_rejects_receptor_axis_input():
     """Ensure delayed heterosynapse enforces raw-spike input layout.
 
-    Delayed HeterSynapsePSC internally owns SpikeHistory over raw spikes
+    Delayed HeterSynapsePSC internally owns Delay over raw spikes
     ``(*batch, n_neuron)``. Passing receptor-expanded tensors would represent
     a different semantic object and can silently produce wrong delay shapes.
 

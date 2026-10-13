@@ -404,13 +404,13 @@ layouts derived from them:
 | output | `n_post * n_receptor` | `post * n_receptor + receptor` |
 
 Delay `d` reads the spikes from `d` steps ago, so delay 0 is the current step.
-The input layout is the one `SpikeHistory.get_flattened(n_delay)` produces; the
+The input layout is the one `Delay.get_flattened(n_delay)` produces; the
 output can be reshaped to `[..., n_post, n_receptor]`.
 
 ```python
-from btorch.models.history import SpikeHistory
+from btorch.models.history import Delay
 
-history = SpikeHistory(n_neuron=3, max_delay_steps=3)
+history = Delay(n_neuron=3, max_delay_steps=3)
 history.init_state(batch_size=1)
 for _ in range(4):
     history.update((torch.rand(1, 3) < 0.5).float())

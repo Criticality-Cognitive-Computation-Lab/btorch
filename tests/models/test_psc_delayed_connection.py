@@ -4,7 +4,7 @@ A connection built with ``Synapse(delay=...)`` has ``n_delay > 1`` and expects
 the delay-expanded input layout ``[..., n_pre * n_delay]`` (index
 ``pre * n_delay + delay``). Every :class:`~btorch.models.synapse.BasePSC`
 detects this through the ``linear.n_delay`` attribute and then owns a
-:class:`~btorch.models.history.SpikeHistory` (``psc.history``, memory
+:class:`~btorch.models.history.Delay` (``psc.delayed_spike``, memory
 ``history.history``): each step it pushes the incoming spikes and feeds
 ``history.get_flattened(n_delay)`` to the connection. So the NEST-style journey
 just works::
@@ -48,7 +48,7 @@ from btorch.models.functional import (
     named_hidden_states,
     reset_net,
 )
-from btorch.models.history import SpikeHistory, expand_delay_sequence
+from btorch.models.history import Delay, expand_delay_sequence
 from btorch.models.neurons import LIF
 from btorch.models.rnn import RecurrentNN
 from btorch.models.synapse import (
@@ -289,7 +289,7 @@ def test_delayed_connection_matches_expanded_and_dense_reference(psc_cls, kwargs
         psc_a = psc_cls(n_neuron=N, linear=conn_a, **kwargs)
         # The PSC found ``linear.n_delay`` and owns a history of that depth.
         assert psc_a.n_delay == N_DELAY
-        assert isinstance(psc_a.history, SpikeHistory)
+        assert isinstance(psc_a.delayed_spike, Delay)
         init_net_state(psc_a, batch_size=BATCH, dtype=DTYPE)
         out_a = _run_steps(psc_a, z_a)
 
@@ -414,13 +414,13 @@ def test_multi_step_forward_matches_stepping(psc_cls, kwargs, batch):
         out_multi = multi(z_seq, kernel_len=N_STEP)
 
         # Stateless: neither the PSC state nor the history was touched.
-        assert multi.history.history.abs().sum() == 0
+        assert multi.delayed_spike.history.abs().sum() == 0
         assert multi.psc.abs().sum() == 0
 
     torch.testing.assert_close(out_multi, out_stepped, atol=1e-9, rtol=0.0)
 
-    # The vectorised expansion is the stepped SpikeHistory, written at once.
-    history = SpikeHistory(N, max_delay_steps=N_DELAY, use_circular_buffer=False)
+    # The vectorised expansion is the stepped Delay, written at once.
+    history = Delay(N, max_delay_steps=N_DELAY, use_circular_buffer=False)
     history.init_state(batch_size=batch or None, dtype=DTYPE)
     stepped_expansion = torch.stack(
         [history.update(z).get_flattened(N_DELAY) for z in z_seq]
@@ -446,7 +446,7 @@ def test_feedforward_source_and_target_of_different_size():
         conn = _direct_connection(pre, post, delay, weight, n_pre, n_post)
         psc = AlphaPSC(n_neuron=n_post, linear=conn, **kwargs)
         init_net_state(psc, batch_size=BATCH, dtype=DTYPE)
-        assert psc.history.history.shape == (BATCH, N_DELAY, n_pre)
+        assert psc.delayed_spike.history.shape == (BATCH, N_DELAY, n_pre)
         assert psc.psc.shape == (BATCH, n_post)
         out = _run_steps(psc, z_seq)
 
@@ -506,14 +506,14 @@ def test_hetersynapse_psc_delays_and_receptors_from_semantic_edges(
         )
         # Inferred from the connection; one history, owned by the outer PSC.
         assert psc.max_delay_steps == psc.n_delay == N_DELAY
-        assert psc.base_psc.history is None
+        assert psc.base_psc.delayed_spike is None
         init_net_state(psc, batch_size=BATCH, dtype=DTYPE)
         assert set(named_hidden_states(psc)) == {
             "psc",
-            "history.history",
+            "delayed_spike.history",
             "base_psc.psc",
             "base_psc.h",
-        }
+        } | ({"delayed_spike._cursor"} if use_circular_buffer else set())
 
         out, per_receptor = [], []
         for z in z_seq:
@@ -626,8 +626,8 @@ def test_projection_alpha_psc_recurrent_nn_bptt(rnn_kwargs):
 
     with environ.context(dt=DT):
         init_net_state(brain, batch_size=batch, dtype=torch.float32)
-        # The history sits at ``synapse.history.history`` among the memories.
-        assert named_hidden_states(brain)["synapse.history.history"].shape == (
+        # The history sits at ``synapse.delayed_spike.history`` among the memories.
+        assert named_hidden_states(brain)["synapse.delayed_spike.history"].shape == (
             batch,
             conn.n_delay,
             n,
@@ -696,10 +696,10 @@ def test_reset_net_and_init_net_state_clear_the_history():
             linear=_direct_connection(pre, post, delay, weight),
         )
         init_net_state(psc, batch_size=BATCH, dtype=DTYPE)
-        history = psc.history
+        history = psc.delayed_spike
         assert history.history.shape == (BATCH, N_DELAY, N)
         assert history.history.dtype == DTYPE
-        assert set(named_hidden_states(psc)) == {"psc", "h", "history.history"}
+        assert set(named_hidden_states(psc)) == {"psc", "h", "delayed_spike.history"}
 
         first = _run_steps(psc, z_seq)
         assert history.history.abs().sum() > 0
@@ -744,9 +744,9 @@ def test_detach_net_cuts_the_graph_through_the_history():
         )
         init_net_state(psc, batch_size=BATCH, dtype=DTYPE)
         _run_steps(psc, z_seq)
-        assert psc.history.history.requires_grad
+        assert psc.delayed_spike.history.requires_grad
         detach_net(psc)
-        assert not psc.history.history.requires_grad
+        assert not psc.delayed_spike.history.requires_grad
         assert not psc.psc.requires_grad
 
 
@@ -773,8 +773,8 @@ def test_state_dict_round_trip_mid_simulation_continues_exactly():
         original = build()
         _run_steps(original, z_seq[:5])
         checkpoint = copy.deepcopy(original.state_dict())
-        assert {"psc", "h", "history.history"} <= set(checkpoint)
-        assert checkpoint["history.history"].abs().sum() > 0
+        assert {"psc", "h", "delayed_spike.history"} <= set(checkpoint)
+        assert checkpoint["delayed_spike.history"].abs().sum() > 0
 
         restored = build()
         restored.load_state_dict(checkpoint)
@@ -805,8 +805,8 @@ def test_no_delay_leaves_memories_and_state_dict_unchanged(psc_cls, kwargs):
     def describe(linear):
         psc = psc_cls(n_neuron=N, linear=linear, **kwargs)
         init_net_state(psc, batch_size=BATCH, dtype=DTYPE, persistent=True)
-        assert psc.history is None and psc.n_delay == 1
-        assert not any(isinstance(m, SpikeHistory) for m in psc.modules())
+        assert psc.delayed_spike is None and psc.n_delay == 1
+        assert not any(isinstance(m, Delay) for m in psc.modules())
         with environ.context(dt=DT):
             out = _run_steps(psc, z_seq)
         memories = set(named_hidden_states(psc))
@@ -828,7 +828,7 @@ def test_no_delay_leaves_memories_and_state_dict_unchanged(psc_cls, kwargs):
 
     assert plain[0] == sparse[0] == delay_zero[0]
     assert plain[1] == sparse[1] == delay_zero[1]
-    assert "history.history" not in plain[0]
+    assert "delayed_spike.history" not in plain[0]
     # Delay 0 is no delay: identical currents to the delay-free connection.
     torch.testing.assert_close(sparse[2], delay_zero[2], atol=0.0, rtol=0.0)
 
@@ -910,7 +910,7 @@ def test_validation_errors():
 def test_already_expanded_input_is_rejected_unless_declared():
     """A delayed PSC buffers the spikes itself; do not expand them twice.
 
-    Feeding the delay-expanded layout (a hand-written ``SpikeHistory`` loop)
+    Feeding the delay-expanded layout (a hand-written ``Delay`` loop)
     to a PSC with a delayed connection raises a clear error.
     ``expect_expanded_input()`` opts out of the internal history; this is what
     ``HeterSynapsePSC`` does for its inner ``base_psc``.
@@ -927,7 +927,7 @@ def test_already_expanded_input_is_rejected_unless_declared():
         manual = ExponentialPSC(
             N, _f64(3.0), _direct_connection(pre, post, delay, weight)
         )
-        history = SpikeHistory(N, max_delay_steps=N_DELAY, use_circular_buffer=False)
+        history = Delay(N, max_delay_steps=N_DELAY, use_circular_buffer=False)
         history.init_state(batch_size=BATCH, dtype=DTYPE)
         init_net_state(manual, batch_size=BATCH, dtype=DTYPE)
 
@@ -936,7 +936,7 @@ def test_already_expanded_input_is_rejected_unless_declared():
             manual.single_step_forward(expanded)
 
         manual.expect_expanded_input()
-        assert manual.history is None
+        assert manual.delayed_spike is None
         assert set(named_hidden_states(manual)) == {"psc"}
         history.reset()
         out_manual = torch.stack(
@@ -979,7 +979,7 @@ def test_delayed_psc_adds_uniform_delay_to_per_edge_delays(psc_cls, kwargs):
         )
         init_net_state(wrapped, batch_size=BATCH, dtype=DTYPE)
         # Two independent histories: the wrapper's and the PSC's.
-        assert {"history.history", "psc_module.history.history"} <= set(
+        assert {"delayed_spike.history", "psc_module.delayed_spike.history"} <= set(
             named_hidden_states(wrapped)
         )
         out = _run_steps(wrapped, z_seq)
