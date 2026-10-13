@@ -306,11 +306,13 @@ def to_torch(A: Sparse, layout: str | torch.layout | None = None, **kwargs) -> T
     A shared-pattern batch has no PyTorch equivalent, so its pattern is
     repeated for every batch member on export.
 
+    Additional keyword arguments are forwarded to :meth:`torch.Tensor.to_sparse`
+    for layout conversion, e.g., ``blocksize=(rows, columns)`` for BSR or BSC.
+
     Args:
         A: Sparse array.
         layout: Target layout name or ``torch.sparse_*`` layout. Defaults to
             the stored format.
-        **kwargs: ``blocksize`` for ``"bsr"`` / ``"bsc"``.
 
     Returns:
         Sparse tensor with ``shape == A.shape``; values keep their autograd
@@ -356,14 +358,16 @@ def to_scipy(A: Sparse, format: str | None = None, **kwargs):
 
     Values are detached and copied to CPU memory.
 
+    When converting to BSR, additional keyword arguments are forwarded to
+    ``scipy.sparse.bsr_array``, e.g., ``blocksize=(rows, columns)``. Other
+    conversion paths do not consume these arguments.
+
     Args:
         A: Unbatched sparse matrix without dense entry dimensions.
         format: SciPy format name. Defaults to the stored format.
-        **kwargs: Passed to the SciPy constructor for formats reached through
-            a SciPy conversion (e.g. ``blocksize`` for ``"bsr"``).
 
     Returns:
-        ``scipy.sparse.sparray`` with ``shape == A.shape``.
+        result (scipy.sparse.sparray): Sparse array with ``shape == A.shape``.
 
     Raises:
         ValueError: If ``A`` is batched, has dense entry dimensions, or does

@@ -398,8 +398,9 @@ class ConstrainedWeight(Weight):
                 weights of each group.
 
         Returns:
-            ``pandas.DataFrame`` with ``group_id``, ``num_connections``,
-            ``scale`` (and the base-weight statistics if requested).
+            result (pandas.DataFrame): Group statistics with ``group_id``,
+                ``num_connections``, and ``scale`` columns (and the base-weight
+                statistics if requested).
         """
         import pandas as pd
 

@@ -60,7 +60,7 @@ class Projection(nn.Module):
             delay, and explicit sparse edges otherwise. ``"sparse"`` always
             materialises the edges.
         hints: Performance expectations forwarded to the sparse connection.
-        device: Target device.
+        device (torch.device | str | None): Target device.
         dtype: Weight dtype.
 
     Attributes:
@@ -187,6 +187,5 @@ class Projection(nn.Module):
 
     def extra_repr(self) -> str:
         return (
-            f"n_pre={self.n_pre}, n_post={self.n_post}, "
-            f"rule={type(self.rule).__name__}"
+            f"n_pre={self.n_pre}, n_post={self.n_post}, rule={type(self.rule).__name__}"
         )

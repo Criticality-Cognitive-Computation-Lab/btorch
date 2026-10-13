@@ -76,10 +76,12 @@ def randn_like(
 ) -> Tensor:
     """Generate standard normal noise matching a reference tensor's metadata.
 
+    Additional keyword arguments are forwarded to :meth:`torch.Tensor.normal_`
+    (e.g., ``mean`` and ``std``). The default distribution is standard normal.
+
     Args:
         like: Reference tensor providing shape, device, dtype.
         generator: Optional RNG generator for deterministic sampling.
-        **kwargs: Additional args passed to ``torch.empty_like``.
 
     Returns:
         Tensor with same shape/device/dtype as ``like``, filled with N(0,1).

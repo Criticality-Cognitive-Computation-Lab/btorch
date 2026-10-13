@@ -167,8 +167,9 @@ class ConnectionRule:
             n_pre: Size of the presynaptic (source) population.
             n_post: Size of the postsynaptic (target) population.
             generator: Source of randomness (ignored by deterministic rules).
-            device: Device of the returned tensors. ``None`` means CPU (or
-                the generator's device) for generated rules and the device
+            device (torch.device | str | None): Device of the returned tensors.
+                ``None`` means CPU (or the generator's device) for generated
+                rules and the device
                 of the stored data for :class:`DistanceDependent`,
                 :class:`FromEdges` and :class:`FromSparse`.
 
