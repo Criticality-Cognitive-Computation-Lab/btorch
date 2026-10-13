@@ -7,7 +7,7 @@ configuration management workflows.
 
 import inspect
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeVar, overload
 
@@ -472,6 +472,33 @@ def _collapse_union_switches(acc: _DiffAccumulator, plain_a, plain_b) -> None:
         )
 
 
+def _mark_structured_type_switches(conf_a, conf_b, plain_a, plain_b) -> None:
+    """Preserve variant discriminators lost by plain-container conversion."""
+    if isinstance(plain_a, dict) and isinstance(plain_b, dict):
+        type_a = OmegaConf.get_type(conf_a)
+        type_b = OmegaConf.get_type(conf_b)
+        if type_a != type_b and is_dataclass(type_a) and is_dataclass(type_b):
+            # OmegaConf keeps structured types on nodes, but to_container does
+            # not serialize them. Mark only replacements so ordinary structured
+            # field edits retain their existing leaf-level diff representation.
+            plain_a.setdefault("_type_", type_a.__name__)
+            plain_b.setdefault("_type_", type_b.__name__)
+            return
+        keys = plain_a.keys() & plain_b.keys()
+    elif isinstance(plain_a, list) and isinstance(plain_b, list):
+        keys = range(min(len(plain_a), len(plain_b)))
+    else:
+        return
+
+    for key in keys:
+        # Inspect only actual container values. Missing values and unresolved
+        # interpolations stay as strings, just like to_container(resolve=False).
+        if _is_container(plain_a[key]) and _is_container(plain_b[key]):
+            _mark_structured_type_switches(
+                conf_a[key], conf_b[key], plain_a[key], plain_b[key]
+            )
+
+
 def diff_conf_records(
     conf_a: DictConfig | ListConfig,
     conf_b: DictConfig | ListConfig,
@@ -502,10 +529,11 @@ def diff_conf_records(
     if not mode_set.issubset(_VALID_STATUS):
         raise ValueError("mode must only contain: 'changed', 'added', 'removed'.")
 
-    # Use plain containers so structured union explicit type metadata (`_type_`)
-    # emitted by OmegaConf is visible to the recursive diff.
+    # Preserve unresolved values, then recover type switches from the original
+    # nodes: recent OmegaConf versions omit `_type_` from plain containers.
     plain_a = OmegaConf.to_container(conf_a, resolve=False)
     plain_b = OmegaConf.to_container(conf_b, resolve=False)
+    _mark_structured_type_switches(conf_a, conf_b, plain_a, plain_b)
 
     acc = _DiffAccumulator()
     _walk_diff(plain_a, plain_b, "", acc, plain_a, plain_b)
