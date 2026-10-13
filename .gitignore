@@ -47,6 +47,7 @@ coverage.xml
 /tags
 
 .agent/rules/env.md
+.agents/
 .codex
 .desloppify
 .kilocode/
