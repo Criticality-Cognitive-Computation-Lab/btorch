@@ -46,6 +46,8 @@ coverage.xml
 /metadata/md5-cache
 /tags
 
+.agents/
+.claude/
 .agent/rules/env.md
 .agents/
 .codex

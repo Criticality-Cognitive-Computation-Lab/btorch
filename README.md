@@ -28,7 +28,7 @@ Use `btorch` if you need:
 - torch native training features (`torch.compile`, checkpointing,
   truncated BPTT)
 - solid runtime performance and ONNX export support
-- connectome import/export via SONATA, and flexible network definition coming soon  
+- network-specific SONATA import/export ([Izhikevich RSNN example](examples/sonata_izhikevich.py)); flexible network definition coming soon
 
 Heavily influenced by [brainstate](https://github.com/chaobrain/brainstate).
 Evolved from [spikingjelly](https://github.com/fangwei123456/spikingjelly).
@@ -44,6 +44,34 @@ We thank the developers of both libraries for the inspirations.
 - More neuron and synapse models
 - Memory state with static size and managed by torch buffer
   - onnx export is easy (note: sparse matrix is not supported by onnx)
+
+## Cell backends and external kernels
+
+Use `KernelOptions(cell="triton", connection="auto")` to select cell dynamics
+independently of sparse propagation. Torch is the default; Triton is available
+with `pip install 'btorch[gpu]'`, and TileLang/CuPy are optional separate installs.
+Training versus simulation follows autograd inputs, including upstream encoders.
+
+External packages can register cell callbacks and validate their outputs, states
+and gradients using the public parity helper. See the
+[backend guide](docs/en/docs/guides/kernel_backends.md),
+[OOT guide](docs/en/docs/guides/oot_kernels.md) and runnable examples
+[training](examples/kernel_backend_training.py) /
+[registration and generation](examples/oot_cell_backend.py).
+
+## Model and kernel generation with agents
+
+Start with the [kernel-gen harness](skills/kernel-gen/README.md), its
+[skill](skills/kernel-gen/SKILL.md), and the
+[tutorial](docs/en/docs/tutorials/kernel_generation.md). The workflow covers
+Python models, three-scale activity plots, kernel generation, OOT parity,
+profiling and upstream review. It uses Humanize, KernelWiki and ncu-report-skill;
+their setup is documented in the harness.
+
+For network-definition serialization, use the [SONATA IO skill](skills/sonata-io/SKILL.md)
+when SONATA is requested or no IO format/backend is specified. The network's
+agent supplies its mapping using shared btorch helpers and a common interface;
+generated network-specific adapters stay in the user's project/OOT package.
 
 ## Installation
 
@@ -125,7 +153,14 @@ python scripts/docs.py command=build-all
 ## Skills
 
 The `skills/` directory contains usage patterns and tips for using btorch with
-AI agents. Install them with `npx skills`:
+AI agents:
+
+- [Kernel generation](skills/kernel-gen/SKILL.md): modeling, activity evidence and kernel validation.
+- [SONATA IO](skills/sonata-io/SKILL.md): network-specific import/export with shared helpers.
+- [SNN modeling](skills/btorch-snn-modelling/SKILL.md): btorch model conventions.
+- [OmegaConf configuration](skills/omegaconf-config/SKILL.md): **stale, to be revised**.
+
+Install a skill with `npx skills`, using its directory URL:
 
 ```bash
 npx skills add https://github.com/Criticality-Cognitive-Computation-Lab/btorch/tree/main/skills/btorch-snn-modelling

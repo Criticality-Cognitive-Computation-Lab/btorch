@@ -32,11 +32,14 @@ from btorch.io.serialization import (
     to_sparse_repr,
     xarray_to_memories,
 )
+from btorch.io.sonata import SonataImport, SonataNetworkIO
 
 
 __all__ = [
     "DimLayout",
     "SparseOptions",
+    "SonataImport",
+    "SonataNetworkIO",
     "ZarrStoreOptions",
     "from_spike_sparse",
     "load_memories_from_xarray",

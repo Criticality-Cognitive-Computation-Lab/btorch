@@ -26,7 +26,7 @@
 - 对稀疏/连接组风格网络结构的实用支持
 - 原生 PyTorch 训练特性（`torch.compile`、检查点保存、截断时间反向传播）
 - 稳定的运行时性能和 ONNX 导出支持
-- 通过 SONATA 进行连接组导入/导出，以及即将推出的灵活网络定义
+- 网络专用 SONATA 导入/导出（[Izhikevich RSNN 示例](examples/sonata_izhikevich.py)），灵活网络定义待推出
 
 深受 [brainstate](https://github.com/chaobrain/brainstate) 影响，
 从 [spikingjelly](https://github.com/fangwei123456/spikingjelly) 演化而来。
@@ -42,6 +42,31 @@
 - 更多神经元和突触模型
 - 具有静态大小并由 torch buffer 管理的记忆状态
   - 易于导出 onnx（注意：稀疏矩阵不受 onnx 支持）
+
+## Cell 后端与外部 kernel
+
+使用 `KernelOptions(cell="triton", connection="auto")` 独立选择 cell dynamics
+和 sparse propagation。Torch 为默认后端；Triton 可通过
+`pip install 'btorch[gpu]'` 安装，TileLang/CuPy 按 CUDA 环境单独安装。
+Training/simulation 由实际 autograd 输入决定，包括上游 encoder。
+
+外部包可注册 cell callback，并通过公共 parity 工具验证输出、状态和梯度。
+参见 [后端指南](docs/zh/docs/guides/kernel_backends.md)、
+[OOT 指南](docs/zh/docs/guides/oot_kernels.md)，以及可运行的
+[训练示例](examples/kernel_backend_training.py) 和
+[注册/生成示例](examples/oot_cell_backend.py)。
+
+## 使用 agent 生成模型和 kernel
+
+从 [kernel-gen harness](skills/kernel-gen/README.md)、
+[skill](skills/kernel-gen/SKILL.md) 和
+[教程](docs/zh/docs/tutorials/kernel_generation.md) 开始。流程包括 Python 模型、
+三种尺度的活动图、kernel 生成、OOT parity、profiling 和 upstream review。
+它使用 Humanize、KernelWiki 和 ncu-report-skill，安装方法见 harness。
+
+需要网络定义序列化时，用户指定 SONATA 或未指定 IO 格式/backend，就使用
+[SONATA IO skill](skills/sonata-io/SKILL.md)。具体网络映射由用户的 agent 实现，
+复用 btorch helper 和统一接口；生成的网络专用 adapter 留在用户项目/OOT 包中。
 
 ## 安装
 
@@ -125,8 +150,14 @@ python scripts/docs.py command=build-all
 
 ## 技能
 
-`skills/` 目录包含与 AI 智能体一起使用 btorch 时的使用模式和技巧。
-通过 `npx skills` 安装：
+`skills/` 提供 btorch 的 agent 工作流：
+
+- [Kernel 生成](skills/kernel-gen/SKILL.md)：建模、活动图证据和 kernel 验证。
+- [SONATA IO](skills/sonata-io/SKILL.md)：复用共享 helper 的网络专用导入/导出。
+- [SNN 建模](skills/btorch-snn-modelling/SKILL.md)：btorch 模型规范。
+- [OmegaConf 配置](skills/omegaconf-config/SKILL.md)：**已过时，待修订**。
+
+通过 `npx skills` 使用对应 skill 的目录 URL 安装：
 
 ```bash
 npx skills add https://github.com/Criticality-Cognitive-Computation-Lab/btorch/tree/main/skills/btorch-snn-modelling

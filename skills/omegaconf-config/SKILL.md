@@ -1,9 +1,12 @@
 ---
 name: omegaconf-config
-description: Dataclass-first configuration using OmegaConf. Use when defining config defaults in Python dataclasses, loading CLI overrides, parameter sweeps, case/preset selection, or option forwarding between launcher and worker processes.
+description: Stale OmegaConf configuration guidance, awaiting revision. Consult current repository implementations instead of relying on this skill's examples.
 ---
 
 # OmegaConf Configuration
+
+**Status: stale — to be revised.** The guidance below has not been revalidated.
+Use the current repository implementations and tests as the source of truth.
 
 ## Core Principle
 
