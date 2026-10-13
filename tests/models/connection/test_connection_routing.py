@@ -32,7 +32,7 @@ from btorch.connectome.connection import (
 from btorch.models import environ
 from btorch.models.connection import ConstrainedWeight, SparseConnection, Synapse
 from btorch.models.functional import init_net_state
-from btorch.models.history import SpikeHistory
+from btorch.models.history import Delay
 from btorch.models.synapse import ExponentialPSC, HeterSynapsePSC
 
 
@@ -317,7 +317,7 @@ def test_constrained_weights_through_hetersynapse_constraint(mode):
 
 # ------------------------------------------------- simulation-level integration
 def test_delays_with_spike_history():
-    """``SpikeHistory.get_flattened`` yields ``[..., pre * n_delay + delay]``,
+    """``Delay.get_flattened`` yields ``[..., pre * n_delay + delay]``,
 
     the input layout of a delayed connection. The current at step ``t`` is
     ``sum_e w[e] * spike[t - delay[e], pre[e]]``, computed here directly from
@@ -334,7 +334,7 @@ def test_delays_with_spike_history():
         expected[d:, :, post] += w * spikes[: steps - d, :, pre]
 
     for label, conn in pathways(s).items():
-        history = SpikeHistory(N, max_delay_steps=N_BINS)
+        history = Delay(N, max_delay_steps=N_BINS)
         history.init_state(batch_size=batch)
         out = []
         for t in range(steps):

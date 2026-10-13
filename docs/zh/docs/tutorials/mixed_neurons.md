@@ -20,7 +20,7 @@
 
 ### 1. 创建子种群
 
-每个子种群都是一个普通的 btorch 神经元模块。它们可以具有不同的参数集、不同的状态变量，甚至不同的 `step_mode`（只要包装器在你预期的模式下调用即可）。
+每个子种群都是一个普通的 btorch 神经元模块，可以具有不同的参数和状态变量。混合种群的单步 scheduler 明确选择子模型的单步执行，同时保留子模型配置的默认模式和 Module hooks。子模型独立的 `multi_step_forward` 是连续序列入口，不能与网络单步调度互换。
 
 ```python
 from btorch.models.neurons import GLIF3, TwoCompartmentGLIF

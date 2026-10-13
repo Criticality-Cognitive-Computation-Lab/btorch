@@ -721,6 +721,46 @@ class BackendRegistry:
 registry = BackendRegistry()
 
 
+class PreparedBackendContext:
+    """Reuse an override identity across repeated sequence calls.
+
+    Unlike an explicit :func:`use_backend` scope, reentering a prepared scope
+    does not express a new routing preference. Its identity stays stable until
+    the surrounding override changes. Registry replacement remains covered by
+    the registry generation in execution and capture cache signatures.
+
+    Args:
+        name: Registered backend to use inside the prepared scope.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        self._source: _OverrideState | None = None
+        self._binding: _OverrideState | None = None
+
+    @contextmanager
+    def enter(self) -> Iterator[None]:
+        """Install the prepared choice and restore the surrounding identity."""
+        previous = registry._override_state()
+        if previous.name == self.name:
+            yield
+            return
+        binding = self._binding if previous == self._source else None
+        if binding is None:
+            # Use the normal validator when first preparing this choice.
+            registry.set_backend(self.name)
+            binding = registry._override_state()
+            self._source, self._binding = previous, binding
+        else:
+            registry._set_override_state(binding)
+            registry._invalidate_resolution()
+        try:
+            yield
+        finally:
+            registry._set_override_state(previous)
+            registry._invalidate_resolution()
+
+
 @contextmanager
 def use_backend(name: str | None) -> Iterator[None]:
     """Temporarily force a kernel backend in the current context.

@@ -97,11 +97,11 @@ python train.py optimizer._type_=SGDConf optimizer.lr=0.01
 
 **症状：** `torch.compile` 在基于循环缓冲区的历史记录模型上失败。
 
-**修复：** 为训练编译时，在 `SpikeHistory` 或 `DelayedPSC`或`HeterSynapsePSC` 中设置 `use_circular_buffer=False`：
+**修复：** 为训练编译时，在 `Delay` 或 `DelayedPSC`或`HeterSynapsePSC` 中设置 `use_circular_buffer=False`：
 
 ```python
-from btorch.models.history import SpikeHistory
-history = SpikeHistory(n_neuron=100, max_delay_steps=5, use_circular_buffer=False)
+from btorch.models.history import Delay
+history = Delay(n_neuron=100, max_delay_steps=5, use_circular_buffer=False)
 ```
 
 这以牺牲内存效率为代价换取完全的 `torch.compile` 兼容性。

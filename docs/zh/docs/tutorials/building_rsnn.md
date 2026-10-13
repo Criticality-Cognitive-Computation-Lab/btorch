@@ -124,3 +124,6 @@ nested["neuron"]["v"][:, 0, :]   # 批次 0 的电压
 ## 下一步
 
 在 [教程 2：训练 SNN](training.md) 中，我们将添加损失函数、训练循环和检查点保存。
+
+参见 [cell 后端训练](kernel_training.md)：独立选择 cell/connection、状态记录 loss
+和连续 BPTT；[OOT kernel 教程](oot_kernels.md) 介绍注册、源码生成与 parity 验证。

@@ -358,12 +358,12 @@ def test_delayed_psc_reset_clears_history_and_psc():
             delayed(z)
 
     # History contains spikes and PSC is non-zero after delay elapses
-    assert delayed.history.history.abs().sum() > 0
+    assert delayed.delayed_spike.history.abs().sum() > 0
     assert delayed.psc.abs().sum() > 0
 
     reset_net(delayed, batch_size=1)
 
-    assert delayed.history.history.abs().sum() == 0
+    assert delayed.delayed_spike.history.abs().sum() == 0
     assert delayed.psc.abs().sum() == 0
 
     # After reset, running again from the same input should give the same result
@@ -569,7 +569,12 @@ def test_delayed_psc_batch_with_different_spike_patterns():
 
 
 def test_delayed_psc_step_mode_s_vs_m_consistency():
-    """Single-step and multi-step modes should produce identical sequences."""
+    """Compare short-sequence outputs from the same reset initial state.
+
+    This case does not establish arbitrary initial-state or chunk-
+    continuation parity between all primitive single-step and multi-step
+    implementations.
+    """
     dt = 1.0
     max_delay_steps = 2
     n_neuron = 3

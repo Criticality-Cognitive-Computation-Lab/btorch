@@ -3,7 +3,7 @@
 This example demonstrates how to use heterogeneous synaptic delays in btorch.
 It shows:
 1. Creating a connection matrix with per-connection delays
-2. Using SpikeHistory for rolling spike buffer
+2. Using Delay for rolling spike buffer
 3. Running a simulation with delayed synaptic transmission
 """
 
@@ -13,7 +13,7 @@ import torch
 
 from btorch.connectome.connection import expand_conn_for_delays
 from btorch.models.connection import SparseConnection, Synapse
-from btorch.models.history import SpikeHistory
+from btorch.models.history import Delay
 
 
 def simple_delay_demo():
@@ -45,7 +45,7 @@ def simple_delay_demo():
     linear = SparseConnection.from_adjacency(conn_d)
 
     # Create spike history buffer
-    history = SpikeHistory(n_neurons, max_delay_steps=5)
+    history = Delay(n_neurons, max_delay_steps=5)
     history.init_state(batch_size=1)  # Initialize with batch_size=1
 
     # Simulate for 10 timesteps
@@ -104,7 +104,7 @@ def multiple_delays_demo():
 
     # Create components
     linear = SparseConnection.from_adjacency(conn_d)
-    history = SpikeHistory(n_neurons, max_delay_steps=5)
+    history = Delay(n_neurons, max_delay_steps=5)
     history.init_state(batch_size=1)  # Initialize with batch_size=1
 
     # Simulate
@@ -163,7 +163,7 @@ def delay_with_dale_demo():
     # With Synapse(dale=True), signs are preserved
     linear = SparseConnection.from_adjacency(conn_d, Synapse(dale=True))
 
-    history = SpikeHistory(n_neurons, max_delay_steps=5)
+    history = Delay(n_neurons, max_delay_steps=5)
     history.init_state(batch_size=1)  # Initialize with batch_size=1
 
     print("\nSimulation (spikes at N0 and N1 at t=0):")

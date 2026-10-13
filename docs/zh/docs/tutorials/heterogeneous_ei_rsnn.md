@@ -211,7 +211,7 @@ synapse = Synapse(
 )
 ```
 
-`SparseConnection` 会声明 `n_delay`，`HeterSynapsePSC` 自动创建 `SpikeHistory`，将延迟历史送入连接。输入仍然是未展开的 `[batch, n_neuron]` 脉冲；历史和扁平索引由 PSC 与连接内部管理。
+`SparseConnection` 会声明 `n_delay`，`HeterSynapsePSC` 自动创建 `Delay`，将延迟历史送入连接。输入仍然是未展开的 `[batch, n_neuron]` 脉冲；历史和扁平索引由 PSC 与连接内部管理。
 
 ## 与物理展开数据互操作
 

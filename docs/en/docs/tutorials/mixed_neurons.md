@@ -20,7 +20,7 @@ Use these tools when your model needs:
 
 ### 1. Create the Sub-Populations
 
-Each sub-population is an ordinary btorch neuron module.  They can have different parameter sets, different state variables, and even different `step_mode` (as long as the wrapper is called in the mode you intend).
+Each sub-population is an ordinary btorch neuron module and can have different parameters and state variables. The mixed-population single-step scheduler explicitly selects single-step child execution while preserving each child's configured default and Module hooks. A child's independent `multi_step_forward` is a separate continuous-sequence entrypoint, not interchangeable with the network scheduler.
 
 ```python
 from btorch.models.neurons import GLIF3, TwoCompartmentGLIF

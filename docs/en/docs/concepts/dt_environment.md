@@ -59,7 +59,11 @@ All neurons and post-synaptic current (PSC) models share one convention:
   further steps.
 
 For example the unit-weight impulse response of `AlphaPSC` is
-`k[t] = (t + 1)(1 - a) a^t`, so `multi_step_forward` (convolution with `k`) equals
-stepping `single_step_forward` exactly.
+`k[t] = (t + 1)(1 - a) a^t`. The Torch convolution `multi_step_forward`
+matches a single-step rollout's outputs from rest when `kernel_len` covers
+the compared time range. This path does not read or update existing PSC/delay
+state; output parity does not establish final-state or chunk-continuation
+equivalence. Stateful sequence kernels have their own initial/final-state
+contract at the primitive multi-step entrypoint.
 
 See [`environ`][btorch.models.environ] for the full environment API.

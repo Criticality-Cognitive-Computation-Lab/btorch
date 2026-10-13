@@ -29,7 +29,7 @@ from btorch.models import environ
 from btorch.models.connection import ConstrainedWeight, SparseConnection, Synapse
 from btorch.models.constrain import constrain_net
 from btorch.models.functional import init_net_state, reset_net
-from btorch.models.history import SpikeHistory
+from btorch.models.history import Delay
 from btorch.models.synapse import AlphaPSC, ExponentialPSC, HeterSynapsePSC
 from tests.utils.file import save_fig
 
@@ -889,11 +889,11 @@ def test_stack_hetersynapse_connection_mode_values():
 
 
 def test_hetersynapse_psc_with_max_delay_steps_matches_manual():
-    """Test HeterSynapsePSC with max_delay_steps matches manual SpikeHistory.
+    """Test HeterSynapsePSC with max_delay_steps matches manual Delay.
 
     This verifies that the built-in delay buffering in HeterSynapsePSC
-    produces the same result as a manual SpikeHistory + get_flattened
-    pipeline when using a delay-expanded connection matrix.
+    produces the same result as a manual Delay + get_flattened pipeline
+    when using a delay-expanded connection matrix.
     """
     from btorch.connectome.connection import expand_conn_for_delays
 
@@ -953,8 +953,8 @@ def test_hetersynapse_psc_with_max_delay_steps_matches_manual():
         )
         init_net_state(hetersynapse_psc, batch_size=1, dtype=torch.float32)
 
-        # Manual pipeline with separate SpikeHistory
-        manual_history = SpikeHistory(
+        # Manual pipeline with separate Delay
+        manual_history = Delay(
             n_neuron=n_neurons,
             max_delay_steps=n_delay_bins,
             use_circular_buffer=False,
@@ -1021,19 +1021,19 @@ def test_hetersynapse_psc_delay_state_init_reset():
             )
             init_net_state(hetersynapse_psc, batch_size=2, dtype=torch.float32)
 
-            assert hetersynapse_psc.history is not None
-            assert hetersynapse_psc.history.history.shape == (2, 4, n_neurons)
+            assert hetersynapse_psc.delayed_spike is not None
+            assert hetersynapse_psc.delayed_spike.history.shape == (2, 4, n_neurons)
 
             z = torch.ones(2, n_neurons)
             hetersynapse_psc.single_step_forward(z)
 
             # History should be non-zero after update
-            assert hetersynapse_psc.history.history.abs().sum() > 0
+            assert hetersynapse_psc.delayed_spike.history.abs().sum() > 0
 
             reset_net(hetersynapse_psc, batch_size=2)
 
             # After reset, history should be zeroed
-            assert hetersynapse_psc.history.history.abs().sum() == 0
+            assert hetersynapse_psc.delayed_spike.history.abs().sum() == 0
             assert hetersynapse_psc.psc.abs().sum() == 0
 
 
@@ -1065,7 +1065,7 @@ def test_hetersynapse_psc_no_delay_when_max_delay_steps_one():
         )
         init_net_state(hetersynapse_psc, batch_size=1, dtype=torch.float32)
 
-        assert hetersynapse_psc.history is None
+        assert hetersynapse_psc.delayed_spike is None
 
         z = torch.randn(1, n_neurons)
         out = hetersynapse_psc.single_step_forward(z)

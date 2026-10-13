@@ -111,6 +111,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `SpikeHistory` is renamed to `Delay`; PSC delay state is now
+  `synapse.delayed_spike.history`. Circular cursor state is included in functional
+  memory snapshots and follows history persistence. Migrate old state paths in
+  recording configurations and checkpoints.
+
+
 - **Breaking (sparse connections, relative to earlier revisions of the
   unreleased `btorch.models.connection` API; no aliases exist):**
   - Orientation strings are `"pre_post"` / `"post_pre"` everywhere;

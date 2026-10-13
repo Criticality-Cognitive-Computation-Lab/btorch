@@ -79,7 +79,7 @@ class SparseConnection(Connection):
     channels the output is ``[..., n_post * n_receptor]`` (index
     ``post * n_receptor + receptor``); with ``n_delay`` delay bins the input is
     ``[..., n_pre * n_delay]`` (index ``pre * n_delay + delay``, the layout
-    produced by :class:`~btorch.models.history.SpikeHistory`). This expanded
+    produced by :class:`~btorch.models.history.Delay`). This expanded
     layout is one lowering of the semantic edge list, not the model itself.
 
     For a batch of different patterns (:func:`btorch.sparse.stack`) the

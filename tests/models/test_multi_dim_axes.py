@@ -112,9 +112,9 @@ def test_synapse_delay_buffer_multi_dim_axes():
 
     init_net_state(synapse, batch_size=batch_shape)
 
-    # Access delay buffer through SpikeHistory interface
+    # Access delay buffer through Delay interface
     # History stores buffer as (*batch, max_delay, *n_neuron)
     # DelayedPSC allocates max_delay_steps + 1 to support get_delay(max_delay_steps)
     expected_history_shape = (*batch_shape, max_delay_steps + 1, *neuron_shape)
-    assert synapse.history.history.shape == expected_history_shape
+    assert synapse.delayed_spike.history.shape == expected_history_shape
     assert synapse.psc.shape == batch_shape + neuron_shape

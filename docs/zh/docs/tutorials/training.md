@@ -161,3 +161,6 @@ for t in range(0, T, chunk_size):
 4. **使用 `detach_net`** — 用于长序列的截断时间反向传播。
 
 有关常见错误和故障排除，请参阅 [FAQ](../faq.md)。
+
+参见 [cell 后端训练](kernel_training.md)：独立选择 cell/connection、状态记录 loss
+和连续 BPTT；[OOT kernel 教程](oot_kernels.md) 介绍注册、源码生成与 parity 验证。
