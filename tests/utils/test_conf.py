@@ -666,3 +666,46 @@ def test_diff_conf_records_type_marker_switch_collapses_subtree():
     # Same marker: ordinary leaf-level diff.
     same = _records({"m": {"_type_": "A", "v": 1}}, {"m": {"_type_": "A", "v": 2}})
     assert same == {"m.v": _rec("changed", 1, 2)}
+
+
+@pytest.mark.parametrize("placement", ["root", "mapping", "list"])
+def test_structured_variant_switch_with_identical_fields(placement):
+    """A type switch is meaningful even when every field value is equal."""
+
+    # Identical shapes defeat a leaf-only diff. Nesting the variants in ordinary
+    # mappings and lists exercises mixed structured/unstructured configs too.
+    @dataclass
+    class SameFieldsA:
+        value: int = 7
+
+    @dataclass
+    class SameFieldsB:
+        value: int = 7
+
+    old = OmegaConf.structured(SameFieldsA())
+    new = OmegaConf.structured(SameFieldsB())
+    if placement == "mapping":
+        old = OmegaConf.create({"item": old, "unresolved": "${absent}"})
+        new = OmegaConf.create({"item": new, "unresolved": "${absent}"})
+        path = "item"
+    elif placement == "list":
+        old, new = OmegaConf.create([old]), OmegaConf.create([new])
+        path = "0"
+    else:
+        path = "<root>"
+
+    # Computing the diff must not inject synthetic discriminator fields into
+    # the caller's configs. Only `changed` should report the replacement.
+    before_old = OmegaConf.to_container(old, resolve=False)
+    before_new = OmegaConf.to_container(new, resolve=False)
+    records = diff_conf_records(old, new)
+    assert records == {
+        path: {
+            "status": "changed",
+            "old": {"_type_": "SameFieldsA", "value": 7},
+            "new": {"_type_": "SameFieldsB", "value": 7},
+        }
+    }
+    assert diff_conf_records(old, new, mode=["added", "removed"]) == {}
+    assert OmegaConf.to_container(old, resolve=False) == before_old
+    assert OmegaConf.to_container(new, resolve=False) == before_new
