@@ -46,6 +46,10 @@ This page summarizes what each skill covers and links to the relevant source fil
 
 ## How to Reference Skills
 
+For model/kernel generation, use Humanize, KernelWiki and ncu-report-skill with
+the [btorch scientific validation and contribution supplement](tutorials/kernel_generation.md).
+Its source is [skills/kernel-gen](https://github.com/Criticality-Cognitive-Computation-Lab/btorch/tree/main/skills/kernel-gen).
+
 When prompting an agent, be explicit:
 
 > "Use the btorch-snn-modelling skill to help me write a training loop with truncated BPTT."
