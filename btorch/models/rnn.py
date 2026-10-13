@@ -213,7 +213,6 @@ class RecurrentNNAbstract(base.MemoryModule):
     submodule whose ``capture_incompatibility()`` returns a reason makes
     ``cudagraph=True`` raise with it. See ``cudagraph.py`` for the protocol.
 
-
     ``update_state_names`` is the single recording spec: plain dotted strings
     populate ``stacked_states``; ``Expr`` / ``grad(...)`` specs (see
     :mod:`btorch.monitor`) are read via :meth:`get_records`.  Strings and
