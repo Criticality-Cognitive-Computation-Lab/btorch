@@ -46,6 +46,10 @@ btorch 内置了编码规范使用模式的技能。如果你使用 AI 智能体
 
 ## 如何引用技能
 
+生成模型和 kernel 时，直接使用 Humanize、KernelWiki 与 ncu-report-skill，
+并结合 [btorch 科学验证和贡献补充指南](tutorials/kernel_generation.md)。
+补充指南源码位于 [skills/kernel-gen](https://github.com/Criticality-Cognitive-Computation-Lab/btorch/tree/main/skills/kernel-gen)。
+
 在提示智能体时，请明确说明：
 
 > "使用 btorch-snn-modelling 技能帮助我编写一个带截断时间反向传播的训练循环。"

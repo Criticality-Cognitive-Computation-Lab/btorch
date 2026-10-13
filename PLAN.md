@@ -1,3 +1,5 @@
+> Active cell backend work: [backend-sep plan](PLAN.backend-sep.md), including out-of-tree registration and public kernel parity validation.
+
 # Task: Prototype and Implement a PyTorch-First Sparse / Connectivity System for btorch
 
 You are working on the existing **btorch** codebase, a PyTorch-based computational neuroscience / recurrent SNN framework.
