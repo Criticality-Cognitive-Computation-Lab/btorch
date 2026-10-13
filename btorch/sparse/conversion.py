@@ -363,7 +363,7 @@ def to_scipy(A: Sparse, format: str | None = None, **kwargs):
             a SciPy conversion (e.g. ``blocksize`` for ``"bsr"``).
 
     Returns:
-        scipy.sparse.sparray: Sparse array with ``shape == A.shape``.
+        result (scipy.sparse.sparray): Sparse array with ``shape == A.shape``.
 
     Raises:
         ValueError: If ``A`` is batched, has dense entry dimensions, or does
