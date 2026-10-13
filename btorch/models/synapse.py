@@ -864,6 +864,9 @@ class HeterSynapsePSC(BasePSC):
     ``history.history``) and the inner ``base_psc`` receives the expanded
     input, so it holds no history of its own.
 
+    Additional keyword arguments are forwarded to the selected ``base_psc``
+    constructor (e.g., ``tau_syn`` for :class:`ExponentialPSC`).
+
     Args:
         n_neuron: Number of neurons.
         n_receptor: Number of receptor types.
@@ -879,7 +882,6 @@ class HeterSynapsePSC(BasePSC):
             torch.compile compatibility. If True, use circular buffer.
         step_mode: Step mode. Default: "s".
         backend: Compute backend. Default: "torch".
-        **kwargs (Any): Passed to ``base_psc`` constructor.
 
     Raises:
         ValueError: If ``max_delay_steps`` conflicts with ``linear.n_delay``,
