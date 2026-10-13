@@ -21,12 +21,14 @@ class HexScatter:
 
     Args:
         values: Time-series data, shape (n_frames, n_hexes)
-        c1, c2: Coordinates (interpreted based on coord_format)
+        c1: First coordinate (interpreted based on coord_format)
+        c2: Second coordinate (interpreted based on coord_format)
         coord_format: Any :data:`~btorch.utils.hex.resolve.CoordFormat`, e.g. "axial"
             (q,r), "zigzag" (x,y), or "pixel" (px,py)
         figsize: Figure size
         cmap: Colormap
-        vmin, vmax: Color limits
+        vmin: Lower color limit
+        vmax: Upper color limit
         interval: Animation interval in milliseconds
 
     Example:
@@ -123,7 +125,8 @@ class HexQuiver:
     Args:
         flow: Flow data, shape (n_frames, 2, n_hexes) where
             [:, 0, :] = dc1, [:, 1, :] = dc2
-        c1, c2: Coordinates (interpreted based on coord_format)
+        c1: First coordinate (interpreted based on coord_format)
+        c2: Second coordinate (interpreted based on coord_format)
         coord_format: Any :data:`~btorch.utils.hex.resolve.CoordFormat`, e.g. "axial"
             (q,r), "zigzag" (x,y), or "pixel" (px,py)
         scale: Vector scale factor

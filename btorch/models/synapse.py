@@ -366,7 +366,7 @@ class ExponentialPSC(BasePSC):
     Args:
         n_neuron: Number of neurons.
         tau_syn: Synaptic time constant (ms).
-        linear: Linear layer for weights.
+        linear (torch.nn.Module): Linear layer for weights.
         step_mode: Step mode. Default: "s".
         backend: Compute backend. Default: "torch".
     """
@@ -879,7 +879,7 @@ class HeterSynapsePSC(BasePSC):
             torch.compile compatibility. If True, use circular buffer.
         step_mode: Step mode. Default: "s".
         backend: Compute backend. Default: "torch".
-        **kwargs: Passed to ``base_psc`` constructor.
+        **kwargs (Any): Passed to ``base_psc`` constructor.
 
     Raises:
         ValueError: If ``max_delay_steps`` conflicts with ``linear.n_delay``,
@@ -1121,7 +1121,6 @@ class GapJunction(nn.Module):
             conductance). If None, an identity weight matrix is used.
             Default: None.
         step_mode: Step mode. Default: "s".
-        backend: Compute backend. Default: "torch".
 
     Attributes:
         g_gap: Gap junction global scaling factor.

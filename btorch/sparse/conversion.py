@@ -310,7 +310,7 @@ def to_torch(A: Sparse, layout: str | torch.layout | None = None, **kwargs) -> T
         A: Sparse array.
         layout: Target layout name or ``torch.sparse_*`` layout. Defaults to
             the stored format.
-        **kwargs: ``blocksize`` for ``"bsr"`` / ``"bsc"``.
+        **kwargs (Any): ``blocksize`` for ``"bsr"`` / ``"bsc"``.
 
     Returns:
         Sparse tensor with ``shape == A.shape``; values keep their autograd
@@ -359,11 +359,11 @@ def to_scipy(A: Sparse, format: str | None = None, **kwargs):
     Args:
         A: Unbatched sparse matrix without dense entry dimensions.
         format: SciPy format name. Defaults to the stored format.
-        **kwargs: Passed to the SciPy constructor for formats reached through
+        **kwargs (Any): Passed to the SciPy constructor for formats reached through
             a SciPy conversion (e.g. ``blocksize`` for ``"bsr"``).
 
     Returns:
-        ``scipy.sparse.sparray`` with ``shape == A.shape``.
+        scipy.sparse.sparray: Sparse array with ``shape == A.shape``.
 
     Raises:
         ValueError: If ``A`` is batched, has dense entry dimensions, or does

@@ -594,22 +594,22 @@ def make_hetersynapse_conn(
 
     Args:
         neurons: DataFrame with neuron information. It must contain the
-        `receptor_type_col` and a column that can be used as a unique identifier
-        (e.g., 'simple_id').
+            `receptor_type_col` and a column that can be used as a unique identifier
+            (e.g., 'simple_id').
         connections: A `scipy.sparse.sparray` or `pandas.DataFrame` representing
-        the network connections. If a DataFrame, it should have 'syn_count',
-        'pre_simple_id' and 'post_simple_id' columns. If a sparray, it should be
-        in (pre_neuron, post_neuron)
+            the network connections. If a DataFrame, it should have 'syn_count',
+            'pre_simple_id' and 'post_simple_id' columns. If a sparray, it should be
+            in (pre_neuron, post_neuron)
         receptor_type_col: The column name in the `neurons` or `connections`
-        DataFrame that specifies the receptor type.
+            DataFrame that specifies the receptor type.
         receptor_type_mode: Specifies whether receptor types are associated with
-        'neuron' or 'connection'.
+            'neuron' or 'connection'.
         return_dict: If True, returns OrderedDict mapping receptor types (pre
-        type with ``ignore_post_type``, ``(pre, post)`` pairs otherwise, the
-        connection's receptor type in 'connection' mode) to sparse matrices
-        instead of a single stacked matrix. Receptor groups without any
-        connection are omitted from the dict. Not available with
-        ``receptor_type_col=None``.
+            type with ``ignore_post_type``, ``(pre, post)`` pairs otherwise, the
+            connection's receptor type in 'connection' mode) to sparse matrices
+            instead of a single stacked matrix. Receptor groups without any
+            connection are omitted from the dict. Not available with
+            ``receptor_type_col=None``.
         dropna: How to handle NaN receptor types. Options:
             - 'error' (default): Raise ValueError if NaN found
             - 'filter': Remove connections involving NaN neurons

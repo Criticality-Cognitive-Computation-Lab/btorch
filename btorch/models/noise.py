@@ -79,7 +79,7 @@ def randn_like(
     Args:
         like: Reference tensor providing shape, device, dtype.
         generator: Optional RNG generator for deterministic sampling.
-        **kwargs: Additional args passed to ``torch.empty_like``.
+        **kwargs (Any): Additional args passed to ``torch.empty_like``.
 
     Returns:
         Tensor with same shape/device/dtype as ``like``, filled with N(0,1).

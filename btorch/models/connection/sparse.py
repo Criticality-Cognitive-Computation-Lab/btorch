@@ -384,7 +384,7 @@ class SparseConnection(Connection):
                 ``"post_pre"``: the matrix already is the operator
                 ``(n_post, n_pre)``. :meth:`to_sparse` returns the matrix in
                 the orientation given here.
-            **kwargs: Passed to the constructor.
+            **kwargs (Any): Passed to the constructor.
         """
         _check_orientation(orientation)
         A = _as_sparse_default_dtype(matrix, kwargs)
@@ -416,7 +416,7 @@ class SparseConnection(Connection):
             n_post: Number of target neurons.
             synapse: Synapse description aligned with the edge list.
             values: Optional ``[*batch, n_edge]`` initial weights (default 1).
-            **kwargs: Passed to the constructor.
+            **kwargs (Any): Passed to the constructor.
         """
         pre = torch.as_tensor(pre)
         post = torch.as_tensor(post, device=pre.device)
@@ -477,7 +477,7 @@ class SparseConnection(Connection):
                 ``make_hetersynapse_conn``; only its length is used, to set
                 ``n_receptor``. Keep the table itself to map channel ids to
                 receptor names.
-            **kwargs: Passed to the constructor.
+            **kwargs (Any): Passed to the constructor.
         """
         if receptor_type_index is not None:
             if n_receptor is not None and n_receptor != len(receptor_type_index):
@@ -1277,7 +1277,7 @@ class SparseConnection(Connection):
     def hints(self, hints: Hints) -> None:
         if not isinstance(hints, Hints):
             raise TypeError(
-                "hints must be a Hints instance, got " f"{type(hints).__name__}."
+                f"hints must be a Hints instance, got {type(hints).__name__}."
             )
         if getattr(self, "_hints", None) == hints:
             return
@@ -1294,7 +1294,7 @@ class SparseConnection(Connection):
         """Change several performance expectations with one re-plan.
 
         Args:
-            **changes: Fields of :class:`~btorch.sparse.Hints` to replace.
+            **changes (Any): Fields of :class:`~btorch.sparse.Hints` to replace.
         """
         self.hints = self.hints.replace(**changes)
 

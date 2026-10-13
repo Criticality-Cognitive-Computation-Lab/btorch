@@ -41,12 +41,14 @@ def kernel(
     """Plot receptive field kernel on hexagonal lattice.
 
     Args:
-        c1, c2: Coordinates
+        c1: First coordinate
+        c2: Second coordinate
         values: Kernel values
         coord_format: Coordinate system
         figsize: Figure size
         cmap: Colormap
-        vmin, vmax: Value limits
+        vmin: Lower value limit
+        vmax: Upper value limit
         midpoint: Center value for colormap
         annotate: Whether to annotate values
         annotate_coords: Whether to annotate coordinates
@@ -133,7 +135,8 @@ def strf(
     Args:
         time: Time points, shape (n_time,)
         rf: Receptive field data, shape (n_time, n_hexes)
-        c1, c2: Coordinates
+        c1: First coordinate
+        c2: Second coordinate
         coord_format: Coordinate system
         figsize: Figure size
         fontsize: Font size

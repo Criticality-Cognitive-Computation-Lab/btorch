@@ -309,7 +309,8 @@ def scatter(
     """Colored hex scatter.
 
     Args:
-        c1, c2: Coordinates (interpreted based on coord_format)
+        c1: First coordinate (interpreted based on coord_format)
+        c2: Second coordinate (interpreted based on coord_format)
         values: Color values for each hex
         coord_format: Any :data:`~btorch.utils.hex.resolve.CoordFormat`
         geometry: Pixel layout (size, orientation, rotation); see
@@ -399,8 +400,10 @@ def quiver(
     """Vector field on hex grid.
 
     Args:
-        c1, c2: Coordinates
-        dc1, dc2: Vector components
+        c1: First coordinate
+        c2: Second coordinate
+        dc1: First vector component
+        dc2: Second vector component
         coord_format: Any :data:`~btorch.utils.hex.resolve.CoordFormat`
         scale: Vector scale factor
         geometry: Pixel layout (size, orientation, rotation); see
