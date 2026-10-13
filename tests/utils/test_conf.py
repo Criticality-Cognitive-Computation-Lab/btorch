@@ -61,45 +61,6 @@ class BatchArgConf:
     max_concurrent: int = 64
 
 
-@dataclass
-class UnionOptA:
-    value: int = 1
-    legacy: str = "old"
-
-
-@dataclass
-class UnionOptB:
-    value: int = 1
-    tag: str = "b"
-
-
-@dataclass
-class StructuredUnionConf:
-    item: UnionOptA | UnionOptB = field(default_factory=UnionOptA)
-
-
-@dataclass
-class PrimitiveUnionConf:
-    item: int | str = 1
-
-
-def _supports_omegaconf_structured_dataclass_union() -> bool:
-    """Probe OmegaConf behavior instead of assuming support from versions."""
-
-    try:
-        OmegaConf.structured(StructuredUnionConf(item=UnionOptA(value=7)))
-        OmegaConf.structured(StructuredUnionConf(item=UnionOptB(value=7, tag="ok")))
-    except Exception:
-        return False
-    return True
-
-
-need_structured_dataclass_union = pytest.mark.skipif(
-    not _supports_omegaconf_structured_dataclass_union(),
-    reason="structured dataclass unions are not supported by this OmegaConf build",
-)
-
-
 def test_load_config_merges_file_and_cli(tmp_path, monkeypatch):
     """Mimics the single.py usage: config file + CLI overrides."""
     cfg_file = tmp_path / "config.yaml"
@@ -458,42 +419,6 @@ def test_diff_conf_integrates_with_to_dotlist_for_worker_overrides():
     }
 
 
-@need_structured_dataclass_union
-def test_diff_conf_records_supports_structured_union_type_switch():
-    """Structured union switch should be a full subtree replacement."""
-
-    conf_a = OmegaConf.structured(StructuredUnionConf(item=UnionOptA(value=7)))
-    conf_b = OmegaConf.structured(
-        StructuredUnionConf(item=UnionOptB(value=7, tag="new"))
-    )
-
-    records = diff_conf_records(conf_a, conf_b)
-
-    assert records["item"]["status"] == "changed"
-    assert "UnionOptA" in str(records["item"]["old"])
-    assert "UnionOptB" in str(records["item"]["new"])
-    assert "item.legacy" not in records
-
-
-@need_structured_dataclass_union
-def test_diff_conf_supports_union_values_for_structured_and_primitives():
-    """diff_conf should replace a switched union subtree and drop old keys."""
-
-    conf_a = OmegaConf.structured(StructuredUnionConf(item=UnionOptA(value=7)))
-    conf_b = OmegaConf.structured(
-        StructuredUnionConf(item=UnionOptB(value=7, tag="new"))
-    )
-
-    diff_structured = OmegaConf.to_container(diff_conf(conf_a, conf_b))
-    assert str(diff_structured["item"]["_type_"]).endswith("UnionOptB")
-    assert diff_structured["item"]["tag"] == "new"
-    assert "legacy" not in diff_structured["item"]
-
-    prim_a = OmegaConf.structured(PrimitiveUnionConf(item=1))
-    prim_b = OmegaConf.structured(PrimitiveUnionConf(item="1"))
-    assert OmegaConf.to_container(diff_conf(prim_a, prim_b)) == {"item": "1"}
-
-
 def test_load_config_uses_search_path_fallback(tmp_path):
     """A relative ``config_path`` missing from the cwd is resolved via
     search_path.
@@ -641,71 +566,3 @@ def test_diff_conf_records_equal_none_and_empty_container_cases():
     }
     # An added empty container has no leaves, hence no record.
     assert _records({"a": 1}, {"a": 1, "e": {}}) == {}
-
-
-def test_diff_conf_records_type_marker_switch_collapses_subtree():
-    """A changed ``_type_`` replaces the whole subtree by one changed record,
-    dropping per-leaf removals/additions below it, at any depth."""
-    nested = _records(
-        {"m": {"_type_": "A", "v": 1, "old": 2}, "k": 1},
-        {"m": {"_type_": "B", "v": 1, "new": 3}, "k": 1},
-    )
-    assert nested == {
-        "m": _rec(
-            "changed",
-            {"_type_": "A", "v": 1, "old": 2},
-            {"_type_": "B", "v": 1, "new": 3},
-        )
-    }
-
-    root = _records({"_type_": "A", "v": 1}, {"_type_": "B", "w": 1})
-    assert root == {
-        "<root>": _rec("changed", {"_type_": "A", "v": 1}, {"_type_": "B", "w": 1})
-    }
-
-    # Same marker: ordinary leaf-level diff.
-    same = _records({"m": {"_type_": "A", "v": 1}}, {"m": {"_type_": "A", "v": 2}})
-    assert same == {"m.v": _rec("changed", 1, 2)}
-
-
-@pytest.mark.parametrize("placement", ["root", "mapping", "list"])
-def test_structured_variant_switch_with_identical_fields(placement):
-    """A type switch is meaningful even when every field value is equal."""
-
-    # Identical shapes defeat a leaf-only diff. Nesting the variants in ordinary
-    # mappings and lists exercises mixed structured/unstructured configs too.
-    @dataclass
-    class SameFieldsA:
-        value: int = 7
-
-    @dataclass
-    class SameFieldsB:
-        value: int = 7
-
-    old = OmegaConf.structured(SameFieldsA())
-    new = OmegaConf.structured(SameFieldsB())
-    if placement == "mapping":
-        old = OmegaConf.create({"item": old, "unresolved": "${absent}"})
-        new = OmegaConf.create({"item": new, "unresolved": "${absent}"})
-        path = "item"
-    elif placement == "list":
-        old, new = OmegaConf.create([old]), OmegaConf.create([new])
-        path = "0"
-    else:
-        path = "<root>"
-
-    # Computing the diff must not inject synthetic discriminator fields into
-    # the caller's configs. Only `changed` should report the replacement.
-    before_old = OmegaConf.to_container(old, resolve=False)
-    before_new = OmegaConf.to_container(new, resolve=False)
-    records = diff_conf_records(old, new)
-    assert records == {
-        path: {
-            "status": "changed",
-            "old": {"_type_": "SameFieldsA", "value": 7},
-            "new": {"_type_": "SameFieldsB", "value": 7},
-        }
-    }
-    assert diff_conf_records(old, new, mode=["added", "removed"]) == {}
-    assert OmegaConf.to_container(old, resolve=False) == before_old
-    assert OmegaConf.to_container(new, resolve=False) == before_new

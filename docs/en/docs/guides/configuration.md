@@ -123,19 +123,6 @@ dotlist = to_dotlist(
 cmd = ["python", "worker.py"] + dotlist + [f"common.id={worker_id}"]
 ```
 
-## Structured Variant Diffs
-
-`diff_conf_records(old, new)` reports a change of dataclass variant as one
-replacement at the variant's path, even if its field values are identical.
-The replacement includes a `_type_` discriminator containing the class name.
-`diff_conf(old, new)` includes that complete replacement subtree, so fields
-belonging only to the previous variant are omitted. Ordinary edits within the
-same variant remain leaf-level changes.
-
-The diff reads structured type information from OmegaConf nodes; it does not
-rely on `OmegaConf.to_container()` emitting discriminators. It preserves
-unresolved interpolation strings and leaves both input configs unchanged.
-
 ## Integration with Training Scripts
 
 The Fashion-MNIST example (`examples/fmnist_lightning.py`) uses a nested `NetworkConfig` dataclass for neuron and synapse hyperparameters, loaded via `load_config`. You can use the same pattern for your own models:
