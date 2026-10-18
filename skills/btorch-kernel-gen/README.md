@@ -27,21 +27,21 @@ Install btorch's normal development dependencies. The example uses actual GLIF3/
 
 ```bash
 python examples/kernel_generation.py --output run/figures
-python skills/kernel-gen/scripts/check_model.py verify --suite examples/kernel_generation.py:run_suite --output run/report.json
+python skills/btorch-kernel-gen/scripts/check_model.py verify --suite examples/kernel_generation.py:run_suite --output run/report.json
 ```
 
 The example covers no-input, impulse and step-on/off at single, pair and network scales. Its assertions are smoke checks for finite values, pre-input silence and spike presence. They do not validate adaptation dynamics, PSC signs, propagation delay, gradients or kernel parity. `verify` records suite-reported results and hashes evidence; it does not independently prove those results or authenticate a human reviewer. Inspect the actual suite, traces and figures before confirming a new model. Only the human who has inspected the results and figures should run:
 
 ```bash
-python skills/kernel-gen/scripts/check_model.py confirm --report run/report.json --reviewer YOUR_NAME --output run/confirmation.json
-python skills/kernel-gen/scripts/check_model.py gate --report run/report.json --confirmation run/confirmation.json
+python skills/btorch-kernel-gen/scripts/check_model.py confirm --report run/report.json --reviewer YOUR_NAME --output run/confirmation.json
+python skills/btorch-kernel-gen/scripts/check_model.py gate --report run/report.json --confirmation run/confirmation.json
 ```
 
 ## Generate, optimize and contribute
 
 Use [Phase 0](prompts/phase0-model.md), then [Phase 1](prompts/phase1-correctness.md), [Phase 2](prompts/phase2-optimization.md) and [Phase 3](prompts/phase3-delivery.md). [Templates](assets/templates/) start from existing btorch models, MemoryModule and native Torch operators. [Execution semantics](references/workflow.md) separates inference, training forward and backward. [Scientific validation](references/workflow.md) includes NESTML references and mandatory activity plots.
 
-OOT output directories are unrestricted. For [upstream](references/workflow.md), follow btorch file/test organization, fig_path/save_fig and the target checkout's pre-commit formatting. Publishing defaults to a GitHub Draft PR or GitLab Draft MR; it does not merge automatically. Run `python skills/kernel-gen/scripts/check_model.py --help` for model evidence verify/confirm/gate commands; upstream uses normal Git and host CLI tools.
+OOT output directories are unrestricted. For [upstream](references/workflow.md), follow btorch file/test organization, fig_path/save_fig and the target checkout's pre-commit formatting. Publishing defaults to a GitHub Draft PR or GitLab Draft MR; it does not merge automatically. Run `python skills/btorch-kernel-gen/scripts/check_model.py --help` for model evidence verify/confirm/gate commands; upstream uses normal Git and host CLI tools.
 
 See the [English tutorial](../../docs/en/docs/tutorials/kernel_generation.md) or [中文教程](../../docs/zh/docs/tutorials/kernel_generation.md), and the input-prompt provenance below.
 

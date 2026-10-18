@@ -7,7 +7,8 @@ import matplotlib.pyplot as plt
 
 
 _SOURCE = (
-    Path(__file__).resolve().parents[2] / "skills/kernel-gen/scripts/check_model.py"
+    Path(__file__).resolve().parents[2]
+    / "skills/btorch-kernel-gen/scripts/check_model.py"
 )
 _SPEC = importlib.util.spec_from_file_location("kernel_gen_evidence", _SOURCE)
 workflow = importlib.util.module_from_spec(_SPEC)

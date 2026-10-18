@@ -58,8 +58,8 @@ Training/simulation 由实际 autograd 输入决定，包括上游 encoder。
 
 ## 使用 agent 生成模型和 kernel
 
-从 [kernel-gen harness](skills/kernel-gen/README.md)、
-[skill](skills/kernel-gen/SKILL.md) 和
+从 [kernel-gen harness](skills/btorch-kernel-gen/README.md)、
+[skill](skills/btorch-kernel-gen/SKILL.md) 和
 [教程](docs/zh/docs/tutorials/kernel_generation.md) 开始。流程包括 Python 模型、
 三种尺度的活动图、kernel 生成、OOT parity、profiling 和 upstream review。
 它使用 Humanize、KernelWiki 和 ncu-report-skill，安装方法见 harness。
@@ -152,7 +152,7 @@ python scripts/docs.py command=build-all
 
 `skills/` 提供 btorch 的 agent 工作流：
 
-- [Kernel 生成](skills/kernel-gen/SKILL.md)：建模、活动图证据和 kernel 验证。
+- [Kernel 生成](skills/btorch-kernel-gen/SKILL.md)：建模、活动图证据和 kernel 验证。
 - [SONATA IO](skills/sonata-io/SKILL.md)：复用共享 helper 的网络专用导入/导出。
 - [SNN 建模](skills/btorch-snn-modelling/SKILL.md)：btorch 模型规范。
 - [OmegaConf 配置](skills/omegaconf-config/SKILL.md)：**已过时，待修订**。

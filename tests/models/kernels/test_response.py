@@ -180,7 +180,7 @@ def test_glif_all_adaptation_channels_and_empty_input():
 def test_harness_model_preserves_adaptation_across_validation_scales():
     factory = (
         Path(__file__).resolve().parents[3]
-        / "skills/kernel-gen/assets/templates/glif3_rsnn.py"
+        / "skills/btorch-kernel-gen/assets/templates/glif3_rsnn.py"
     )
     build_model = runpy.run_path(str(factory))["build_model"]
     responses = []

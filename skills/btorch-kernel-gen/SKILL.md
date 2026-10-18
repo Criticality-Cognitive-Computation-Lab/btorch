@@ -1,5 +1,5 @@
 ---
-name: kernel-gen
+name: btorch-kernel-gen
 description: Validate stateful btorch models and generated kernels, and prepare contributions.
 ---
 

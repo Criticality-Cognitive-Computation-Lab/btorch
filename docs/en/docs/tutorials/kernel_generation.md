@@ -4,13 +4,13 @@ The kernel-gen harness starts with an actual Torch model, validates its activity
 
 ## Set up external tools
 
-Use the installed [Humanize](https://github.com/PolyArch/humanize), [KernelWiki](https://github.com/DongyunZou/KernelWiki) and [ncu-report-skill](https://github.com/DongyunZou/ncu-report-skill). They are external dependencies, not repository submodules. Reuse existing installations; otherwise follow `skills/kernel-gen/README.md` and each upstream's installation instructions. Expose their skills and `skills/kernel-gen` through your agent's supported discovery.
+Use the installed [Humanize](https://github.com/PolyArch/humanize), [KernelWiki](https://github.com/DongyunZou/KernelWiki) and [ncu-report-skill](https://github.com/DongyunZou/ncu-report-skill). They are external dependencies, not repository submodules. Reuse existing installations; otherwise follow `skills/btorch-kernel-gen/README.md` and each upstream's installation instructions. Expose their skills and `skills/btorch-kernel-gen` through your agent's supported discovery.
 
 In the task workspace, write `docs/draft.md`, invoke `/humanize:gen-plan`, then `/humanize:start-rlcr-loop`. Phase 1 finds a correct implementation; Phase 2 explores measured optimization directions; Phase 3 validates the complete workload and justified specialization. Hardware and budget are task-specific.
 
 ## Validate the Python model first
 
-Start with `skills/kernel-gen/assets/templates/glif3_rsnn.py`: it constructs actual GLIF3, AlphaPSC and SparseConnection Modules and delegates sequence execution to RecurrentNN. The same factory builds one neuron, an upstream/downstream pair and a larger network. `stateful_module.py` shows a new model's register_memory pattern; it does not duplicate a built-in neuron.
+Start with `skills/btorch-kernel-gen/assets/templates/glif3_rsnn.py`: it constructs actual GLIF3, AlphaPSC and SparseConnection Modules and delegates sequence execution to RecurrentNN. The same factory builds one neuron, an upstream/downstream pair and a larger network. `stateful_module.py` shows a new model's register_memory pattern; it does not duplicate a built-in neuron.
 
 Run no-input, impulse, sustained-input and step-off protocols, then connection/delay and network cases. Produce an activity figure at all three scales. Include every relevant adaptation/receptor channel, input, spikes, membrane and PSC. Inspect state and event timing as well as outputs. See `tests/models/neurons/test_neurons.py` for GLIF3 examples.
 
@@ -36,7 +36,7 @@ import torch
 from btorch.models import environ, functional
 
 CumulativeDrive = runpy.run_path(
-    "skills/kernel-gen/assets/templates/stateful_module.py"
+    "skills/btorch-kernel-gen/assets/templates/stateful_module.py"
 )["CumulativeDrive"]
 model = CumulativeDrive(3, device="cpu", dtype=torch.float32)
 x_seq = torch.ones(10, 2, 3, dtype=torch.float32)
@@ -66,7 +66,7 @@ from btorch.models.kernels.native import load_kernel_package
 
 import torch
 
-bindings = load_kernel_package("skills/kernel-gen/assets/templates/native_operator.py")
+bindings = load_kernel_package("skills/btorch-kernel-gen/assets/templates/native_operator.py")
 x = torch.randn(5, 2, 3, requires_grad=True)
 gain = torch.ones(3, requires_grad=True)
 result = bindings["affine"](x, gain)
@@ -104,10 +104,10 @@ A suite callable returns `checks`, `figures`, `source_files`, `required_checks` 
 `plot_response` aligns input, raster and state panels, separates adaptation/receptor components, and keeps neuron colors consistent. Pass `ResponsePlotOptions(units=..., time_unit="ms", batch_index=0)` for explicit units and trial selection. The example uses the same units for plots and JSON evidence. Unknown state layouts retain all indexed values, without guessing neuron identities; values are not clipped or normalized for appearance.
 
 ```bash
-python skills/kernel-gen/scripts/check_model.py verify --suite examples/kernel_generation.py:run_suite --output run/report.json
+python skills/btorch-kernel-gen/scripts/check_model.py verify --suite examples/kernel_generation.py:run_suite --output run/report.json
 # Run this only after you, the user, have inspected and confirmed a new model:
-python skills/kernel-gen/scripts/check_model.py confirm --report run/report.json --reviewer YOUR_NAME --output run/confirmation.json
-python skills/kernel-gen/scripts/check_model.py gate --report run/report.json --confirmation run/confirmation.json
+python skills/btorch-kernel-gen/scripts/check_model.py confirm --report run/report.json --reviewer YOUR_NAME --output run/confirmation.json
+python skills/btorch-kernel-gen/scripts/check_model.py gate --report run/report.json --confirmation run/confirmation.json
 ```
 
 Keep candidate and optimization records with the planning/review tool; this supplement only supplies model validation and upstream helpers. Keep correctness, profile and before/after performance evidence. Measure inference, training forward and backward separately, including memory and compile/capture costs. OOT output paths are yours to choose.

@@ -4,13 +4,13 @@ kernel-gen harness 先验证实际 Torch 模型，再检查 kernel 正确性、�
 
 ## 配置外部工具
 
-使用已安装的 [Humanize](https://github.com/PolyArch/humanize)、[KernelWiki](https://github.com/DongyunZou/KernelWiki) 和 [ncu-report-skill](https://github.com/DongyunZou/ncu-report-skill)。它们是外部依赖，不是仓库 submodules；优先复用现有安装，否则按 `skills/kernel-gen/README.md` 和各上游说明安装。通过 agent 支持的 discovery 加载其 skills 与 `skills/kernel-gen`。
+使用已安装的 [Humanize](https://github.com/PolyArch/humanize)、[KernelWiki](https://github.com/DongyunZou/KernelWiki) 和 [ncu-report-skill](https://github.com/DongyunZou/ncu-report-skill)。它们是外部依赖，不是仓库 submodules；优先复用现有安装，否则按 `skills/btorch-kernel-gen/README.md` 和各上游说明安装。通过 agent 支持的 discovery 加载其 skills 与 `skills/btorch-kernel-gen`。
 
 在任务工作目录编写 `docs/draft.md`，运行 `/humanize:gen-plan` 和 `/humanize:start-rlcr-loop`。Phase 1 产生正确实现；Phase 2 根据测量探索优化；Phase 3 验证完整 workload，加入有收益依据的特化。硬件与预算由任务确定。
 
 ## 先验证 Torch 模型
 
-使用 `skills/kernel-gen/assets/templates/glif3_rsnn.py`，实例化实际 GLIF3、AlphaPSC 和 SparseConnection，由 RecurrentNN 执行序列。同一 factory 用于单神经元、上下游两个神经元和完整网络；不另写时间循环 simulator。`stateful_module.py` 展示自定义模型的 register_memory 用法，不重新实现内置 neuron。
+使用 `skills/btorch-kernel-gen/assets/templates/glif3_rsnn.py`，实例化实际 GLIF3、AlphaPSC 和 SparseConnection，由 RecurrentNN 执行序列。同一 factory 用于单神经元、上下游两个神经元和完整网络；不另写时间循环 simulator。`stateful_module.py` 展示自定义模型的 register_memory 用法，不重新实现内置 neuron。
 
 检查无输入、脉冲、固定输入和停止输入，再检查连接/delay 与网络响应。三个层级必须有活动图，覆盖全部相关 adaptation/receptor、输入、spikes、膜电位和 PSC。参考 `tests/models/neurons/test_neurons.py` 的 GLIF3 实践。
 
@@ -36,7 +36,7 @@ import torch
 from btorch.models import environ, functional
 
 CumulativeDrive = runpy.run_path(
-    "skills/kernel-gen/assets/templates/stateful_module.py"
+    "skills/btorch-kernel-gen/assets/templates/stateful_module.py"
 )["CumulativeDrive"]
 model = CumulativeDrive(3, device="cpu", dtype=torch.float32)
 x_seq = torch.ones(10, 2, 3, dtype=torch.float32)
@@ -66,7 +66,7 @@ from btorch.models.kernels.native import load_kernel_package
 
 import torch
 
-bindings = load_kernel_package("skills/kernel-gen/assets/templates/native_operator.py")
+bindings = load_kernel_package("skills/btorch-kernel-gen/assets/templates/native_operator.py")
 x = torch.randn(5, 2, 3, requires_grad=True)
 gain = torch.ones(3, requires_grad=True)
 result = bindings["affine"](x, gain)
@@ -104,10 +104,10 @@ Suite callable 返回 `checks`、`figures`、`source_files`、`required_checks` 
 `plot_response` 对齐 input、raster 和状态面板，分开 adaptation/receptor 分量，并保持 neuron 颜色一致。通过 `ResponsePlotOptions(units=..., time_unit="ms", batch_index=0)` 显式指定单位和 trial。示例对图和 JSON evidence 使用同一份单位；未知 state layout 保留所有索引值，不猜测 neuron 身份，也不为美观裁剪或归一化数据。
 
 ```bash
-python skills/kernel-gen/scripts/check_model.py verify --suite examples/kernel_generation.py:run_suite --output run/report.json
+python skills/btorch-kernel-gen/scripts/check_model.py verify --suite examples/kernel_generation.py:run_suite --output run/report.json
 # 仅在用户检查并确认新模型后执行：
-python skills/kernel-gen/scripts/check_model.py confirm --report run/report.json --reviewer YOUR_NAME --output run/confirmation.json
-python skills/kernel-gen/scripts/check_model.py gate --report run/report.json --confirmation run/confirmation.json
+python skills/btorch-kernel-gen/scripts/check_model.py confirm --report run/report.json --reviewer YOUR_NAME --output run/confirmation.json
+python skills/btorch-kernel-gen/scripts/check_model.py gate --report run/report.json --confirmation run/confirmation.json
 ```
 
 用规划和 review 工具记录候选与优化过程；本补充仅提供模型验证和 upstream 工具。反馈应给出首次分歧时间、状态、索引、数值和图/trace 路径。分别测量 inference、training forward、backward、显存及编译/capture 成本。OOT 输出路径不受仓库图目录规则限制。

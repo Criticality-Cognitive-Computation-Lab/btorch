@@ -61,8 +61,8 @@ and gradients using the public parity helper. See the
 
 ## Model and kernel generation with agents
 
-Start with the [kernel-gen harness](skills/kernel-gen/README.md), its
-[skill](skills/kernel-gen/SKILL.md), and the
+Start with the [kernel-gen harness](skills/btorch-kernel-gen/README.md), its
+[skill](skills/btorch-kernel-gen/SKILL.md), and the
 [tutorial](docs/en/docs/tutorials/kernel_generation.md). The workflow covers
 Python models, three-scale activity plots, kernel generation, OOT parity,
 profiling and upstream review. It uses Humanize, KernelWiki and ncu-report-skill;
@@ -155,7 +155,7 @@ python scripts/docs.py command=build-all
 The `skills/` directory contains usage patterns and tips for using btorch with
 AI agents:
 
-- [Kernel generation](skills/kernel-gen/SKILL.md): modeling, activity evidence and kernel validation.
+- [Kernel generation](skills/btorch-kernel-gen/SKILL.md): modeling, activity evidence and kernel validation.
 - [SONATA IO](skills/sonata-io/SKILL.md): network-specific import/export with shared helpers.
 - [SNN modeling](skills/btorch-snn-modelling/SKILL.md): btorch model conventions.
 - [OmegaConf configuration](skills/omegaconf-config/SKILL.md): **stale, to be revised**.

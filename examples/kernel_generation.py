@@ -30,7 +30,7 @@ from btorch.models.synapse import AlphaPSC
 
 _FACTORY_SOURCE = (
     Path(__file__).resolve().parents[1]
-    / "skills/kernel-gen/assets/templates/glif3_rsnn.py"
+    / "skills/btorch-kernel-gen/assets/templates/glif3_rsnn.py"
 )
 
 
