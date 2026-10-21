@@ -1298,13 +1298,13 @@ def test_explain_respects_use_backend(device):
     connection was built).
 
     On CUDA the default (Triton, when installed) is
-    replaced by ``aten`` inside ``use_backend("aten")``.
+    replaced by the reference inside ``use_backend("torch")``.
     """
     conn = SparseConnection.from_edges(
         PRE_A, POST_A, N_PRE, N_POST, values=W_A, device=device
     )
     available = registry.available("csr_matvec", device)
-    assert "aten" in available
+    assert "torch" in available
     default = available[0]  # best first
     x = _x().to(device)
     expected = _x() @ _dense(PRE_A, POST_A, W_A).T

@@ -2,8 +2,6 @@ import math
 
 import torch
 
-from btorch import jit
-
 from .base import SurrogateFunctionBase
 
 
@@ -13,20 +11,18 @@ from .base import SurrogateFunctionBase
 _SS_K = math.sqrt(2.0) - 1.0  # ≈ 0.4142
 
 
-@jit.script
 def _superspike_primitive(x: torch.Tensor, alpha: float) -> torch.Tensor:
-    k: float = math.sqrt(2.0) - 1.0  # sqrt(2)-1 ≈ 0.4142
+    k = _SS_K
     k_alpha = k * alpha
     pos = 1.0 - 0.5 / (1.0 + k_alpha * x)
     neg = 0.5 / (1.0 - k_alpha * x)
     return torch.where(x >= 0.0, pos, neg)
 
 
-@jit.script
 def _superspike_derivative(
     x: torch.Tensor, grad_output: torch.Tensor, alpha: float, damping: float
 ) -> torch.Tensor:
-    k: float = math.sqrt(2.0) - 1.0  # sqrt(2)-1 ≈ 0.4142
+    k = _SS_K
     grad = damping / (1.0 + k * alpha * x.abs()) ** 2
     return grad_output * grad
 

@@ -1,8 +1,8 @@
 """Execution planning for sparse propagation.
 
-Planning happens when a connection is built or its hints change, never inside
-``forward``. The result is an internal object; model code cannot depend on
-it. Use :func:`btorch.sparse.explain` to inspect a decision.
+Plans are bound when static execution choices change, before launching tensor
+operations. The result is internal; model code cannot depend on it. Use
+:func:`btorch.sparse.explain` to inspect a decision.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import torch
 
 from ..properties import Hints
 from .backend import RouteResolutionSnapshot, registry
+from .method import PropagationMethod, validate_method
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,8 @@ class PlanningContext:
     requires_backward: bool = True
     compile: bool = False
     capture: bool = False
+    firing_rate_hz: float | None = None
+    method: PropagationMethod = "auto"
 
 
 @dataclass(frozen=True)
@@ -40,24 +43,28 @@ class _Plan:
     deterministic: bool
     max_density: float
     reason: str
+    method: PropagationMethod = "auto"
 
 
 class Planner:
     """Choose representation, algorithm and backend for a propagation.
 
     The planner only consults cheap, static information: device, batching and
-    the user's :class:`~btorch.sparse.Hints`. Today it decides one thing, the
-    algorithm:
+    the user's :class:`~btorch.sparse.Hints` and explicit method. An explicit
+    method constrains candidate routes and overrides hints; unsupported requests
+    raise. Automatic planning chooses the algorithm:
 
     - ``"pull"``: destination-driven product (deterministic).
     - ``"push"``: source-driven with compaction on the device (Triton on
-      CUDA). It is taken whenever the density hint is at or below the limit,
+      CUDA). It is taken when a CUDA firing-rate hint is strictly below 5 Hz
+      or the density hint is at or below the limit,
       whatever the density of an individual input turns out to be; it
       accumulates with floating-point atomics, so it is not bitwise
       reproducible and is not planned when deterministic algorithms are
       requested.
     - ``"adaptive-push"``: source-driven with host-side packing (reference
       backend); each call falls back to pull above the density limit.
+
 
     Args:
         push_max_density: Per device type, the largest expected input density
@@ -80,9 +87,16 @@ class Planner:
         value_batched: bool,
         hints: Hints,
         dtype: torch.dtype,
+        method: PropagationMethod = "auto",
     ) -> _Plan:
+        validate_method(method)
         limit = self.push_max_density.get(device, 0.0)
         density = hints.expected_density
+        low_rate = (
+            device == "cuda"
+            and hints.firing_rate_hz is not None
+            and hints.firing_rate_hz < 5.0
+        )
         deterministic = torch.are_deterministic_algorithms_enabled()
         context = PlanningContext(
             device=device,
@@ -90,12 +104,26 @@ class Planner:
             expected_density=density,
             deterministic=deterministic,
             dtype=dtype,
+            firing_rate_hz=hints.firing_rate_hz,
+            method=method,
         )
-        if value_batched:
+        if method != "auto":
+            algorithm, reason = method, f"explicit method={method!r}"
+            if method == "push" and device == "cuda" and deterministic:
+                raise RuntimeError(
+                    "method='push' requires nondeterministic atomic accumulation"
+                )
+            if not registry.has_route(algorithm, device, context):
+                raise RuntimeError(
+                    f"Unsupported sparse method={method!r} on {device} with "
+                    f"dtype={dtype}, batched_values={value_batched}, "
+                    f"backend={registry.override or 'auto'!r}"
+                )
+        elif value_batched:
             algorithm, reason = "pull", "shared-pattern batch of values"
-        elif density is None:
+        elif density is None and not low_rate:
             algorithm, reason = "pull", "no expected_density hint"
-        elif density > limit:
+        elif density is not None and density > limit and not low_rate:
             algorithm, reason = "pull", f"expected_density {density:g} > {limit:g}"
         else:
             algorithm = "push"
@@ -107,30 +135,33 @@ class Planner:
                 )
                 if not registry.has_route(algorithm, device, context):
                     algorithm = "pull"
-            if device == "cuda" and algorithm != "pull" and deterministic:
+            if algorithm == "pull":
+                reason = "no supported source-driven route"
+            elif device == "cuda" and deterministic:
                 # CUDA source-driven routes accumulate with floating-point
                 # atomics, including ATen's adaptive reference route.
                 algorithm = "pull"
                 reason = "deterministic algorithms requested"
             else:
-                reason = f"expected_density {density:g} <= {limit:g}"
-        if algorithm == "pull":
-            context = PlanningContext(
-                device=device,
-                value_batched=value_batched,
-                expected_density=density,
-                deterministic=deterministic,
-                dtype=dtype,
-            )
+                reason = (
+                    f"firing_rate_hz {hints.firing_rate_hz:g} < 5"
+                    if low_rate
+                    else f"expected_density {density:g} <= {limit:g}"
+                )
         route = registry.resolve_route(algorithm, device, context)
         return _Plan(
-            representation="destination CSR + source CSR",
+            representation=(
+                "device spike list + source CSR"
+                if route.key.representation == "spike_list_csr"
+                else "destination CSR + source CSR"
+            ),
             algorithm=algorithm,
             backend=route.backend,
             route=route,
             deterministic=deterministic,
             max_density=limit if algorithm != "pull" else 0.0,
             reason=reason,
+            method=method,
         )
 
 

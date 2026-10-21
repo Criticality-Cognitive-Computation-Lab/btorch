@@ -75,7 +75,7 @@ def test_replacing_index_data_is_noticed():
         getattr(cache, name).data = getattr(other, name).data.clone()
 
     out = _propagate(cache, values, x)
-    with runtime.use_backend("aten"):
+    with runtime.use_backend("torch"):
         expected = _propagate(cache, values, x)
     torch.testing.assert_close(out, expected)
 

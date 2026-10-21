@@ -1,9 +1,6 @@
 import torch
 
-from btorch import jit
 
-
-@jit.script
 def _heaviside(x: torch.Tensor) -> torch.Tensor:
     return (x >= 0).to(x)
 

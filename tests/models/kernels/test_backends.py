@@ -1,17 +1,15 @@
 """Compare GPU sequence kernels with trusted eager autograd recurrences."""
 
-import importlib.util
-
 import pytest
 import torch
 
-from btorch.models.kernels.backends.engine import backward, forward
+from btorch.models.kernels.backends.engine import backward, forward, generate_source
 from btorch.models.kernels.contracts import CellSpec
 from btorch.models.kernels.templates import get_template
 from btorch.models.kernels.torch_backend import forward_step
+from tests.models.kernels.helpers import GPU_BACKENDS, require_cuda_backend
 
 
-BACKENDS = ("triton", "cupy", "tilelang")
 MODELS = (
     "if",
     "lif",
@@ -24,9 +22,40 @@ MODELS = (
 )
 
 
-def _available(backend):
-    if not torch.cuda.is_available() or importlib.util.find_spec(backend) is None:
-        pytest.skip(f"{backend} CUDA runtime is unavailable")
+@pytest.mark.parametrize("backend", GPU_BACKENDS)
+@pytest.mark.parametrize("model", MODELS)
+def test_inference_source_contains_only_requested_trajectory_storage(backend, model):
+    # Inspect the executable buffer ABI even on CPU-only machines. Inference
+    # needs output spikes/current and final continuation state, but must not
+    # inherit the training state's temporal tape. Explicit public records are
+    # legitimate extra outputs; requesting one must not enable all histories.
+    spec = CellSpec(model)
+    template = get_template(spec)
+    modes = 2 if model == "glif3" else 0
+    for requested in ((), (template.state_names[0],)):
+        _, pointers = generate_source(backend, spec, 7, 11, requested, modes=modes)
+        names = {name for name, _ in pointers}
+        expected = {
+            "dt",
+            "x_seq",
+            "output_seq",
+            *template.parameter_names,
+            *(name + "_init" for name in template.state_names),
+            *(name + "_final" for name in template.state_names),
+            *(name + "_seq" for name in requested),
+        }
+        assert names == expected
+        # Final states do not grow with T; only the required output and
+        # requested records change size when the sequence becomes longer.
+        _, longer = generate_source(backend, spec, 7, 23, requested, modes=modes)
+        sizes = dict(pointers)
+        longer_sizes = dict(longer)
+        growing = {name for name in names if sizes[name] != longer_sizes[name]}
+        assert growing == {
+            "x_seq",
+            "output_seq",
+            *(name + "_seq" for name in requested),
+        }
 
 
 def _example(spec, dtype=torch.float32):
@@ -87,13 +116,18 @@ def _trusted(x, states, parameters, spec, names):
     )
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
-@pytest.mark.parametrize("model", MODELS)
-@pytest.mark.parametrize("dt", (0.25, 1.0))
-def test_sequence_outputs_and_all_float_gradients(backend, model, dt):
-    _available(backend)
-    if model == "alpha_billeh" and dt != 1.0:
-        pytest.skip("AlphaPSCBilleh fixes its discrete timestep to one")
+@pytest.mark.parametrize("backend", GPU_BACKENDS)
+@pytest.mark.parametrize(
+    "model,dt",
+    [
+        (model, dt)
+        for model in MODELS
+        for dt in ((1.0,) if model == "alpha_billeh" else (0.25, 1.0))
+    ],
+)
+@pytest.mark.parametrize("precise_division", (False, True))
+def test_sequence_outputs_and_all_float_gradients(backend, model, dt, precise_division):
+    require_cuda_backend(backend)
     # Different physical timesteps share generated source, but must change both
     # the recurrence and its VJP consistently with the Python Module golden.
     spec = CellSpec(
@@ -102,8 +136,31 @@ def test_sequence_outputs_and_all_float_gradients(backend, model, dt):
     template = get_template(spec)
     names = template.history_names
     x, states, parameters = _example(spec)
+    if precise_division:
+        # A view with gaps in its storage verifies that precise floating `/`
+        # lowering does not disturb generated integer lane coordinates. GLIF3's
+        # mode axis remains explicit while every other model uses neuron vectors.
+        strided_parameters = []
+        for value in parameters:
+            storage = torch.empty(
+                (value.shape[0] * 2, *value.shape[1:]),
+                device=value.device,
+                dtype=value.dtype,
+            )
+            storage[::2].copy_(value.detach())
+            storage[1::2].fill_(float("nan"))
+            strided_parameters.append(storage[::2].detach().requires_grad_())
+        parameters = tuple(strided_parameters)
     expected = _trusted(x, states, parameters, spec, names)
-    actual = forward(backend, x, states, parameters, spec, names)
+    actual = forward(
+        backend,
+        x,
+        states,
+        parameters,
+        spec,
+        names,
+        precise_division=precise_division,
+    )
     expected_flat = (expected[0], *expected[1], *expected[2])
     actual_flat = (actual[0], *actual[1], *actual[2])
     for result, reference in zip(actual_flat, expected_flat):
@@ -127,6 +184,7 @@ def test_sequence_outputs_and_all_float_gradients(backend, model, dt):
         cotangents[0],
         cotangents[1 : 1 + n_state],
         cotangents[1 + n_state :],
+        precise_division=precise_division,
     )
     for result, reference, value in zip(
         (actual_grads[0], *actual_grads[1], *actual_grads[2]),
@@ -140,7 +198,7 @@ def test_sequence_outputs_and_all_float_gradients(backend, model, dt):
         torch.testing.assert_close(result, reference, atol=5e-5, rtol=5e-4)
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("backend", GPU_BACKENDS)
 @pytest.mark.parametrize(
     "surrogate", ("sigmoid", "atan", "atan_approx", "erf", "superspike", "triangle")
 )
@@ -149,7 +207,7 @@ def test_sequence_outputs_and_all_float_gradients(backend, model, dt):
 def test_normalized_surrogate_and_detached_soft_reset(
     backend, surrogate, detach_reset, refractory
 ):
-    _available(backend)
+    require_cuda_backend(backend)
     spec = CellSpec(
         "lif",
         surrogate=surrogate,
@@ -191,10 +249,10 @@ def test_normalized_surrogate_and_detached_soft_reset(
         torch.testing.assert_close(result, reference, atol=4e-5, rtol=4e-4)
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("backend", GPU_BACKENDS)
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 def test_low_precision_long_sequence_reports_first_spike_divergence(backend, dtype):
-    _available(backend)
+    require_cuda_backend(backend)
     spec = CellSpec("lif")
     x, states, parameters = _example(spec, dtype)
     x = x.detach().repeat(32, 1, 1).requires_grad_()
@@ -228,9 +286,9 @@ def test_low_precision_long_sequence_reports_first_spike_divergence(backend, dty
     )
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("backend", GPU_BACKENDS)
 def test_simulation_chunk_continuation_and_cuda_graph(backend):
-    _available(backend)
+    require_cuda_backend(backend)
     spec = CellSpec("alpha")
     x, states, parameters = _example(spec)
     with torch.no_grad():
@@ -271,9 +329,9 @@ def test_simulation_chunk_continuation_and_cuda_graph(backend):
             )
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("backend", GPU_BACKENDS)
 def test_fullgraph_trainable_encoder_through_frozen_cell(backend):
-    _available(backend)
+    require_cuda_backend(backend)
     from btorch.models.kernels import HistoryPlan, run_multi_step
 
     spec = CellSpec("alpha")
@@ -304,9 +362,9 @@ def test_fullgraph_trainable_encoder_through_frozen_cell(backend):
     torch.testing.assert_close(actual_grad, expected_grad, atol=5e-5, rtol=5e-4)
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("backend", GPU_BACKENDS)
 def test_empty_sequence_and_masked_parameter_gradients(backend):
-    _available(backend)
+    require_cuda_backend(backend)
     spec = CellSpec("alpha")
     x, states, parameters = _example(spec)
     template = get_template(spec)
@@ -338,7 +396,7 @@ def test_empty_sequence_and_masked_parameter_gradients(backend):
     assert grad[2] == (None, None)
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("backend", GPU_BACKENDS)
 @pytest.mark.parametrize("record_loss", (False, True))
 @pytest.mark.parametrize("neuron_model", ("if", "lif", "glif3", "izhikevich"))
 @pytest.mark.parametrize(
@@ -347,7 +405,7 @@ def test_empty_sequence_and_masked_parameter_gradients(backend):
 def test_fused_psc_then_neuron_receptor_order(
     backend, neuron_model, psc_model, record_loss
 ):
-    _available(backend)
+    require_cuda_backend(backend)
     from btorch.models.kernels.backends.fused import (
         fused_step_backward,
         fused_step_forward,
@@ -487,9 +545,9 @@ def test_fused_psc_then_neuron_receptor_order(
         torch.testing.assert_close(value, reference, atol=5e-5, rtol=5e-4)
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("backend", GPU_BACKENDS)
 def test_fused_merged_state_preserves_drive_receptor_layout(backend):
-    _available(backend)
+    require_cuda_backend(backend)
     from btorch.models.kernels.backends.fused import (
         fused_step_backward,
         fused_step_forward,
@@ -551,9 +609,9 @@ def test_fused_merged_state_preserves_drive_receptor_layout(backend):
     assert reverse[5] == (None,) * len(psc_parameters)
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("backend", GPU_BACKENDS)
 def test_gpu_sparse_recurrent_heter_delay_and_ring_gradient(backend):
-    _available(backend)
+    require_cuda_backend(backend)
     import copy
 
     from btorch.models import environ
@@ -580,7 +638,7 @@ def test_gpu_sparse_recurrent_heter_delay_and_ring_gradient(backend):
     model = RecurrentNN(
         LIF(3, v_threshold=0.7, trainable_param={"tau", "v_threshold"}),
         synapse,
-        backend=KernelOptions(cell=backend, connection="triton"),
+        backend=KernelOptions(neuron=backend, connection="triton"),
         update_state_names=("neuron.v", "synapse.base_psc.psc"),
     ).to(device="cuda", dtype=torch.float32)
     model.neuron.init_state(batch_size=2, dtype=torch.float32, device="cuda")
@@ -624,7 +682,7 @@ def test_gpu_sparse_recurrent_heter_delay_and_ring_gradient(backend):
         )
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("backend", GPU_BACKENDS)
 @pytest.mark.parametrize("neuron_model", ("if", "lif", "glif3", "izhikevich"))
 @pytest.mark.parametrize(
     "psc_model", ("exponential", "alpha", "alpha_billeh", "dual_exponential")
@@ -632,7 +690,7 @@ def test_gpu_sparse_recurrent_heter_delay_and_ring_gradient(backend):
 def test_recurrent_all_model_pairs_state_record_and_parameter_gradients(
     backend, neuron_model, psc_model
 ):
-    _available(backend)
+    require_cuda_backend(backend)
     import copy
 
     from btorch.models import environ
@@ -705,7 +763,7 @@ def test_recurrent_all_model_pairs_state_record_and_parameter_gradients(
     model = RecurrentNN(
         neuron,
         synapse,
-        backend=KernelOptions(cell=backend),
+        backend=KernelOptions(neuron=backend),
         update_state_names=state_names,
     ).to(device="cuda", dtype=torch.float32)
     neuron.init_state(batch_size=2, dtype=torch.float32, device="cuda")

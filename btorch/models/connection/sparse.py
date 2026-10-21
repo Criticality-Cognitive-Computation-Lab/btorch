@@ -13,13 +13,14 @@ from ...sparse import COO, CSR, Hints, Sparse, as_sparse
 from ...sparse.coo import _ravel
 from ...sparse.runtime import (
     RepresentationCache,
-    kernels_aten,
+    kernels_torch,
     kernels_triton_push,
     kernels_triton_tasks,
     ops,
     planner,
     registry,
 )
+from ...sparse.runtime.method import PropagationMethod, resolve_method, validate_method
 from .base import Connection
 from .synapse import Synapse
 from .weight import Weight
@@ -101,6 +102,10 @@ class SparseConnection(Connection):
         bias: ``True`` for a zero-initialised bias, or an initial
             ``[out_features]`` tensor (copied; becomes a parameter).
         hints: Performance expectations for execution planning.
+        method: Execution request independent of storage and hints: ``auto``
+            uses planning policy, ``pull`` requests destination-driven execution,
+            and ``push`` requests spike-list SpMSpV. Unsupported explicit
+            requests raise rather than silently falling back.
         device: Target device.
         dtype: Weight dtype. Defaults to the matrix dtype for btorch and
             PyTorch input, and to the PyTorch default dtype for SciPy input
@@ -125,12 +130,15 @@ class SparseConnection(Connection):
         *,
         bias: Tensor | bool | None = None,
         hints: Hints | None = None,
+        method: PropagationMethod = "auto",
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
         _adjacency: Sparse | None = None,
         _scipy_origin: bool = False,
     ):
         super().__init__()
+        validate_method(method)
+        self._method = method
         synapse = synapse or Synapse()
         # SciPy data is float64 by NumPy convention, not by choice: such
         # matrices (and integer ones) get the default dtype unless one is
@@ -274,14 +282,28 @@ class SparseConnection(Connection):
         if device is not None or dtype is not None:
             self.to(device=device, dtype=dtype)
 
-    def _replan(self) -> None:
-        self._clear_prepared_task_values()
-        plan = planner.plan(
+    def _execution_plan(self, method: PropagationMethod | None = None):
+        """Resolve current static execution choices through the sparse
+        planner."""
+        return planner.plan(
             device=self.indices.device.type,
             value_batched=self._value_batch_dim > 0 or bool(self._member_shape),
             hints=self.hints,
             dtype=self.weight().dtype,
+            method=resolve_method(self.method) if method is None else method,
         )
+
+    @torch.compiler.assume_constant_result
+    def _compiled_method_route(self, method: PropagationMethod):
+        """Bind a static method without changing the standalone default
+        plan."""
+        plan = self._execution_plan(method)
+        token = ops.bind_route(registry.bind_route(plan.route))
+        return token, None if plan.algorithm == "pull" else plan.max_density
+
+    def _replan(self) -> None:
+        plan = self._execution_plan()
+        self._clear_prepared_task_values()
         old_plan = getattr(self, "_plan", None)
         if (
             old_plan is not None
@@ -320,6 +342,7 @@ class SparseConnection(Connection):
             plan.route.registry_generation != registry.registry_generation
             or plan.route.override != override.name
             or plan.deterministic != torch.are_deterministic_algorithms_enabled()
+            or plan.method != resolve_method(self.method)
         ):
             self._replan()
             self._prepare()
@@ -634,14 +657,27 @@ class SparseConnection(Connection):
                 else ops.propagate_binding
             )
             compiled = torch.compiler.is_compiling()
+            method = resolve_method(self.method)
+            explicit_route = (
+                self._compiled_method_route(method)
+                if compiled and method != self._plan.method
+                else None
+            )
             use_fallback = (
                 self._plan.algorithm == "push"
                 and self._run_task_values is None
+                and self._plan.route.key.representation != "spike_list_csr"
                 and self._fallback_route is not None
             )
             if compiled:
                 route = (
-                    self._fallback_route_token if use_fallback else self._route_token
+                    explicit_route[0]
+                    if explicit_route is not None
+                    else (
+                        self._fallback_route_token
+                        if use_fallback
+                        else self._route_token
+                    )
                 )
             else:
                 route = self._fallback_route if use_fallback else self._route
@@ -654,8 +690,10 @@ class SparseConnection(Connection):
                 cache.t_crow,
                 cache.t_col,
                 cache.t_perm,
-                None if use_fallback else self._max_density,
-                self._run_task_values,
+                explicit_route[1]
+                if explicit_route is not None
+                else (None if use_fallback else self._max_density),
+                self._run_task_values if explicit_route is None else None,
             )
         finally:
             if temporary_run:
@@ -875,7 +913,7 @@ class SparseConnection(Connection):
         ptr[1:] = torch.cumsum(counts, 0)
         cache = self.cache
         weight = self.weight().index_select(-1, cache.perm)
-        out = kernels_aten.spike_push_values(
+        out = kernels_torch.spike_push_values(
             cache.t_crow,
             cache.t_col,
             cache.t_perm,
@@ -977,6 +1015,7 @@ class SparseConnection(Connection):
             registry.kernels.generation,
             str(self.indices.device),
             self._plan.route.fingerprint,
+            resolve_method(self.method),
             registry.registry_generation,
             registry.override_snapshot(),
             torch.are_deterministic_algorithms_enabled(),
@@ -1228,6 +1267,7 @@ class SparseConnection(Connection):
 
     def explain(self, x: Tensor | None = None) -> str:
         """Describe how this connection is executed (debugging aid)."""
+        self._ensure_plan_current()
         device = self.indices.device.type
         plan = self._plan
         lines = []
@@ -1249,17 +1289,10 @@ class SparseConnection(Connection):
             + (", delay" if self.delay is not None else ""),
             f"    topology_version = {self.topology_version}",
             "Selected runtime:",
+            f"    requested method = {plan.method}",
             f"    cached representation = {plan.representation}",
             f"    algorithm = {plan.algorithm} ({plan.reason})",
-            "    backend = "
-            + registry.name(
-                "csr_matvec"
-                if plan.algorithm == "pull"
-                else "spike_push_dense"
-                if registry.has("spike_push_dense", device)
-                else "spike_push",
-                device,
-            ),
+            f"    backend = {plan.backend}",
             "    available backends = "
             + str(
                 registry.available(
@@ -1273,6 +1306,27 @@ class SparseConnection(Connection):
             "(expanded reference lowering)",
         ]
         return "\n".join(lines)
+
+    @property
+    def method(self) -> PropagationMethod:
+        """Explicit execution request; independent of activity hints."""
+        return self._method
+
+    @method.setter
+    def method(self, method: PropagationMethod) -> None:
+        validate_method(method)
+        if method == self._method:
+            return
+        previous = self._method
+        self._method = method
+        try:
+            self._replan()
+            self._prepare()
+        except Exception:
+            self._method = previous
+            self._replan()
+            self._prepare()
+            raise
 
     @property
     def hints(self) -> Hints:
@@ -1300,7 +1354,8 @@ class SparseConnection(Connection):
         """Change several performance expectations with one re-plan.
 
         Keyword arguments name fields of :class:`~btorch.sparse.Hints` to
-        replace: ``expected_calls``, ``expected_density``, and ``expected_batch``.
+        replace: ``expected_calls``, ``expected_density``, ``expected_batch``, and
+        ``firing_rate_hz``.
         """
         self.hints = self.hints.replace(**changes)
 

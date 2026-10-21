@@ -720,7 +720,7 @@ class MemoryModule(StepModule, torch.nn.Module):
     @backend.setter
     def backend(self, value: Backend) -> None:
         options = normalize_backend(value)
-        if options.cell != "torch" or isinstance(value, KernelOptions):
+        if options.neuron != "torch" or isinstance(value, KernelOptions):
             # Only models with named equation templates may select a cell kernel.
             from .kernels.adapters import validate_module
 

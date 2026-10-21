@@ -8,8 +8,47 @@ from torch import nn
 from ..connection.sparse import SparseConnection
 from ..synapse import HeterSynapsePSC
 from .adapters import connection_scope, prepare_cell
-from .operators import encode_spec
-from .options import normalize_backend
+from .operators import (
+    _validate_compile_policy,
+    _validate_parameter_shapes,
+    _validate_poisson_fp32,
+    encode_spec,
+)
+from .options import normalize_backend, resolve_model_options
+from .registry import _NATIVE_GPU_BACKENDS, resolve_cell_backend
+from .templates import get_template
+
+
+_PAIRED_CHECKPOINT_INTERVAL = 16
+
+
+def _reject_stochastic_input_composition(module):
+    """Reject known input RNG whose step order cannot be preserved.
+
+    Custom input callbacks used with a Poisson neuron must be
+    deterministic.
+    """
+    from ..surrogate import PoissonRandomSpike
+
+    stochastic = isinstance(module.neuron.surrogate_function, PoissonRandomSpike)
+    if not stochastic:
+        return
+    for input_module in (module.neuron_inp_module, module.syn_inp_module):
+        if input_module is None:
+            continue
+        if any(
+            isinstance(
+                child,
+                (PoissonRandomSpike, nn.modules.dropout._DropoutNd, nn.RReLU),
+            )
+            for child in input_module.modules()
+        ):
+            raise NotImplementedError(
+                "Native recurrent Poisson execution does not support stochastic "
+                "input modules because their draws cannot be interleaved with "
+                "per-step neuron execution; custom input callbacks must be "
+                "deterministic"
+            )
 
 
 @torch.compiler.assume_constant_result
@@ -17,7 +56,14 @@ def _encode_recurrent_spec(spec):
     return json.dumps(spec, sort_keys=True)
 
 
-def _prepare_connection(connection):
+@torch.compiler.assume_constant_result
+def _compiled_sparse_route(connection, options, method):
+    """Bind static RSNN execution choices before tracing tensor operations."""
+    with connection_scope(options):
+        return connection._compiled_method_route(method)
+
+
+def _prepare_connection(connection, options=None):
     if isinstance(connection, nn.Identity):
         return {"connection": "identity"}, (), ()
     if isinstance(connection, nn.Linear):
@@ -35,25 +81,59 @@ def _prepare_connection(connection):
                 "Recurrent tensor operators do not yet fold sparse member batches"
             )
         cache = connection.cache
+        from ...sparse.runtime.method import resolve_method
+
+        method = resolve_method(
+            options.connection_method
+            if options is not None and options.connection_method != "auto"
+            else connection.method
+        )
+        explicit_route = (
+            _compiled_sparse_route(connection, options, method)
+            if options is not None
+            and (
+                options.connection_method != "auto"
+                or options.connection != "auto"
+                or method != connection._plan.method
+            )
+            else None
+        )
         values = connection._run_weight
         if values is None:
             values = connection.weight()
             if connection._always_permute or not cache.identity_perm:
                 values = values.index_select(-1, cache.perm)
-        route = (
-            connection._fallback_route_token
-            if connection._plan.algorithm == "push"
+        use_fallback = (
+            connection._plan.algorithm == "push"
             and connection._run_task_values is None
+            and connection._plan.route.key.representation != "spike_list_csr"
             and connection._fallback_route is not None
-            else connection._route_token
         )
+        route = (
+            explicit_route[0]
+            if explicit_route is not None
+            else (
+                connection._fallback_route_token
+                if use_fallback
+                else connection._route_token
+            )
+        )
+        topology = (cache.crow, cache.col, cache.t_crow, cache.t_col, cache.t_perm)
+        if connection._run_task_values is not None and explicit_route is None:
+            topology += (connection._run_task_values,)
         return (
-            {"connection": "sparse", "route": route},
+            {
+                "connection": "sparse",
+                "route": route,
+                "max_density": explicit_route[1]
+                if explicit_route is not None
+                else (None if use_fallback else connection._max_density),
+            },
             (
                 values.float(),
                 *(() if connection.bias is None else (connection.bias.float(),)),
             ),
-            (cache.crow, cache.col, cache.t_crow, cache.t_col, cache.t_perm),
+            topology,
         )
     raise NotImplementedError(
         f"No recurrent tensor connection adapter for {type(connection).__name__}"
@@ -150,11 +230,12 @@ def recurrent_sequence(
             return module._multi_step_forward_impl(
                 x_seq, *(() if x_syn is None else (x_syn,)), loop_args=loop_args
             )
+    _reject_stochastic_input_composition(module)
     if module.neuron_inp_module is not None:
         x_seq = module.neuron_inp_module(x_seq)
     if module.syn_inp_module is not None:
         x_syn = module.syn_inp_module(x_syn)
-    options = normalize_backend(module.backend)
+    backend = module.backend
     neuron, synapse = module.neuron, module.synapse
     cell = synapse.base_psc if isinstance(synapse, HeterSynapsePSC) else synapse
     if not x_seq.shape[0]:
@@ -165,6 +246,7 @@ def recurrent_sequence(
     synapse_spec, synapse_names, synapse_states, synapse_parameters = prepare_cell(
         cell, cell.psc.unsqueeze(0)
     )
+    options = resolve_model_options(backend, neuron_spec.model, synapse_spec.model)
     if options.merge_synapse:
         synapse_states, synapse_parameters = _merge_receptors(
             module, synapse_states, synapse_parameters
@@ -213,9 +295,45 @@ def recurrent_sequence(
         for name in requested
     ]
     x_syn_seq = torch.zeros_like(x_seq) if x_syn is None else x_syn
+    connection_tensors = tuple(
+        (f"connection parameter {name}", value)
+        for name, value in cell.linear.named_parameters()
+    )
+    delay_tensors = (
+        (("initial delay history", synapse.delayed_spike.history),) if n_delay else ()
+    )
+    _validate_poisson_fp32(
+        neuron_spec,
+        (
+            ("x_seq", x_seq),
+            ("x_syn_seq", x_syn_seq),
+            *(
+                (f"initial neuron {name}", value)
+                for name, value in zip(neuron_names, neuron_states)
+            ),
+            *(
+                (f"initial synapse {name}", value)
+                for name, value in zip(synapse_names, synapse_states)
+            ),
+            *(
+                (f"neuron parameter {name}", value)
+                for name, value in zip(
+                    get_template(neuron_spec).parameter_names, neuron_parameters
+                )
+            ),
+            *(
+                (f"synapse parameter {name}", value)
+                for name, value in zip(
+                    get_template(synapse_spec).parameter_names, synapse_parameters
+                )
+            ),
+            *delay_tensors,
+            *connection_tensors,
+        ),
+    )
     if torch.compiler.is_compiling():
         connection_spec, connection_parameters, topology = _prepare_connection(
-            cell.linear
+            cell.linear, options
         )
         return _execute(
             module,
@@ -286,42 +404,110 @@ def _execute(
     options,
     cell,
 ):
+    from .operators import poisson_uniforms
     from .recurrent_operator import inference, training
 
+    _validate_compile_policy(
+        options.neuron,
+        options.enable_fp_fusion,
+        options.precise_division,
+        options.precise_exp,
+    )
+    if x_syn_seq.shape != x_seq.shape or x_syn_seq.device != x_seq.device:
+        raise ValueError("x_syn must have the same time-first shape and device as x")
+    # Resolve both implementations and all tensor broadcast layouts before a
+    # stochastic neuron consumes the first global-generator draw. CUDA dt value
+    # checks remain device assertions so capture does not introduce host sync.
+    resolve_cell_backend(options.neuron, neuron_spec, x_seq.device)
+    resolve_cell_backend(options.neuron, synapse_spec, x_seq.device)
+    _validate_parameter_shapes(
+        neuron_parameters,
+        neuron_spec,
+        states[: len(neuron_names)],
+        x_seq.shape[1:],
+        label="Neuron",
+    )
     parameters = [*neuron_parameters, *synapse_parameters, *connection_parameters]
     needs_backward = torch.is_grad_enabled() and any(
         t.requires_grad for t in (x_seq, x_syn_seq, *states, *parameters)
     )
     charged_indices = list(range(len(states), len(states) + len(charged_names)))
-    history_indices = list(
-        dict.fromkeys(
-            (*range(len(states)), *indices, *charged_indices)
-            if needs_backward
-            else (*indices, *charged_indices)
+    checkpoint_interval = (
+        _PAIRED_CHECKPOINT_INTERVAL
+        if needs_backward
+        and options.neuron in _NATIVE_GPU_BACKENDS
+        and x_seq.device.type == "cuda"
+        and neuron_spec.model == "lif"
+        and not (neuron_spec.poisson is not None and neuron_spec.poisson.spiking)
+        and not neuron_spec.refractory
+        and synapse_spec.model == "exponential"
+        and len(neuron_names) == 1
+        and len(synapse_names) == 1
+        and not n_delay
+        and cell is module.synapse
+        and not options.merge_synapse
+        and all(index >= len(states) for index in indices)
+        else 0
+    )
+    if needs_backward:
+        residual_indices = () if checkpoint_interval else range(len(states))
+        history_indices = list(dict.fromkeys((*residual_indices, *indices)))
+        # The general reverse path retains physical trajectories; the selected
+        # paired checkpoint plan reconstructs them. Charged values only need a
+        # trajectory when the caller requested one publicly; otherwise the
+        # final pre-spike memory is enough to seed its last-step cotangent.
+        history_indices.extend(
+            -offset - 1
+            for offset, index in enumerate(charged_indices)
+            if index not in history_indices
         )
-    )
-    encoded = _encode_recurrent_spec(
-        {
-            **connection_spec,
-            "neuron": encode_spec(neuron_spec),
-            "synapse": encode_spec(synapse_spec),
-            "neuron_states": len(neuron_names),
-            "synapse_states": len(synapse_names),
-            "neuron_parameters": len(neuron_parameters),
-            "synapse_parameters": len(synapse_parameters),
-            "delay": n_delay,
-            "charged_names": charged_names,
-            "receptors": module.synapse.n_receptor
-            if cell is not module.synapse and not options.merge_synapse
-            else 0,
-            "merge_receptors": module.synapse.n_receptor
-            if options.merge_synapse
-            else 0,
-            "neuron_shape": list(module.neuron.n_neuron),
-        }
-    )
+    else:
+        history_indices = list(dict.fromkeys(indices))
+        # Negative entries request only the final charged value. This keeps
+        # pre-spike module state current without retaining an unrequested
+        # time-by-state trajectory during inference.
+        history_indices.extend(
+            -offset - 1
+            for offset, index in enumerate(charged_indices)
+            if index not in history_indices
+        )
+    recurrent_spec = {
+        **connection_spec,
+        "neuron": encode_spec(neuron_spec),
+        "synapse": encode_spec(synapse_spec),
+        "neuron_states": len(neuron_names),
+        "synapse_states": len(synapse_names),
+        "neuron_parameters": len(neuron_parameters),
+        "synapse_parameters": len(synapse_parameters),
+        "delay": n_delay,
+        "charged_names": charged_names,
+        "receptors": module.synapse.n_receptor
+        if cell is not module.synapse and not options.merge_synapse
+        else 0,
+        "merge_receptors": module.synapse.n_receptor if options.merge_synapse else 0,
+        "neuron_shape": list(module.neuron.n_neuron),
+        # Execution policy is deliberately outside both semantic CellSpec
+        # encodings, but remains part of this captured recurrent call.
+        "enable_fp_fusion": options.enable_fp_fusion,
+        "precise_division": options.precise_division,
+        "precise_exp": options.precise_exp,
+    }
+    if checkpoint_interval:
+        # This first residual slice is the native paired LIF + ExponentialPSC
+        # schedule only. The encoded layout is part of operator specialization.
+        recurrent_spec["paired_checkpoint_interval"] = checkpoint_interval
+    encoded = _encode_recurrent_spec(recurrent_spec)
     operator = training if needs_backward else inference
-    result = operator(
+    poisson = neuron_spec.poisson
+    if poisson is not None and options.neuron not in _NATIVE_GPU_BACKENDS:
+        raise NotImplementedError(
+            "Native recurrent Poisson execution requires a built-in GPU backend"
+        )
+    if poisson is not None and poisson.spiking:
+        uniform_seq = poisson_uniforms(x_seq)
+    else:
+        uniform_seq = x_seq.new_empty(0, dtype=torch.float32)
+    arguments = (
         x_seq,
         x_syn_seq,
         states,
@@ -329,8 +515,12 @@ def _execute(
         list(topology),
         encoded,
         history_indices,
-        options.cell,
+        options.neuron,
         torch.as_tensor(neuron_spec.dt, dtype=torch.float32, device=x_seq.device),
+    )
+    result = operator(
+        *arguments,
+        *((uniform_seq,) if poisson is not None and poisson.spiking else ()),
     )
     ns = len(neuron_names)
     for name, value in zip(neuron_names, result[1 : 1 + ns]):
@@ -341,9 +531,10 @@ def _execute(
         delay = module.synapse.delayed_spike
         delay.history = result[len(states)].movedim(0, -len(delay.n_neuron) - 1)
     histories = dict(zip(history_indices, result[1 + len(states) :]))
-    for offset, name in enumerate(charged_names):
+    for offset, (name, index) in enumerate(zip(charged_names, charged_indices)):
         attribute = "v_pre_spike" if name == "v_charged" else "u_pre_spike"
-        setattr(module.neuron, attribute, histories[len(states) + offset][-1])
+        value = histories[index][-1] if index in histories else histories[-offset - 1]
+        setattr(module.neuron, attribute, value)
     records = {}
     for name, index in zip(requested, indices):
         value = histories[index]

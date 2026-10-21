@@ -116,14 +116,14 @@ def test_use_backend_is_context_local_and_does_not_change_generation():
     generation = registry.registry_generation
     before = registry.override_snapshot()
 
-    with runtime.use_backend("aten"):
-        assert registry.override == "aten"
+    with runtime.use_backend("torch"):
+        assert registry.override == "torch"
         inside = registry.override_snapshot()
-        assert inside.name == "aten"
+        assert inside.name == "torch"
         assert inside.revision > before.revision
         with runtime.use_backend(None):
             assert registry.override is None
-        assert registry.override == "aten"
+        assert registry.override == "torch"
 
     assert registry.override is None
     assert registry.registry_generation == generation
@@ -173,9 +173,10 @@ def test_bound_route_keeps_one_exact_kernel_revision():
 def test_kernel_cache_clear_rebuilds_derived_artifacts_once():
     """Clearing a kernel cache invalidates derived artifacts as one unit.
 
-    A prepared sparse layout may be requested by several forwards.  It should
-    be built once until topology invalidation clears the cache, after which the
-    next request must rebuild it rather than returning stale derived tensors.
+    A prepared sparse layout may be requested by several forwards.  It
+    should be built once until topology invalidation clears the cache,
+    after which the next request must rebuild it rather than returning
+    stale derived tensors.
     """
     cache = KernelCache()
     builds = []
@@ -200,10 +201,11 @@ def test_kernel_cache_clear_rebuilds_derived_artifacts_once():
 def test_route_policy_filters_capabilities_then_ranks_cost_and_override():
     """Route selection applies capability filters before cost and override.
 
-    The low-cost route cannot participate in CUDA-graph capture.  Capture must
-    therefore choose the safe route; ordinary execution chooses the cheaper
-    route, while an explicit backend override selects the requested complete
-    route without mixing callbacks from another backend.
+    The low-cost route cannot participate in CUDA-graph capture. Capture
+    must therefore choose the safe route; ordinary execution chooses the
+    cheaper route, while an explicit backend override selects the
+    requested complete route without mixing callbacks from another
+    backend.
     """
     registry = BackendRegistry()
     registry.register("matvec", "fast", lambda: "fast", device="cpu")
@@ -227,9 +229,7 @@ def test_route_policy_filters_capabilities_then_ranks_cost_and_override():
         route("safe", cost=5.0, supports_capture=True), device="cpu"
     )
     ordinary = PlanningContext("cpu", False, None, False, torch.float32)
-    capture = PlanningContext(
-        "cpu", False, None, False, torch.float32, capture=True
-    )
+    capture = PlanningContext("cpu", False, None, False, torch.float32, capture=True)
 
     assert registry.resolve_route("pull", "cpu", ordinary).backend == "fast"
     captured = registry.resolve_route("pull", "cpu", capture)
@@ -246,7 +246,8 @@ def test_route_policy_filters_capabilities_then_ranks_cost_and_override():
 
 
 def test_route_availability_change_rejects_prepared_binding():
-    """A route that disappears after planning cannot execute stale callbacks."""
+    """A route that disappears after planning cannot execute stale
+    callbacks."""
     available = True
     registry = BackendRegistry()
     registry.register("matvec", "demo", lambda: "demo", device="cpu")

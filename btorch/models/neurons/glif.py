@@ -431,7 +431,7 @@ class GLIF3(BaseNode):
         exp_m = torch.exp(-t / self.tau)  # (*state)
         exp_asc = torch.exp(-t[..., None] * self.k)  # (*state, n_Iasc)
 
-        v_inf = self.v_reset + x * self.tau / self.c_m
+        v_inf = self.v_rest + x * self.tau / self.c_m
         Iasc = Iasc0 * exp_asc
 
         # Contribution of Iasc to v. When tau == 1 / k the generic formula is

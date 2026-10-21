@@ -7,49 +7,7 @@ import torch
 from btorch.models.kernels.contracts import CellSpec, HistoryPlan
 from btorch.models.kernels.templates import get_template
 from btorch.models.kernels.torch_backend import forward_step
-
-
-def cell_inputs(model, refractory=False):
-    spec = CellSpec(model, dt=1, refractory=refractory)
-    template = get_template(spec)
-    values = dict(
-        v_threshold=1.0,
-        v_reset=0.0,
-        c_m=1.2,
-        tau=3.0,
-        v_rest=-0.2,
-        k=0.1,
-        asc_amps=0.2,
-        v_peak=1.3,
-        a=0.1,
-        b=0.2,
-        d=0.3,
-        tau_syn=2.0,
-        g_max=0.7,
-        syn_decay=0.6,
-        tau_rise=2.0,
-        tau_decay=4.0,
-        tau_ref=2.0,
-    )
-    x = (torch.randn(2, 3) * 0.4 + 0.6).requires_grad_()
-    states = tuple(
-        (
-            torch.randn(2, 3, 2) * 0.2 if n == "Iasc" else torch.randn(2, 3) * 0.2
-        ).requires_grad_()
-        for n in template.state_names
-    )
-    if refractory:
-        states = (
-            *states[:-1],
-            torch.tensor([[0.0, 1.0, 0.0], [1.0, 0.0, 2.0]], requires_grad=True),
-        )
-    parameters = tuple(
-        torch.full(
-            (3, 2) if n in ("k", "asc_amps") and model == "glif3" else (3,), values[n]
-        ).requires_grad_()
-        for n in template.parameter_names
-    )
-    return spec, x, states, parameters
+from tests.models.kernels.helpers import cell_inputs
 
 
 @pytest.mark.parametrize(

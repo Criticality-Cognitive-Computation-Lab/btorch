@@ -13,49 +13,45 @@ _connection_contexts = {}
 
 def _model_layout(module):
     # Exact classes protect subclass equations from being silently replaced.
+    from ..neurons.alif import ALIF, ELIF
     from ..neurons.glif import GLIF3
     from ..neurons.izhikevich import Izhikevich
     from ..neurons.lif import IF, LIF
     from ..synapse import AlphaPSC, AlphaPSCBilleh, DualExponentialPSC, ExponentialPSC
+    from .contracts import CellSpec
+    from .templates import get_template
 
-    layouts = {
-        LIF: ("lif", ("v",), ("v_threshold", "v_reset", "c_m", "tau")),
-        IF: ("if", ("v",), ("v_threshold", "v_reset", "c_m")),
-        GLIF3: (
-            "glif3",
-            ("v", "Iasc"),
-            ("v_threshold", "v_reset", "c_m", "tau", "v_rest", "k", "asc_amps"),
-        ),
-        Izhikevich: (
-            "izhikevich",
-            ("v", "u"),
-            ("v_threshold", "v_reset", "c_m", "k", "v_rest", "v_peak", "a", "b", "d"),
-        ),
-        AlphaPSC: ("alpha", ("psc", "h"), ("tau_syn", "g_max")),
-        ExponentialPSC: ("exponential", ("psc",), ("tau_syn",)),
-        AlphaPSCBilleh: ("alpha_billeh", ("psc", "h"), ("tau_syn", "syn_decay")),
-        DualExponentialPSC: (
-            "dual_exponential",
-            ("psc", "g_rise", "g_decay"),
-            ("tau_rise", "tau_decay", "a"),
-        ),
+    models = {
+        LIF: "lif",
+        IF: "if",
+        ALIF: "alif",
+        ELIF: "elif",
+        GLIF3: "glif3",
+        Izhikevich: "izhikevich",
+        AlphaPSC: "alpha",
+        ExponentialPSC: "exponential",
+        AlphaPSCBilleh: "alpha_billeh",
+        DualExponentialPSC: "dual_exponential",
     }
-    if type(module) not in layouts:
+    if type(module) not in models:
         raise NotImplementedError(
             f"No cell backend template for {type(module).__name__}"
         )
-    model, states, parameters = layouts[type(module)]
-    if getattr(module, "_use_refractory", False):
-        states += ("refractory",)
-        parameters += ("tau_ref",)
-    return model, states, parameters
+    model = models[type(module)]
+    template = get_template(
+        CellSpec(model, refractory=getattr(module, "_use_refractory", False))
+    )
+    return model, template.state_names, template.parameter_names
 
 
 def validate_module(module, options: KernelOptions) -> None:
-    """Reject modules without a named cell template."""
-    from ..synapse import HeterSynapsePSC
+    """Reject modules without a general or exact-class sequence adapter."""
+    from ..synapse import ConductancePSC, HeterSynapsePSC
 
-    if type(module) is not HeterSynapsePSC:
+    # ConductancePSC has an exact-class standalone sequence adapter. Keeping it
+    # out of _model_layout makes recurrent preparation reject COBA until the
+    # scheduler has an explicit voltage-observation contract.
+    if type(module) not in (ConductancePSC, HeterSynapsePSC):
         _model_layout(module)
     if options.merge_synapse:
         raise ValueError(
@@ -67,25 +63,28 @@ def validate_module(module, options: KernelOptions) -> None:
 def connection_scope(options: KernelOptions):
     """Select the existing sparse runtime before preparing its cached route."""
     from ...sparse.runtime.backend import PreparedBackendContext
+    from ...sparse.runtime.method import resolve_method, use_method
 
-    if options.connection == "auto":
+    if options.connection == "auto" and options.connection_method == "auto":
         yield
         return
-    context = _connection_contexts.get(options.connection)
-    if context is None:
-        context = PreparedBackendContext(options.connection)
-        _connection_contexts[options.connection] = context
-    with context.enter():
+    backend_scope = nullcontext()
+    if options.connection != "auto":
+        context = _connection_contexts.get(options.connection)
+        if context is None:
+            context = PreparedBackendContext(options.connection)
+            _connection_contexts[options.connection] = context
+        backend_scope = context.enter()
+    with backend_scope, use_method(resolve_method(options.connection_method)):
         yield
 
 
-def prepare_cell(module, x_seq: Tensor):
-    """Collect model tensors without disconnecting parameter or state
-    gradients."""
+def _prepare_cell_from_layout(module, x_seq: Tensor, layout):
+    """Normalize tensors for one explicitly selected cell layout."""
     from .contracts import CellSpec
     from .operators import environment_dt
 
-    model, state_names, parameter_names = _model_layout(module)
+    model, state_names, parameter_names = layout
     kwargs = {"model": model, "dt": environment_dt(x_seq, model)}
     if hasattr(module, "surrogate_function"):
         from .. import surrogate
@@ -98,22 +97,52 @@ def prepare_cell(module, x_seq: Tensor):
             surrogate.SuperSpike: "superspike",
             surrogate.Triangle: "triangle",
             surrogate.ATanApprox: "atan_approx",
+            surrogate.PoissonRandomSpike: "poisson",
         }
-        if type(function) not in names or not function.spiking:
+        if type(function) not in names:
             raise NotImplementedError(
-                "Cell kernels require a supported built-in spiking surrogate"
+                "Cell kernels require a supported built-in surrogate"
             )
-        if not isinstance(function.alpha, (float, int)) or not isinstance(
-            function.damping_factor, (float, int)
-        ):
+        if not isinstance(function.damping_factor, (float, int)):
             raise NotImplementedError(
                 "Surrogate hyperparameters must be non-trainable scalars"
             )
+        if type(function) is surrogate.PoissonRandomSpike:
+            from .contracts import PoissonOptions
+
+            poisson_values = (
+                function.tau,
+                function.rho,
+                function.leak,
+                function.k,
+            )
+            if any(not isinstance(value, (float, int)) for value in poisson_values):
+                raise NotImplementedError(
+                    "Poisson hyperparameters must be non-trainable scalars"
+                )
+            kwargs["poisson"] = PoissonOptions(
+                function.spiking,
+                float(function.tau),
+                float(function.rho),
+                float(function.leak),
+                float(function.k),
+            )
+            alpha = 1.0
+        else:
+            if not function.spiking:
+                raise NotImplementedError(
+                    "Deterministic surrogate kernels require spiking=True"
+                )
+            if not isinstance(function.alpha, (float, int)):
+                raise NotImplementedError(
+                    "Surrogate hyperparameters must be non-trainable scalars"
+                )
+            alpha = float(function.alpha)
         kwargs.update(
             hard_reset=module.hard_reset,
             detach_reset=module.detach_reset,
             surrogate=names[type(function)],
-            alpha=float(function.alpha),
+            alpha=alpha,
             damping=float(function.damping_factor),
             refractory=getattr(module, "_use_refractory", False),
         )
@@ -135,6 +164,12 @@ def prepare_cell(module, x_seq: Tensor):
     return CellSpec(**kwargs), state_names, tuple(states), parameters
 
 
+def prepare_cell(module, x_seq: Tensor):
+    """Collect model tensors without disconnecting parameter or state
+    gradients."""
+    return _prepare_cell_from_layout(module, x_seq, _model_layout(module))
+
+
 def neuron_sequence(module, x_seq: Tensor) -> Tensor:
     """Execute a neuron sequence and retain its differentiable final state."""
     from .contracts import HistoryPlan
@@ -150,7 +185,7 @@ def neuron_sequence(module, x_seq: Tensor) -> Tensor:
         parameters,
         spec,
         HistoryPlan(requested=requested),
-        backend=normalize_backend(module.backend).cell,
+        backend=module.backend,
     )
     for name, value in zip(names, result[1 : 1 + len(names)]):
         setattr(module, name, value)
@@ -164,8 +199,8 @@ def neuron_sequence(module, x_seq: Tensor) -> Tensor:
     return result[0]
 
 
-def psc_sequence(module, z_seq: Tensor) -> Tensor:
-    """Propagate connections separately and execute stateful PSC dynamics."""
+def _psc_sequence(module, z_seq: Tensor, *, layout=None) -> Tensor:
+    """Execute PSC dynamics, optionally with an exact private cell layout."""
     from ..base import unflatten_neuron
 
     # Reuse the existing connection and delay APIs. A call-scoped sparse route
@@ -200,13 +235,39 @@ def psc_sequence(module, z_seq: Tensor) -> Tensor:
         else:
             drive = module.linear(delay_sequence(module, source))
     drive = unflatten_neuron(drive, drive.shape[:-1], module.n_neuron)
-    spec, names, states, parameters = prepare_cell(module, drive)
-    result = run_multi_step(
-        drive, states, parameters, spec, backend=normalize_backend(module.backend).cell
+    prepared = (
+        prepare_cell(module, drive)
+        if layout is None
+        else _prepare_cell_from_layout(module, drive, layout)
     )
+    spec, names, states, parameters = prepared
+    result = run_multi_step(drive, states, parameters, spec, backend=module.backend)
     for name, value in zip(names, result[1 : 1 + len(names)]):
         setattr(module, name, value)
     return result[0]
+
+
+def psc_sequence(module, z_seq: Tensor) -> Tensor:
+    """Propagate connections separately and execute stateful PSC dynamics."""
+    return _psc_sequence(module, z_seq)
+
+
+def conductance_sequence(module, z_seq: Tensor, v_seq: Tensor | None = None) -> Tensor:
+    """Reuse exponential state kernels for an exact ConductancePSC sequence."""
+    from ..synapse import ConductancePSC
+
+    if type(module) is not ConductancePSC:
+        raise TypeError("conductance_sequence requires an exact ConductancePSC")
+    conductance = _psc_sequence(
+        module,
+        z_seq,
+        layout=("exponential", ("psc",), ("tau_syn",)),
+    )
+    if v_seq is None:
+        return conductance
+    padding = conductance.ndim - v_seq.ndim
+    voltage = v_seq.reshape(v_seq.shape[0], *((1,) * padding), *v_seq.shape[1:])
+    return conductance * (module.E - voltage)
 
 
 def delay_sequence(module, source: Tensor) -> Tensor:

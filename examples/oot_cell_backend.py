@@ -113,7 +113,7 @@ def run_example(
     recurrent = RecurrentNN(
         LIF(8, tau=4.0),
         AlphaPSC(8, tau_syn=4.0, linear=connection),
-        backend=KernelOptions(cell="tutorial_cell"),
+        backend=KernelOptions(neuron="tutorial_cell"),
         update_state_names=("neuron.v", "synapse.psc"),
     )
     functional.init_net_state(

@@ -11,6 +11,7 @@ from btorch.models.kernels.options import KernelOptions
 from btorch.models.neurons.lif import LIF
 from btorch.models.rnn import RecurrentNN
 from btorch.models.synapse import AlphaPSC
+from tests.models.kernels.helpers import GPU_BACKENDS, require_cuda_backend
 
 
 def test_compiled_cell_reads_changed_environment_dt_without_retracing():
@@ -136,25 +137,21 @@ def test_recurrent_fullgraph_encoder_readout():
     assert readout.weight.grad.abs().sum() > 0
 
 
-@pytest.mark.parametrize("cell_backend", ["torch", "triton", "tilelang", "cupy"])
+@pytest.mark.parametrize("cell_backend", ("torch", *GPU_BACKENDS))
 @pytest.mark.parametrize("neuron_model", ["lif", "izhikevich"])
 def test_sparse_heter_delay_preserves_initial_ring_adjoint(cell_backend, neuron_model):
     # Compare the complete sparse/receptor/delay pipeline to the existing
     # Python Module recurrence, rather than a second implementation of its
     # equations. Nonzero incoming states expose continuation errors; losses
     # on all states expose missing adjoints even when spikes happen to match.
-    import importlib.util
-
     from btorch.models.connection import SparseConnection, Synapse
     from btorch.models.kernels.adapters import prepare_cell
     from btorch.models.neurons.izhikevich import Izhikevich
     from btorch.models.synapse import HeterSynapsePSC
 
     device = "cpu" if cell_backend == "torch" else "cuda"
-    if device == "cuda" and (
-        not torch.cuda.is_available() or importlib.util.find_spec(cell_backend) is None
-    ):
-        pytest.skip(f"{cell_backend} GPU backend unavailable")
+    if device == "cuda":
+        require_cuda_backend(cell_backend)
     torch.manual_seed(163)
     connection = SparseConnection.from_edges(
         torch.tensor([0, 0, 1, 2]),
@@ -194,7 +191,9 @@ def test_sparse_heter_delay_preserves_initial_ring_adjoint(cell_backend, neuron_
     model = RecurrentNN(
         neuron,
         synapse,
-        backend=KernelOptions(cell=cell_backend, connection="aten"),
+        backend=KernelOptions(
+            neuron=cell_backend, connection="torch" if device == "cpu" else "cusparse"
+        ),
         update_state_names=record_names,
     ).to(device=device, dtype=torch.float32)
     neuron.init_state(batch_size=2, dtype=torch.float32, device=device)
@@ -407,7 +406,7 @@ def test_sparse_fullgraph_sequence_and_upstream_gradient():
     rnn = RecurrentNN(
         LIF(3),
         AlphaPSC(3, 2.0, conn),
-        backend=KernelOptions(connection="aten"),
+        backend=KernelOptions(connection="torch"),
         update_state_names=("neuron.v",),
     )
     rnn.float()
@@ -442,18 +441,15 @@ def test_sparse_fullgraph_sequence_and_upstream_gradient():
     torch.testing.assert_close(encoder.weight.grad, encoder_reference.weight.grad)
 
 
-@pytest.mark.parametrize("backend", ["triton", "tilelang", "cupy"])
+@pytest.mark.parametrize("backend", GPU_BACKENDS)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_gpu_sparse_fullgraph_training_and_cudagraph_replay(backend):
     # Verify the two supported execution boundaries in a complete sparse RNN:
     # compiled training retains encoder gradients, and the inference runner
     # replays a captured trajectory while advancing its recurrent state.
-    import importlib.util
-
     from btorch.models.connection import SparseConnection
 
-    if importlib.util.find_spec(backend) is None:
-        pytest.skip(f"{backend} dependency unavailable")
+    require_cuda_backend(backend)
     conn = SparseConnection.from_edges(
         torch.tensor([0, 1, 2], device="cuda"),
         torch.tensor([1, 2, 0], device="cuda"),
@@ -464,7 +460,7 @@ def test_gpu_sparse_fullgraph_training_and_cudagraph_replay(backend):
     rnn = RecurrentNN(
         LIF(3),
         AlphaPSC(3, 2.0, conn),
-        backend=KernelOptions(cell=backend, connection="aten"),
+        backend=KernelOptions(neuron=backend, connection="cusparse"),
         update_state_names=("neuron.v",),
     )
     rnn.to(device="cuda", dtype=torch.float32)
@@ -529,7 +525,7 @@ def test_gpu_sparse_fullgraph_training_and_cudagraph_replay(backend):
         assert rnn._cudagraph_runner.n_captures == 2
         # Backend changes preserve the numerical state but invalidate the
         # captured implementation even though topology and shapes are stable.
-        rnn.backend = KernelOptions(cell="torch", connection="aten")
+        rnn.backend = KernelOptions(neuron="torch", connection="cusparse")
         with torch.no_grad():
             captured, state = rnn(drive)
             reference_spikes, reference_state = reference(drive)
@@ -540,7 +536,7 @@ def test_gpu_sparse_fullgraph_training_and_cudagraph_replay(backend):
         assert rnn._cudagraph_runner.n_captures == 3
 
 
-@pytest.mark.parametrize("cell_backend", ["torch", "triton", "tilelang", "cupy"])
+@pytest.mark.parametrize("cell_backend", ("torch", *GPU_BACKENDS))
 @pytest.mark.parametrize("neuron_model", ["if", "lif", "glif3", "izhikevich"])
 @pytest.mark.parametrize(
     "psc_model", ["exponential", "alpha", "alpha_billeh", "dual_exponential"]
@@ -552,8 +548,6 @@ def test_recurrent_model_pairs_all_float_and_initial_state_gradients(
     # on every recorded state require all adjoints, rather than only the spike
     # surrogate path. Floating buffers are made trainable deliberately so PSC
     # time constants and gain coefficients participate in the same comparison.
-    import importlib.util
-
     from btorch.models.kernels.adapters import prepare_cell
     from btorch.models.neurons.glif import GLIF3
     from btorch.models.neurons.izhikevich import Izhikevich
@@ -561,10 +555,8 @@ def test_recurrent_model_pairs_all_float_and_initial_state_gradients(
     from btorch.models.synapse import AlphaPSCBilleh, DualExponentialPSC, ExponentialPSC
 
     device = "cpu" if cell_backend == "torch" else "cuda"
-    if device == "cuda" and (
-        not torch.cuda.is_available() or importlib.util.find_spec(cell_backend) is None
-    ):
-        pytest.skip(f"{cell_backend} GPU backend unavailable")
+    if device == "cuda":
+        require_cuda_backend(cell_backend)
     common = dict(v_threshold=0.7, v_reset=0.0, c_m=1.0)
     neuron = {
         "if": lambda: IF(3, **common),
@@ -584,7 +576,7 @@ def test_recurrent_model_pairs_all_float_and_initial_state_gradients(
             "alpha_billeh": lambda: AlphaPSCBilleh(3, 2.0, connection),
             "dual_exponential": lambda: DualExponentialPSC(3, 3.0, 1.0, connection),
         }[psc_model]()
-    model = RecurrentNN(neuron, psc, backend=KernelOptions(cell=cell_backend))
+    model = RecurrentNN(neuron, psc, backend=KernelOptions(neuron=cell_backend))
     model.to(device=device, dtype=torch.float32)
     neuron.init_state(batch_size=2, dtype=torch.float32, device=device)
     psc.init_state(batch_size=2, dtype=torch.float32, device=device)
@@ -701,20 +693,16 @@ def test_low_precision_encoder_rnn_readout_preserves_fp32_states(dtype):
     )
 
 
-@pytest.mark.parametrize("cell_backend", ["torch", "triton", "tilelang", "cupy"])
+@pytest.mark.parametrize("cell_backend", ("torch", *GPU_BACKENDS))
 def test_frozen_receptor_vectors_merge_fullgraph_and_capture(cell_backend):
     # Frozen parameters may differ between neurons but must agree across that
     # neuron's receptors. Compatibility is checked at construction/move/load,
     # before Dynamo tracing and before CUDA graph capture begins.
-    import importlib.util
-
     from btorch.models.synapse import HeterSynapsePSC
 
     device = "cpu" if cell_backend == "torch" else "cuda"
-    if device == "cuda" and (
-        not torch.cuda.is_available() or importlib.util.find_spec(cell_backend) is None
-    ):
-        pytest.skip(f"{cell_backend} GPU backend unavailable")
+    if device == "cuda":
+        require_cuda_backend(cell_backend)
     tau = torch.tensor([2.0, 2.0, 3.0, 3.0, 4.0, 4.0], dtype=torch.float32)
     synapse = HeterSynapsePSC(
         3, 2, None, nn.Linear(3, 6, bias=False), base_psc=AlphaPSC, tau_syn=tau
@@ -722,7 +710,7 @@ def test_frozen_receptor_vectors_merge_fullgraph_and_capture(cell_backend):
     model = RecurrentNN(
         LIF(3),
         synapse,
-        backend=KernelOptions(cell=cell_backend, merge_synapse=True),
+        backend=KernelOptions(neuron=cell_backend, merge_synapse=True),
         update_state_names=("neuron.v", "synapse.psc"),
     )
     model.to(device=device, dtype=torch.float32)
@@ -909,7 +897,7 @@ def test_replaced_external_backend_invalidates_recurrent_capture():
     model = RecurrentNN(
         LIF(3),
         AlphaPSC(3, 2.0, nn.Identity()),
-        backend=KernelOptions(cell=name),
+        backend=KernelOptions(neuron=name),
         update_state_names=("neuron.v", "synapse.psc"),
     ).to(device="cuda", dtype=torch.float32)
     model.neuron.init_state(batch_size=2, dtype=torch.float32, device="cuda")
@@ -963,7 +951,7 @@ def test_recurrent_refuses_replaced_backend_before_backward(compiled):
     model = RecurrentNN(
         LIF(3),
         AlphaPSC(3, 2.0, nn.Identity()),
-        backend=KernelOptions(cell=name),
+        backend=KernelOptions(neuron=name),
         update_state_names=("neuron.v",),
     ).float()
     model.neuron.init_state(batch_size=2, dtype=torch.float32)

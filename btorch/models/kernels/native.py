@@ -12,7 +12,7 @@ import torch
 from torch import Tensor
 from torch.utils._pytree import tree_flatten
 
-from .testing import ParityReport, _compare
+from .testing import ParityReport, _compare, _loss_weights
 
 
 @dataclass(frozen=True)
@@ -167,23 +167,6 @@ def _outputs(result):
     return values, structure
 
 
-def _cotangents(outputs):
-    # One reproducible nonperiodic VJP probe, not complete Jacobian validation.
-    # Separate local generators avoid changing user stochastic model execution.
-    values = []
-    for index, value in enumerate(outputs):
-        generator = torch.Generator(device=value.device).manual_seed(1729 + index)
-        values.append(
-            torch.randn(
-                value.shape,
-                device=value.device,
-                dtype=torch.float32,
-                generator=generator,
-            ).to(value.dtype)
-        )
-    return tuple(values)
-
-
 def _vjp(inputs, outputs, cotangents):
     active = list(dict.fromkeys(value for value in inputs if value.requires_grad))
     selected = [
@@ -263,7 +246,10 @@ def check_model_parity(
                             f"{label}/backward: no inputs request gradients"
                         )
                         continue
-                    cotangents = _cotangents(expected)
+                    cotangents = tuple(
+                        weight.to(value.dtype)
+                        for value, weight in zip(expected, _loss_weights(expected))
+                    )
                     expected_gradients = (
                         case.gradient_oracle(expected_inputs, expected, cotangents)
                         if case.gradient_oracle is not None

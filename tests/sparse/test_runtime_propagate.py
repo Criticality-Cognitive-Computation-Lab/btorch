@@ -414,7 +414,7 @@ WEIGHT = torch.randn(N_EDGE, generator=_gen, dtype=torch.float64)
 # The expected density of the hint; the planner turns it into a source-driven
 # plan: "push" on a backend that compacts the input on the device (Triton on
 # CUDA), "adaptive-push" on the reference backend (CPU, or CUDA under
-# ``use_backend("aten")``).
+# ``use_backend("torch")``).
 KINDS = {"pull": None, "push": Hints(expected_density=0.001)}
 
 

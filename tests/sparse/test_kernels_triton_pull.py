@@ -1,7 +1,7 @@
 """Triton pull kernels (``csr_matvec`` / ``edge_grad``) against the ATen
 reference.
 
-The ATen kernels in ``btorch.sparse.runtime.kernels_aten`` define the
+The ATen kernels in ``btorch.sparse.runtime.kernels_torch`` define the
 semantics of every backend. These tests feed both backends the same raw CSR
 buffers and compare the results, so they exercise the Triton kernels directly
 (the backend does not have to be registered for them to run).
@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 import torch
 
-from btorch.sparse.runtime import kernels_aten, kernels_triton
+from btorch.sparse.runtime import kernels_torch, kernels_triton
 from btorch.sparse.runtime.backend import BackendRegistry, KernelCache
 
 
@@ -133,7 +133,7 @@ def test_csr_matvec_unbatched_values(variant, sample):
 
     assert out.shape == (*sample, m)
     assert out.is_contiguous()
-    assert_matches(out, kernels_aten.csr_matvec(crow, col, values, x))
+    assert_matches(out, kernels_torch.csr_matvec(crow, col, values, x))
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
@@ -149,7 +149,7 @@ def test_csr_matvec_batched_values(variant, sample):
     out = kernels_triton.csr_matvec(crow, col, values, x)
 
     assert out.shape == (3, *sample, m)
-    assert_matches(out, kernels_aten.csr_matvec(crow, col, values, x))
+    assert_matches(out, kernels_torch.csr_matvec(crow, col, values, x))
 
 
 def test_csr_matvec_broadcast_batch():
@@ -162,10 +162,10 @@ def test_csr_matvec_broadcast_batch():
 
     # x shared by the three members.
     out = kernels_triton.csr_matvec(crow, col, values, x[:1])
-    assert_matches(out, kernels_aten.csr_matvec(crow, col, values, x[:1]))
+    assert_matches(out, kernels_torch.csr_matvec(crow, col, values, x[:1]))
     # values shared by the three members.
     out = kernels_triton.csr_matvec(crow, col, values[:1], x)
-    assert_matches(out, kernels_aten.csr_matvec(crow, col, values[:1], x))
+    assert_matches(out, kernels_torch.csr_matvec(crow, col, values[:1], x))
 
     # Two value-batch dimensions; a partial broadcast ([2, 1] against [1, 3])
     # is delegated to the reference kernel and must still be correct.
@@ -173,7 +173,7 @@ def test_csr_matvec_broadcast_batch():
     x2 = torch.randn(1, 3, 4, n, device=DEVICE, generator=gen)
     out = kernels_triton.csr_matvec(crow, col, values2, x2)
     assert out.shape == (2, 3, 4, m)
-    assert_matches(out, kernels_aten.csr_matvec(crow, col, values2, x2))
+    assert_matches(out, kernels_torch.csr_matvec(crow, col, values2, x2))
 
 
 def test_csr_matvec_non_contiguous_and_mixed_dtype():
@@ -188,13 +188,13 @@ def test_csr_matvec_non_contiguous_and_mixed_dtype():
     assert not x.is_contiguous()
     assert_matches(
         kernels_triton.csr_matvec(crow, col, values, x),
-        kernels_aten.csr_matvec(crow, col, values, x),
+        kernels_torch.csr_matvec(crow, col, values, x),
     )
 
     spikes = x > 0.5
     assert_matches(
         kernels_triton.csr_matvec(crow, col, values, spikes),
-        kernels_aten.csr_matvec(crow, col, values, spikes),
+        kernels_torch.csr_matvec(crow, col, values, spikes),
     )
 
 
@@ -212,7 +212,7 @@ def test_edge_grad_unbatched(variant, sample):
     out = kernels_triton.edge_grad(crow, col, grad, x, 0)
 
     assert out.shape == (col.shape[0],)
-    assert_matches(out, kernels_aten.edge_grad(crow, col, grad, x, 0))
+    assert_matches(out, kernels_torch.edge_grad(crow, col, grad, x, 0))
 
 
 @pytest.mark.parametrize("variant", ("plain", "empty_rows", "hub", "multi_hub"))
@@ -227,11 +227,11 @@ def test_edge_grad_batched(variant, sample):
 
     out = kernels_triton.edge_grad(crow, col, grad, x, 1)
     assert out.shape == (3, col.shape[0])
-    assert_matches(out, kernels_aten.edge_grad(crow, col, grad, x, 1))
+    assert_matches(out, kernels_torch.edge_grad(crow, col, grad, x, 1))
 
     # The forward input may be shared by all members (size-1 batch dim).
     out = kernels_triton.edge_grad(crow, col, grad, x[:1], 1)
-    assert_matches(out, kernels_aten.edge_grad(crow, col, grad, x[:1], 1))
+    assert_matches(out, kernels_torch.edge_grad(crow, col, grad, x[:1], 1))
 
 
 def test_edge_grad_matches_autograd():
@@ -325,16 +325,16 @@ def test_fallback_dtypes_and_cpu():
 
     out = kernels_triton.csr_matvec(crow, col, values.double(), x)
     assert out.dtype == torch.float64
-    assert_matches(out, kernels_aten.csr_matvec(crow, col, values.double(), x))
+    assert_matches(out, kernels_torch.csr_matvec(crow, col, values.double(), x))
 
     out = kernels_triton.edge_grad(crow, col, grad.double(), x, 0)
     assert out.dtype == torch.float64
-    assert_matches(out, kernels_aten.edge_grad(crow, col, grad.double(), x, 0))
+    assert_matches(out, kernels_torch.edge_grad(crow, col, grad.double(), x, 0))
 
     cpu = [t.cpu() for t in (crow, col, values, x, grad)]
     out = kernels_triton.csr_matvec(*cpu[:4])
     assert out.device.type == "cpu"
-    assert_matches(out, kernels_aten.csr_matvec(*cpu[:4]))
+    assert_matches(out, kernels_torch.csr_matvec(*cpu[:4]))
     out = kernels_triton.edge_grad(cpu[0], cpu[1], cpu[4], cpu[3], 0)
     assert out.device.type == "cpu"
 
@@ -344,13 +344,13 @@ def test_register_and_layout_cache_invalidation():
     # the derived layouts (int32 index copies, expanded row index) to the
     # registry's kernel cache.
     reg = BackendRegistry()
-    reg.register("csr_matvec", "aten", kernels_aten.csr_matvec)
-    reg.register("edge_grad", "aten", kernels_aten.edge_grad)
+    reg.register("csr_matvec", "torch", kernels_torch.csr_matvec)
+    reg.register("edge_grad", "torch", kernels_torch.edge_grad)
     kernels_triton.register(reg)
     assert reg.name("csr_matvec", "cuda") == "triton"
     assert reg.name("edge_grad", "cuda") == "triton"
     # Not registered for the CPU.
-    assert reg.name("csr_matvec", "cpu") == "aten"
+    assert reg.name("csr_matvec", "cpu") == "torch"
     matvec = reg.resolve("csr_matvec", "cuda")
     edge_grad = reg.resolve("edge_grad", "cuda")
 
@@ -364,11 +364,11 @@ def test_register_and_layout_cache_invalidation():
     def check():
         assert_matches(
             matvec(crow, col, values, x),
-            kernels_aten.csr_matvec(crow, col, values, x),
+            kernels_torch.csr_matvec(crow, col, values, x),
         )
         assert_matches(
             edge_grad(crow, col, grad, x, 0),
-            kernels_aten.edge_grad(crow, col, grad, x, 0),
+            kernels_torch.edge_grad(crow, col, grad, x, 0),
         )
 
     def n_layouts():
@@ -436,7 +436,7 @@ def test_layout_cache_is_bounded_and_evicts_dead_patterns(monkeypatch):
     crow, col, m, n = make_csr("plain")
     values = torch.randn(col.shape[0], device=DEVICE)
     x = torch.randn(n, device=DEVICE)
-    expected = kernels_aten.csr_matvec(crow, col, values, x)
+    expected = kernels_torch.csr_matvec(crow, col, values, x)
 
     for _ in range(200):
         transient = col.clone()
@@ -518,7 +518,7 @@ def test_too_few_dimensions_raise_like_the_reference():
     values = torch.randn(3, col.shape[0], device=DEVICE)
     x = torch.randn(3, device=DEVICE)
     with pytest.raises(ValueError, match="at least 2 dimensions"):
-        kernels_aten.csr_matvec(crow, col, values, x)
+        kernels_torch.csr_matvec(crow, col, values, x)
     with pytest.raises(ValueError, match="at least 2 dimensions"):
         kernels_triton.csr_matvec(crow, col, values, x)
     with pytest.raises(ValueError, match="at least 2 dimensions"):
@@ -544,8 +544,8 @@ def test_mismatched_sizes_never_reach_the_kernel(monkeypatch):
         raise AssertionError("the Triton kernel was launched")
 
     monkeypatch.setattr(kernels_triton, "_launch", tripwire)
-    monkeypatch.setattr(kernels_aten, "csr_matvec", lambda *a: "reference")
-    monkeypatch.setattr(kernels_aten, "edge_grad", lambda *a: "reference")
+    monkeypatch.setattr(kernels_torch, "csr_matvec", lambda *a: "reference")
+    monkeypatch.setattr(kernels_torch, "edge_grad", lambda *a: "reference")
 
     short = torch.randn(col.shape[0] - 1, device=DEVICE)  # one value missing
     assert kernels_triton.csr_matvec(crow, col, short, x) == "reference"
@@ -589,7 +589,7 @@ def test_buffers_on_another_gpu_fall_back():
     x = torch.randn(2, n, device="cuda:1")
     out = kernels_triton.csr_matvec(*other, values, x)
     assert out.device == x.device
-    assert_matches(out, kernels_aten.csr_matvec(*other, values, x))
+    assert_matches(out, kernels_torch.csr_matvec(*other, values, x))
 
 
 def test_layout_cache_survives_address_reuse():
@@ -670,7 +670,7 @@ def test_inference_mode_buffers():
         for _ in range(2):
             out = kernels_triton._csr_matvec(cache, crow, col, values, x)
             out_grad = kernels_triton._edge_grad(cache, crow, col, grad, x, 0)
-        assert_matches(out, kernels_aten.csr_matvec(crow, col, values, x))
+        assert_matches(out, kernels_torch.csr_matvec(crow, col, values, x))
         row = torch.repeat_interleave(
             torch.arange(m, device=DEVICE), crow[1:] - crow[:-1]
         )
@@ -701,7 +701,7 @@ def test_csr_matvec_gather(variant, sample, batched):
 
     gathered = values.index_select(-1, perm)
     assert torch.equal(out, kernels_triton.csr_matvec(crow, col, gathered, x))
-    assert_matches(out, kernels_aten.csr_matvec(crow, col, gathered, x))
+    assert_matches(out, kernels_torch.csr_matvec(crow, col, gathered, x))
 
 
 def test_csr_matvec_gather_follows_the_permutation_buffer():
@@ -719,7 +719,7 @@ def test_csr_matvec_gather_follows_the_permutation_buffer():
 
     def check(perm, values=values):
         out = kernels_triton._csr_matvec(cache, crow, col, values, x, perm)
-        expected = kernels_aten.csr_matvec(crow, col, values[perm], x)
+        expected = kernels_torch.csr_matvec(crow, col, values[perm], x)
         assert_matches(out, expected)
 
     perm = torch.randperm(n_edge, device=DEVICE, generator=gen)

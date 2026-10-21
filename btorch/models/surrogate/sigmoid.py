@@ -2,8 +2,6 @@ import math
 
 import torch
 
-from btorch import jit
-
 from .base import SurrogateFunctionBase
 
 
@@ -13,17 +11,15 @@ from .base import SurrogateFunctionBase
 _SIG_K = 2.0 * math.log(math.sqrt(2.0) + 1.0)  # ≈ 1.7627
 
 
-@jit.script
 def _sigmoid_primitive(x: torch.Tensor, alpha: float) -> torch.Tensor:
-    k: float = 2.0 * math.log(math.sqrt(2.0) + 1.0)  # 2*ln(sqrt(2)+1) ≈ 1.7627
+    k = _SIG_K
     return torch.sigmoid(k * alpha * x)
 
 
-@jit.script
 def _sigmoid_derivative(
     x: torch.Tensor, grad_output: torch.Tensor, alpha: float, damping: float
 ) -> torch.Tensor:
-    k: float = 2.0 * math.log(math.sqrt(2.0) + 1.0)  # 2*ln(sqrt(2)+1) ≈ 1.7627
+    k = _SIG_K
     sigma = torch.sigmoid(k * alpha * x)
     grad = damping * 4.0 * sigma * (1.0 - sigma)
     return grad_output * grad

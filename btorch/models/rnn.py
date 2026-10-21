@@ -21,6 +21,29 @@ _sparse_scope_states: ContextVar[dict[int, tuple[int, tuple[int, torch.dtype]]]]
 )
 
 
+def _restore_autograd_multithreading() -> None:
+    torch.autograd.set_multithreading_enabled(True)
+
+
+def _serialize_offload_backward(grad: Tensor) -> Tensor:
+    """Serialize backward for a multi-chunk CPU-offloaded trajectory.
+
+    The CPU and CUDA branches of this graph can be scheduled on
+    different autograd device threads. Each compiled chunk then tries to
+    enter the same AOTAutograd context, which is not re-entrant across
+    threads. Disabling multithreading for this backward keeps the
+    compiled cell graphs intact and makes those contexts run
+    sequentially. The previous global setting is restored once the
+    engine finishes.
+    """
+    if torch.autograd.is_multithreading_enabled():
+        torch.autograd.set_multithreading_enabled(False)
+        torch.autograd.Variable._execution_engine.queue_callback(
+            _restore_autograd_multithreading
+        )
+    return grad
+
+
 def _split_loop_args(args: Sequence, loop_args: Sequence[int], size: int):
     """Yield positional-arg tuples, splitting only ``loop_args`` along time.
 
@@ -49,9 +72,17 @@ def _append_chunk(z_list: list, states_lists: dict[str, list], z, states: dict) 
         lst.append(v) if isinstance(v, Tensor) else lst.extend(v)
 
 
+@partial(torch.compiler.disable, recursive=True)
 def _chunk_to_cpu(z, states: dict):
-    """Move one chunk's outputs and states to CPU (tensors or lists of
-    them)."""
+    """Move one chunk's outputs and states to CPU (tensors or lists of them).
+
+    Keep the host copies outside AOTAutograd. If they are captured, the
+    backward graph contains both CPU and CUDA compiled subgraphs; multithreaded
+    autograd can then enter the same compiled-autograd context concurrently and
+    fail with "cannot enter context". This is a host-transfer helper, not a
+    cell-computation boundary: the recursive=False unroll/chunk boundaries
+    still compile the lower-level cell functions.
+    """
 
     def to_cpu(x):
         return x.cpu() if isinstance(x, Tensor) else [t.cpu() for t in x]
@@ -273,9 +304,20 @@ class RecurrentNNAbstract(base.MemoryModule):
             tensor.register_hook(grad_hook)
 
     def _run_unroll_block(
-        self, *args: Any, loop_args: Sequence[int] = (0,), **kwargs: Any
+        self,
+        *args: Any,
+        loop_args: Sequence[int] = (0,),
+        timestep_offset: int = 0,
+        **kwargs: Any,
     ) -> tuple[list[Tensor], dict[str, list[Tensor]]]:
         """Inner loop for processing a small chunk.
+
+        Gradient-history hooks are attached here, before the state is cloned.
+        The clone is only a record: nothing consumes it during backward, so a
+        hook on the clone would never observe a cotangent. The live state does
+        participate in the next step (and, at the end, in the output), which is
+        where its adjoint is produced. Checkpointed runs register the same hook
+        during recomputation, when the state tensors require grad.
 
         Returns:
             - z_seq: list[Tensor]
@@ -293,6 +335,12 @@ class RecurrentNNAbstract(base.MemoryModule):
             z, states = self.single_step_forward(*static_args, **kwargs)
             z_seq.append(z)
             for k, v in states.items():
+                if self._should_save_grad(k):
+                    history = self._grad_history.setdefault(k, [])
+                    needed = timestep_offset + t + 1
+                    if len(history) < needed:
+                        history.extend([None] * (needed - len(history)))
+                    self._register_grad_hook(v, k, timestep_offset + t)
                 # Records are snapshots of this logical timestep. Memories
                 # such as a circular delay cursor can be updated in place on
                 # the next step; retaining a reference would rewrite history.
@@ -301,7 +349,14 @@ class RecurrentNNAbstract(base.MemoryModule):
         return z_seq, states_seq
 
     @partial(torch.compiler.disable, recursive=False)
-    def _run_chunk_steps(self, *chunk_args, loop_args=(0,), unroll_size=1, **kwargs):
+    def _run_chunk_steps(
+        self,
+        *chunk_args,
+        loop_args=(0,),
+        unroll_size=1,
+        timestep_offset=0,
+        **kwargs,
+    ):
         """Process a large chunk by splitting it into small unroll blocks.
 
         This function is NOT checkpointed itself, but is the body of the
@@ -311,12 +366,16 @@ class RecurrentNNAbstract(base.MemoryModule):
             chunk_z = []
             chunk_states = {}
 
+            block_offset = timestep_offset
             for sub_args in _split_loop_args(chunk_args, loop_args, unroll_size):
                 z_sub, states_sub = self._run_unroll_block(
                     *sub_args,
                     loop_args=loop_args,
+                    timestep_offset=block_offset,
                     **kwargs,
                 )
+
+                block_offset += sub_args[loop_args[0]].shape[0]
 
                 chunk_z.extend(z_sub)
                 for k, v in states_sub.items():
@@ -329,6 +388,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         *chunk_args,
         loop_args=(0,),
         unroll_size=1,
+        timestep_offset=0,
         **kwargs: Any,
     ) -> None:
         memories = named_hidden_states(self)
@@ -343,10 +403,16 @@ class RecurrentNNAbstract(base.MemoryModule):
         def _pure(env, memories, *inner_args):
             set_hidden_states(self, memories)
             with environ.context(**env):
+                history_kwargs = (
+                    {"timestep_offset": timestep_offset}
+                    if self.save_grad_history
+                    else {}
+                )
                 return self._run_chunk_steps(
                     *inner_args,
                     loop_args=loop_args,
                     unroll_size=unroll_size,
+                    **history_kwargs,
                     **kwargs,
                 )
 
@@ -442,6 +508,7 @@ class RecurrentNNAbstract(base.MemoryModule):
 
         all_z_list = []
         all_states_lists = {}
+        timestep_offset = 0
 
         # ------------------------------------------------------------------
         # Outer Loop: Large Chunks (Checkpointing & CPU Offloading)
@@ -452,33 +519,36 @@ class RecurrentNNAbstract(base.MemoryModule):
                 if use_checkpoint
                 else self._run_chunk_steps
             )
+            history_kwargs = (
+                {"timestep_offset": timestep_offset} if self.save_grad_history else {}
+            )
             z_chunk, states_chunk = process(
                 *chunk_args,
                 loop_args=loop_args,
                 unroll_size=unroll_size,
+                **history_kwargs,
                 **kwargs,
             )
+
+            timestep_offset += chunk_args[loop_args[0]].shape[0]
 
             if self.cpu_offload:
                 z_chunk, states_chunk = _chunk_to_cpu(z_chunk, states_chunk)
             _append_chunk(all_z_list, all_states_lists, z_chunk, states_chunk)
 
         # ------------------------------------------------------------------
-        # Post-process: Register gradient hooks and stack
+        # Post-process: stack
         # ------------------------------------------------------------------
-        # Register hooks BEFORE stacking, on the original tensors in the lists
-        # This ensures hooks are on tensors that participate in the backward pass
-        if self.save_grad_history:
-            for state_name, tensors in all_states_lists.items():
-                if not self._should_save_grad(state_name):
-                    continue
-                if state_name not in self._grad_history:
-                    self._grad_history[state_name] = [None] * T
-                for t, tensor in enumerate(tensors):
-                    self._register_grad_hook(tensor, state_name, t)
-
         stacked_outputs = torch.stack(all_z_list, dim=0)
         stacked_states = {k: torch.stack(v, dim=0) for k, v in all_states_lists.items()}
+
+        # Only compiled multi-chunk CPU offload needs serialization: its CPU
+        # and CUDA compiled branches can enter the same AOTAutograd context on
+        # different device threads. Eager offload keeps multithreaded autograd.
+        if self.cpu_offload and large_chunk_size < T and torch._dynamo.is_compiling():
+            for tensor in (stacked_outputs, *stacked_states.values()):
+                if tensor.requires_grad:
+                    tensor.register_hook(_serialize_offload_backward)
 
         return (stacked_outputs, stacked_states)
 
@@ -727,15 +797,23 @@ class RecurrentNN(RecurrentNNAbstract):
     def capture_version(self) -> tuple:
         """Invalidate captured trajectories when implementation choices
         change."""
-        from .kernels.options import normalize_backend
+        from .kernels.options import resolve_model_options
         from .kernels.registry import cell_backend_revision
+        from .neurons.alif import ALIF, ELIF
 
-        options = normalize_backend(self.backend)
+        neuron_model = {ALIF: "alif", ELIF: "elif"}.get(type(self.neuron))
+        options = resolve_model_options(
+            self.backend, *(() if neuron_model is None else (neuron_model,))
+        )
         return (
-            options.cell,
+            options.neuron,
             options.connection,
             options.merge_synapse,
-            cell_backend_revision(options.cell),
+            options.enable_fp_fusion,
+            options.precise_division,
+            options.precise_exp,
+            cell_backend_revision(options.neuron),
+            options.connection_method,
         )
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
@@ -782,9 +860,32 @@ class RecurrentNN(RecurrentNNAbstract):
             error_msgs,
         )
 
+    def _reject_native_conductance_recurrence(self) -> None:
+        """Reject COBA until recurrence supplies the observed voltage."""
+        from .kernels.options import normalize_backend
+
+        recurrent_synapses = (self.synapse, getattr(self, "synapse_apical", None))
+        for recurrent_synapse in recurrent_synapses:
+            if type(recurrent_synapse) is not synapse.ConductancePSC:
+                continue
+            network_native = normalize_backend(self.backend).neuron != "torch"
+            synapse_native = (
+                normalize_backend(recurrent_synapse.backend).neuron != "torch"
+            )
+            if network_native or synapse_native:
+                raise NotImplementedError(
+                    "Native RecurrentNN does not yet support ConductancePSC: "
+                    "voltage-aware recurrent scheduling is required"
+                )
+
     def multi_step_forward(self, *args, loop_args=None, **kwargs):
+        self._reject_native_conductance_recurrence()
         if self.backend == "torch":
-            return super().multi_step_forward(*args, loop_args=loop_args, **kwargs)
+            from .kernels.adapters import connection_scope
+            from .kernels.options import normalize_backend
+
+            with connection_scope(normalize_backend(self.backend)):
+                return super().multi_step_forward(*args, loop_args=loop_args, **kwargs)
         if self.cudagraph:
             from .kernels.options import normalize_backend
 
@@ -805,6 +906,7 @@ class RecurrentNN(RecurrentNNAbstract):
         return recurrent_sequence(self, *args, loop_args=loop_args, **kwargs)
 
     def _run_chunk_steps(self, *chunk_args, loop_args=(0,), unroll_size=1, **kwargs):
+        self._reject_native_conductance_recurrence()
         if self.backend == "torch":
             return super()._run_chunk_steps(
                 *chunk_args, loop_args=loop_args, unroll_size=unroll_size, **kwargs
@@ -821,16 +923,150 @@ class RecurrentNN(RecurrentNNAbstract):
     def single_step_forward(
         self, x: Tensor, x_syn: Tensor | None = None
     ) -> tuple[Tensor, dict[str, Tensor]]:
+        self._reject_native_conductance_recurrence()
         if self.neuron_inp_module is not None:
             x = self.neuron_inp_module(x)
         if self.syn_inp_module is not None:
             x_syn = self.syn_inp_module(x_syn)
         z = base._single_step_call(self.neuron, self.synapse.psc + x)
-        _ = base._single_step_call(self.synapse, z if x_syn is None else z + x_syn)
+        from .kernels.adapters import connection_scope
+        from .kernels.options import normalize_backend
+
+        with connection_scope(normalize_backend(self.backend)):
+            _ = base._single_step_call(self.synapse, z if x_syn is None else z + x_syn)
         states = filter_hidden_states(
             self, self.update_state_names, allow_buffer=self.allow_buffer
         )
 
+        return z, states
+
+
+class ConductanceRecurrentNN(RecurrentNN):
+    r"""Run a recurrent conductance network with previous-voltage coupling.
+
+    The recurrent current at step :math:`t` uses the conductance and post-reset
+    membrane voltage left by step :math:`t-1`:
+
+    .. math::
+        I_t &= g_{t-1}\,(E - v_{t-1}) \\
+        z_t &= \operatorname{neuron}(x_t + I_t) \\
+        g_t &= \operatorname{ConductancePSC}(z_t + x_{\mathrm{syn},t})
+
+    The neuron advances, fires, and resets before its emitted spikes update the
+    conductance. A recurrent spike emitted at step :math:`t` can therefore
+    affect membrane current beginning at step :math:`t+1`. This initial public
+    schedule is deliberately Torch-only and requires the exact
+    :class:`~btorch.models.synapse.ConductancePSC` class.
+
+    Constructor arguments are inherited from :class:`RecurrentNN`.
+
+    Raises:
+        TypeError: If ``synapse`` is not an exact ``ConductancePSC`` or the
+            neuron has no membrane state ``v``.
+        NotImplementedError: If any backend-bearing module in the network is
+            not plain ``"torch"``.
+
+    Examples:
+        Run a voltage-aware recurrent sequence while recording its physical
+        states:
+
+        >>> network = ConductanceRecurrentNN(
+        ...     neuron,
+        ...     conductance_psc,
+        ...     backend="torch",
+        ...     update_state_names=("neuron.v", "synapse.psc"),
+        ... )
+        >>> spikes, states = network(input_sequence)
+    """
+
+    @staticmethod
+    def _capture_tensor_token(value: Tensor) -> tuple:
+        """Describe a non-state tensor address wired into a CUDA graph."""
+        stride = tuple(value.stride()) if value.layout == torch.strided else ()
+        return (
+            id(value),
+            value.data_ptr(),
+            value.device,
+            value.dtype,
+            tuple(value.shape),
+            stride,
+        )
+
+    @property
+    def capture_version(self) -> tuple:
+        """Track tensor replacements and scalar time-step specialization."""
+        parameters = tuple(
+            (name, self._capture_tensor_token(value))
+            for name, value in self.named_parameters()
+        )
+        buffers = []
+        for module_name, module in self.named_modules():
+            memories = getattr(module, "_memories_rv", {})
+            for name, value in module.named_buffers(recurse=False):
+                if name in memories:
+                    continue
+                qualified_name = f"{module_name}.{name}" if module_name else name
+                buffers.append((qualified_name, self._capture_tensor_token(value)))
+
+        dt = environ.all().get("dt")
+        if torch.is_tensor(dt):
+            dt_token = ("tensor", self._capture_tensor_token(dt))
+            if dt.device.type == "cpu":
+                # A host scalar becomes a kernel argument at capture time rather
+                # than a device-memory read. Its address can stay fixed while the
+                # captured value becomes stale, so an in-place write must recapture.
+                try:
+                    revision = ("version", dt._version)
+                except RuntimeError:
+                    # Inference tensors have no version counter. CPU values are
+                    # cheap to inspect and scalar dt is the supported capture use.
+                    revision = ("value", dt.item())
+                dt_token = (*dt_token, revision)
+        else:
+            dt_token = ("value", dt)
+        return (*super().capture_version, tuple(parameters), tuple(buffers), dt_token)
+
+    def _reject_native_conductance_recurrence(self) -> None:
+        """Validate the explicit Torch COBA schedule before state advances."""
+        if type(self.synapse) is not synapse.ConductancePSC:
+            raise TypeError(
+                "ConductanceRecurrentNN requires an exact ConductancePSC synapse"
+            )
+        if not hasattr(self.neuron, "v"):
+            raise TypeError(
+                "ConductanceRecurrentNN requires a neuron with membrane state 'v'"
+            )
+        unsupported = []
+        for name, module in self.named_modules():
+            if not hasattr(module, "backend"):
+                continue
+            if module.backend != "torch":
+                unsupported.append(name or "network")
+        if unsupported:
+            raise NotImplementedError(
+                "ConductanceRecurrentNN currently requires plain backend='torch' "
+                "for every backend-bearing module; unsupported: "
+                + ", ".join(unsupported)
+            )
+
+    def single_step_forward(
+        self, x: Tensor, x_syn: Tensor | None = None
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Advance one previous-post-reset-voltage conductance step."""
+        self._reject_native_conductance_recurrence()
+        if self.neuron_inp_module is not None:
+            x = self.neuron_inp_module(x)
+        if self.syn_inp_module is not None:
+            x_syn = self.syn_inp_module(x_syn)
+
+        voltage_observed = self.neuron.v
+        current = self.synapse.current_charge(voltage_observed)
+        z = base._single_step_call(self.neuron, x + current)
+        event = z if x_syn is None else z + x_syn
+        _ = base._single_step_call(self.synapse, event, voltage_observed)
+        states = filter_hidden_states(
+            self, self.update_state_names, allow_buffer=self.allow_buffer
+        )
         return z, states
 
 
@@ -924,6 +1160,7 @@ class ApicalRecurrentNN(RecurrentNN):
             ``(spikes, states)`` where ``spikes`` has shape
             ``(*batch, n_neuron)``.
         """
+        self._reject_native_conductance_recurrence()
         if self.neuron_inp_module is not None:
             x = self.neuron_inp_module(x)
         if self.syn_inp_module is not None:

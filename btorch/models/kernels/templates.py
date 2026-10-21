@@ -45,10 +45,117 @@ class ModelTemplate:
     state_extra_dims: tuple[tuple[str, int], ...] = ()
     history_sources: tuple[tuple[str, str], ...] = ()
 
+    def history_state_name(self, name: str) -> str:
+        """Look up the state supplying a declared history's shape.
+
+        Post-step states use their own shape; auxiliary records use the
+        explicit history_sources declaration.
+
+        Args:
+            name: Declared post-step state or auxiliary history.
+
+        Returns:
+            Name of the state supplying the history shape.
+
+        Raises:
+            KeyError: If no state shape is declared for the history.
+        """
+        return name if name in self.state_names else dict(self.history_sources)[name]
+
+
+@dataclass(frozen=True)
+class ResidualTemplate:
+    """Declare private storage selected by one generated reverse algorithm.
+
+    Args:
+        histories: Full post-step trajectories required by reverse.
+        checkpoint_state: State reconstructed from periodic checkpoints.
+        checkpoint_interval: Number of steps between saved checkpoints.
+        save_output: Retain the forward output tensor for local replay.
+    """
+
+    histories: tuple[str, ...]
+    checkpoint_state: str | None = None
+    checkpoint_interval: int = 0
+    save_output: bool = False
+
+    @property
+    def encoded(self) -> str:
+        """Return stable lowering metadata independent from
+        :class:`CellSpec`."""
+        checkpoint = self.checkpoint_state or ""
+        histories = ",".join(self.histories)
+        return (
+            f"{histories}|{checkpoint}|{self.checkpoint_interval}|"
+            f"{int(self.save_output)}"
+        )
+
+
+def decode_residual_template(encoded: str) -> ResidualTemplate:
+    """Restore normalized private residual metadata at the operator
+    boundary."""
+    histories, checkpoint, interval, save_output = encoded.split("|")
+    return ResidualTemplate(
+        tuple(filter(None, histories.split(","))),
+        checkpoint or None,
+        int(interval),
+        bool(int(save_output)),
+    )
+
+
+def residual_template(spec: CellSpec, requested: tuple[str, ...]) -> ResidualTemplate:
+    """Select the built-in primitive reverse representation.
+
+    GLIF adaptation is replayed from block checkpoints unless the caller
+    already requests its complete trajectory. Other models retain their
+    established full-state representation.
+    """
+    template = get_template(spec)
+    if spec.surrogate == "poisson" and spec.poisson.spiking:
+        # Reverse reuses the sampled raster. Replaying random draws would change
+        # both reset semantics and the user's global generator continuation.
+        return ResidualTemplate(template.state_names, save_output=True)
+    if spec.model == "glif3" and "Iasc" not in requested:
+        return ResidualTemplate(
+            tuple(name for name in template.state_names if name != "Iasc"),
+            "Iasc",
+            16,
+            True,
+        )
+    return ResidualTemplate(template.state_names)
+
 
 _MODELS = {
     "lif": (("v",), ("v_threshold", "v_reset", "c_m", "tau")),
     "if": (("v",), ("v_threshold", "v_reset", "c_m")),
+    "alif": (
+        ("v", "g_k"),
+        (
+            "v_threshold",
+            "v_reset",
+            "c_m",
+            "g_leak",
+            "E_leak",
+            "E_k",
+            "tau_adapt",
+            "dg_k",
+        ),
+    ),
+    "elif": (
+        ("v", "g_k"),
+        (
+            "v_threshold",
+            "v_reset",
+            "c_m",
+            "g_leak",
+            "E_leak",
+            "E_k",
+            "tau_adapt",
+            "dg_k",
+            "delta_T",
+            "v_T",
+        ),
+    ),
     "glif3": (
         ("v", "Iasc"),
         ("v_threshold", "v_reset", "c_m", "tau", "v_rest", "k", "asc_amps"),
@@ -165,8 +272,32 @@ def get_template(spec: CellSpec) -> ModelTemplate:
         "erf",
         "superspike",
         "triangle",
+        "poisson",
     ):
         raise NotImplementedError(f"Unsupported surrogate: {spec.surrogate!r}")
+    if (spec.surrogate == "poisson") != (spec.poisson is not None):
+        raise ValueError("Poisson surrogate and options must be selected together")
+    state_names, parameter_names = _MODELS[spec.model]
+    if spec.poisson is not None:
+        if "v" not in state_names and "u" not in state_names:
+            raise NotImplementedError(
+                "Poisson lowering requires a built-in neuron template"
+            )
+        if not isinstance(spec.poisson.spiking, bool):
+            raise TypeError("Poisson spiking must be a bool")
+        values = (
+            spec.poisson.tau,
+            spec.poisson.rho,
+            spec.poisson.leak,
+            spec.poisson.k,
+            spec.damping,
+        )
+        if any(not isinstance(value, (float, int)) for value in values):
+            raise TypeError("Poisson options must be non-trainable Python scalars")
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("Poisson options must be finite")
+        if spec.poisson.tau <= 0:
+            raise ValueError("Poisson tau must be positive")
     if not isinstance(spec.dt, torch.Tensor) and (
         not math.isfinite(spec.dt) or spec.dt <= 0
     ):
@@ -177,9 +308,8 @@ def get_template(spec: CellSpec) -> ModelTemplate:
         and spec.dt != 1
     ):
         raise ValueError("AlphaPSCBilleh requires dt == 1")
-    state_names, parameter_names = _MODELS[spec.model]
     if spec.refractory:
-        if spec.model not in ("lif", "if", "glif3"):
+        if spec.model not in ("lif", "if", "alif", "elif", "glif3"):
             raise ValueError(f"{spec.model} does not support a refractory state")
         state_names += ("refractory",)
         parameter_names += ("tau_ref",)

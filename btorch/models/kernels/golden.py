@@ -5,6 +5,7 @@ import torch
 from torch import Tensor
 
 from .. import environ, surrogate
+from ..neurons.alif import ALIF, ELIF
 from ..neurons.glif import GLIF3
 from ..neurons.izhikevich import Izhikevich
 from ..neurons.lif import IF, LIF
@@ -43,7 +44,14 @@ def python_module_sequence(
     template = get_template(spec)
     n_neuron = x_seq.shape[-1]
     kwargs = dict(n_neuron=n_neuron, backend="torch", step_mode="s")
-    neurons = {"if": IF, "lif": LIF, "glif3": GLIF3, "izhikevich": Izhikevich}
+    neurons = {
+        "if": IF,
+        "lif": LIF,
+        "alif": ALIF,
+        "elif": ELIF,
+        "glif3": GLIF3,
+        "izhikevich": Izhikevich,
+    }
     if spec.model in neurons:
         functions = dict(
             sigmoid=surrogate.Sigmoid,
@@ -52,11 +60,22 @@ def python_module_sequence(
             erf=surrogate.Erf,
             superspike=surrogate.SuperSpike,
             triangle=surrogate.Triangle,
+            poisson=surrogate.PoissonRandomSpike,
+        )
+        function_kwargs = (
+            {
+                "spiking": spec.poisson.spiking,
+                "tau": spec.poisson.tau,
+                "rho": spec.poisson.rho,
+                "leak": spec.poisson.leak,
+                "k": spec.poisson.k,
+                "damping_factor": spec.damping,
+            }
+            if spec.poisson is not None
+            else {"alpha": spec.alpha, "damping_factor": spec.damping}
         )
         kwargs.update(
-            surrogate_function=functions[spec.surrogate](
-                alpha=spec.alpha, damping_factor=spec.damping
-            ),
+            surrogate_function=functions[spec.surrogate](**function_kwargs),
             hard_reset=spec.hard_reset,
             detach_reset=spec.detach_reset,
             device="cpu",

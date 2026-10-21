@@ -20,7 +20,12 @@ import torch
 from torch import Tensor
 from torch.library import custom_op
 
-from . import kernels_aten, kernels_triton, kernels_triton_push
+from . import (
+    kernels_torch,
+    kernels_triton,
+    kernels_triton_push,
+    kernels_triton_spikelist,
+)
 from .backend import (
     RegisteredOperator,
     RouteBinding,
@@ -31,21 +36,30 @@ from .backend import (
 )
 
 
-registry.register("csr_matvec", "aten", kernels_aten.csr_matvec)
-registry.register("edge_grad", "aten", kernels_aten.edge_grad)
-registry.register("spike_push", "aten", kernels_aten.spike_push)
+registry.register("csr_matvec", "torch", kernels_torch.csr_matvec)
+registry.register("edge_grad", "torch", kernels_torch.edge_grad)
+registry.register("spike_push", "torch", kernels_torch.spike_push)
+registry.register(
+    "csr_matvec",
+    "cusparse",
+    kernels_torch.csr_matvec_cusparse,
+    device="cuda",
+    priority=1,
+    available=torch.cuda.is_available,
+)
 registry.register(
     "csr_matvec",
     "torch_sparse",
-    kernels_aten.csr_matvec_torch_sparse,
+    kernels_torch.csr_matvec_torch_sparse,
     priority=-1,
-    available=kernels_aten.torch_sparse_available,
+    available=kernels_torch.torch_sparse_available,
 )
 
 
 # Optional CUDA backends; each checks its own availability lazily.
 kernels_triton.register(registry)
 kernels_triton_push.register(registry)
+kernels_triton_spikelist.register(registry)
 
 
 def _out_shape(values: Tensor, x: Tensor, n_out: int) -> tuple[int, ...]:
@@ -147,7 +161,7 @@ def _push_or_pull_kernels(
                 task_values=task_values,
             )
         else:
-            active_idx, ptr = kernels_aten.pack_spikes(flat)
+            active_idx, ptr = kernels_torch.pack_spikes(flat)
             if active_idx.shape[0] > max_density * flat.numel():
                 return _kernel("csr_matvec", x)(crow, col, values, x)
             push = _kernel("spike_push", x)
@@ -189,35 +203,19 @@ def _fused_backward(device: str):
 
 
 def _grad_kernels(saved, grad, need_values: bool, need_x: bool):
-    crow, col, values, x, t_crow, t_col, t_perm = saved
-    device = x.device.type
-    grad_values = grad_x = None
+    device = saved[3].device.type
     fused = _fused_backward(device)
-    if fused is not None:
-        grad_values, grad_x = fused(
-            crow, col, t_crow, t_col, t_perm, values, x, grad, need_values, need_x
-        )
-    else:
-        if need_values:
-            edge_grad = registry.resolve("edge_grad", device)
-            grad_values = edge_grad(crow, col, grad, x, values.ndim - 1)
-        if need_x:
-            # Transposed product as a pull over the source-major CSR: no
-            # atomics, deterministic, and always a dense gradient w.r.t. the
-            # input.
-            matvec = registry.resolve("csr_matvec", device)
-            grad_x = matvec(t_crow, t_col, values.index_select(-1, t_perm), grad)
-    if grad_values is not None:
-        if grad_values.shape != values.shape:
-            grad_values = grad_values.sum_to_size(values.shape)
-        if grad_values.dtype != values.dtype:
-            grad_values = grad_values.to(values.dtype)
-    if grad_x is not None:
-        if grad_x.shape != x.shape:
-            grad_x = grad_x.sum_to_size(x.shape)
-        if grad_x.dtype != x.dtype:
-            grad_x = grad_x.to(x.dtype)
-    return grad_values, grad_x
+    return _apply_backward(
+        saved,
+        grad,
+        need_values,
+        need_x,
+        registry.resolve("edge_grad", device)
+        if need_values and fused is None
+        else None,
+        registry.resolve("csr_matvec", device) if need_x and fused is None else None,
+        fused,
+    )
 
 
 def _grads(saved, grad, need_values: bool, need_x: bool):
@@ -278,7 +276,7 @@ def csr_propagate_backward(
     return grad_values, grad_x
 
 
-def _bound_grads(
+def _apply_backward(
     saved,
     grad: Tensor,
     need_values: bool,
@@ -287,7 +285,7 @@ def _bound_grads(
     matvec,
     fused=None,
 ):
-    """Compute backward with the kernels captured by one route binding."""
+    """Apply selected reverse kernels and restore input shapes and dtypes."""
     crow, col, values, x, t_crow, t_col, t_perm = saved
     grad_values = grad_x = None
     if fused is not None:
@@ -321,28 +319,17 @@ def _bound_grads(
     return grad_values, grad_x
 
 
-def _build_pull(kernels: dict[str, object]) -> RouteImplementation:
-    matvec = kernels["csr_matvec"]
+def _build_backward(kernels: dict[str, object]):
+    """Bind one reverse implementation shared by pull and source-driven
+    routes."""
     edge_grad = kernels["edge_grad"]
+    matvec = kernels["csr_matvec"]
     fused = kernels.get("csr_backward")
-    prepare = kernels.get("prepare_pull")
-
-    def forward(crow, col, values, x, t_crow, t_col, t_perm, max_density, task_values):
-        return matvec(crow, col, values, x)
 
     def backward(
-        crow,
-        col,
-        values,
-        x,
-        t_crow,
-        t_col,
-        t_perm,
-        grad,
-        need_values,
-        need_x,
+        crow, col, values, x, t_crow, t_col, t_perm, grad, need_values, need_x
     ):
-        return _bound_grads(
+        return _apply_backward(
             (crow, col, values, x, t_crow, t_col, t_perm),
             grad,
             need_values,
@@ -352,63 +339,49 @@ def _build_pull(kernels: dict[str, object]) -> RouteImplementation:
             fused,
         )
 
-    return RouteImplementation(forward, backward, prepare)
+    return backward
+
+
+def _build_pull(kernels: dict[str, object]) -> RouteImplementation:
+    matvec = kernels["csr_matvec"]
+    prepare = kernels.get("prepare_pull")
+
+    def forward(crow, col, values, x, t_crow, t_col, t_perm, max_density, task_values):
+        return matvec(crow, col, values, x)
+
+    return RouteImplementation(forward, _build_backward(kernels), prepare)
 
 
 def _build_adaptive_push(kernels: dict[str, object]) -> RouteImplementation:
     push = kernels["spike_push"]
     matvec = kernels["csr_matvec"]
-    edge_grad = kernels["edge_grad"]
 
     def forward(crow, col, values, x, t_crow, t_col, t_perm, max_density, task_values):
         if values.ndim != 1 or x.numel() == 0:
             return matvec(crow, col, values, x)
         flat = x if x.ndim == 2 else x.reshape(-1, x.shape[-1])
-        active_idx, ptr = kernels_aten.pack_spikes(flat)
+        active_idx, ptr = kernels_torch.pack_spikes(flat)
         if active_idx.shape[0] > max_density * flat.numel():
             return matvec(crow, col, values, x)
         out = push(
-            t_crow,
-            t_col,
-            t_perm,
-            values,
-            flat,
-            active_idx,
-            ptr,
-            crow.shape[0] - 1,
+            t_crow, t_col, t_perm, values, flat, active_idx, ptr, crow.shape[0] - 1
         )
         return out if x.ndim == 2 else out.reshape(*x.shape[:-1], crow.shape[0] - 1)
 
-    def backward(
-        crow,
-        col,
-        values,
-        x,
-        t_crow,
-        t_col,
-        t_perm,
-        grad,
-        need_values,
-        need_x,
-    ):
-        return _bound_grads(
-            (crow, col, values, x, t_crow, t_col, t_perm),
-            grad,
-            need_values,
-            need_x,
-            edge_grad,
-            matvec,
-        )
-
-    return RouteImplementation(forward, backward)
+    return RouteImplementation(forward, _build_backward(kernels))
 
 
-def _build_dense_push(kernels: dict[str, object]) -> RouteImplementation:
-    push = kernels["spike_push_dense"]
+def _build_source_push(
+    kernels: dict[str, object],
+    *,
+    push_kernel: str = "spike_push_dense",
+    values_kernel: str = "prepare_task_values",
+) -> RouteImplementation:
+    """Bind source-driven forward kernels to the shared sparse reverse."""
+    push = kernels[push_kernel]
     matvec = kernels["csr_matvec"]
     prepare = kernels.get("prepare_push")
-    prepare_values = kernels.get("prepare_task_values")
-    fused = kernels.get("csr_backward")
+    prepare_values = kernels.get(values_kernel)
 
     def forward(crow, col, values, x, t_crow, t_col, t_perm, max_density, task_values):
         if values.ndim != 1 or x.numel() == 0:
@@ -428,29 +401,18 @@ def _build_dense_push(kernels: dict[str, object]) -> RouteImplementation:
         )
         return out if x.ndim == 2 else out.reshape(*x.shape[:-1], crow.shape[0] - 1)
 
-    def backward(
-        crow,
-        col,
-        values,
-        x,
-        t_crow,
-        t_col,
-        t_perm,
-        grad,
-        need_values,
-        need_x,
-    ):
-        return _bound_grads(
-            (crow, col, values, x, t_crow, t_col, t_perm),
-            grad,
-            need_values,
-            need_x,
-            kernels["edge_grad"] if "edge_grad" in kernels else kernels["csr_backward"],
-            matvec,
-            fused,
-        )
+    return RouteImplementation(
+        forward, _build_backward(kernels), prepare, prepare_values
+    )
 
-    return RouteImplementation(forward, backward, prepare, prepare_values)
+
+def _build_spike_list(kernels: dict[str, object]) -> RouteImplementation:
+    """Reuse sparse autograd and route preparation with device spike lists."""
+    return _build_source_push(
+        kernels,
+        push_kernel="spike_push_list",
+        values_kernel="prepare_spike_list_values",
+    )
 
 
 @csr_propagate_backward.register_fake
@@ -999,8 +961,51 @@ def _register_route_specs() -> None:
     """Register complete built-in routes after all low-level kernels exist."""
     registry.register_route(
         RouteSpec(
-            key=RouteKey("propagate", "post_pre_csr", "pull", "aten"),
-            kernel_bindings=(("csr_matvec", "aten"), ("edge_grad", "aten")),
+            key=RouteKey("propagate", "post_pre_csr", "pull", "cusparse"),
+            kernel_bindings=(("csr_matvec", "cusparse"), ("edge_grad", "torch")),
+            build=_build_pull,
+            supports=lambda context: (
+                context is not None and context.dtype in (torch.float32, torch.float64)
+            ),
+        ),
+        device="cuda",
+        priority=1,
+        available=torch.cuda.is_available,
+    )
+    registry.register_route(
+        RouteSpec(
+            key=RouteKey("propagate", "spike_list_csr", "push", "triton"),
+            kernel_bindings=(
+                ("spike_push_list", "triton"),
+                ("prepare_spike_list_values", "triton"),
+                ("csr_matvec", "triton"),
+                ("edge_grad", "triton"),
+                ("csr_backward", "triton"),
+                ("prepare_push", "triton"),
+            ),
+            build=_build_spike_list,
+            supports=lambda context: (
+                context is not None
+                and context.dtype == torch.float32
+                and not context.value_batched
+                and (
+                    context.method == "push"
+                    or (
+                        context.method == "auto"
+                        and context.firing_rate_hz is not None
+                        and context.firing_rate_hz < 5.0
+                    )
+                )
+            ),
+        ),
+        device="cuda",
+        priority=20,
+        available=kernels_triton_push.is_available,
+    )
+    registry.register_route(
+        RouteSpec(
+            key=RouteKey("propagate", "post_pre_csr", "pull", "torch"),
+            kernel_bindings=(("csr_matvec", "torch"), ("edge_grad", "torch")),
             build=_build_pull,
         ),
         device=("cpu", "cuda"),
@@ -1011,13 +1016,13 @@ def _register_route_specs() -> None:
             key=RouteKey("propagate", "post_pre_csr", "pull", "torch_sparse"),
             kernel_bindings=(
                 ("csr_matvec", "torch_sparse"),
-                ("edge_grad", "aten"),
+                ("edge_grad", "torch"),
             ),
             build=_build_pull,
         ),
         device=("cpu", "cuda"),
         priority=-1,
-        available=kernels_aten.torch_sparse_available,
+        available=kernels_torch.torch_sparse_available,
     )
     registry.register_route(
         RouteSpec(
@@ -1036,11 +1041,11 @@ def _register_route_specs() -> None:
     )
     registry.register_route(
         RouteSpec(
-            key=RouteKey("propagate", "post_pre_csr", "adaptive-push", "aten"),
+            key=RouteKey("propagate", "post_pre_csr", "adaptive-push", "torch"),
             kernel_bindings=(
-                ("spike_push", "aten"),
-                ("csr_matvec", "aten"),
-                ("edge_grad", "aten"),
+                ("spike_push", "torch"),
+                ("csr_matvec", "torch"),
+                ("edge_grad", "torch"),
             ),
             build=_build_adaptive_push,
             operator=RegisteredOperator(supports_capture=False),
@@ -1059,9 +1064,10 @@ def _register_route_specs() -> None:
                 ("prepare_push", "triton"),
                 ("prepare_task_values", "triton"),
             ),
-            build=_build_dense_push,
+            build=_build_source_push,
             supports=lambda context: (
                 context is not None
+                and context.method == "auto"
                 and context.dtype == torch.float32
                 and not context.value_batched
             ),
@@ -1085,4 +1091,4 @@ def pack_spikes(x: Tensor) -> tuple[Tensor, Tensor]:
         ``(active_idx, ptr)``; sample ``b`` owns
         ``active_idx[ptr[b]:ptr[b + 1]]``.
     """
-    return kernels_aten.pack_spikes(x)
+    return kernels_torch.pack_spikes(x)

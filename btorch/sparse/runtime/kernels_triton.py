@@ -1,7 +1,7 @@
 """Triton (CUDA) backend of the destination-driven sparse kernels.
 
 Implements ``csr_matvec`` and ``edge_grad`` with the semantics of
-:mod:`btorch.sparse.runtime.kernels_aten` for ``float32`` data on CUDA and
+:mod:`btorch.sparse.runtime.kernels_torch` for ``float32`` data on CUDA and
 defers to the ATen kernels for everything else (other dtypes, CPU tensors,
 index spaces that do not fit ``int32``, partially broadcast value batches,
 grids too large for one launch).
@@ -56,7 +56,7 @@ import weakref
 import torch
 from torch import Tensor
 
-from . import kernels_aten
+from . import kernels_torch
 from .backend import BackendRegistry, KernelCache, registry as _default_registry
 
 
@@ -888,7 +888,7 @@ def _csr_matvec(
     if not supported:
         if perm is not None:
             values = values.index_select(-1, perm)
-        return kernels_aten.csr_matvec(crow, col, values, x)
+        return kernels_torch.csr_matvec(crow, col, values, x)
 
     out_shape = (*batch, *sample, n_out)
     if n_out == 0 or n_member * n_sample == 0 or n_edge == 0:
@@ -902,7 +902,7 @@ def _csr_matvec(
     if n_member * (n_sample if hub else n_sample_block) > _MAX_GRID_Y:
         if perm is not None:
             values = values.index_select(-1, perm)
-        return kernels_aten.csr_matvec(crow, col, values, x)
+        return kernels_torch.csr_matvec(crow, col, values, x)
 
     device_index = pattern.device.index
     if values.dtype != torch.float32:
@@ -969,7 +969,7 @@ def _csr_matvec(
 def csr_matvec(crow: Tensor, col: Tensor, values: Tensor, x: Tensor) -> Tensor:
     """``y[..., m] = sum_k values[..., k] * x[..., col[k]]`` over row ``m``.
 
-    Same contract as :func:`btorch.sparse.runtime.kernels_aten.csr_matvec`.
+    Same contract as :func:`btorch.sparse.runtime.kernels_torch.csr_matvec`.
     All samples and value-batch members are computed by one launch whose
     programs own a few rows for a block of samples and walk those rows a
     fixed number of entries at a time. There is no maximum row length: rows
@@ -1054,7 +1054,7 @@ def _edge_grad(
                 and n_member <= _MAX_GRID_Y
             )
     if not supported:
-        return kernels_aten.edge_grad(crow, col, grad, x, n_vb)
+        return kernels_torch.edge_grad(crow, col, grad, x, n_vb)
 
     out_shape = (*batch, n_edge)
     if n_edge == 0 or n_member == 0 or n_sample == 0:

@@ -1,7 +1,5 @@
 import torch
 
-from btorch import jit
-
 from .base import SurrogateFunctionBase
 
 
@@ -10,7 +8,6 @@ from .base import SurrogateFunctionBase
 _TRIANGLE_SCALE = 0.5
 
 
-@jit.script
 def _triangle_primitive(x: torch.Tensor, alpha: float) -> torch.Tensor:
     ax = 0.5 * alpha * x
     result = torch.where(
@@ -29,7 +26,6 @@ def _triangle_primitive(x: torch.Tensor, alpha: float) -> torch.Tensor:
     return result
 
 
-@jit.script
 def _triangle_derivative(
     x: torch.Tensor, grad_output: torch.Tensor, alpha: float, damping: float
 ) -> torch.Tensor:

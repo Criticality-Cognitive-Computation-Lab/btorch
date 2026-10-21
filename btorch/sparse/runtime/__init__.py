@@ -7,6 +7,7 @@ executed kernels, and the place where additional backends are registered.
 
 from .backend import BackendRegistry, KernelCache, registry, use_backend
 from .cache import RepresentationCache
+from .method import PropagationMethod, use_method
 from .ops import csr_propagate, pack_spikes, propagate, spike_propagate
 from .planner import Planner, planner
 
@@ -15,6 +16,7 @@ __all__ = [
     "BackendRegistry",
     "KernelCache",
     "Planner",
+    "PropagationMethod",
     "RepresentationCache",
     "csr_propagate",
     "pack_spikes",
@@ -23,4 +25,5 @@ __all__ = [
     "registry",
     "spike_propagate",
     "use_backend",
+    "use_method",
 ]

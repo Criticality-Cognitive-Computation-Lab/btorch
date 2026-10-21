@@ -1,46 +1,28 @@
-"""Triton CUDA kernels for source-driven (push) spike propagation.
+"""Reuse source-major Triton kernels for sparse push routes.
 
-Two kernels reproduce :func:`btorch.sparse.runtime.kernels_aten.spike_push`
-for float32 CUDA tensors; everything else falls back to the ATen reference.
+``spike_push`` consumes already-packed source IDs. Its persistent programs
+balance work per delivered edge using a prefix sum and binary source lookup.
+The device spike-list route in ``kernels_triton_spikelist`` reuses this same
+``push_packed`` kernel after device compaction; it does not implement another
+sparse product. All samples share one work range, whose length stays on device.
 
-``spike_push`` (packed input, the registered ``"spike_push"`` backend)
-    *Thread per gathered non-zero.* The out-edges of all active ``(sample,
-    source)`` pairs of the whole batch form one flat work range ``[0, W)``,
-    where ``W`` is the last element of the prefix sum of the active
-    out-degrees. A fixed number of persistent programs stride over blocks of
-    that range; every lane finds the active source owning its work position
-    with a vectorised binary search over the prefix sum, then performs one
-    ``atomic_add``. Work is therefore balanced per *edge*: a hub is split
-    across as many programs as it has blocks, and sources without out-edges
-    cost nothing. One launch covers every sample of the batch, and ``W`` is
-    read on the device, so no host synchronisation is added to the one
-    ``pack_spikes`` already paid.
+``spike_push_dense`` consumes dense activity. With prepared task values it
+executes the existing direct/hash task queues in ``kernels_triton_tasks``.
+Complete task routes require that preparation and reject missing state. The
+standalone low-level API also retains the tiled dense/hub kernel and its
+unsupported-input Torch fallback. Host packing in that low-level fallback is
+not used by the complete device spike-list route.
 
-``spike_push_dense`` (dense input, no packing)
-    *Compaction inside the kernel.* A fixed grid of programs covers every
-    ``(sample, tile of sources)``; a program loads its tile of ``x``, returns
-    if it is silent and otherwise pushes the out-edges of its active sources.
-    Sources with more than ``_HUB_DEGREE`` out-edges are skipped there and
-    served by a static list of *hub tasks* (one program per ``(sample, chunk
-    of a hub's out-edges)``) appended to the same grid, so long edge lists are
-    still split across programs. The grid depends on shapes only: there is no
-    ``nonzero``, no host round trip and no data-dependent launch, which makes
-    the kernel CUDA-graph friendly.
+All native push variants accumulate with floating-point atomics, so reduction
+order and results can vary within FP32 rounding. Sparse autograd is shared with
+pull: its input derivative remains a dense transposed product.
 
-Both kernels accumulate with float atomics: the summation order of the
-contributions to one destination is not deterministic, so results agree with
-the reference (and between two runs) only up to float32 rounding of the
-partial sums.
-
-Derived layouts (int32 copies of the source-major CSR, the hub task list) are
-memoised in the registry's :class:`~btorch.sparse.runtime.backend.KernelCache`;
-see :func:`_layout` for the invalidation rule.
-
-CUDA graphs: only the dense kernel can be captured (packing uses ``nonzero``,
-which synchronises). :func:`prepare` builds or refreshes the layout ahead of a
-capture; an in-place rewrite of the index buffers is absorbed in place, with
-unchanged addresses and launch arguments (see :class:`_Layout`), and
-:func:`layout_epoch` changes whenever that was not possible.
+Derived source-major layouts are owned by ``KernelCache``. ``prepare`` refreshes
+versioned topology outside execution; shape/address changes advance the layout
+epoch. Prepared task queues and device spike lists can be captured in CUDA
+graphs. The public host-packing helper itself cannot be captured. Persistent
+source-major values retain stable addresses for graph replay and are refreshed
+from canonical weights at trajectory preparation.
 """
 
 from __future__ import annotations
@@ -52,7 +34,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from . import kernels_aten, kernels_triton, kernels_triton_tasks
+from . import kernels_torch, kernels_triton, kernels_triton_tasks
 from .backend import BackendRegistry, KernelCache, registry as _default_registry
 
 
@@ -314,6 +296,8 @@ class _Layout:
     mean_degree: float
     epoch: int = 0  # stamp of the last allocation (see ``layout_epoch``)
     n_fill: int = 0  # times the buffers were (re)derived
+    source_values: Tensor | None = None  # optional spike-list read layout
+    source_value_epoch: int = 0
 
     def fill(self, t_crow: Tensor, t_col: Tensor, t_perm: Tensor) -> None:
         """(Re)derive every buffer from the canonical tensors, in place.
@@ -545,7 +529,7 @@ def _reference(
     if source_major_values:
         # Values already follow the source-major order: identity permutation.
         t_perm = torch.arange(t_col.shape[0], device=t_col.device)
-    return kernels_aten.spike_push(
+    return kernels_torch.spike_push(
         t_crow, t_col, t_perm, values, x, active_idx, ptr, n_out
     )
 
@@ -658,7 +642,7 @@ def spike_push_dense(
         else None
     )
     if layout is None or n_out > _INT32_MAX:
-        active_idx, ptr = kernels_aten.pack_spikes(x)
+        active_idx, ptr = kernels_torch.pack_spikes(x)
         return _reference(
             t_crow,
             t_col,
@@ -696,7 +680,7 @@ def spike_push(
     """Source-driven propagation of the packed non-zero inputs (Triton).
 
     Drop-in replacement of
-    :func:`btorch.sparse.runtime.kernels_aten.spike_push` for float32 CUDA
+    :func:`btorch.sparse.runtime.kernels_torch.spike_push` for float32 CUDA
     tensors; other inputs are forwarded to it. The whole batch is served by
     one launch. Accumulation uses float atomics, so the result matches the
     reference up to float32 rounding and is not bit-reproducible.

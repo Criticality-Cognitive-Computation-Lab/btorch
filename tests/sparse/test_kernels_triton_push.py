@@ -7,7 +7,7 @@ The kernels under test (``btorch.sparse.runtime.kernels_triton_push``) compute
 
 with float32 ``atomic_add``. Two references are used:
 
-- the ATen kernel ``kernels_aten.spike_push`` (the contract to reproduce), and
+- the ATen kernel ``kernels_torch.spike_push`` (the contract to reproduce), and
 - a float64 dense product ``x @ A.T`` on the CPU, built with a NumPy
   scatter-add that shares no code with ``btorch.sparse``.
 
@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 import torch
 
-from btorch.sparse.runtime import kernels_aten, kernels_triton_push as ktp
+from btorch.sparse.runtime import kernels_torch, kernels_triton_push as ktp
 from btorch.sparse.runtime.backend import BackendRegistry, KernelCache
 from btorch.sparse.runtime.cache import RepresentationCache
 
@@ -159,7 +159,7 @@ def run(mode, cache, values, x, kernel_cache, monkeypatch):
     if mode == "dense":
         return ktp.spike_push_dense(*args, N_DST, cache=kernel_cache)
     force_kernel(monkeypatch, mode)
-    active_idx, ptr = kernels_aten.pack_spikes(x)
+    active_idx, ptr = kernels_torch.pack_spikes(x)
     return ktp.spike_push(*args, active_idx, ptr, N_DST, cache=kernel_cache)
 
 
@@ -215,8 +215,8 @@ def test_matches_references(graph, kernel_cache, monkeypatch, mode, n_batch, kin
 
     # The ATen kernel is itself a float32 sum (in another order), so the two
     # may differ by twice the bound.
-    active_idx, ptr = kernels_aten.pack_spikes(x)
-    reference = kernels_aten.spike_push(
+    active_idx, ptr = kernels_torch.pack_spikes(x)
+    reference = kernels_torch.spike_push(
         cache.t_crow, cache.t_col, cache.t_perm, values, x, active_idx, ptr, N_DST
     )
     difference = (out - reference).abs().double().cpu().numpy()
@@ -288,7 +288,7 @@ def test_source_major_values(graph, kernel_cache, monkeypatch, mode, dtype):
         )
     else:
         force_kernel(monkeypatch, mode)
-        active_idx, ptr = kernels_aten.pack_spikes(x)
+        active_idx, ptr = kernels_torch.pack_spikes(x)
         out = ktp.spike_push(
             *args, active_idx, ptr, N_DST, source_major_values=True, cache=kernel_cache
         )
@@ -305,7 +305,7 @@ def test_fallback_for_unsupported_inputs(graph, kernel_cache):
     """
     cache, values, dense = graph
     x = make_input("sparse", 2).double()
-    active_idx, ptr = kernels_aten.pack_spikes(x)
+    active_idx, ptr = kernels_torch.pack_spikes(x)
     args = (cache.t_crow, cache.t_col, cache.t_perm, values.double(), x)
     out = ktp.spike_push(*args, active_idx, ptr, N_DST, cache=kernel_cache)
     assert out.dtype == torch.float64
@@ -318,7 +318,7 @@ def test_fallback_for_unsupported_inputs(graph, kernel_cache):
     # CPU tensors: same forwarding.
     cpu = [t.cpu() for t in (cache.t_crow, cache.t_col, cache.t_perm, values)]
     x_cpu = make_input("sparse", 2).cpu()
-    active_idx, ptr = kernels_aten.pack_spikes(x_cpu)
+    active_idx, ptr = kernels_torch.pack_spikes(x_cpu)
     out = ktp.spike_push(*cpu, x_cpu, active_idx, ptr, N_DST, cache=kernel_cache)
     assert out.device.type == "cpu"
     assert (dense.error(out, x_cpu) <= rounding_bound(dense, x_cpu)).all()
@@ -438,7 +438,7 @@ def test_views_sharing_an_address_are_not_confused(kernel_cache, monkeypatch, mo
         if mode == "dense":
             return ktp.spike_push_dense(*args, N_DST, cache=kernel_cache)
         force_kernel(monkeypatch, mode)
-        active_idx, ptr = kernels_aten.pack_spikes(x)
+        active_idx, ptr = kernels_torch.pack_spikes(x)
         return ktp.spike_push(*args, active_idx, ptr, N_DST, cache=kernel_cache)
 
     def expected(t_col):
@@ -466,7 +466,7 @@ def test_mismatched_sizes_and_index_types_fall_back(graph, kernel_cache, monkeyp
     """
     cache, values, dense = graph
     x = make_input("sparse", 3)
-    active_idx, ptr = kernels_aten.pack_spikes(x)
+    active_idx, ptr = kernels_torch.pack_spikes(x)
 
     def tripwire(*args, **kwargs):
         raise AssertionError("a Triton kernel was launched")
@@ -498,7 +498,7 @@ def test_non_contiguous_packed_indices(graph, kernel_cache, monkeypatch):
     """A strided view of the packed index list is read element by element."""
     cache, values, dense = graph
     x = make_input("sparse", 3)
-    active_idx, ptr = kernels_aten.pack_spikes(x)
+    active_idx, ptr = kernels_torch.pack_spikes(x)
     doubled = torch.stack([active_idx, torch.zeros_like(active_idx)], dim=1)
     view = doubled.reshape(-1)[::2]
     assert not view.is_contiguous() and torch.equal(view, active_idx)
@@ -543,16 +543,16 @@ def test_register_on_private_registry(graph):
     """
     cache, values, dense = graph
     registry = BackendRegistry()
-    registry.register("spike_push", "aten", kernels_aten.spike_push)
+    registry.register("spike_push", "torch", kernels_torch.spike_push)
     ktp.register(registry)
-    assert registry.available("spike_push", "cuda") == ["triton", "aten"]
+    assert registry.available("spike_push", "cuda") == ["triton", "torch"]
     # The pack-free kernel is offered under its own name.
     assert registry.available("spike_push_dense", "cuda") == ["triton"]
-    assert registry.available("spike_push", "cpu") == ["aten"]
+    assert registry.available("spike_push", "cpu") == ["torch"]
     assert registry.name("spike_push", "cuda") == "triton"
 
     x = make_input("sparse", 4)
-    active_idx, ptr = kernels_aten.pack_spikes(x)
+    active_idx, ptr = kernels_torch.pack_spikes(x)
     push = registry.resolve("spike_push", "cuda")
     out = push(
         cache.t_crow, cache.t_col, cache.t_perm, values, x, active_idx, ptr, N_DST

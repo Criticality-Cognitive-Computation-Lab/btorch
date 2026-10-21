@@ -1,6 +1,6 @@
 """Public cell backend extension and pure tensor sequence interfaces."""
 
-from .contracts import CellSpec, HistoryPlan
+from .contracts import CellSpec, HistoryPlan, PoissonOptions
 from .options import KernelOptions
 from .registry import (
     CellBackendEntry,
@@ -23,6 +23,7 @@ __all__ = [
     "HistoryPlan",
     "KernelOptions",
     "ModelTemplate",
+    "PoissonOptions",
     "cell_backend_names",
     "get_template",
     "register_cell_backend",

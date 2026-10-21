@@ -2,8 +2,6 @@ import math
 
 import torch
 
-from btorch import jit
-
 from .base import SurrogateFunctionBase
 
 
@@ -13,13 +11,11 @@ from .base import SurrogateFunctionBase
 _ERF_K = math.sqrt(math.log(2.0))  # ≈ 0.8326
 
 
-@jit.script
 def _erf_primitive(x: torch.Tensor, alpha: float) -> torch.Tensor:
     k: float = math.sqrt(math.log(2.0))  # sqrt(ln2) ≈ 0.8326
     return torch.special.erfc(-k * alpha * x) / 2.0
 
 
-@jit.script
 def _erf_derivative(
     x: torch.Tensor, grad_output: torch.Tensor, alpha: float, damping: float
 ) -> torch.Tensor:

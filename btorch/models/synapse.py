@@ -14,6 +14,7 @@ from .base import (
     MemoryModule,
     StepMode,
     flatten_neuron,
+    is_broadcastable,
     normalize_n_neuron,
     unflatten_neuron,
 )
@@ -438,6 +439,13 @@ class ConductancePSC(ExponentialPSC):
     degenerates to the current-based (``CUBA``) output ``I_syn = g``. The conductance
     state is still ``psc``, so reset/init and the recurrent machinery treat it as a PSC.
 
+    For a stateful Torch sequence, pass ``v_seq`` explicitly to
+    :meth:`multi_step_forward`. Each voltage is observed after that step's
+    conductance update. With ``backend="torch"``, omitting voltage retains the
+    inherited stateless convolution path. Native standalone execution uses the
+    stateful exponential adapter with or without voltage; it does not select
+    voltage-aware recurrent scheduling.
+
     Args:
         n_neuron: Number of post-synaptic neurons.
         tau_syn: Synaptic (conductance) time constant (ms).
@@ -466,9 +474,102 @@ class ConductancePSC(ExponentialPSC):
         return self.psc if v is None else self.psc * (self.E - v)
 
     def single_step_forward(self, z: Tensor, v: Tensor | None = None):
+        if self.backend != "torch":
+            from .kernels.adapters import conductance_sequence
+
+            voltage = None if v is None else v.unsqueeze(0)
+            return conductance_sequence(self, z.unsqueeze(0), voltage)[0]
         self.conductance_charge()
         self.adaptation_charge(z)
         return self.current_charge(v)
+
+    def multi_step_forward(
+        self,
+        z_seq: Tensor,
+        kernel_len: int = 64,
+        *,
+        v_seq: Tensor | None = None,
+    ) -> Tensor:
+        """Run a spike sequence with an optional post-synaptic voltage
+        sequence.
+
+        Supplying ``v_seq`` selects the stateful conductance path and is exactly
+        equivalent to calling :meth:`single_step_forward` once per timestep.
+        Its leading dimension must be ``T`` or ``1``; a length-one sequence is
+        broadcast over time. The remaining dimensions must broadcast to
+        ``(*batch, *n_neuron)`` without expanding that target shape.
+
+        With ``backend="torch"``, omitting ``v_seq`` preserves the inherited
+        stateless convolution from rest, including ``kernel_len`` truncation.
+        That legacy path neither reads nor updates ``psc`` or the delay history.
+        Native backends instead reuse their stateful exponential PSC adapter
+        and emit conductance when voltage is omitted.
+
+        Args:
+            z_seq: Presynaptic events with shape ``(T, *batch, n_source)``.
+            kernel_len: Kernel truncation used only when ``v_seq`` is omitted
+                with ``backend="torch"``.
+            v_seq: Post-synaptic voltage with leading length ``T`` or ``1``.
+
+        Returns:
+            Current sequence with shape ``(T, *batch, *n_neuron)``. With
+            ``v_seq``, each step returns ``g_t * (E - v_t)`` and the final
+            ``psc`` and delay history remain registered on this Module.
+
+        Raises:
+            ValueError: If ``v_seq`` has no time axis, has an incompatible time
+                length, or cannot broadcast to the post-synaptic output shape.
+        """
+        if v_seq is None:
+            if self.backend != "torch":
+                from .kernels.adapters import conductance_sequence
+
+                return conductance_sequence(self, z_seq)
+            return super().multi_step_forward(z_seq, kernel_len=kernel_len)
+        if v_seq.ndim == 0:
+            raise ValueError("v_seq must have a leading time dimension")
+
+        T = z_seq.shape[0]
+        if v_seq.shape[0] not in (1, T):
+            raise ValueError(
+                f"v_seq time length must be 1 or match z_seq ({T}), got "
+                f"{v_seq.shape[0]}"
+            )
+        if (
+            len(self.n_neuron) > 1
+            and tuple(z_seq.shape[-len(self.n_neuron) :]) == self.n_neuron
+        ):
+            leading = z_seq.shape[1 : -len(self.n_neuron)]
+        else:
+            leading = z_seq.shape[1:-1]
+        output_shape = (*leading, *self.n_neuron)
+        if not is_broadcastable(v_seq.shape[1:], output_shape):
+            raise ValueError(
+                f"v_seq step shape {tuple(v_seq.shape[1:])} must broadcast to "
+                f"post-synaptic shape {output_shape}"
+            )
+        if T == 0:
+            # Preserve the same dtype promotion and empty-output VJP as the
+            # ordinary COBA expression without advancing either memory.
+            padding = len(output_shape) - (v_seq.ndim - 1)
+            voltage = v_seq.reshape(
+                v_seq.shape[0], *((1,) * padding), *v_seq.shape[1:]
+            ).expand(0, *output_shape)
+            return self.psc * (self.E - voltage)
+        if self.backend != "torch":
+            from .kernels.adapters import conductance_sequence
+
+            return conductance_sequence(self, z_seq, v_seq)
+
+        static_voltage = v_seq.shape[0] == 1
+        return torch.stack(
+            [
+                self.single_step_forward(
+                    z_seq[t], v_seq[0] if static_voltage else v_seq[t]
+                )
+                for t in range(T)
+            ]
+        )
 
 
 class _Adaptive2VarPSC(BasePSC):

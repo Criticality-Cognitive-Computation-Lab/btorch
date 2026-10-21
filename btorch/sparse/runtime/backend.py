@@ -296,19 +296,6 @@ class BackendRegistry:
     kernels: KernelCache = field(default_factory=KernelCache)
 
     @property
-    def _override(self) -> str | None:
-        """Return the current context-local override.
-
-        This private compatibility property is retained for older callers and
-        tests. New code should use :attr:`override` or :meth:`snapshot`.
-        """
-        return self._override_state().name
-
-    @_override.setter
-    def _override(self, name: str | None) -> None:
-        self.set_backend(name)
-
-    @property
     def override(self) -> str | None:
         """Return the backend override active in the current context."""
         return self._override_state().name
@@ -342,7 +329,7 @@ class BackendRegistry:
 
         Args:
             kernel: Kernel name.
-            name: Backend name (``"aten"``, ``"triton"``, ...).
+            name: Backend name (``"torch"``, ``"triton"``, ...).
             fn: Implementation.
             device: Device type(s) the implementation supports.
             priority: Higher wins when several backends are available.
@@ -389,7 +376,7 @@ class BackendRegistry:
     ) -> None:
         """Register one complete route candidate.
 
-        A route is deliberately separate from legacy kernel registrations:
+        A route is separate from individual kernel registrations:
         the latter remain independently usable by the public low-level ops,
         while planning only sees complete route contracts.
         """
@@ -480,8 +467,7 @@ class BackendRegistry:
             )
         if not self._route_is_available(entry):
             raise RuntimeError(
-                f"Sparse route {snapshot.key!r} is unavailable on "
-                f"{snapshot.device!r}."
+                f"Sparse route {snapshot.key!r} is unavailable on {snapshot.device!r}."
             )
         callbacks: dict[str, Callable] = {}
         for kernel, backend in entry.spec.kernel_bindings:
@@ -767,7 +753,7 @@ def use_backend(name: str | None) -> Iterator[None]:
 
     Examples:
         >>> from btorch.sparse import runtime
-        >>> with runtime.use_backend("aten"):      # doctest: +SKIP
+        >>> with runtime.use_backend("torch"):      # doctest: +SKIP
         ...     y = conn(x)
     """
     previous = registry._override_state()

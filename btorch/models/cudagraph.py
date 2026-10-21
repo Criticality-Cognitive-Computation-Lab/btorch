@@ -75,6 +75,7 @@ loop's state mutation defeats. The runner refuses grad-recording calls up front
 rather than let them fail later and elsewhere.
 """
 
+import gc
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -291,6 +292,7 @@ class CudaGraphRunner:
         if torch.is_grad_enabled() and (
             any(a.requires_grad for a in args if torch.is_tensor(a))
             or any(p.requires_grad for p in module.parameters())
+            or any(b.requires_grad for b in module.buffers())
         ):
             raise RuntimeError(
                 "cudagraph=True is inference-only: each call rewrites the runner's "
@@ -352,9 +354,24 @@ class CudaGraphRunner:
         }
         set_hidden_states(module, {**snapshot, **static_state_in})
 
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            outputs = fn(*static_args, **kwargs)
+        # Completed runners and entries form reference cycles. Reclaiming one
+        # during an active capture resets its stream and invalidates the capture
+        # (``cudaErrorStreamCaptureInvalidated``). Collect stale graphs before
+        # recording, then suspend automatic cyclic GC until capture ends.
+        # Snapshot the caller's setting first so finalizers run by the explicit
+        # collection cannot change which state is restored.
+        gc_was_enabled = gc.isenabled()
+        gc.collect()
+        gc.disable()
+        try:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                outputs = fn(*static_args, **kwargs)
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+            else:
+                gc.disable()
 
         # After capture the module points at the graph's final-step tensors, and
         # replay writes to those same addresses -- keep them to re-point later.

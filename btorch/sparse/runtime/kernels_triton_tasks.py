@@ -99,16 +99,16 @@ class PreparedTaskState:
 
 @dataclass
 class TaskBinding:
-    """Task values and queue workspace owned by one execution context."""
+    """Task metadata and queue workspace associated with execution values."""
 
     task_state: PreparedTaskState
-    task_values: Tensor
     workspace: TaskQueueWorkspace
 
 
 @dataclass
 class _TaskStateCache:
-    """Prepared states and the persistent value buffers bound to them."""
+    """Prepared states and workspaces indexed by weak execution-value
+    references."""
 
     states: dict[tuple, PreparedTaskState] = field(default_factory=dict)
     bound_values: dict[tuple, tuple[weakref.ReferenceType, TaskBinding]] = field(
@@ -426,6 +426,7 @@ def _task_cache(cache: KernelCache) -> _TaskStateCache:
         if any(source() is None for source in state.sources):
             _unbind_state(task_cache, state)
             task_cache.states.pop(key, None)
+    _prune_bound_values(task_cache)
     return task_cache
 
 
@@ -678,11 +679,7 @@ def bind_values(
         packed_values.numel(),
         packed_values.dtype,
     )
-    _prune_bound_values(task_cache)
-    previous_binding = task_cache.bound_values.pop(binding_key, None)
-    if previous_binding is not None and previous_binding[1] is not state:
-        _prune_bound_values(task_cache)
-    task_binding = TaskBinding(state, packed_values, state.workspace)
+    task_binding = TaskBinding(state, state.workspace)
     task_cache.bound_values[binding_key] = (
         weakref.ref(packed_values),
         task_binding,
@@ -703,7 +700,7 @@ def create_task_values(
         device=task_values.device,
         dtype=task_values.dtype,
     )
-    task_binding = TaskBinding(task_state, task_values, workspace)
+    task_binding = TaskBinding(task_state, workspace)
     task_cache = _task_cache(cache)
     _remember_state(task_cache, task_state.layout_cache_key, task_state)
     binding_key = (
@@ -734,7 +731,6 @@ def state_for_values(
         packed_values.numel(),
         packed_values.dtype,
     )
-    _prune_bound_values(task_cache)
     binding = task_cache.bound_values.get(binding_key)
     if binding is None:
         return None
@@ -753,7 +749,6 @@ def state_for_values(
         )
     ):
         task_cache.bound_values.pop(binding_key, None)
-        _prune_bound_values(task_cache)
         return None
     return task_binding
 
@@ -786,11 +781,7 @@ def restore_binding(
         packed_values.numel(),
         packed_values.dtype,
     )
-    task_binding = TaskBinding(
-        task_state,
-        packed_values,
-        task_state.workspace,
-    )
+    task_binding = TaskBinding(task_state, task_state.workspace)
     task_cache.bound_values[binding_key] = (
         weakref.ref(packed_values),
         task_binding,

@@ -2,8 +2,6 @@ import math
 
 import torch
 
-from btorch import jit
-
 from .base import SurrogateFunctionBase
 
 
@@ -12,12 +10,10 @@ from .base import SurrogateFunctionBase
 # g(v_hw) = 0.5  =>  (alpha*v_hw)^2 = 1  =>  v_hw = 1/alpha.
 
 
-@jit.script
 def _atan_primitive(x: torch.Tensor, alpha: float) -> torch.Tensor:
     return 0.5 + torch.atan(alpha * x) / math.pi
 
 
-@jit.script
 def _atan_approx_primitive(x: torch.Tensor, alpha: float) -> torch.Tensor:
     z = alpha * x
     approx_a = 0.28
@@ -26,7 +22,6 @@ def _atan_approx_primitive(x: torch.Tensor, alpha: float) -> torch.Tensor:
     return 0.5 + atan_approx / math.pi
 
 
-@jit.script
 def _atan_derivative(
     x: torch.Tensor, grad_output: torch.Tensor, alpha: float, damping: float
 ) -> torch.Tensor:
@@ -34,7 +29,6 @@ def _atan_derivative(
     return grad_output * grad
 
 
-@jit.script
 def _atan_approx_derivative(
     x: torch.Tensor, grad_output: torch.Tensor, alpha: float, damping: float
 ) -> torch.Tensor:

@@ -47,7 +47,11 @@ We thank the developers of both libraries for the inspirations.
 
 ## Cell backends and external kernels
 
-Use `KernelOptions(cell="triton", connection="auto")` to select cell dynamics
+Surrogate functions use ordinary PyTorch autograd and `torch.compile`, without
+TorchScript. Native cells support Sigmoid, ATan, ATanApprox, Erf, SuperSpike,
+Triangle, and PoissonRandomSpike surrogate templates.
+
+Use `KernelOptions(neuron="triton", connection="auto")` to select cell dynamics
 independently of sparse propagation. Torch is the default; Triton is available
 with `pip install 'btorch[gpu]'`, and TileLang/CuPy are optional separate installs.
 Training versus simulation follows autograd inputs, including upstream encoders.
@@ -58,6 +62,12 @@ and gradients using the public parity helper. See the
 [OOT guide](docs/en/docs/guides/oot_kernels.md) and runnable examples
 [training](examples/kernel_backend_training.py) /
 [registration and generation](examples/oot_cell_backend.py).
+
+Submit large GPU parity and timing runs through Slurm, using a local launcher
+kept outside the repository. The scheduler assigns the GPU and a unique job
+log. See the [external parity workflow](benchmarks/models/002HIP_PARITY.md) for
+the local helper interface and reproducible 002HIP and benchmark-branch GLIF
+commands.
 
 ## Model and kernel generation with agents
 

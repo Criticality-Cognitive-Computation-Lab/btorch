@@ -991,6 +991,49 @@ except RuntimeError as err:
 `Hints` describe how a connection will be used. They do not change what is
 computed, only how the product is executed (see the note on rounding below).
 
+Execution method is independent of both hints and sparse storage format:
+
+```python
+connection = SparseConnection.from_adjacency(W, device="cuda", method="push")
+current = connection(spikes)  # spike-list SpMSpV, without a firing-rate hint
+connection.method = "pull"   # explicitly select destination-driven execution
+connection.method = "auto"   # restore hint-driven planning
+```
+
+`method="push"` specifically requests the device spike-list route; it does not
+select the older task/hash implementation. Explicit methods override activity
+hints, and unsupported combinations raise rather than silently choosing another
+method. Push currently requires CUDA/Triton FP32 with unbatched weights and
+nondeterministic accumulation. Construct on the target device when requesting it.
+For RSNNs, `KernelOptions(neuron="triton", connection_method="push")` supplies
+the same request. A `btorch.sparse.runtime.use_method("pull")` scope overrides
+both the RSNN and connection method temporarily; an `"auto"` setting inherits.
+The numerical sparse-array products (`A @ x`, `sparse.matvec`) remain independent
+reference operations; these execution options apply to the connection runtime.
+
+For low-activity spiking networks, supply `Hints(firing_rate_hz=4.0)` on the
+`SparseConnection`. On CUDA, a rate **strictly below 5 Hz** selects the existing
+Triton source-driven SpMSpV route. It compacts active source IDs on the device
+and reuses the packed, edge-balanced fanout kernel with source-major weights.
+Discovery scans neurons rather than every static edge task; this route does
+not use per-task destination hashing. Source-major weights are prepared once
+per recurrent trajectory, outside the timestep loop.
+Compiled calls that have no prepared source-major weight buffer still execute
+the spike-list route: the shared fanout kernel gathers canonical weights using
+the existing source-CSR permutation instead of silently falling back to pull.
+This also applies inside native `RecurrentNN` sequence execution: the recurrent
+operator uses the connection's prepared route and workspace. No separate CUDA
+C++ extension is needed. The hint does not change neuron dynamics or truncate
+spikes when actual activity is higher.
+
+The rate is in Hz, independent of the simulation timestep. It is a routing
+policy, not a conversion to spike probability per step. A low-rate CUDA hint
+takes precedence over `expected_density`; rates at or above 5 Hz leave density
+planning unchanged. CPU planning continues to use density. Deterministic
+execution, batched weights, unsupported dtypes, and explicit backend overrides
+retain their existing fallback rules. Inspect `conn.explain()` to see the
+selected implementation.
+
 ```python
 from btorch.sparse import Hints
 
@@ -1007,8 +1050,8 @@ built, moved to a device, or given new hints:
 | Algorithm | When it is planned | What it does |
 |---|---|---|
 | `"pull"` | no density hint; a hint above the limit of the device; a network batch of weights | Visits every edge: each target sums over its incoming edges. Deterministic. |
-| `"push"` | a hint at or below the limit, on a backend that compacts the spikes on the device (Triton on CUDA) | Visits only the outgoing edges of active sources, in one launch without host synchronisation. Used for every call, whatever the density of an individual input. |
-| `"adaptive-push"` | a hint at or below the limit, on the reference backend (CPU, or CUDA without Triton) | Packs the active sources on the host and visits only their outgoing edges. Each call whose input is denser than the limit falls back to pull. |
+| `"push"` | a hint at or below the limit, on a backend that compacts the spikes on the device (Triton on CUDA) | Visits only the outgoing edges of active sources using device kernels without a host count read. Used for every call, whatever the density of an individual input. |
+| `"adaptive-push"` | a hint at or below the limit, on the reference backend (CPU, or an explicit Torch override on CUDA) | Packs the active sources on the host and visits only their outgoing edges. Each call whose input is denser than the limit falls back to pull. |
 
 The limits are measured crossover points: 0.2 % on CPU and 2 % on CUDA. They
 are stored in `btorch.sparse.runtime.planner.push_max_density`.
@@ -1538,7 +1581,12 @@ modules are internal.
 
 A *kernel* is a low-level routine such as the CSR product; a *backend* is one
 implementation of it. The runtime picks the highest-priority available
-backend. The default backend `"aten"` uses only PyTorch and is the reference.
+backend. The general backend `"torch"` uses only PyTorch and is the CPU reference.
+`"cusparse"` explicitly selects native CUDA CSR products through PyTorch for
+FP32/FP64, reusing the same CSR implementation without gather/scatter fallback.
+It is a pull backend; it does not implement spike-list SpMSpV. Its weight VJP
+uses the shared PyTorch sampled edge-gradient routine. There is no `"aten"`
+backend alias.
 If `torch_sparse` is installed it is registered as an additional,
 lower-priority backend for the CSR product, and can be selected for a block of
 code:
@@ -1546,13 +1594,13 @@ code:
 ```python
 from btorch.sparse import runtime
 
-print(runtime.registry.available("csr_matvec", "cpu"))  # ['aten'] or ['aten', 'torch_sparse']
+print(runtime.registry.available("csr_matvec", "cpu"))  # ['torch'] or ['torch', 'torch_sparse']
 
-with runtime.use_backend("aten"):
+with runtime.use_backend("torch"):
     y = per_edge(torch.rand(5, 6))
 ```
 
-`use_backend` is a process-wide override meant for debugging and benchmarks.
+`use_backend` is a context-local override meant for debugging and benchmarks.
 A backend that does not implement a kernel is skipped for that kernel. A name
 that no kernel knows raises a `ValueError` listing the registered backends.
 
@@ -1573,12 +1621,13 @@ On a GPU, the kernels have a second implementation written in
 | `"spike_push_dense"` | the source-driven ("push") product that compacts the spikes on the device |
 
 The backend is available when the `triton` package can be imported and CUDA is
-present. It then has a higher priority than `"aten"`, so it is the default on
+present. It then has a higher priority than `"cusparse"` and `"torch"`, so it is the default on
 CUDA and nothing has to be selected. The Triton kernels handle `float32` data
 only. For every other dtype they call the ATen kernel themselves, without a
-message; `conn.explain()` still reports `triton` in that case. `"aten"`
-remains the fallback when Triton is missing, the default on CPU, and the
-reference the Triton kernels are tested against.
+message; `conn.explain()` still reports `triton` in that case. When Triton is
+missing, native CUDA FP32/FP64 pull uses `"cusparse"`; `"torch"` remains the
+general fallback, the default on CPU, and the reference the Triton kernels
+are tested against.
 
 ```python
 print(runtime.registry.available("csr_matvec", "cuda"))  # best first
@@ -1589,10 +1638,10 @@ if torch.cuda.is_available():
 
     xg = torch.rand(5, 6, device="cuda")
     y_default = gpu_conn(xg)
-    with runtime.use_backend("aten"):  # force the reference kernels
-        assert runtime.registry.name("csr_matvec", "cuda") == "aten"
-        y_aten = gpu_conn(xg)
-    assert torch.allclose(y_default, y_aten, atol=1e-5)
+    with runtime.use_backend("cusparse"):  # force native CUDA CSR products
+        assert runtime.registry.name("csr_matvec", "cuda") == "cusparse"
+        y_cusparse = gpu_conn(xg)
+    assert torch.allclose(y_default, y_cusparse, atol=1e-5)
 ```
 
 The connection keeps its prepared route until planning inputs change.
@@ -1600,9 +1649,10 @@ Entering or leaving `use_backend` invalidates that route, so the next call
 replans an existing connection; `conn.explain()` reports the backend that
 would run under the current override.
 
-With the Triton push kernel a density-hinted connection is planned as
-`"push"`; without it (CPU, or CUDA without Triton) as `"adaptive-push"`. The
-differences between the two are listed under
+A supported Triton route uses device `"push"` for a low-density hint. CPU
+reference routing uses `"adaptive-push"`; an explicit Torch override can also
+select that reference route on CUDA. Automatic CUDA planning falls back to
+`"pull"` when no supported device push route exists. The differences are listed under
 [Performance hints](#performance-hints-and-explain).
 
 ## Migration from `SparseConn`

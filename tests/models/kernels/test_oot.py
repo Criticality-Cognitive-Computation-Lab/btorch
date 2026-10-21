@@ -261,7 +261,7 @@ def test_public_parity_uses_original_python_models(model):
     # including charged-state losses, multiple adaptation modes and every
     # participating parameter. This is the same golden used by OOT authors.
     from btorch.models.kernels.templates import get_template
-    from tests.models.kernels.test_reference import cell_inputs
+    from tests.models.kernels.helpers import cell_inputs
 
     torch.manual_seed(41)
     spec, x, states, parameters = cell_inputs(model)

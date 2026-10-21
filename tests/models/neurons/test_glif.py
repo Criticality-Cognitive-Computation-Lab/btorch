@@ -173,6 +173,56 @@ def test_exact_no_spike_composes_by_assigning_the_last_time_point():
     torch.testing.assert_close(second_leg, one_leg)
 
 
+def test_exact_no_spike_explicit_v_rest_with_asc_matches_ode_and_continues():
+    """Use explicit ``v_rest`` in the closed form and preserve its semigroup.
+
+    The membrane steady state is ``v_rest + x * tau / c_m``.  This test keeps
+    ``v_reset`` different from ``v_rest`` and uses non-zero ASC so the helper
+    validates both the resting-potential term and the coupled ASC contribution.
+    The second assertion treats the first exact endpoint as a continuation
+    state and compares it with one direct exact evaluation.
+    """
+    neuron = GLIF3(
+        2,
+        v_threshold=-40.0,
+        v_reset=-70.0,
+        v_rest=-58.0,
+        c_m=2.5,
+        tau=17.0,
+        k=[0.11, 0.29],
+        asc_amps=[-0.4, 0.2],
+        dtype=torch.float64,
+    )
+    init_net_state(neuron, dtype=torch.float64)
+    v0 = torch.tensor([-54.0, -51.0], dtype=torch.float64)
+    iasc0 = torch.tensor([[0.8, -0.3], [0.2, 0.6]], dtype=torch.float64)
+    x = torch.tensor([0.7, 1.1], dtype=torch.float64)
+    times = torch.tensor([0.0, 1.5, 3.0, 7.0], dtype=torch.float64)
+
+    actual_v, actual_iasc = neuron.forward_exact_no_spike(x, times, v0=v0, Iasc0=iasc0)
+    exp_m = torch.exp(-times[:, None] / neuron.tau)
+    exp_asc = torch.exp(-times[:, None, None] * neuron.k)
+    v_inf = neuron.v_rest + x * neuron.tau / neuron.c_m
+    gap = 1.0 / neuron.tau[..., None] - neuron.k
+    expected_v = (
+        v_inf
+        + (v0 - v_inf) * exp_m
+        + (iasc0 / neuron.c_m[..., None] * (exp_asc - exp_m[..., None]) / gap).sum(-1)
+    )
+    expected_iasc = iasc0 * exp_asc
+    torch.testing.assert_close(actual_v, expected_v, atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(actual_iasc, expected_iasc, atol=1e-12, rtol=1e-12)
+
+    neuron.v, neuron.Iasc = actual_v[2], actual_iasc[2]
+    continued_v, continued_iasc = neuron.forward_exact_no_spike(x, t=4.0)
+    # Continuing four more milliseconds from t=3 must reach the same endpoint
+    # as the independently calculated seven-millisecond trajectory.
+    torch.testing.assert_close(continued_v[0], expected_v[3], atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(
+        continued_iasc[0], expected_iasc[3], atol=1e-12, rtol=1e-12
+    )
+
+
 @pytest.mark.parametrize(
     ("x_shape", "t", "batch", "n_time"),
     [

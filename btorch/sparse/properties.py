@@ -5,6 +5,7 @@ rely on (for example that indices are sorted). Hints are expectations
 about how the object will be used; they never change results.
 """
 
+import math
 from dataclasses import dataclass, replace
 
 import torch
@@ -50,8 +51,8 @@ class Properties:
 class Hints:
     """Performance expectations; advisory only.
 
-    Only ``expected_density`` is consulted by the planner today; the other
-    two are accepted and reserved.
+    Density and firing rate guide propagation planning; call and batch counts
+    are reserved.
 
     Args:
         expected_calls: How many products the object will take part in
@@ -60,6 +61,11 @@ class Hints:
             ``[0, 1]``.
         expected_batch: Expected number of right-hand sides per call
             (reserved).
+        firing_rate_hz: Expected per-neuron firing rate in Hz. On CUDA, a
+            rate strictly below 5 Hz requests source-driven spike-list SpMSpV.
+            This is a routing policy, not a conversion to per-step density;
+            no timestep is assumed. Determinism and layout constraints still
+            apply. An explicit low-rate hint takes precedence over density.
 
     Raises:
         ValueError: If a value is out of range.
@@ -68,8 +74,19 @@ class Hints:
     expected_calls: int | None = None
     expected_density: float | None = None
     expected_batch: int | None = None
+    firing_rate_hz: float | None = None
 
     def __post_init__(self) -> None:
+        rate = self.firing_rate_hz
+        if rate is not None and (
+            isinstance(rate, bool)
+            or not isinstance(rate, (int, float))
+            or not math.isfinite(rate)
+            or rate < 0
+        ):
+            raise ValueError(
+                f"firing_rate_hz must be finite and non-negative, got {rate!r}."
+            )
         density = self.expected_density
         if density is not None and not (
             isinstance(density, (int, float)) and 0.0 <= density <= 1.0

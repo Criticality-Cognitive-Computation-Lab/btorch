@@ -26,7 +26,7 @@ def run_example(backend: str = "torch", device: str = "cpu"):
     model = RecurrentNN(
         LIF(4, v_threshold=0.6, trainable_param={"tau"}, device=device),
         AlphaPSC(4, tau_syn=2.0, linear=connection),
-        backend=KernelOptions(cell=backend),
+        backend=KernelOptions(neuron=backend),
         update_state_names=("neuron.v", "synapse.psc"),
     )
     functional.init_net_state(model, batch_size=2, device=device, dtype=torch.float32)

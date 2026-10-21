@@ -16,7 +16,7 @@ from btorch.sparse import runtime
 from btorch.sparse.runtime import (
     BackendRegistry,
     RepresentationCache,
-    kernels_aten,
+    kernels_torch,
     ops,
 )
 from tests.sparse.helpers import DEVICES
@@ -153,7 +153,7 @@ def test_row_index_memo_is_not_keyed_by_memory_address():
     x = torch.randn(3, N, dtype=torch.float64)
     grad = torch.randn(3, M, dtype=torch.float64)
     full = grad.T @ x  # dense dL/dA; the value gradient is its stored entries
-    with runtime.use_backend("aten"):
+    with runtime.use_backend("torch"):
         for seed in (0, 1):  # two patterns with the same number of entries
             (crow, col, *_), _ = make_layout(seed)
             row = torch.repeat_interleave(torch.arange(M), crow.diff())
@@ -215,7 +215,7 @@ def test_non_contiguous_values(layout, device):
     buffers, _, x = make_sample("batch", device)
     values = NON_CONTIGUOUS[layout](buffers[2])
     assert not values.is_contiguous()
-    with runtime.use_backend("aten"):
+    with runtime.use_backend("torch"):
         out = propagate(buffers, x, values)
         expected = propagate(buffers, x, values.contiguous())
     torch.testing.assert_close(out, expected)
@@ -395,26 +395,26 @@ def test_registry_priority_availability_and_override():
     # The global registry: ``use_backend`` forces a backend inside the block
     # and restores the previous choice afterwards, also when the block raises.
     registry = runtime.registry
-    assert registry.name("csr_matvec", "cpu") == "aten"  # the reference backend
+    assert registry.name("csr_matvec", "cpu") == "torch"  # the reference backend
     with pytest.raises(KeyError), runtime.use_backend("torch_sparse"):
-        assert registry._override == "torch_sparse"
+        assert registry.override == "torch_sparse"
         raise KeyError("boom")
-    assert registry._override is None
-    assert registry.name("csr_matvec", "cpu") == "aten"
+    assert registry.override is None
+    assert registry.name("csr_matvec", "cpu") == "torch"
 
 
 @pytest.mark.skipif(
-    not kernels_aten.torch_sparse_available(), reason="torch_sparse not installed"
+    not kernels_torch.torch_sparse_available(), reason="torch_sparse not installed"
 )
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("name", SAMPLES)
-def test_torch_sparse_backend_equals_aten(name, device):
+def test_torch_sparse_backend_equals_reference(name, device):
     """The optional legacy backend is selectable and numerically identical,
     forward and backward (the backward goes through the same kernel)."""
     buffers, dense, x = make_sample(name, device, requires_grad=True)
     registry = runtime.registry
     defaults = [registry.name(k, device) for k in ("csr_matvec", "edge_grad")]
-    with runtime.use_backend("aten"):
+    with runtime.use_backend("torch"):
         reference = propagate(buffers, x)
         g_ref = torch.autograd.grad(reference.sum(), (buffers[2], x))
     with runtime.use_backend("torch_sparse"):

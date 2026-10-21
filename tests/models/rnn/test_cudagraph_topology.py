@@ -74,7 +74,7 @@ def _noop_move_changes_version() -> bool:
     using ``cudagraph`` at all).
     """
     pre, post, weight = _edges(seed=0)
-    conn = SparseConnection.from_edges(pre, post, N, N, values=weight)
+    conn = SparseConnection.from_edges(pre, post, N, N, values=weight, device=DEVICE)
     before = conn.capture_version
     conn.to(device=None, dtype=None)
     return conn.capture_version != before
@@ -97,20 +97,20 @@ def _assert_replayed(runner: CudaGraphRunner, n_captures: int) -> None:
     assert runner.n_captures == n_captures
 
 
-@pytest.fixture(params=["aten", None], ids=["aten", "default-backend"])
+@pytest.fixture(params=["cusparse", None], ids=["cusparse", "default-backend"])
 def backend(request):
     """Run the whole test under one sparse kernel backend.
 
     The two backends go stale for *different* reasons, so both are covered:
 
-    * ``aten`` reads the connection's CSR buffers directly (those are rewritten
+    * ``cusparse`` reads the connection's CSR buffers directly (those are rewritten
       in place and would survive a replay), but after rewiring the forward takes
       a new python branch -- a weight ``index_select`` through the slot
       permutation -- that the old graph never recorded.
     * the default backend (Triton when installed) additionally keeps derived
       device buffers of its own that only host-side code refreshes.
 
-    ``use_backend`` is process-global state, hence a fixture around the test body
+    ``use_backend`` is scoped state, hence a fixture around the test body
     (connection construction included: the execution plan is made at build time).
     """
     with use_backend(request.param):
@@ -131,8 +131,9 @@ def _edges(seed: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
 def _connection(seed: int, **kwargs) -> SparseConnection:
     pre, post, weight = _edges(seed)
-    conn = SparseConnection.from_edges(pre, post, N, N, values=weight, **kwargs)
-    return conn.to(DEVICE)
+    return SparseConnection.from_edges(
+        pre, post, N, N, values=weight, device=DEVICE, **kwargs
+    )
 
 
 def _network(linear: nn.Module, **rnn_kwargs) -> RecurrentNN:
@@ -346,7 +347,7 @@ def test_capture_version_tracks_backend_override_context():
     with use_backend(None):
         conn = _connection(seed=0)
         automatic = conn.capture_version
-        with use_backend("aten"):
+        with use_backend("torch"):
             assert conn.capture_version != automatic
         assert conn.capture_version != automatic
 
@@ -360,7 +361,7 @@ def test_capture_version_tracks_deterministic_mode():
         nondeterministic = conn.capture_version
         torch.use_deterministic_algorithms(True)
         assert conn.capture_version != nondeterministic
-        with use_backend("aten"):
+        with use_backend("torch"):
             conn(torch.zeros(48, device="cuda"))
             assert "algorithm = pull" in conn.explain()
     finally:
@@ -409,7 +410,7 @@ def test_host_packed_connection_is_refused():
     refused up front with the connection's own explanation instead of
     replaying capture-time spikes.
     """
-    with use_backend("aten"):  # the reference backend has no device compaction
+    with use_backend("torch"):  # the reference backend has no device compaction
         conn = _connection(seed=0, hints=Hints(expected_density=0.01))
         reason = conn.capture_incompatibility()
         if reason is None:
@@ -483,7 +484,8 @@ def test_changed_capture_version_of_any_submodule_recaptures():
     runner = graphed._cudagraph_runner
     drive = _drive()
 
-    assert capture_versions(graphed) == (0,)
+    versions_before = capture_versions(graphed)
+    assert graphed.neuron_inp_module.capture_version == 0
     assert torch.equal(_run(graphed, drive)[0], _run(eager, drive)[0])
     assert torch.equal(_run(graphed, drive)[0], _run(eager, drive)[0])
     assert runner.n_captures == 1
@@ -492,7 +494,8 @@ def test_changed_capture_version_of_any_submodule_recaptures():
     # graphed twin would keep multiplying by the captured 1.0.
     eager.neuron_inp_module.set_gain(-0.5)
     graphed.neuron_inp_module.set_gain(-0.5)
-    assert capture_versions(graphed) == (1,)
+    assert graphed.neuron_inp_module.capture_version == 1
+    assert capture_versions(graphed) != versions_before
     old = _run(_dense_network(_HostGain()), drive)[0]
     new = _run(eager, drive)[0]
     assert (old != new).sum() > 100
@@ -550,25 +553,33 @@ def test_reported_incompatibility_refuses_capture():
         _run(graphed, drive)
 
 
-def test_tree_without_participants_behaves_as_before():
-    """No submodule opts in -> no versions, no extra capture, and in-place
-    parameter updates (here a full ``load_state_dict``) are still picked up by
-    plain replays, as they always were."""
+def test_network_backend_participant_preserves_parameter_replay():
+    """A stable backend version permits parameter replacement by plain replay.
+
+    ``RecurrentNN`` participates because changing its execution backend changes
+    captured topology. Replacing tensors' values through ``load_state_dict``
+    leaves that backend choice unchanged, and replay must read the new values.
+    """
     eager = _dense_network()
     graphed = _dense_network(cudagraph=True)
     runner = graphed._cudagraph_runner
     drive = _drive()
 
-    assert capture_versions(graphed) == ()
+    versions = capture_versions(graphed)
+    assert graphed.capture_version in versions
     assert capture_incompatibilities(graphed) == {}
     for _ in range(3):
         assert torch.equal(_run(graphed, drive)[0], _run(eager, drive)[0])
     assert runner.n_captures == 1
 
+    old = _run(eager, drive)[0]
     state = {k: v * -2.0 for k, v in eager.synapse.linear.state_dict().items()}
     eager.synapse.linear.load_state_dict(state)
     graphed.synapse.linear.load_state_dict(state)
-    assert torch.equal(_run(graphed, drive)[0], _run(eager, drive)[0])
+    assert capture_versions(graphed) == versions
+    new = _run(eager, drive)[0]
+    assert (old != new).sum() > 100
+    assert torch.equal(_run(graphed, drive)[0], new)
     assert runner.n_captures == 1
 
 

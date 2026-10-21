@@ -2,7 +2,7 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
-from btorch import config, jit
+from btorch import config
 
 
 try:
@@ -18,5 +18,4 @@ except PackageNotFoundError:
 __all__ = [
     "__version__",
     "config",
-    "jit",
 ]

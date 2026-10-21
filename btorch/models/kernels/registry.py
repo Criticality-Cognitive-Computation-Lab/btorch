@@ -3,7 +3,7 @@
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from importlib import import_module
+from functools import partial
 
 import torch
 
@@ -29,7 +29,8 @@ class CellBackendEntry:
     revision: int = 1
 
 
-_BUILTINS = ("torch", "triton", "tilelang", "cupy")
+_NATIVE_GPU_BACKENDS = ("triton", "tilelang", "cupy")
+_BUILTINS = ("torch", *_NATIVE_GPU_BACKENDS)
 _entries: dict[str, CellBackendEntry] = {}
 
 
@@ -134,15 +135,19 @@ def resolve_cell_backend(
             raise ValueError(
                 f"Unknown cell backend {name!r}; known: {cell_backend_names()}"
             )
-        path = ".torch_backend" if name == "torch" else f".backends.{name}"
-        module = import_module(path, package=__package__)
-        forward = getattr(module, "forward", None)
-        backward = getattr(module, "backward", None)
         if name == "torch":
-            forward, backward = module.forward_sequence, module.backward_sequence
-        entry = CellBackendEntry(
-            name, forward, backward, getattr(module, "supports", None)
-        )
+            from .torch_backend import backward_sequence, forward_sequence
+
+            entry = CellBackendEntry(name, forward_sequence, backward_sequence)
+        else:
+            from .backends import engine
+
+            entry = CellBackendEntry(
+                name,
+                partial(engine.forward, name),
+                partial(engine.backward, name),
+                engine.supports,
+            )
         _entries[name] = entry
     device = torch.device(device)
     if entry.supports is not None and not entry.supports(spec, device):

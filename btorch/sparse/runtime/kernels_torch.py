@@ -1,4 +1,4 @@
-"""Reference kernels built from stock PyTorch (ATen) operations.
+"""Reference kernels built from stock PyTorch operations.
 
 They run on every device and dtype and define the semantics every other
 backend must reproduce. Conventions shared by all kernels:
@@ -124,6 +124,21 @@ def csr_matvec(crow: Tensor, col: Tensor, values: Tensor, x: Tensor) -> Tensor:
         [_csr_mm(crow, col, values[g], x[g], n_out) for g in range(values.shape[0])]
     )
     return out.reshape(*batch, *sample, n_out)
+
+
+def csr_matvec_cusparse(crow: Tensor, col: Tensor, values: Tensor, x: Tensor) -> Tensor:
+    """Apply native CUDA CSR products through PyTorch's cuSPARSE integration.
+
+    Reuse the reference's native CSR implementation, including batched
+    sample and shared-pattern weight handling. Reject configurations
+    that would select its gather/scatter fallback, so an explicit
+    cuSPARSE request stays explicit.
+    """
+    if values.device.type != "cuda" or x.device.type != "cuda":
+        raise ValueError("The cusparse backend requires CUDA tensors")
+    if torch.promote_types(values.dtype, x.dtype) not in _NATIVE_CSR_DTYPES:
+        raise ValueError("The cusparse backend requires FP32 or FP64 products")
+    return csr_matvec(crow, col, values, x)
 
 
 def edge_grad(crow: Tensor, col: Tensor, grad: Tensor, x: Tensor, n_vb: int) -> Tensor:
@@ -273,7 +288,8 @@ def csr_matvec_torch_sparse(
 ) -> Tensor:
     """``csr_matvec`` through the optional ``torch_sparse`` package.
 
-    Kept as a selectable legacy backend; nothing depends on it.
+    Select this optional implementation independently of the built-in
+    backends.
     """
     if values.ndim != 1:
         return csr_matvec(crow, col, values, x)

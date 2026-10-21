@@ -10,13 +10,14 @@ keeps the tests focused on the implementation's important contracts:
   batch; and
 * an in-place topology rewrite refreshes task metadata and its epoch.
 
-The module is skipped until the task backend is present. It is intentionally
-not a CPU reference test: PR70's queue and hash kernels are CUDA/Triton code.
+The module requires CUDA/Triton; optional dependencies may be absent on CPU
+installations. Tests use the implemented task-state and workspace declarations.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import gc
+import weakref
 from dataclasses import fields, is_dataclass
 from typing import Any
 
@@ -24,19 +25,17 @@ import numpy as np
 import pytest
 import torch
 
-from btorch.sparse.runtime import kernels_aten, kernels_triton_push
+from btorch.sparse.runtime import (
+    kernels_torch,
+    kernels_triton_push,
+    kernels_triton_tasks as task_kernels,
+)
 from btorch.sparse.runtime.backend import KernelCache
 from btorch.sparse.runtime.cache import RepresentationCache
 
 
-task_kernels = pytest.importorskip(
-    "btorch.sparse.runtime.kernels_triton_tasks",
-    reason="the PR70 task-queue backend is not installed yet",
-)
-
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not getattr(task_kernels, "_available", lambda: False)(),
+    not torch.cuda.is_available() or not task_kernels._available(),
     reason="needs CUDA and Triton",
 )
 
@@ -130,8 +129,8 @@ def _aten_reference(graph: dict[str, Any], spikes: torch.Tensor) -> torch.Tensor
     """Reference source-driven result using the existing ATen
     implementation."""
     representation = graph["representation"]
-    active, ptr = kernels_aten.pack_spikes(spikes)
-    return kernels_aten.spike_push(
+    active, ptr = kernels_torch.pack_spikes(spikes)
+    return kernels_torch.spike_push(
         representation.t_crow,
         representation.t_col,
         representation.t_perm,
@@ -181,11 +180,6 @@ def _tensor_data_ptrs(value: Any) -> set[int]:
     """Collect tensor addresses from a task state or workspace dataclass."""
     if torch.is_tensor(value):
         return {value.data_ptr()}
-    if isinstance(value, Mapping):
-        pointers: set[int] = set()
-        for child in value.values():
-            pointers.update(_tensor_data_ptrs(child))
-        return pointers
     if is_dataclass(value) and not isinstance(value, type):
         pointers = set()
         for field in fields(value):
@@ -197,36 +191,6 @@ def _tensor_data_ptrs(value: Any) -> set[int]:
             pointers.update(_tensor_data_ptrs(child))
         return pointers
     return set()
-
-
-def _workspace(value: Any) -> Any:
-    """Return the explicitly named workspace when the state exposes one."""
-    if isinstance(value, Mapping):
-        return value.get("workspace", value)
-    return getattr(value, "workspace", value)
-
-
-def _capacity(value: Any) -> int | None:
-    """Read the PR70 queue capacity without prescribing a state container."""
-    candidate = _workspace(value)
-    for name in ("queue_capacity", "capacity", "workspace_capacity"):
-        capacity = getattr(candidate, name, None)
-        if capacity is not None:
-            return int(capacity)
-        if isinstance(candidate, Mapping) and name in candidate:
-            return int(candidate[name])
-    return None
-
-
-def _epoch(value: Any) -> int | None:
-    """Read the task-layout epoch exposed by the prepared state."""
-    for name in ("epoch", "layout_epoch", "topology_epoch"):
-        epoch = getattr(value, name, None)
-        if epoch is not None:
-            return int(epoch)
-        if isinstance(value, Mapping) and name in value:
-            return int(value[name])
-    return None
 
 
 @pytest.fixture()
@@ -441,16 +405,12 @@ def test_workspace_reuses_storage_and_grows_for_a_larger_batch(graph, kernel_cac
     second = _prepare(graph, kernel_cache, batch_size=1)
     assert first is second
     assert first.layout_version == second.layout_version
-    assert _tensor_data_ptrs(_workspace(first)) == _tensor_data_ptrs(_workspace(second))
+    assert _tensor_data_ptrs(first.workspace) == _tensor_data_ptrs(second.workspace)
 
-    first_capacity = _capacity(first)
-    if first_capacity is None:
-        pytest.skip("task state does not expose queue capacity")
-
-    larger_batch = max(2, first_capacity + 1)
+    larger_batch = 2
     grown = _prepare(graph, kernel_cache, batch_size=larger_batch)
-    grown_capacity = _capacity(grown)
-    assert grown_capacity is not None and grown_capacity >= larger_batch
+    assert grown.workspace.queue_capacity >= larger_batch * grown.task_count
+    assert grown.workspace.queue_capacity > first.workspace.queue_capacity
     assert grown is not first
     assert grown.layout_version != first.layout_version
     assert _prepare(graph, kernel_cache, batch_size=1) is grown
@@ -475,9 +435,7 @@ def test_inplace_topology_refresh_updates_task_layout_and_epoch(graph, kernel_ca
         id(getattr(representation, name)) for name in RepresentationCache._NAMES
     )
     state_before = _prepare(graph, kernel_cache, batch_size=graph["spikes"].shape[0])
-    epoch_before = _epoch(state_before)
-    if epoch_before is None:
-        pytest.skip("task state does not expose a layout epoch")
+    epoch_before = state_before.layout_version
     assert (
         task_kernels.layout_epoch(
             kernel_cache,
@@ -507,7 +465,7 @@ def test_inplace_topology_refresh_updates_task_layout_and_epoch(graph, kernel_ca
     )
 
     state_after = _prepare(updated, kernel_cache, batch_size=updated["spikes"].shape[0])
-    epoch_after = _epoch(state_after)
+    epoch_after = state_after.layout_version
     assert epoch_after != epoch_before
     assert (
         task_kernels.layout_epoch(
@@ -527,7 +485,7 @@ def test_inplace_topology_refresh_updates_task_layout_and_epoch(graph, kernel_ca
 def test_bounded_hash_probe_fallback_preserves_colliding_edges(
     monkeypatch, kernel_cache
 ):
-    """When available, bounded probing must spill rather than drop an edge."""
+    """Bounded probing must spill rather than drop a colliding edge."""
     monkeypatch.setattr(task_kernels, "_HASH_CAPACITY", 2)
     monkeypatch.setattr(task_kernels, "_HASH_MAX_PROBE", 1)
     graph = _graph()
@@ -536,5 +494,32 @@ def test_bounded_hash_probe_fallback_preserves_colliding_edges(
     hub_destinations = set(graph["destination"][8:].tolist())
     assert len(hub_destinations) > 2
     assert all((destination * 2654435761) & 1 == 0 for destination in hub_destinations)
+    actual = _run_task(graph, state, kernel_cache)
+    _assert_matches_references(graph, actual, silent_rows=(1,))
+
+
+def test_independent_task_values_release_their_workspace(graph, kernel_cache):
+    """Dropping a concurrent execution must release its private GPU storage."""
+    state = _prepare(graph, kernel_cache, batch_size=4)
+    values = task_kernels.create_task_values(kernel_cache, state, graph["csr_values"])
+    representation = graph["representation"]
+    binding = task_kernels.state_for_values(
+        kernel_cache,
+        values,
+        representation.t_crow,
+        representation.t_col,
+        representation.t_perm,
+    )
+    assert binding is not None
+    value_reference = weakref.ref(values)
+    workspace_reference = weakref.ref(binding.workspace.direct_queue)
+    del binding, values
+    gc.collect()
+    assert value_reference() is None
+    # The next cache access must prune the now-unowned execution workspace,
+    # while keeping the shared topology state usable for another trajectory.
+    assert _prepare(graph, kernel_cache, batch_size=4) is state
+    gc.collect()
+    assert workspace_reference() is None
     actual = _run_task(graph, state, kernel_cache)
     _assert_matches_references(graph, actual, silent_rows=(1,))

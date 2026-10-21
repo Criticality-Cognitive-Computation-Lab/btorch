@@ -423,36 +423,44 @@ frozen at capture time. Weights are read at replay time and may change.
 
 ## 9. Runtime backends
 
-| Kernel | ATen (reference, all devices) | Triton (CUDA) |
+| Kernel / route | Torch reference | Triton (CUDA) |
 |---|---|---|
-| `csr_matvec` (pull, also the transposed product of the input gradient) | `torch.sparse` CSR product; gather / `index_add` for dtypes without one | row-block tiles over `(rows, samples)`, hub rows cut into segments, one writer per output: deterministic |
-| `edge_grad` (value gradient) | chunked gather-multiply | one launch over entry blocks, no `[B, E]` temporary |
-| `spike_push` (packed events) | expand active sources into out-edges, `index_add` | thread per delivered edge with a binary search over the prefix sum of active degrees, float atomics |
-| `spike_push_dense` (device compaction) | – | fixed grid of 64-source tiles, silent tiles exit after one load; long out-edge lists as static chunks; no host sync |
+| `csr_matvec` (pull and transposed input gradient) | native CSR product where supported; gather / `index_add` otherwise | row-block tiles, segmented hub rows, deterministic output ownership |
+| `edge_grad` (value gradient) | chunked gather-multiply | entry-block launch without a `[B, E]` temporary |
+| `spike_push` (packed events) | expand active sources into out-edges, `index_add` | edge-balanced fanout using active-degree prefix sums and float atomics |
+| `spike_push_dense` (prepared tasks) | – | device task discovery, direct/hash queues and bounded hash aggregation; failed hash insertion spills to the output |
+| `spike_push_list` (device spike list) | – | compact active source IDs and degrees, then reuse packed edge-balanced fanout |
 
-The Triton kernels reuse ideas from the earlier experiments listed in 1.9
-(row-block and CSR-vector pull, nnz-balanced handling of hubs, tiled and
-per-edge atomic push). Sort-based and hash-based push variants were not ported
-because they never won in the measured regime. Push results depend on the
-arrival order of float atomics (relative error up to about `4e-7`); pull
-results are bitwise reproducible.
+The `torch` backend supplies the general reference. `cusparse` explicitly
+selects native CUDA CSR pull through PyTorch for FP32/FP64; its edge-value
+gradients reuse the Torch sampled product. Neither selector requests SpMSpV.
+Triton push routes use floating-point atomics and are not bitwise reproducible.
+The kernels reuse the existing packed/source-major implementations rather than
+introducing another sparse product for the spike-list route.
 
-The planner chooses one of three algorithms when a connection is built,
-moved or given new hints. Without an `expected_density` hint, with a hint
-above the measured crossover (2% on CUDA, 0.2% on CPU), and for a
-shared-pattern batch of weights it plans `"pull"`. With a hint at or below
-the crossover it plans a source-driven algorithm, and which one depends on
-the backend:
+The planner binds a complete forward/backward route when static execution
+choices change. Explicit `method="pull"` or `method="push"` overrides activity
+hints; `push` specifically requests device spike-list SpMSpV and unsupported
+requests raise. In automatic mode, a CUDA firing-rate hint strictly below 5 Hz
+selects the spike-list route when supported. Otherwise, an expected-density
+hint at or below the measured crossover (2% CUDA, 0.2% CPU) selects a supported
+source-driven route. Missing hints, higher density or shared-pattern batched
+weights select pull. Backend and determinism constraints still apply.
 
-| Algorithm | Backend | Behaviour |
+| Algorithm | Route | Behaviour |
 |---|---|---|
-| `"pull"` | all | destination-driven product over every edge; deterministic |
-| `"push"` | device-compacting (`spike_push_dense`, Triton on CUDA) | taken for every call once planned, whatever the density of an individual input; one launch, no host synchronisation; float atomics, so not bitwise reproducible; can be captured in a CUDA graph |
-| `"adaptive-push"` | reference (`spike_push`, ATen) | packs the active sources on the host; each call falls back to pull when its input is denser than the limit; cannot be captured in a CUDA graph |
+| `"pull"` | destination CSR | visits every edge; deterministic |
+| `"push"` | device spike list or prepared task queues | runs for every call once selected, even above hinted activity; no host count read; capturable; float atomics |
+| `"adaptive-push"` | Torch host-packed reference | falls back to pull above the density limit; not capturable |
+
+The current spike-list route consumes dense neuron outputs and compacts them
+at the connection boundary. Direct list emission by the neuron kernel is a
+separate pending optimization; it is not implemented by the low-rate hint.
 
 Two consequences of `"push"` differ from `"pull"`. Under
 `torch.use_deterministic_algorithms(True)` the planner plans `"pull"` instead
-of `"push"` (the flag is read when the plan is made). And `"push"` never
+of automatic `"push"` (the flag is read when the plan is made); an explicit
+CUDA push request raises under deterministic execution. And `"push"` never
 visits the edges of a silent source, so a non-finite weight on such an edge
 does not reach the output, whereas `"pull"` propagates it (`inf * 0`).
 
@@ -462,9 +470,10 @@ reserved `expected_calls` and `expected_batch` must be positive integers.
 The optional `torch_sparse` backend remains selectable with
 `runtime.use_backend("torch_sparse")` and nothing depends on it.
 `btorch.sparse.runtime.__all__` lists the registry, planner, cache and
-operator names only; the kernel modules (`ops`, `kernels_aten`,
-`kernels_triton`, `kernels_triton_push`) are internal. Importing
-`kernels_aten` no longer installs process-wide warning filters.
+operator names only; the kernel modules (`ops`, `kernels_torch`,
+`kernels_triton`, `kernels_triton_push`, `kernels_triton_tasks`,
+`kernels_triton_spikelist`) are internal. Importing them does not install
+process-wide warning filters.
 
 Eager and compiled execution take different routes to the same kernels:
 compiled code calls the registered operators, eager code a plain
@@ -556,7 +565,7 @@ exist):
   used for value-batched weights. `"push"` (Triton on CUDA) is not bitwise
   deterministic, is used for every input once planned even when that input is
   dense, and does not propagate a non-finite weight of a silent source.
-  `"adaptive-push"` (CPU, and CUDA without Triton) packs spikes on the host,
+  `"adaptive-push"` (CPU, or an explicit Torch override on CUDA) packs spikes on the host,
   which synchronises and cannot be captured in a CUDA graph.
 - **CUDA graphs.** A graph captured around a connection is invalid after
   `set_edges_`, `load_state_dict` with different edges, `.to()` and a

@@ -117,11 +117,7 @@ def forward_sequence(
     output_seq = torch.empty_like(x_float)
     histories = []
     for name in history_names:
-        source = (
-            state_map[name]
-            if name in state_map
-            else state_map[dict(template.history_sources)[name]]
-        )
+        source = state_map[template.history_state_name(name)]
         histories.append(source.new_empty((x_seq.shape[0], *source.shape)))
     # Allocate each sequence once, rather than retaining every step followed
     # by a second full-sequence stack allocation. Slice writes still preserve
