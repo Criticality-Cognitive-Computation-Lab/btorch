@@ -76,7 +76,7 @@ def _prototype(n_neurons, batch):
 def _runner(model, backend):
     """Restore fixed initial tensors without altering continuation
     semantics."""
-    model.backend = "torch" if backend == "eager" else KernelOptions(cell=backend)
+    model.backend = "torch" if backend == "eager" else KernelOptions(neuron=backend)
     initial_states = tuple(
         (module, name, getattr(module, name))
         for module in model.modules()

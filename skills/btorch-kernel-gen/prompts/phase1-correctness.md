@@ -1,6 +1,5 @@
 # Phase 1: first correct implementation
 
-
 Inspect the confirmed Python model and task contract: objective, inputs/outputs, axes/dtypes, initial/final states, units, event order, gradient meaning, representative and complete workloads, validation/evaluation commands and promotion criteria.
 
 Use KernelWiki to research relevant recurrence, sparse connectivity, delay and implementation techniques. Read the installed dependency skills. Write `docs/draft.md` with baseline validation, risks, ranked approaches, concrete steps and evidence. Run `/humanize:gen-plan`, then `/humanize:start-rlcr-loop`.

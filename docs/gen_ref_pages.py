@@ -18,7 +18,6 @@ EXCLUDES = {
     "btorch.backend",
     "btorch.types",
     "btorch.config",
-    "btorch.jit",
 }
 
 # Deep prefixes that get their own dedicated page instead of being grouped.

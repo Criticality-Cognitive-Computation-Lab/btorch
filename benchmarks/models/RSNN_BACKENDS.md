@@ -21,7 +21,7 @@ PYTHONPATH=. python benchmarks/models/bench_rsnn_backends.py \
 ```
 
 The historical `backend="torch"` module is the ordinary-autograd baseline.
-The explicit Torch row uses `KernelOptions(cell="torch")` and its handwritten
+The explicit Torch row uses `KernelOptions(neuron="torch")` and its handwritten
 sequence VJP. All rows use the existing automatic sparse connection routing;
 connection algorithms are not ported to TileLang or CuPy. Sparse edge count
 is 48. Parameters include sparse weights, neuron tau/threshold and PSC

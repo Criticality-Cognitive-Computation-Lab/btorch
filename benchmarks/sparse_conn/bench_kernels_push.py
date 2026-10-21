@@ -3,15 +3,15 @@ pull.
 
 Times, on raw buffers (no modules, custom operators or autograd):
 
-- ``pack``: ``kernels_aten.pack_spikes`` (host ``nonzero``; synchronises).
-- ``aten``: ``pack`` + ``kernels_aten.spike_push``.
+- ``pack``: ``kernels_torch.pack_spikes`` (host ``nonzero``; synchronises).
+- ``torch``: ``pack`` + ``kernels_torch.spike_push``.
 - ``packed``: ``pack`` + the packed Triton kernel (thread per gathered edge).
 - ``packed_k``: the packed Triton kernel alone, on indices packed beforehand.
 - ``auto``: ``pack`` + ``kernels_triton_push.spike_push`` as registered (it
   uses the dense kernel for small or dense inputs).
 - ``dense``: ``kernels_triton_push.spike_push_dense`` (no pack at all).
 - ``dense_sm``: the same with source-major values (no ``t_perm`` gather).
-- ``pull``: ``kernels_aten.csr_matvec`` (``torch.sparse`` CSR product).
+- ``pull``: ``kernels_torch.csr_matvec`` (``torch.sparse`` CSR product).
 - ``pull_tri``: ``kernels_triton.csr_matvec`` when that module is importable.
 
 Run::
@@ -41,7 +41,7 @@ from pathlib import Path
 
 import torch
 
-from btorch.sparse.runtime import kernels_aten, kernels_triton_push as ktp
+from btorch.sparse.runtime import kernels_torch, kernels_triton_push as ktp
 from btorch.sparse.runtime.backend import KernelCache
 from btorch.sparse.runtime.cache import RepresentationCache
 
@@ -113,13 +113,13 @@ def measure_cell(cache, values, values_sm, x, kernel_cache, args) -> dict:
     """Microseconds per call of every path on one input."""
     n = x.shape[-1]
     push_args = (cache.t_crow, cache.t_col, cache.t_perm, values, x)
-    active_idx, ptr = kernels_aten.pack_spikes(x)
+    active_idx, ptr = kernels_torch.pack_spikes(x)
     layout = ktp._layout(kernel_cache, cache.t_crow, cache.t_col, cache.t_perm)
     work = int(layout.degree[active_idx].sum())
 
-    def aten():
-        idx, ptr = kernels_aten.pack_spikes(x)
-        return kernels_aten.spike_push(*push_args, idx, ptr, n)
+    def torch_reference():
+        idx, ptr = kernels_torch.pack_spikes(x)
+        return kernels_torch.spike_push(*push_args, idx, ptr, n)
 
     def never_dense(*_):
         return False
@@ -127,7 +127,7 @@ def measure_cell(cache, values, values_sm, x, kernel_cache, args) -> dict:
     def triton(force_packed: bool):
         def call():
             ktp._prefer_dense = never_dense if force_packed else default
-            idx, ptr = kernels_aten.pack_spikes(x)
+            idx, ptr = kernels_torch.pack_spikes(x)
             return ktp.spike_push(*push_args, idx, ptr, n, cache=kernel_cache)
 
         return call
@@ -138,7 +138,7 @@ def measure_cell(cache, values, values_sm, x, kernel_cache, args) -> dict:
 
     default = ktp._prefer_dense
     paths = {
-        "pack": lambda: kernels_aten.pack_spikes(x),
+        "pack": lambda: kernels_torch.pack_spikes(x),
         "packed": triton(True),
         "packed_k": packed_kernel,
         "auto": triton(False),
@@ -153,10 +153,10 @@ def measure_cell(cache, values, values_sm, x, kernel_cache, args) -> dict:
             source_major_values=True,
             cache=kernel_cache,
         ),
-        "pull": lambda: kernels_aten.csr_matvec(cache.crow, cache.col, values, x),
+        "pull": lambda: kernels_torch.csr_matvec(cache.crow, cache.col, values, x),
     }
     if work <= _ATEN_MAX_WORK:
-        paths["aten"] = aten
+        paths["torch"] = torch_reference
     if kernels_triton is not None:
         paths["pull_tri"] = lambda: kernels_triton.csr_matvec(
             cache.crow, cache.col, values, x
@@ -179,11 +179,11 @@ def measure_cell(cache, values, values_sm, x, kernel_cache, args) -> dict:
 
     # Accuracy against a float64 pull product, relative to the largest output,
     # and the run-to-run spread caused by the order of the atomics.
-    exact = kernels_aten.csr_matvec(cache.crow, cache.col, values.double(), x.double())
+    exact = kernels_torch.csr_matvec(cache.crow, cache.col, values.double(), x.double())
     scale = float(exact.abs().max().clamp_min(1e-30))
     ktp._prefer_dense = never_dense
     try:
-        idx, ptr = kernels_aten.pack_spikes(x)
+        idx, ptr = kernels_torch.pack_spikes(x)
         packed = [
             ktp.spike_push(*push_args, idx, ptr, n, cache=kernel_cache)
             for _ in range(2)
@@ -191,7 +191,7 @@ def measure_cell(cache, values, values_sm, x, kernel_cache, args) -> dict:
     finally:
         ktp._prefer_dense = default
     dense = ktp.spike_push_dense(*push_args, n, cache=kernel_cache)
-    pull = kernels_aten.csr_matvec(cache.crow, cache.col, values, x)
+    pull = kernels_torch.csr_matvec(cache.crow, cache.col, values, x)
     row["err_packed"] = float((packed[0] - exact).abs().max()) / scale
     row["err_dense"] = float((dense - exact).abs().max()) / scale
     row["err_pull"] = float((pull - exact).abs().max()) / scale
@@ -216,7 +216,7 @@ def crossover(densities: list[float], push: list[float], pull: list[float]):
     return None
 
 
-TIMED = ("pack", "aten", "packed", "packed_k", "auto", "dense", "dense_sm")
+TIMED = ("pack", "torch", "packed", "packed_k", "auto", "dense", "dense_sm")
 PULLS = ("pull", "pull_tri")
 
 

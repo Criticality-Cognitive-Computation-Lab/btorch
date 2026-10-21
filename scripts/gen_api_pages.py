@@ -16,7 +16,6 @@ EXCLUDES = {
     "btorch.backend",
     "btorch.types",
     "btorch.config",
-    "btorch.jit",
 }
 
 DEEP_PAGES = {

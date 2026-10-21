@@ -73,6 +73,35 @@ Stochastic comparisons use a declared pathwise random input or statistical contr
 Feedback distinguishes PASS, FAIL, BLOCKED, UNSUPPORTED and NOT_RUN. Include reproducible commands, first differing time/state/index, expected/actual/tolerance and raw data/figure paths. Hypotheses are labeled hypotheses. No missing required capability is silently accepted.
 
 
+# Performance sweep
+
+Use this contract for kernels whose cost varies with neuron count, connection
+density and activity. It selects workloads and gates acceptance; it is not a
+second profiling workflow. Use ncu-report-skill for collection, diagnosis and
+reports, and Humanize for the implementation/review loop.
+
+Use anchors `N={1e3, 1e5}`, `density={0.1%, 5%, 10%}` and target rate
+`{1, 5, 20 Hz}`. Density is the fraction of nonzero recurrent edges,
+`density = nnz / (N * N)`, and `nnz` is the primary workload axis. `N_small` is
+launch/occupancy-bound and `N_large` is the largest size that fits on the target
+device at 10% density; treat them as a search space, not a mandatory factorial.
+Activity is hard to control, so calibrate input drive toward the target and
+record the measured rate `realized_hz = 1000 * spikes / (N * T * dt_ms)`.
+
+Screen the grid with a light initial profile, then use that profile and the
+current bottleneck to choose 3-5 representative points covering both `N`
+regimes and the density/activity operating plane. Treat the set as
+provisional: re-select points as profiling evidence and failures change the
+bottleneck. Optimize only the current representative points, then verify the
+candidate on the remaining combinations for correctness, latency, memory,
+`nnz` and realized activity. Keep one declared baseline and report small and
+large workloads separately.
+
+The optional final report has three speedup curves with at least five points
+each: versus neuron count, versus density/`nnz`, and versus realized firing
+rate. Ask the user before running it.
+
+
 # btorch upstream delivery
 
 For SONATA IO, or network-definition serialization without a specified IO format/backend, use [sonata-io](../../sonata-io/SKILL.md). The network-specific adapter owns traversal and reconstruction, calls shared file helpers, and validates both reader interoperability and model round-trip behavior. No common network-definition protocol is assumed.

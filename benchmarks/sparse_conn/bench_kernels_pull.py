@@ -1,20 +1,19 @@
-"""Kernel-level benchmark of the pull kernels: Triton against ATen.
+"""Compare Triton pull kernels with cuSPARSE products and Torch edge gradients.
 
 Times ``csr_matvec`` (forward) and ``edge_grad`` (gradient w.r.t. the values)
-of ``btorch.sparse.runtime.kernels_triton`` and ``kernels_aten`` on raw CSR
+of ``btorch.sparse.runtime.kernels_triton`` and ``kernels_torch`` on raw CSR
 buffers, without modules, custom operators or autograd in the way.
 
 Run::
 
-    python benchmarks/sparse_conn/bench_kernels_pull.py \
+    python -m benchmarks.sparse_conn.bench_kernels_pull \
         --out benchmarks/sparse_conn/results/kernels_pull_rtx5090.json
 
 Workloads are ``name: (n_neuron, in-degree, n_hub, hub_degree)``. Rows have a
 uniform length except for ``n_hub`` rows of ``hub_degree`` entries.
 
-The forward is also compared with ``cusparse``: the same cuSPARSE product as
-the ATen kernel but with a contiguous transposed operand (see
-:func:`spmm_contiguous`).
+The forward baseline reuses the runtime's native cuSPARSE product, including
+its contiguous transposed operand. Edge gradients use the Torch reference.
 
 Timing: calls are queued back to back and the device is synchronised once
 per repeat, so the figure is the steady-state cost per call including the
@@ -32,10 +31,10 @@ from pathlib import Path
 
 import torch
 
-from btorch.sparse.runtime import kernels_aten, kernels_triton
+from btorch.sparse.runtime import kernels_torch, kernels_triton
 
 
-_BASELINES = ("aten_ms", "cusparse_ms")
+_BASELINES = ("torch_ms", "cusparse_ms")
 
 WORKLOADS = {
     "4k": (4096, 100, 0, 0),
@@ -90,20 +89,6 @@ def time_calls(
     return {k: (statistics.median(v), min(v)) for k, v in samples.items()}
 
 
-def spmm_contiguous(crow, col, values, x):
-    """CuSPARSE product with a *contiguous* transposed dense operand.
-
-    The ATen kernel multiplies by the strided view ``x.T``; ``torch.sparse``
-    is several times slower on a non-contiguous operand at large sizes, so
-    this is the strongest stock-PyTorch baseline for batched inputs.
-    """
-    n_out = crow.shape[0] - 1
-    mat = torch.sparse_csr_tensor(crow, col, values, size=(n_out, x.shape[-1]))
-    if x.ndim == 1:
-        return mat @ x
-    return (mat @ x.T.contiguous()).T.contiguous()
-
-
 def bench_workload(name: str, batches: list[int], density: float, device: str):
     n, degree, n_hub, hub_degree = WORKLOADS[name]
     crow, col = make_csr(n, degree, n_hub, hub_degree, device)
@@ -117,12 +102,13 @@ def bench_workload(name: str, batches: list[int], density: float, device: str):
         # name -> callable per implementation; "cusparse" only for forward.
         cases = {
             "forward": {
-                "aten": lambda x=x: kernels_aten.csr_matvec(crow, col, values, x),
-                "cusparse": lambda x=x: spmm_contiguous(crow, col, values, x),
+                "cusparse": lambda x=x: kernels_torch.csr_matvec_cusparse(
+                    crow, col, values, x
+                ),
                 "triton": lambda x=x: kernels_triton.csr_matvec(crow, col, values, x),
             },
             "edge_grad": {
-                "aten": lambda x=x, grad=grad: kernels_aten.edge_grad(
+                "torch": lambda x=x, grad=grad: kernels_torch.edge_grad(
                     crow, col, grad, x, 0
                 ),
                 "triton": lambda x=x, grad=grad: kernels_triton.edge_grad(
@@ -132,7 +118,8 @@ def bench_workload(name: str, batches: list[int], density: float, device: str):
         }
         for case, impls in cases.items():
             # Agreement of the two backends on this exact input.
-            ref, out = impls["aten"](), impls["triton"]()
+            baseline = "cusparse" if case == "forward" else "torch"
+            ref, out = impls[baseline](), impls["triton"]()
             err = float((ref - out).abs().max() / ref.abs().max().clamp_min(1e-30))
             del ref, out
             row = {
