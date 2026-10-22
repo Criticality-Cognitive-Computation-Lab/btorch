@@ -48,7 +48,9 @@ def test_hop_distance_edges_and_sparse_agree():
 
 def test_hop_distance_max_hops_and_missing_seed():
     model = HopDistanceModel(edges=_chain_edges())
-    df = model.compute_distances(["a", "zzz"], max_hops=1)  # unknown seed is ignored
+    # Unknown seeds are ignored with an explicit diagnostic.
+    with pytest.warns(UserWarning, match="Seeds not found in network"):
+        df = model.compute_distances(["a", "zzz"], max_hops=1)
     assert set(df["node"]) == {"a", "b", "c"}
 
 

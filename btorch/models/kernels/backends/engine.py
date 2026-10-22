@@ -400,19 +400,16 @@ def _generate_source(
                 "__LINE__, __func__, sizeof(char))"
             )
     else:
+        # Use TileLang's stack-aware assertion path, retaining diagnostics.
+        # One predicate covers both validity checks without two device asserts.
         source.lines.append(
-            'T.device_assert(index != 0 or T.isfinite(dt), "dt must be finite", '
-            "no_stack_info=True)"
-        )
-        source.lines.append(
-            'T.device_assert(index != 0 or dt > 0.0, "dt must be positive", '
-            "no_stack_info=True)"
+            "T.device_assert(index != 0 or (T.isfinite(dt) and dt > 0.0), "
+            '"dt must be finite and positive")'
         )
         if spec.model == "alpha_billeh":
             source.lines.append(
                 "T.device_assert(index != 0 or dt == 1.0, "
-                '"AlphaPSCBilleh requires dt == 1", '
-                "no_stack_info=True)"
+                '"AlphaPSCBilleh requires dt == 1")'
             )
     size = lambda name: (
         n * modes
@@ -962,8 +959,8 @@ def _launch_cupy(kernel, args, n):
     import numpy
 
     with cupy.cuda.Device(args[0].device.index):
-        stream = cupy.cuda.ExternalStream(
-            torch.cuda.current_stream(args[0].device).cuda_stream
+        stream = cupy.cuda.Stream.from_external(
+            torch.cuda.current_stream(args[0].device)
         )
         with stream:
             # RawKernel copies each NumPy scalar's bytes into the matching

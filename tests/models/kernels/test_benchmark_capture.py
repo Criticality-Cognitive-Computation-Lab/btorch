@@ -72,8 +72,8 @@ def _launch(cupy, kernel, input, output, *, bind_torch_stream):
     grid = ((input.numel() + 127) // 128,)
     with cupy.cuda.Device(input.device.index):
         if bind_torch_stream:
-            stream = cupy.cuda.ExternalStream(
-                torch.cuda.current_stream(input.device).cuda_stream
+            stream = cupy.cuda.Stream.from_external(
+                torch.cuda.current_stream(input.device)
             )
         else:
             stream = cupy.cuda.Stream.null

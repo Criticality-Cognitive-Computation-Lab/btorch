@@ -87,17 +87,22 @@ def test_cudagraph_linear(use_compile: bool):
                 static_x.grad.zero_()
                 model.zero_grad()
         torch.cuda.current_stream().wait_stream(s)
+        del out
+        static_x.grad = None
+        model.zero_grad(set_to_none=True)
 
         # Capture
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
+        with torch.cuda.graph(g, stream=s):
             static_out = model(static_x)
             static_out.sum().backward()
 
         # Replay with actual input
         static_x.data.copy_(input_x)
         g.replay()
-        return static_out.clone(), static_x.grad.clone()
+        # Return numerical results without keeping the captured autograd graph
+        # alive when the same model is warmed up on a new stream.
+        return static_out.detach().clone(), static_x.grad.detach().clone()
 
     # Forward pass without batch.
     out_dense, grad_dense = _run_cudagraph(dense, x)

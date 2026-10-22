@@ -32,8 +32,7 @@ def test_primitive_source_contains_backend_device_timestep_assertions(backend):
         assert "index == 0 && !(isfinite(dt) && dt > 0.0f)" in source
         assert '__assertfail("dt must be finite and positive"' in source
     else:
-        assert "index != 0 or T.isfinite(dt[0])" in source
-        assert "index != 0 or dt[0] > 0.0" in source
+        assert "index != 0 or (T.isfinite(dt[0]) and dt[0] > 0.0)" in source
         compile(source, "<tilelang-dt-validation>", "exec")
 
 

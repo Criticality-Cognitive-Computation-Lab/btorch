@@ -144,9 +144,14 @@ def test_gain_stability_restores_weights_and_returns_nan(monkeypatch):
         raise ValueError("series too short")
 
     monkeypatch.setattr(complexity, "compute_max_lyapunov_exponent", le_fail)
-    slope, intercept, g, lam = complexity.compute_gain_stability_sensitivity(
-        model, loader, g_values=np.array([1.0, 2.0, 3.0]), device="cpu"
-    )
+    with pytest.warns(UserWarning) as diagnostics:
+        slope, intercept, g, lam = complexity.compute_gain_stability_sensitivity(
+            model, loader, g_values=np.array([1.0, 2.0, 3.0]), device="cpu"
+        )
+    assert [str(item.message) for item in diagnostics] == [
+        f"Lyapunov exponent failed for g={gain}: series too short"
+        for gain in (1.0, 2.0, 3.0)
+    ] + ["Fewer than two finite Lyapunov exponents; slope is NaN"]
     assert np.isnan(slope) and np.isnan(intercept)
     assert np.isnan(lam).all() and len(lam) == 3
 
