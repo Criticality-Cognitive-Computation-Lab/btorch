@@ -5,6 +5,7 @@ from .poisson_random import PoissonRandomSpike, poisson_random_spike
 from .sigmoid import Sigmoid, sigmoid
 from .superspike import SuperSpike, superspike
 from .triangle import Triangle, triangle
+from .truncated import Truncated
 
 
 __all__ = [
@@ -15,6 +16,7 @@ __all__ = [
     "Sigmoid",
     "SuperSpike",
     "Triangle",
+    "Truncated",
     "PoissonRandomSpike",
     "atan",
     "atan_approx",

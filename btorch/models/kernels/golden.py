@@ -10,7 +10,7 @@ from ..neurons.glif import GLIF3
 from ..neurons.izhikevich import Izhikevich
 from ..neurons.lif import IF, LIF
 from ..synapse import AlphaPSC, AlphaPSCBilleh, DualExponentialPSC, ExponentialPSC
-from .contracts import CellSpec
+from .contracts import NeuronSpec
 from .templates import get_template
 
 
@@ -18,7 +18,7 @@ def python_module_sequence(
     x_seq: Tensor,
     states: tuple[Tensor, ...],
     parameters: tuple[Tensor, ...],
-    spec: CellSpec,
+    spec: NeuronSpec,
     requested: tuple[str, ...] = (),
 ) -> tuple[Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]:
     """Run the original btorch single-step implementation as the golden
@@ -74,8 +74,11 @@ def python_module_sequence(
             if spec.poisson is not None
             else {"alpha": spec.alpha, "damping_factor": spec.damping}
         )
+        spike_function = functions[spec.surrogate](**function_kwargs)
+        if spec.surrogate_width is not None:
+            spike_function = surrogate.Truncated(spike_function, spec.surrogate_width)
         kwargs.update(
-            surrogate_function=functions[spec.surrogate](**function_kwargs),
+            surrogate_function=spike_function,
             hard_reset=spec.hard_reset,
             detach_reset=spec.detach_reset,
             device="cpu",
@@ -154,7 +157,7 @@ def python_module_step(
     x: Tensor,
     states: tuple[Tensor, ...],
     parameters: tuple[Tensor, ...],
-    spec: CellSpec,
+    spec: NeuronSpec,
 ) -> tuple[Tensor, tuple[Tensor, ...], dict[str, Tensor]]:
     """Execute an original Python Module step with all declared records.
 

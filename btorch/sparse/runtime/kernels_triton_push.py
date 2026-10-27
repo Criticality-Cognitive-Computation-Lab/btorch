@@ -14,7 +14,7 @@ unsupported-input Torch fallback. Host packing in that low-level fallback is
 not used by the complete device spike-list route.
 
 All native push variants accumulate with floating-point atomics, so reduction
-order and results can vary within FP32 rounding. Sparse autograd is shared with
+order and results can vary within accumulation rounding. Sparse autograd is shared with
 pull: its input derivative remains a dense transposed product.
 
 Derived source-major layouts are owned by ``KernelCache``. ``prepare`` refreshes
@@ -66,8 +66,8 @@ _INT32_MAX = 2**31 - 1
 _MAX_LAYOUTS = 1024
 
 # Runtime arguments of the kernels, in signature order. None of them is
-# specialised on its value or alignment, so a compiled kernel depends on the
-# constexprs only and can be launched through a cached handle (see
+# specialised on its value or alignment. Compiled handles include constexprs
+# and pointer dtypes (see
 # :func:`btorch.sparse.runtime.kernels_triton._launch`).
 _PACKED_ARGS = [
     "crow",
@@ -87,7 +87,7 @@ _PACKED_ARGS = [
     "b_iter",
     "n_programs",
 ]
-_PACKED_CONSTS = ("BLOCK", "PERMUTE")
+_PACKED_CONSTS = ("BLOCK", "PERMUTE", "SPIKE_BLOCK")
 _DENSE_ARGS = [
     "crow",
     "col",
@@ -125,12 +125,12 @@ def _build_kernels():
         crow,  # int32 [N + 1] source-major pointers
         col,  # int32 [E] destination of each source-major entry
         perm,  # int32 [E] position in ``values`` of each source-major entry
-        values,  # float32 [E]
-        x,  # float32 [B * N]
-        active,  # int64 [A] packed source indices, sample-major
+        values,  # floating storage [E]
+        x,  # floating storage [B * N]; values determine product promotion
+        active,  # packed source indices; flat sample/source IDs for local lists
         cum,  # int64 [A] inclusive prefix sum of the active out-degrees
         ptr,  # int64 [B + 1] sample offsets into ``active``
-        out,  # float32 [B * M]
+        out,  # FP32 or FP64 accumulation [B * M]
         n_active,
         n_in,
         n_out,
@@ -140,9 +140,18 @@ def _build_kernels():
         n_programs,
         BLOCK: tl.constexpr,
         PERMUTE: tl.constexpr,
+        SPIKE_BLOCK: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        total = tl.load(cum + n_active - 1)
+        if SPIKE_BLOCK:
+            # Flatten the grid: a large batch/population can have more list
+            # blocks than CUDA's grid-y limit, even with a valid source layout.
+            group = pid // n_programs
+            pid = pid % n_programs
+            active += group * SPIKE_BLOCK
+            cum += group * SPIKE_BLOCK
+            n_active = tl.load(ptr + group)
+        total = tl.load(cum + tl.maximum(n_active - 1, 0), mask=n_active > 0, other=0)
         lane = tl.arange(0, BLOCK).to(tl.int64)
         # Persistent program: blocks pid, pid + n_programs, ... of the work.
         for base in range(pid.to(tl.int64) * BLOCK, total, n_programs * BLOCK):
@@ -160,20 +169,24 @@ def _build_kernels():
             owner = tl.where(live, lo, 0)
             c_end = tl.load(cum + owner, mask=live, other=0)
             src = tl.load(active + owner, mask=live, other=0)
+            if SPIKE_BLOCK:
+                sample = (src // n_in).to(tl.int64)
+                src = src % n_in
             row_end = tl.load(crow + src + 1, mask=live, other=0)
             # ``c_end - g`` edges of the owner remain, counted from its end.
             edge = row_end.to(tl.int64) - (c_end - g)
-            # sample = first s with ptr[s + 1] > owner, searched in [0, B - 1].
-            s_lo = tl.zeros([BLOCK], dtype=tl.int32)
-            s_hi = tl.zeros([BLOCK], dtype=tl.int32) + (n_batch - 1)
-            for _ in range(b_iter):
-                s_open = s_lo < s_hi
-                s_mid = (s_lo + s_hi) >> 1
-                p = tl.load(ptr + s_mid + 1, mask=s_open, other=0)
-                s_hi = tl.where(s_open & (p > owner), s_mid, s_hi)
-                s_lo = tl.where(s_open & (p <= owner), s_mid + 1, s_lo)
-            # 64-bit offsets: ``sample * n`` overflows int32 on large batches.
-            sample = s_lo.to(tl.int64)
+            if not SPIKE_BLOCK:
+                # sample = first s with ptr[s + 1] > owner, searched in [0, B - 1].
+                s_lo = tl.zeros([BLOCK], dtype=tl.int32)
+                s_hi = tl.zeros([BLOCK], dtype=tl.int32) + (n_batch - 1)
+                for _ in range(b_iter):
+                    s_open = s_lo < s_hi
+                    s_mid = (s_lo + s_hi) >> 1
+                    p = tl.load(ptr + s_mid + 1, mask=s_open, other=0)
+                    s_hi = tl.where(s_open & (p > owner), s_mid, s_hi)
+                    s_lo = tl.where(s_open & (p <= owner), s_mid + 1, s_lo)
+                # 64-bit offsets: ``sample * n`` overflows int32 on large batches.
+                sample = s_lo.to(tl.int64)
             amp = tl.load(x + sample * n_in + src, mask=live, other=0.0)
             dst = tl.load(col + edge, mask=live, other=0)
             if PERMUTE:
@@ -181,7 +194,9 @@ def _build_kernels():
                 w = tl.load(values + slot, mask=live, other=0.0)
             else:
                 w = tl.load(values + edge, mask=live, other=0.0)
-            tl.atomic_add(out + sample * n_out + dst, w * amp, mask=live)
+            tl.atomic_add(
+                out + sample * n_out + dst, kernels_triton._multiply(w, amp), mask=live
+            )
 
     @triton.jit(
         do_not_specialize=_DENSE_ARGS, do_not_specialize_on_alignment=_DENSE_ARGS
@@ -230,7 +245,11 @@ def _build_kernels():
                                     w = tl.load(values + slot, mask=m, other=0.0)
                                 else:
                                     w = tl.load(values + edge, mask=m, other=0.0)
-                                tl.atomic_add(out_row + dst, w * amp, mask=m)
+                                tl.atomic_add(
+                                    out_row + dst,
+                                    kernels_triton._multiply(w, amp),
+                                    mask=m,
+                                )
         else:
             h = (task - n_tiles) * 3
             e0 = tl.load(hub + h + 1)
@@ -248,7 +267,9 @@ def _build_kernels():
                             w = tl.load(values + slot, mask=m, other=0.0)
                         else:
                             w = tl.load(values + edge, mask=m, other=0.0)
-                        tl.atomic_add(out_row + dst, w * amp, mask=m)
+                        tl.atomic_add(
+                            out_row + dst, kernels_triton._multiply(w, amp), mask=m
+                        )
 
     return push_packed, push_dense
 
@@ -475,8 +496,8 @@ def _supported(values: Tensor, x: Tensor, t_crow: Tensor, t_col: Tensor) -> bool
         x.is_cuda
         and x.ndim == 2
         and values.ndim == 1
-        and x.dtype == torch.float32
-        and values.dtype == torch.float32
+        and x.dtype in kernels_torch._FLOAT_DTYPES
+        and values.dtype in kernels_torch._FLOAT_DTYPES
         and values.device == device
         and t_col.device == device
         and t_col.shape[0] > 0
@@ -543,7 +564,13 @@ def _launch_dense(
     permute: bool,
 ) -> Tensor:
     n_batch, n_in = x.shape
-    out = torch.zeros(n_batch, n_out, dtype=torch.float32, device=x.device)
+    output_dtype = torch.promote_types(values.dtype, x.dtype)
+    out = torch.zeros(
+        n_batch,
+        n_out,
+        dtype=kernels_torch._accumulation_dtype(output_dtype),
+        device=x.device,
+    )
     n_tiles = (n_in + _TILE - 1) // _TILE
     grid = n_batch * (n_tiles + layout.n_hub)
     if grid > _INT32_MAX:
@@ -572,7 +599,7 @@ def _launch_dense(
         (_TILE, _TILE_BLOCK, permute),
         _TILE_WARPS,
     )
-    return out
+    return out.to(output_dtype)
 
 
 def spike_push_dense(
@@ -626,7 +653,7 @@ def spike_push_dense(
             return kernels_triton_tasks.run(
                 task_binding.task_state,
                 task_values,
-                x.contiguous(),
+                x,
                 n_out,
                 cache,
                 workspace=task_binding.workspace,
@@ -680,10 +707,10 @@ def spike_push(
     """Source-driven propagation of the packed non-zero inputs (Triton).
 
     Drop-in replacement of
-    :func:`btorch.sparse.runtime.kernels_torch.spike_push` for float32 CUDA
+    :func:`btorch.sparse.runtime.kernels_torch.spike_push` for floating CUDA
     tensors; other inputs are forwarded to it. The whole batch is served by
     one launch. Accumulation uses float atomics, so the result matches the
-    reference up to float32 rounding and is not bit-reproducible.
+    reference up to accumulation rounding and is not bit-reproducible.
 
     Args:
         t_crow: ``[N + 1]`` pointers of the source-major (transposed) CSR.
@@ -736,11 +763,22 @@ def spike_push(
         )
     n_batch, n_in = x.shape
     if n_active == 0:
-        return torch.zeros(n_batch, n_out, dtype=torch.float32, device=x.device)
+        return torch.zeros(
+            n_batch,
+            n_out,
+            dtype=torch.promote_types(values.dtype, x.dtype),
+            device=x.device,
+        )
     values, x = values.contiguous(), x.contiguous()
     if _prefer_dense(layout, n_active, x.numel()):
         return _launch_dense(cache, layout, values, x, n_out, not source_major_values)
-    out = torch.zeros(n_batch, n_out, dtype=torch.float32, device=x.device)
+    output_dtype = torch.promote_types(values.dtype, x.dtype)
+    out = torch.zeros(
+        n_batch,
+        n_out,
+        dtype=kernels_torch._accumulation_dtype(output_dtype),
+        device=x.device,
+    )
     # Inclusive prefix sum of the active out-degrees; its last element is the
     # total work, which only the kernel reads (no host synchronisation).
     active_idx, ptr = active_idx.contiguous(), ptr.contiguous()
@@ -775,10 +813,10 @@ def spike_push(
             n_programs,
         ),
         _PACKED_CONSTS,
-        (_BLOCK, not source_major_values),
+        (_BLOCK, not source_major_values, 0),
         _BLOCK_WARPS,
     )
-    return out
+    return out.to(output_dtype)
 
 
 def prepare(

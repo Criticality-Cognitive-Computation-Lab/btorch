@@ -7,10 +7,9 @@ import torch
 from torch import nn
 
 from btorch.models import environ
-from btorch.models.kernels import CellSpec, KernelOptions
+from btorch.models.kernels import KernelOptions, NeuronSpec
 from btorch.models.kernels.backends import engine, fused
-from btorch.models.kernels.recurrent_operator import _glif_membrane_coefficients
-from btorch.models.kernels.templates import get_template
+from btorch.models.kernels.templates import get_template, prepare_parameters
 from btorch.models.neurons.glif import GLIF3
 from btorch.models.rnn import RecurrentNN
 from btorch.models.synapse import ExponentialPSC
@@ -217,8 +216,8 @@ def test_recurrent_glif_infinite_tau_matches_zero_linear_module_vjp(backend):
 
 
 def test_recurrent_glif_inference_private_abi_contains_phi_without_delta():
-    neuron_spec = CellSpec("glif3", dt=torch.tensor(0.25))
-    psc_spec = CellSpec("exponential", dt=torch.tensor(0.25))
+    neuron_spec = NeuronSpec("glif3", dt=torch.tensor(0.25))
+    psc_spec = NeuronSpec("exponential", dt=torch.tensor(0.25))
     n_neuron, modes = 8, 2
     neuron_layouts = tuple(
         engine._ParameterLayout(
@@ -244,7 +243,7 @@ def test_recurrent_glif_inference_private_abi_contains_phi_without_delta():
         modes=modes,
         neuron_parameter_layouts=neuron_layouts,
         psc_parameter_layouts=psc_layouts,
-        neuron_coefficient_layouts=(phi_layout,),
+        neuron_prepared_layouts=(("glif_phi_coefficient", phi_layout),),
     )
     pointer_names = tuple(name for name, _ in pointers)
 
@@ -255,7 +254,7 @@ def test_recurrent_glif_inference_private_abi_contains_phi_without_delta():
     assert "neuron_glif_delta_coefficient_ptr" not in source
     assert (
         len(
-            _glif_membrane_coefficients(
+            prepare_parameters(
                 neuron_spec,
                 (
                     torch.tensor(1.0),

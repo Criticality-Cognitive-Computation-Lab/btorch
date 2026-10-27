@@ -5,7 +5,7 @@ import torch
 
 from btorch.models.kernels import HistoryPlan, KernelOptions
 from btorch.models.kernels.backends import engine
-from btorch.models.kernels.contracts import CellSpec
+from btorch.models.kernels.contracts import NeuronSpec
 from btorch.models.kernels.golden import python_module_sequence
 from btorch.models.kernels.operators import run_multi_step
 from btorch.models.kernels.templates import get_template
@@ -29,7 +29,7 @@ def test_long_dual_exponential_sequence_matches_module_state_and_parameter_vjps(
     require_cuda_backend(backend)
 
     steps, neurons = 128, 7
-    spec = CellSpec("dual_exponential", dt=0.3)
+    spec = NeuronSpec("dual_exponential", dt=0.3)
     template = get_template(spec)
     time = torch.arange(steps, device="cuda", dtype=torch.float32)[:, None, None]
     lane = torch.arange(neurons, device="cuda", dtype=torch.float32)[None, None]
@@ -123,7 +123,7 @@ def test_precise_exp_dual_sequence_matches_actual_module_forward_and_vjp(backend
     require_cuda_backend(backend)
 
     steps, neurons = 128, 64
-    spec = CellSpec("dual_exponential", dt=1.0)
+    spec = NeuronSpec("dual_exponential", dt=1.0)
     template = get_template(spec)
     time = torch.arange(steps, device="cuda", dtype=torch.float32)[:, None, None]
     lane = torch.arange(neurons, device="cuda", dtype=torch.float32)[None, None]

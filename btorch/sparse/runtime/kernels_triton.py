@@ -1,8 +1,8 @@
 """Triton (CUDA) backend of the destination-driven sparse kernels.
 
 Implements ``csr_matvec`` and ``edge_grad`` with the semantics of
-:mod:`btorch.sparse.runtime.kernels_torch` for ``float32`` data on CUDA and
-defers to the ATen kernels for everything else (other dtypes, CPU tensors,
+:mod:`btorch.sparse.runtime.kernels_torch` for floating data on CUDA and
+defers to the Torch kernels for unsupported cases (non-floating or CPU tensors,
 index spaces that do not fit ``int32``, partially broadcast value batches,
 grids too large for one launch).
 
@@ -22,7 +22,7 @@ Design, shared by both kernels:
 - Every output element is written by exactly one program and reduced in a
   fixed order, so results are bitwise reproducible. No atomics are used.
   The tile is chosen from the number of samples only, never from the data;
-  kernels compiled for different tiles agree up to float32 rounding only.
+  kernels compiled for different tiles agree up to accumulation rounding only.
 - Indices are read from cached ``int32`` copies (the kernels are
   bandwidth-bound). See :func:`_pattern` for the cache and its invalidation.
 
@@ -52,11 +52,14 @@ from __future__ import annotations
 
 import itertools
 import weakref
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor
 
 from . import kernels_torch
+from .activity import GradientList
 from .backend import BackendRegistry, KernelCache, registry as _default_registry
 
 
@@ -77,6 +80,8 @@ _MAX_GRID_Y = 65535
 # :class:`_RowLayout`). It bounds the work of one program, so the latency of a
 # launch does not grow with the longest row.
 _SEGMENT = 512
+# Bound the shape-only list grid; each program strides over further segments.
+_LIST_PARTITIONS = 8
 
 # ``csr_matvec`` tile ``(rows, entries, samples, warps)`` of one program: it
 # owns ``rows`` consecutive rows (or row segments) for ``samples`` consecutive
@@ -132,10 +137,19 @@ def is_available() -> bool:
 
 # ------------------------------------------------------------------ kernels
 # Arguments are never specialised on their value or alignment: the compiled
-# kernel then depends only on the constexpr tile sizes and on the integer
-# width of the scalars, which is what makes the cached direct launch sound.
+# kernel depends on constexpr tiles, pointer dtypes and scalar integer widths.
+# The direct-launch cache includes tiles and dtypes; callers bound scalar widths.
 
 if triton is not None:
+
+    @triton.jit
+    def _multiply(a, b):
+        """Multiply typed operands in their accumulation precision."""
+        dtype: tl.constexpr = (
+            tl.float64 if a.dtype == tl.float64 or b.dtype == tl.float64 else tl.float32
+        )
+        return a.to(dtype) * b.to(dtype)
+
     _MATVEC_ARGS = [
         "ptr_ptr",
         "target_ptr",
@@ -152,6 +166,12 @@ if triton is not None:
         "n_tmp",
         "val_stride",
         "x_stride",
+        "mask_ptr",
+        "owner_ptr",
+        "activity_ptr",
+        "grad_values_ptr",
+        "list_ptr",
+        "list_counts_ptr",
     ]
 
     @triton.jit(
@@ -173,11 +193,21 @@ if triton is not None:
         n_tmp,
         val_stride,
         x_stride,
+        mask_ptr,
+        owner_ptr,
+        activity_ptr,
+        grad_values_ptr,
+        list_ptr,
+        list_counts_ptr,
         BR: tl.constexpr,
         BK: tl.constexpr,
         BS: tl.constexpr,
         HUB: tl.constexpr,
         PERM: tl.constexpr,
+        MASK: tl.constexpr,
+        WEIGHT_GRAD: tl.constexpr,
+        LIST: tl.constexpr,
+        SEGMENT: tl.constexpr,
     ):
         """One program per (``BR`` row segments, member, ``BS`` samples).
 
@@ -195,57 +225,202 @@ if triton is not None:
 
         seg = pid * BR + tl.arange(0, BR)
         seg_mask = seg < n_seg
-        start = tl.load(ptr_ptr + seg, mask=seg_mask, other=0)
-        end = tl.load(ptr_ptr + seg + 1, mask=seg_mask, other=0)
-        length = end - start
-        longest = tl.max(length, axis=0)
-
-        v_base = val_ptr + member * val_stride
-        x_base = x_ptr + member * x_stride
-        lane = tl.arange(0, BK)
-        acc = tl.zeros([BS, BR, BK], dtype=tl.float32)
-        for k in range(0, longest, BK):
-            pos = k + lane
-            mask = pos[None, :] < length[:, None]
-            idx = start[:, None] + pos[None, :]
-            c = tl.load(col_ptr + idx, mask=mask, other=0)
-            if PERM:
-                slot = tl.load(perm_ptr + idx, mask=mask, other=0)
-                w = tl.load(v_base + slot, mask=mask, other=0.0)
-            else:
-                w = tl.load(v_base + idx, mask=mask, other=0.0)
-            full = mask[None, :, :] & sample_mask[:, None, None]
-            if BS == 1:  # a single sample: x[member, column]
-                offset = c[None, :, :]
-            else:
-                offset = c[None, :, :] * n_sample + sample[:, None, None]
-            xv = tl.load(x_base + offset, mask=full, other=0.0)
-            acc += w[None, :, :] * xv
-        total = tl.sum(acc, axis=2)
-
-        slot = member * n_sample + sample.to(tl.int64)
-        if HUB:
-            # Segments of split rows go to the partial-sum buffer.
-            target = tl.load(target_ptr + seg, mask=seg_mask, other=0)
-            # Unused segments of the fixed-capacity layout have target -1.
-            direct = seg_mask & (target >= 0) & (target < n_rows)
-            partial = seg_mask & (target >= n_rows)
-            tl.store(
-                out_ptr + (slot * n_rows)[:, None] + target[None, :],
-                total,
-                mask=sample_mask[:, None] & direct[None, :],
-            )
-            tl.store(
-                tmp_ptr + (slot * n_tmp)[:, None] + (target - n_rows)[None, :],
-                total,
-                mask=sample_mask[:, None] & partial[None, :],
+        if LIST:
+            # The producer packed rows inside each original 128-neuron block.
+            # Empty blocks take no edge traversal; counts never reach the host.
+            block = pid // (128 // BR)
+            rank = (pid % (128 // BR)) * BR + tl.arange(0, BR)
+            count = tl.load(list_counts_ptr + block)
+            seg_mask = rank < count
+            seg = tl.load(list_ptr + block * 128 + rank, mask=seg_mask, other=0)
+            list_sample = seg // n_rows
+            seg = seg % n_rows
+        row_start = tl.load(ptr_ptr + seg, mask=seg_mask, other=0)
+        row_end = tl.load(ptr_ptr + seg + 1, mask=seg_mask, other=0)
+        if LIST:
+            first_chunk = tl.program_id(2)
+            chunk_step = tl.num_programs(2)
+            chunks = tl.maximum(
+                1, tl.cdiv(tl.max(row_end - row_start, axis=0), SEGMENT)
             )
         else:
-            tl.store(
-                out_ptr + (slot * n_rows)[:, None] + seg[None, :],
-                total,
-                mask=sample_mask[:, None] & seg_mask[None, :],
+            first_chunk, chunks, chunk_step = 0, 1, 1
+        for chunk in range(first_chunk, chunks, chunk_step):
+            start, end = row_start, row_end
+            if LIST:
+                start += chunk * SEGMENT
+                end = tl.minimum(end, start + SEGMENT)
+                start = tl.minimum(start, end)
+            length = end - start
+            if MASK:
+                row = tl.load(owner_ptr + seg, mask=seg_mask, other=-1) if HUB else seg
+                if LIST:
+                    mask_offset = list_sample[None, :] * n_rows + row[None, :]
+                else:
+                    mask_offset = (member * n_sample + sample.to(tl.int64))[
+                        :, None
+                    ] * n_rows + row[None, :]
+                active = (
+                    tl.load(
+                        mask_ptr + mask_offset,
+                        mask=sample_mask[:, None]
+                        & seg_mask[None, :]
+                        & (row[None, :] >= 0),
+                        other=0.0,
+                    )
+                    != 0.0
+                )
+                if not WEIGHT_GRAD:
+                    length = tl.where(
+                        tl.sum(active.to(tl.int32), axis=0) > 0, length, 0
+                    )
+            if WEIGHT_GRAD:
+                row = tl.load(owner_ptr + seg, mask=seg_mask, other=-1) if HUB else seg
+                amplitude = tl.load(
+                    activity_ptr + row[None, :] * n_sample + sample[:, None],
+                    mask=sample_mask[:, None] & seg_mask[None, :] & (row[None, :] >= 0),
+                    other=0.0,
+                )
+            longest = tl.max(length, axis=0)
+
+            v_base = val_ptr + member * val_stride
+            x_base = x_ptr + member * x_stride
+            lane = tl.arange(0, BK)
+            compute_dtype: tl.constexpr = (
+                tl.float64 if out_ptr.dtype.element_ty == tl.float64 else tl.float32
             )
+            acc = tl.zeros([BS, BR, BK], dtype=compute_dtype)
+            for k in range(0, longest, BK):
+                pos = k + lane
+                mask = pos[None, :] < length[:, None]
+                idx = start[:, None] + pos[None, :]
+                c = tl.load(col_ptr + idx, mask=mask, other=0)
+                full = mask[None, :, :] & sample_mask[:, None, None]
+                if MASK and not WEIGHT_GRAD:
+                    full = full & active[:, :, None]
+                if LIST:
+                    offset = c[None, :, :] * n_sample + list_sample[None, :, None]
+                elif BS == 1:  # a single sample: x[member, column]
+                    offset = c[None, :, :]
+                else:
+                    offset = c[None, :, :] * n_sample + sample[:, None, None]
+                xv = tl.load(x_base + offset, mask=full, other=0.0)
+                if WEIGHT_GRAD:
+                    increment = tl.sum(
+                        _multiply(xv, amplitude[:, :, None].to(xv.dtype)), axis=0
+                    )
+                    # Match the separate edge VJP's storage rounding and the
+                    # route's restoration to the original parameter dtype.
+                    increment = increment.to(x_ptr.dtype.element_ty).to(
+                        grad_values_ptr.dtype.element_ty
+                    )
+                    changed = mask & (increment != 0.0)
+                if PERM:
+                    slot_mask = mask
+                    if MASK:
+                        slot_mask = (
+                            mask & (tl.sum(active.to(tl.int32), axis=0) > 0)[:, None]
+                        )
+                        if WEIGHT_GRAD:
+                            slot_mask = slot_mask | changed
+                    slot = tl.load(perm_ptr + idx, mask=slot_mask, other=0)
+                    weight_mask = mask
+                    if MASK:
+                        weight_mask = (
+                            weight_mask
+                            & (tl.sum(active.to(tl.int32), axis=0) > 0)[:, None]
+                        )
+                    w = tl.load(v_base + slot, mask=weight_mask, other=0.0)
+                else:
+                    w = tl.load(v_base + idx, mask=mask, other=0.0)
+                product_input = xv
+                if MASK:
+                    product_input = tl.where(active[:, :, None], xv, 0.0)
+                acc += _multiply(w[None, :, :], product_input)
+                if WEIGHT_GRAD:
+                    previous = tl.load(grad_values_ptr + slot, mask=changed, other=0.0)
+                    value_dtype: tl.constexpr = (
+                        tl.float64
+                        if grad_values_ptr.dtype.element_ty == tl.float64
+                        else tl.float32
+                    )
+                    tl.store(
+                        grad_values_ptr + slot,
+                        previous.to(value_dtype) + increment.to(value_dtype),
+                        mask=changed,
+                    )
+            total = tl.sum(acc, axis=2)
+
+            slot = member * n_sample + sample.to(tl.int64)
+            if HUB:
+                # Segments of split rows go to the partial-sum buffer.
+                target = tl.load(target_ptr + seg, mask=seg_mask, other=0)
+                # Unused segments of the fixed-capacity layout have target -1.
+                direct = seg_mask & (target >= 0) & (target < n_rows)
+                partial = seg_mask & (target >= n_rows)
+                tl.store(
+                    out_ptr + (slot * n_rows)[:, None] + target[None, :],
+                    total,
+                    mask=sample_mask[:, None] & direct[None, :],
+                )
+                tl.store(
+                    tmp_ptr + (slot * n_tmp)[:, None] + (target - n_rows)[None, :],
+                    total,
+                    mask=sample_mask[:, None] & partial[None, :],
+                )
+            else:
+                if LIST:
+                    first = tl.load(owner_ptr + seg, mask=seg_mask, other=0)
+                    last = tl.load(owner_ptr + seg + 1, mask=seg_mask, other=0)
+                    seg_mask = seg_mask & (chunk < last - first)
+                    output_offset = (
+                        list_sample[None, :] * n_tmp + first[None, :] + chunk
+                    )
+                else:
+                    output_offset = (slot * n_rows)[:, None] + seg[None, :]
+                tl.store(
+                    out_ptr + output_offset,
+                    total,
+                    mask=sample_mask[:, None] & seg_mask[None, :],
+                )
+
+    @triton.jit
+    def _sum_row_segments(base, start, length, live, BK: tl.constexpr):
+        """Reduce contiguous row partials in the shared split-row order."""
+        lane = tl.arange(0, BK)
+        compute_dtype: tl.constexpr = (
+            tl.float64 if base.dtype.element_ty == tl.float64 else tl.float32
+        )
+        acc = tl.zeros([start.shape[0], BK], dtype=compute_dtype)
+        for k in range(0, tl.max(length, axis=0), BK):
+            pos = k + lane
+            mask = live[:, None] & (pos[None, :] < length[:, None])
+            acc += tl.load(base + start[:, None] + pos[None, :], mask=mask, other=0)
+        return tl.sum(acc, axis=1)
+
+    @triton.jit
+    def _listed_matvec_output_kernel(
+        partial,
+        mask,
+        output,
+        row_start,
+        N: tl.constexpr,
+        N_ROWS: tl.constexpr,
+        N_SEG: tl.constexpr,
+        BH: tl.constexpr,
+        BK: tl.constexpr,
+    ):
+        """Reduce listed rows and materialize zero inactive adjoints."""
+        index = tl.program_id(0) * BH + tl.arange(0, BH)
+        live = index < N
+        active = tl.load(mask + index, mask=live, other=0) != 0
+        row = index % N_ROWS
+        start = tl.load(row_start + row, mask=live, other=0)
+        end = tl.load(row_start + row + 1, mask=live, other=0)
+        length = tl.where(active, end - start, 0)
+        start += (index // N_ROWS) * N_SEG
+        value = _sum_row_segments(partial, start, length, live & active, BK)
+        tl.store(output + index, value, mask=live)
 
     _COMBINE_ARGS = [
         "hub_row_ptr",
@@ -287,14 +462,8 @@ if triton is not None:
             end = tl.load(hub_ptr + hub + 1, mask=live, other=0)
             length = end - start
             base = tmp_ptr + slot * n_tmp
-            lane = tl.arange(0, BK)
-            acc = tl.zeros([BH, BK], dtype=tl.float32)
-            for k in range(0, tl.max(length, axis=0), BK):
-                pos = k + lane
-                mask = pos[None, :] < length[:, None]
-                at = start[:, None] + pos[None, :]
-                acc += tl.load(base + at, mask=mask, other=0.0)
-            tl.store(out_ptr + slot * n_rows + row, tl.sum(acc, axis=1), mask=live)
+            value = _sum_row_segments(base, start, length, live, BK)
+            tl.store(out_ptr + slot * n_rows + row, value, mask=live)
 
     _EDGE_ARGS = [
         "row_ptr",
@@ -321,6 +490,7 @@ if triton is not None:
         x_stride,
         BE: tl.constexpr,
         BS: tl.constexpr,
+        ACCUMULATE: tl.constexpr,
     ):
         """One program per (``BE`` entries, member).
 
@@ -338,26 +508,48 @@ if triton is not None:
         x_base = x_ptr + member * x_stride
         if BS == 1:  # a single sample
             g = tl.load(g_base + r, mask=mask, other=0.0)
-            total = g * tl.load(x_base + c, mask=mask, other=0.0)
+            xv = tl.load(x_base + c, mask=mask, other=0.0).to(g.dtype)
+            total = _multiply(g, xv)
         else:
             r_off = r * n_sample
             c_off = c * n_sample
             lane = tl.arange(0, BS)
-            acc = tl.zeros([BE, BS], dtype=tl.float32)
+            compute_dtype: tl.constexpr = (
+                tl.float64 if grad_ptr.dtype.element_ty == tl.float64 else tl.float32
+            )
+            acc = tl.zeros([BE, BS], dtype=compute_dtype)
             for s in range(0, n_sample, BS):
                 pos = s + lane
                 full = mask[:, None] & (pos < n_sample)[None, :]
                 at = pos[None, :]
                 g = tl.load(g_base + r_off[:, None] + at, mask=full, other=0.0)
                 xv = tl.load(x_base + c_off[:, None] + at, mask=full, other=0.0)
-                acc += g * xv
+                acc += _multiply(g, xv.to(g.dtype))
             total = tl.sum(acc, axis=1)
-        tl.store(out_ptr + member * n_edge + k, total, mask=mask)
+        destination = out_ptr + member * n_edge + k
+        if ACCUMULATE:
+            increment = total.to(grad_ptr.dtype.element_ty).to(out_ptr.dtype.element_ty)
+            previous = tl.load(destination, mask=mask, other=0.0)
+            value_dtype: tl.constexpr = (
+                tl.float64 if out_ptr.dtype.element_ty == tl.float64 else tl.float32
+            )
+            total = previous.to(value_dtype) + increment.to(value_dtype)
+        tl.store(destination, total, mask=mask)
 
 
-_MATVEC_CONSTS = ("BR", "BK", "BS", "HUB", "PERM")
+_MATVEC_CONSTS = (
+    "BR",
+    "BK",
+    "BS",
+    "HUB",
+    "PERM",
+    "MASK",
+    "WEIGHT_GRAD",
+    "LIST",
+    "SEGMENT",
+)
 _COMBINE_CONSTS = ("BH", "BK")
-_EDGE_CONSTS = ("BE", "BS")
+_EDGE_CONSTS = ("BE", "BS", "ACCUMULATE")
 
 _HANDLES_KEY = ("triton", "compiled")
 _PATTERNS_KEY = ("triton", "patterns")
@@ -388,7 +580,7 @@ def _launch(
     name: str,
     kernel,
     device_index: int,
-    grid: tuple[int, int],
+    grid: tuple[int, ...],
     args: tuple,
     const_names: tuple[str, ...],
     consts: tuple,
@@ -397,16 +589,16 @@ def _launch(
     """Launch ``kernel`` over ``grid`` on the current stream.
 
     Every integer in ``args`` must fit ``int32``: the kernel binary depends
-    on the width of its scalar arguments, and the cached handle is keyed on
-    the constexprs only. The callers guarantee it by leaving larger problems
-    to the ATen kernels.
+    on the width of its scalar arguments. Cached handles include constexprs
+    and pointer dtypes; callers guarantee scalar widths by leaving larger
+    problems to the Torch kernels.
 
     Args:
         cache: Holds the compiled kernel handles.
         name: Kernel name (cache key).
         kernel: The ``triton.jit`` function.
         device_index: CUDA device of the arguments (the current device).
-        grid: ``(programs, batch)``.
+        grid: Programs, batch and optional row-segment axis.
         args: Runtime arguments in signature order.
         const_names: Names of the constexprs, in signature order.
         consts: Their values.
@@ -415,13 +607,14 @@ def _launch(
     if _DIRECT_LAUNCH and _no_launch_hooks():
         handles = cache.get(_HANDLES_KEY, dict)
         # A compiled module belongs to the CUDA context it was loaded in.
-        key = (name, consts, warps, device_index)
+        pointer_dtypes = tuple(arg.dtype for arg in args if isinstance(arg, Tensor))
+        key = (name, consts, warps, device_index, pointer_dtypes)
         compiled = handles.get(key)
         if compiled is not None:
             compiled.run(
                 grid[0],
-                grid[1],
-                1,
+                grid[1] if len(grid) > 1 else 1,
+                grid[2] if len(grid) > 2 else 1,
                 _raw_stream(device_index),
                 compiled.function,
                 compiled.packed_metadata,
@@ -503,6 +696,7 @@ class _RowLayout:
         target: ``[n_seg]`` destination of each segment: the row for an
             unsplit row, ``M + j`` for partial sum ``j`` of a split row,
             ``-1`` for an unused slot; ``None`` if plain.
+        owner: Original row of each segment, for output-adjoint support masks.
         hub_row: ``[n_hub]`` the split rows (``-1``: unused slot).
         hub_ptr: ``[n_hub + 1]`` partial sums owned by each split row.
         n_seg: Segments the kernel is launched over (``M`` if plain, else
@@ -511,6 +705,7 @@ class _RowLayout:
         n_hub: Split-row slots the combine kernel is launched over
             (capacity; 0 if plain).
         n_split: Rows actually split by the current pattern (informative).
+        row_segment_start: Per-row offsets into compact listed-row partials.
     """
 
     __slots__ = (
@@ -524,15 +719,20 @@ class _RowLayout:
         "ptr",
         "segmented",
         "target",
+        "owner",
+        "row_segment_start",
     )
 
     def __init__(self, crow: Tensor, n_edge: int) -> None:
         self.crow32 = torch.empty(crow.shape, dtype=torch.int32, device=crow.device)
         self.ptr = self.crow32
-        self.target = self.hub_row = self.hub_ptr = None
+        self.target = self.owner = self.hub_row = self.hub_ptr = None
         self.segmented = False
         self.n_seg = crow.shape[0] - 1
         self.n_tmp = self.n_hub = self.n_split = 0
+        self.row_segment_start = torch.arange(
+            crow.numel(), dtype=torch.int32, device=crow.device
+        )
         self.fill(crow, n_edge)
 
     def fill(self, crow: Tensor, n_edge: int) -> bool:
@@ -541,7 +741,7 @@ class _RowLayout:
         Synchronises with the host (once per topology, never per call).
 
         Returns:
-            Whether tensors were allocated (the layout became segmented).
+            Whether derived tensors were allocated.
         """
         self.crow32.copy_(crow)
         n_rows = crow.shape[0] - 1
@@ -550,12 +750,13 @@ class _RowLayout:
         allocated = False
         if not self.segmented:
             if n_rows == 0 or not bool(long.any()):
-                return False
+                return allocated
             device = crow.device
             n_seg = n_rows + n_edge // _SEGMENT
             n_hub = min(n_rows, n_edge // (_SEGMENT + 1))
             self.ptr = torch.empty(n_seg + 1, dtype=torch.int32, device=device)
             self.target = torch.empty(n_seg, dtype=torch.int32, device=device)
+            self.owner = torch.empty(n_seg, dtype=torch.int32, device=device)
             self.hub_row = torch.empty(n_hub, dtype=torch.int32, device=device)
             self.hub_ptr = torch.empty(n_hub + 1, dtype=torch.int32, device=device)
             self.n_seg, self.n_hub = n_seg, n_hub
@@ -564,6 +765,8 @@ class _RowLayout:
         # Segments per row; empty rows keep one (it writes their zero).
         n_seg = ((counts + (_SEGMENT - 1)) // _SEGMENT).clamp_(min=1)
         first = torch.cumsum(n_seg, 0) - n_seg
+        self.row_segment_start[:-1].copy_(first)
+        self.row_segment_start[-1:].copy_(first[-1:] + n_seg[-1:])
         seg_row = torch.repeat_interleave(
             torch.arange(n_rows, device=crow.device), n_seg
         )
@@ -575,6 +778,8 @@ class _RowLayout:
         self.ptr[used:] = n_edge  # unused slots own no entries
         self.target[:used].copy_(torch.where(seg_long, n_rows + partial, seg_row))
         self.target[used:] = -1
+        self.owner[:used].copy_(seg_row)
+        self.owner[used:] = -1
         hub_row = long.nonzero().squeeze(1)
         n_split = self.n_split = hub_row.shape[0]
         self.hub_row[:n_split].copy_(hub_row)
@@ -799,16 +1004,23 @@ def _numel(shape) -> int:
     return n
 
 
-def _sample_minor(t: Tensor, n_sample: int) -> Tensor:
-    """``[*vb, *sample, n]`` -> contiguous float32 ``[members, n, samples]``.
+def _prepare_sample_minor(t: Tensor, n_sample: int):
+    """Prepare reusable sample-minor storage without changing operand dtype."""
+    if n_sample <= 1 and t.is_contiguous():
+        return lambda input: input
+    minor = t.reshape(-1, n_sample, t.shape[-1]).transpose(1, 2) if n_sample > 1 else t
+    workspace = torch.empty_like(minor, memory_format=torch.contiguous_format)
 
-    With a single sample the two layouts coincide and nothing is copied.
-    """
-    if t.dtype != torch.float32:
-        t = t.to(torch.float32)
-    if n_sample > 1:
-        t = t.reshape(-1, n_sample, t.shape[-1]).transpose(1, 2)
-    return t.contiguous()
+    def forward(input):
+        minor = (
+            input.reshape(-1, n_sample, input.shape[-1]).transpose(1, 2)
+            if n_sample > 1
+            else input
+        )
+        workspace.copy_(minor)
+        return workspace
+
+    return forward
 
 
 def _on_current_device(pattern: _Pattern, a: Tensor, b: Tensor) -> bool:
@@ -825,7 +1037,24 @@ def _on_current_device(pattern: _Pattern, a: Tensor, b: Tensor) -> bool:
 # ---------------------------------------------------------------- csr_matvec
 
 
-def _csr_matvec(
+@dataclass(frozen=True)
+class _WeightGradient:
+    source: Tensor
+    destination: Tensor
+
+
+@dataclass(frozen=True)
+class _PreparedMatvec:
+    """Bind a product and whether it also accumulates its value VJP."""
+
+    forward: Callable
+    accumulates_values: bool = False
+
+    def __call__(self, input, mask=None, activity=None):
+        return self.forward(input, mask, activity)
+
+
+def _prepare_matvec(
     cache: KernelCache,
     crow: Tensor,
     col: Tensor,
@@ -833,10 +1062,12 @@ def _csr_matvec(
     x: Tensor,
     perm: Tensor | None = None,
     x_minor: Tensor | None = None,
-) -> Tensor:
-    """``csr_matvec`` (``perm is None``) or ``csr_matvec_gather``.
+    input_mask: Tensor | GradientList | None = None,
+    weight_gradient: _WeightGradient | None = None,
+) -> _PreparedMatvec:
+    """Prepare reusable destinations for ``csr_matvec`` or its gather variant.
 
-    ``x_minor`` is ``_sample_minor(x, n_sample)`` if the caller already has
+    ``x_minor`` is the sample-minor layout of ``x`` if the caller already has
     it (the backward shares one transposed gradient between its kernels).
     """
     n_vb = values.ndim - 1
@@ -864,13 +1095,17 @@ def _csr_matvec(
             v_member = x_member = n_member = 1
         n_sample = _numel(sample)
         rows, entries, samples, warps = _tile(_MATVEC_TILES, n_sample)
+        if (
+            isinstance(input_mask, GradientList)
+            and n_vb == 0
+            and (weight_gradient is None or n_sample == 1)
+        ):
+            rows, entries, samples, warps = _tile(_MATVEC_TILES, 1)
         perm32 = None if perm is None else pattern.permutation(perm)
         supported = (
             _on_current_device(pattern, values, x)
-            and (
-                (values.dtype == torch.float32 and x.dtype == torch.float32)
-                or torch.promote_types(values.dtype, x.dtype) == torch.float32
-            )
+            and values.dtype in kernels_torch._FLOAT_DTYPES
+            and x.dtype in kernels_torch._FLOAT_DTYPES
             # Entry values are read at ``k`` (or ``perm[k]``) without a bound.
             and (values.shape[-1] == n_edge if perm is None else perm32 is not None)
             and values.shape[-1] < _INT32_MAX
@@ -888,82 +1123,182 @@ def _csr_matvec(
     if not supported:
         if perm is not None:
             values = values.index_select(-1, perm)
-        return kernels_torch.csr_matvec(crow, col, values, x)
+        return _PreparedMatvec(
+            lambda input, mask, activity: kernels_torch.csr_matvec(
+                crow, col, values, input
+            )
+        )
 
     out_shape = (*batch, *sample, n_out)
+    output_dtype = torch.promote_types(values.dtype, x.dtype)
     if n_out == 0 or n_member * n_sample == 0 or n_edge == 0:
-        return torch.zeros(out_shape, dtype=torch.float32, device=x.device)
+        empty = torch.zeros(out_shape, dtype=output_dtype, device=x.device)
+        return _PreparedMatvec(lambda input, mask, activity: empty)
 
     layout = pattern.rows
     if layout is None:
         layout = pattern.row_layout(crow)
-    hub = layout.segmented
-    n_sample_block = -(-n_sample // samples)
+    gradient_list = input_mask if isinstance(input_mask, GradientList) else None
+    if gradient_list is not None:
+        input_mask = gradient_list.mask
+    listed = (
+        gradient_list is not None
+        and n_vb == 0
+        and (weight_gradient is None or n_sample == 1)
+    )
+    hub = layout.segmented and not listed
+    n_sample_block = 1 if listed else -(-n_sample // samples)
     if n_member * (n_sample if hub else n_sample_block) > _MAX_GRID_Y:
         if perm is not None:
             values = values.index_select(-1, perm)
-        return kernels_torch.csr_matvec(crow, col, values, x)
+        return _PreparedMatvec(
+            lambda input, mask, activity: kernels_torch.csr_matvec(
+                crow, col, values, input
+            )
+        )
 
     device_index = pattern.device.index
-    if values.dtype != torch.float32:
-        values = values.to(torch.float32)
     values = values.contiguous()
-    x = _sample_minor(x, n_sample) if x_minor is None else x_minor
-    out = torch.empty(out_shape, dtype=torch.float32, device=x.device)
+    prepare_input = _prepare_sample_minor(x, n_sample) if x_minor is None else None
+    out = torch.empty(out_shape, dtype=output_dtype, device=x.device)
+    accumulate_values = (
+        weight_gradient is not None
+        and perm32 is not None
+        and n_vb == 0
+        and n_sample_block == 1
+        and (not listed or n_sample == 1)
+        and weight_gradient.destination.is_contiguous()
+        and weight_gradient.source.dtype in kernels_torch._FLOAT_DTYPES
+    )
+    prepare_activity = (
+        _prepare_sample_minor(weight_gradient.source, n_sample)
+        if accumulate_values
+        else None
+    )
     tmp = out
     if hub:
         tmp = torch.empty(
-            (n_member * n_sample, layout.n_tmp), dtype=torch.float32, device=x.device
+            (n_member * n_sample, layout.n_tmp),
+            dtype=kernels_torch._accumulation_dtype(output_dtype),
+            device=x.device,
         )
-    n_seg = layout.n_seg
-    _launch(
-        cache,
-        "csr_matvec",
-        _csr_matvec_kernel,
-        device_index,
-        (-(-n_seg // rows), n_member * n_sample_block),
-        (
-            layout.ptr,
-            layout.target if hub else layout.ptr,
-            pattern.col32,
-            pattern.col32 if perm32 is None else perm32,
-            values,
-            x,
-            out,
-            tmp,
-            n_seg,
-            n_out,
-            n_sample,
-            n_sample_block,
-            layout.n_tmp,
-            0 if v_member == 1 else values.shape[-1],
-            0 if x_member == 1 else n_sample * n_in,
-        ),
-        _MATVEC_CONSTS,
-        (rows, entries, samples, hub, perm32 is not None),
-        warps,
-    )
-    if hub:
+    if listed:
+        # Sparse row traversal writes only listed rows. The final consumer
+        # materializes inactive zeros, so previous-timestep work cannot leak.
+        tmp = torch.empty(
+            (n_sample, layout.n_seg),
+            dtype=kernels_torch._accumulation_dtype(out.dtype),
+            device=out.device,
+        )
+
+    def forward(input, mask, activity):
+        queue = mask if isinstance(mask, GradientList) else None
+        mask = queue.mask if queue is not None else mask
+        indices, counts = queue.work(accumulate_values) if listed else (out, out)
+        source = x_minor if x_minor is not None else prepare_input(input)
+        activity_minor = (
+            source if prepare_activity is None else prepare_activity(activity)
+        )
+        n_seg = gradient_list.capacity if listed else layout.n_seg
         _launch(
             cache,
-            "hub_combine",
-            _hub_combine_kernel,
+            "csr_matvec",
+            _csr_matvec_kernel,
             device_index,
-            (-(-layout.n_hub // _COMBINE_TILE[0]), n_member * n_sample),
             (
-                layout.hub_row,
-                layout.hub_ptr,
-                tmp,
-                out,
-                layout.n_hub,
-                n_out,
-                layout.n_tmp,
+                -(-n_seg // rows),
+                n_member * n_sample_block,
+                min(_LIST_PARTITIONS, max(1, -(-n_edge // _SEGMENT))) if listed else 1,
             ),
-            _COMBINE_CONSTS,
-            _COMBINE_TILE,
-            1,
+            (
+                layout.crow32 if listed else layout.ptr,
+                layout.target if hub else layout.ptr,
+                pattern.col32,
+                pattern.col32 if perm32 is None else perm32,
+                values,
+                source,
+                tmp if listed else out,
+                tmp,
+                n_seg,
+                n_out,
+                n_sample,
+                n_sample_block,
+                layout.n_seg if listed else layout.n_tmp,
+                0 if v_member == 1 else values.shape[-1],
+                0 if x_member == 1 else n_sample * n_in,
+                source if input_mask is None else mask,
+                layout.row_segment_start
+                if listed
+                else layout.ptr
+                if layout.owner is None
+                else layout.owner,
+                activity_minor,
+                out if not accumulate_values else weight_gradient.destination,
+                indices,
+                counts,
+            ),
+            _MATVEC_CONSTS,
+            (
+                rows,
+                entries,
+                samples,
+                hub,
+                perm32 is not None,
+                input_mask is not None,
+                accumulate_values,
+                listed,
+                _SEGMENT,
+            ),
+            warps,
         )
-    return out
+        if listed:
+            _listed_matvec_output_kernel[(triton.cdiv(out.numel(), _COMBINE_TILE[0]),)](
+                tmp,
+                mask,
+                out,
+                layout.row_segment_start,
+                out.numel(),
+                n_out,
+                layout.n_seg,
+                *_COMBINE_TILE,
+            )
+        if hub:
+            _launch(
+                cache,
+                "hub_combine",
+                _hub_combine_kernel,
+                device_index,
+                (-(-layout.n_hub // _COMBINE_TILE[0]), n_member * n_sample),
+                (
+                    layout.hub_row,
+                    layout.hub_ptr,
+                    tmp,
+                    out,
+                    layout.n_hub,
+                    n_out,
+                    layout.n_tmp,
+                ),
+                _COMBINE_CONSTS,
+                _COMBINE_TILE,
+                1,
+            )
+        return out
+
+    return _PreparedMatvec(forward, accumulate_values)
+
+
+def _csr_matvec(
+    cache: KernelCache,
+    crow: Tensor,
+    col: Tensor,
+    values: Tensor,
+    x: Tensor,
+    perm: Tensor | None = None,
+    x_minor: Tensor | None = None,
+) -> Tensor:
+    """Execute a product through the shared prepared destination launcher."""
+    forward = _prepare_matvec(cache, crow, col, values, x, perm, x_minor)
+    return forward(x)
 
 
 def csr_matvec(crow: Tensor, col: Tensor, values: Tensor, x: Tensor) -> Tensor:
@@ -1018,7 +1353,7 @@ def csr_matvec_gather(
 # ----------------------------------------------------------------- edge_grad
 
 
-def _edge_grad(
+def _prepare_edge_grad(
     cache: KernelCache,
     crow: Tensor,
     col: Tensor,
@@ -1026,8 +1361,9 @@ def _edge_grad(
     x: Tensor,
     n_vb: int,
     grad_minor: Tensor | None = None,
-) -> Tensor:
-    """``edge_grad``; ``grad_minor`` is ``_sample_minor(grad, n_sample)`` if
+    destination: Tensor | None = None,
+) -> Callable[[Tensor, Tensor], Tensor]:
+    """``edge_grad``; ``grad_minor`` is the sample-minor layout of ``grad`` if
     the caller already has it."""
     supported = False
     # Both operands need the value-batch dimensions and the neuron axis.
@@ -1043,8 +1379,8 @@ def _edge_grad(
             entries, samples, warps = _tile(_EDGE_TILES, n_sample)
             supported = (
                 _on_current_device(pattern, grad, x)
-                and grad.dtype == torch.float32
-                and not x.is_complex()
+                and grad.dtype in kernels_torch._FLOAT_DTYPES
+                and x.dtype in kernels_torch._FLOAT_DTYPES
                 and grad.shape[-1] == n_out
                 # 32-bit sample-minor offsets (the lanes past the last
                 # sample of a block are masked but still computed).
@@ -1052,42 +1388,84 @@ def _edge_grad(
                 and (x_member == n_member or x_member == 1)
                 and _numel(x.shape[n_vb:-1]) == n_sample
                 and n_member <= _MAX_GRID_Y
+                and (
+                    destination is None
+                    or (
+                        destination.shape == (*batch, n_edge)
+                        and destination.is_contiguous()
+                    )
+                )
             )
     if not supported:
-        return kernels_torch.edge_grad(crow, col, grad, x, n_vb)
+
+        def reference(gradient, input):
+            result = kernels_torch.edge_grad(crow, col, gradient, input, n_vb)
+            if destination is None:
+                return result
+            destination.add_(
+                result.sum_to_size(destination.shape).to(destination.dtype)
+            )
+            return None
+
+        return reference
 
     out_shape = (*batch, n_edge)
     if n_edge == 0 or n_member == 0 or n_sample == 0:
-        return torch.zeros(out_shape, dtype=torch.float32, device=grad.device)
+        out = torch.zeros(out_shape, dtype=grad.dtype, device=grad.device)
+        return lambda gradient, input: out if destination is None else None
 
     row32 = pattern.row32
     if row32 is None:
         row32 = pattern.row_index(crow)
-    grad = _sample_minor(grad, n_sample) if grad_minor is None else grad_minor
-    x = _sample_minor(x, n_sample)
-    out = torch.empty(out_shape, dtype=torch.float32, device=grad.device)
-    _launch(
-        cache,
-        "edge_grad",
-        _edge_grad_kernel,
-        pattern.device.index,
-        (-(-n_edge // entries), n_member),
-        (
-            row32,
-            pattern.col32,
-            grad,
-            x,
-            out,
-            n_edge,
-            n_sample,
-            n_sample * n_out,
-            0 if x_member == 1 else n_sample * n_in,
-        ),
-        _EDGE_CONSTS,
-        (entries, samples),
-        warps,
+    prepare_grad = _prepare_sample_minor(grad, n_sample) if grad_minor is None else None
+    prepare_input = _prepare_sample_minor(x, n_sample)
+    out = (
+        torch.empty(out_shape, dtype=grad.dtype, device=grad.device)
+        if destination is None
+        else destination
     )
-    return out
+
+    def forward(gradient, input):
+        gradient = grad_minor if grad_minor is not None else prepare_grad(gradient)
+        input = prepare_input(input)
+        _launch(
+            cache,
+            "edge_grad",
+            _edge_grad_kernel,
+            pattern.device.index,
+            (-(-n_edge // entries), n_member),
+            (
+                row32,
+                pattern.col32,
+                gradient,
+                input,
+                out,
+                n_edge,
+                n_sample,
+                n_sample * n_out,
+                0 if x_member == 1 else n_sample * n_in,
+            ),
+            _EDGE_CONSTS,
+            (entries, samples, destination is not None),
+            warps,
+        )
+        return out if destination is None else None
+
+    return forward
+
+
+def _edge_grad(
+    cache: KernelCache,
+    crow: Tensor,
+    col: Tensor,
+    grad: Tensor,
+    x: Tensor,
+    n_vb: int,
+    grad_minor: Tensor | None = None,
+) -> Tensor:
+    """``edge_grad``; ``grad_minor`` is the sample-minor layout of ``grad`` if
+    the caller already has it."""
+    return _prepare_edge_grad(cache, crow, col, grad, x, n_vb, grad_minor)(grad, x)
 
 
 def edge_grad(crow: Tensor, col: Tensor, grad: Tensor, x: Tensor, n_vb: int) -> Tensor:
@@ -1115,6 +1493,77 @@ def edge_grad(crow: Tensor, col: Tensor, grad: Tensor, x: Tensor, n_vb: int) -> 
 # ------------------------------------------------------------------ backward
 
 
+def _prepare_backward(
+    cache: KernelCache,
+    crow: Tensor,
+    col: Tensor,
+    t_crow: Tensor,
+    t_col: Tensor,
+    t_perm: Tensor,
+    values: Tensor,
+    x: Tensor,
+    grad: Tensor,
+    need_values: bool,
+    need_x: bool,
+    input_mask: Tensor | None = None,
+    grad_values: Tensor | None = None,
+):
+    n_vb = values.ndim - 1
+    grad_minor = None
+    prepare_grad = None
+    if (
+        need_values
+        and need_x
+        and grad.is_cuda
+        and grad.dtype in kernels_torch._FLOAT_DTYPES
+        and grad.ndim > n_vb + 1
+        and grad.numel() > 0
+    ):
+        # Both kernels read the output gradient sample-minor: transpose once.
+        n_sample = _numel(grad.shape[n_vb:-1])
+        if n_sample > 1:
+            prepare_grad = _prepare_sample_minor(grad, n_sample)
+            grad_minor = prepare_grad(grad)
+    input_backward = (
+        _prepare_matvec(
+            cache,
+            t_crow,
+            t_col,
+            values,
+            grad,
+            t_perm,
+            grad_minor,
+            input_mask,
+            _WeightGradient(x, grad_values)
+            if need_values and grad_values is not None
+            else None,
+        )
+        if need_x
+        else None
+    )
+    fused_values = input_backward is not None and input_backward.accumulates_values
+    values_backward = (
+        _prepare_edge_grad(cache, crow, col, grad, x, n_vb, grad_minor, grad_values)
+        if need_values and not fused_values
+        else None
+    )
+
+    def backward(input, gradient, mask=None):
+        if prepare_grad is not None:
+            prepare_grad(gradient)
+        value_gradient = (
+            values_backward(gradient, input) if values_backward is not None else None
+        )
+        grad_x = (
+            (input_backward(gradient, mask, input))
+            if input_backward is not None
+            else None
+        )
+        return value_gradient, grad_x
+
+    return backward
+
+
 def _backward(
     cache: KernelCache,
     crow: Tensor,
@@ -1128,26 +1577,9 @@ def _backward(
     need_values: bool,
     need_x: bool,
 ) -> tuple[Tensor | None, Tensor | None]:
-    n_vb = values.ndim - 1
-    grad_minor = None
-    if (
-        need_values
-        and need_x
-        and grad.is_cuda
-        and grad.dtype == torch.float32
-        and grad.ndim > n_vb + 1
-        and grad.numel() > 0
-    ):
-        # Both kernels read the output gradient sample-minor: transpose once.
-        n_sample = _numel(grad.shape[n_vb:-1])
-        if n_sample > 1:
-            grad_minor = _sample_minor(grad, n_sample)
-    grad_values = grad_x = None
-    if need_values:
-        grad_values = _edge_grad(cache, crow, col, grad, x, n_vb, grad_minor)
-    if need_x:
-        grad_x = _csr_matvec(cache, t_crow, t_col, values, grad, t_perm, grad_minor)
-    return grad_values, grad_x
+    return _prepare_backward(
+        cache, crow, col, t_crow, t_col, t_perm, values, x, grad, need_values, need_x
+    )(x, grad)
 
 
 def csr_backward(
@@ -1338,6 +1770,9 @@ def register(registry: BackendRegistry, priority: int = 10) -> None:
     def _matvec(crow: Tensor, col: Tensor, values: Tensor, x: Tensor) -> Tensor:
         return _csr_matvec(cache, crow, col, values, x)
 
+    def _prepare_forward(crow, col, values, x):
+        return _prepare_matvec(cache, crow, col, values, x)
+
     def _grad(crow: Tensor, col: Tensor, grad: Tensor, x: Tensor, n_vb: int) -> Tensor:
         return _edge_grad(cache, crow, col, grad, x, n_vb)
 
@@ -1356,6 +1791,37 @@ def register(registry: BackendRegistry, priority: int = 10) -> None:
             grad,
             need_values,
             need_x,
+        )
+
+    def _prepare_reverse(
+        crow,
+        col,
+        t_crow,
+        t_col,
+        t_perm,
+        values,
+        x,
+        grad,
+        need_values,
+        need_x,
+        *,
+        input_mask=None,
+        grad_values=None,
+    ):
+        return _prepare_backward(
+            cache,
+            crow,
+            col,
+            t_crow,
+            t_col,
+            t_perm,
+            values,
+            x,
+            grad,
+            need_values,
+            need_x,
+            input_mask,
+            grad_values,
         )
 
     def _prepare_all(crow, col, t_crow, t_col, t_perm) -> None:
@@ -1397,4 +1863,8 @@ def register(registry: BackendRegistry, priority: int = 10) -> None:
             device="cuda",
             priority=priority,
             available=is_available,
+            prepare_execution={
+                "csr_matvec": _prepare_forward,
+                "csr_backward": _prepare_reverse,
+            }.get(kernel),
         )

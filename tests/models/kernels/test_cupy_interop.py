@@ -2,7 +2,7 @@
 
 import torch
 
-from btorch.models.kernels import CellSpec, HistoryPlan
+from btorch.models.kernels import HistoryPlan, NeuronSpec
 from btorch.models.kernels.operators import run_multi_step
 from tests.models.kernels.helpers import require_cuda_backend
 
@@ -59,7 +59,7 @@ def _evaluate(backend, cotangents=None):
         x_seq,
         states,
         parameters,
-        CellSpec("lif", dt=0.5, hard_reset=True),
+        NeuronSpec("lif", dt=0.5, hard_reset=True),
         HistoryPlan(("v_charged",)),
         backend=backend,
     )
@@ -117,7 +117,7 @@ def test_cupy_raw_pointers_replay_forward_and_vjp_in_cuda_graph():
                 x_seq,
                 states,
                 parameters,
-                CellSpec("lif", dt=0.5, hard_reset=True),
+                NeuronSpec("lif", dt=0.5, hard_reset=True),
                 HistoryPlan(("v_charged",)),
                 backend="cupy",
             )
@@ -139,7 +139,7 @@ def test_cupy_raw_pointers_replay_forward_and_vjp_in_cuda_graph():
             x_seq,
             states,
             parameters,
-            CellSpec("lif", dt=0.5, hard_reset=True),
+            NeuronSpec("lif", dt=0.5, hard_reset=True),
             HistoryPlan(("v_charged",)),
             backend="cupy",
         )

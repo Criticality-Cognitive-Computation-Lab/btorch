@@ -50,7 +50,7 @@ def test_rate_boundary_and_density_precedence(monkeypatch, rate, density, algori
         assert "firing_rate_hz" in plan.reason
 
 
-@pytest.mark.parametrize("constraint", ["deterministic", "batched", "float64", "cpu"])
+@pytest.mark.parametrize("constraint", ["deterministic", "batched", "integer", "cpu"])
 def test_low_rate_respects_execution_constraints(monkeypatch, constraint):
     pytest.importorskip("triton")
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
@@ -63,7 +63,7 @@ def test_low_rate_respects_execution_constraints(monkeypatch, constraint):
         device="cpu" if constraint == "cpu" else "cuda",
         value_batched=constraint == "batched",
         hints=Hints(firing_rate_hz=1),
-        dtype=torch.float64 if constraint == "float64" else torch.float32,
+        dtype=torch.int64 if constraint == "integer" else torch.float32,
     )
     # Low activity cannot override a missing supported route, reproducibility,
     # or shared-pattern value batching. CPU keeps its existing density policy.
@@ -73,7 +73,7 @@ def test_low_rate_respects_execution_constraints(monkeypatch, constraint):
             device="cpu" if constraint == "cpu" else "cuda",
             value_batched=constraint == "batched",
             hints=Hints(),
-            dtype=torch.float64 if constraint == "float64" else torch.float32,
+            dtype=torch.int64 if constraint == "integer" else torch.float32,
             method="push",
         )
 
@@ -92,7 +92,7 @@ def test_explicit_method_overrides_hints_and_rejects_unsupported_routes(monkeypa
     with use_backend("torch"), pytest.raises(RuntimeError, match="method='push'"):
         planner.plan(**args, method="push", hints=Hints())
     with pytest.raises(RuntimeError, match="method='push'"):
-        planner.plan(**{**args, "dtype": torch.float64}, method="push", hints=Hints())
+        planner.plan(**{**args, "dtype": torch.int64}, method="push", hints=Hints())
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
     with pytest.raises(RuntimeError, match="atomic"):
         planner.plan(**args, method="push", hints=Hints())
@@ -176,6 +176,7 @@ def test_device_spike_list_preserves_product_and_vjp(variant, activity):
         shape[0],
         values=torch.as_tensor(values, device="cuda"),
         hints=Hints(firing_rate_hz=4),
+        method="push",
     )
     # Use a strided source view: compaction and fanout must consume the same
     # contiguous snapshot, while autograd still returns the dense-input VJP.

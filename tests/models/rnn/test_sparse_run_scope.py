@@ -13,7 +13,15 @@ from btorch.sparse import Hints
 from btorch.sparse.runtime import (
     kernels_triton_tasks as task_kernels,
     registry,
+    use_backend,
 )
+
+
+@pytest.fixture
+def sparse_reference_backend():
+    # These cases exercise task preparation, not the small-network dense route.
+    with use_backend("torch"):
+        yield
 
 
 class _ScopedCell(MemoryModule):
@@ -116,7 +124,9 @@ class _SparseCell(MemoryModule):
         return self.connection(x)
 
 
-def test_sparse_connection_materializes_once_for_a_multichunk_trajectory(monkeypatch):
+def test_sparse_connection_materializes_once_for_a_multichunk_trajectory(
+    monkeypatch, sparse_reference_backend
+):
     """Weight ordering and task preparation are outside the timestep loop."""
     cell = make_rnn(_SparseCell, chunk_size=2, unroll=1)()
     connection = cell.rnn_cell.connection
@@ -182,7 +192,9 @@ def test_bound_route_does_not_resolve_registry_inside_trajectory(monkeypatch):
     assert output.shape == (8, 4, 3)
 
 
-def test_checkpoint_recompute_reuses_prepared_task_values(monkeypatch):
+def test_checkpoint_recompute_reuses_prepared_task_values(
+    monkeypatch, sparse_reference_backend
+):
     """Backward recomputation reuses the trajectory's packed task values."""
     cell = make_rnn(
         _SparseCell,
@@ -292,12 +304,70 @@ def test_cuda_task_route_supports_a_standalone_connection_call():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_cuda_task_route_rejects_mixed_input_weight_dtype_early():
-    """Runtime input dtype is validated before task preparation or launch."""
-    connection = _SparseCell().connection.cuda()
+@pytest.mark.parametrize(
+    "backend,weight_dtype,input_dtype",
+    [
+        ("triton", torch.float16, torch.float16),
+        ("triton", torch.float32, torch.float64),
+        ("triton", torch.float64, torch.float16),
+        ("triton", torch.bfloat16, torch.float16),
+        ("cusparse", torch.float16, torch.float16),
+        ("cusparse", torch.bfloat16, torch.bfloat16),
+    ],
+)
+def test_cuda_sparse_routes_preserve_typed_activity_and_gradients(
+    backend, weight_dtype, input_dtype, monkeypatch
+):
+    """Sparse routes use actual operand dtypes, including strided views.
 
-    with pytest.raises(ValueError, match="input dtype must match"):
-        connection(torch.ones(4, 3, device="cuda", dtype=torch.float64))
+    These selected cases cover half storage, double activity with single
+    weights, double weights with half activity, and Torch's FP16/BF16
+    promotion. A fractional FP64 perturbation detects accidental FP32
+    calculation; the independent dense product checks both input and
+    trainable edge gradients.
+    """
+    from btorch.sparse.runtime import kernels_torch, use_backend
+
+    def no_reference(*args, **kwargs):
+        pytest.fail("Supported floating operands must execute native sparse kernels")
+
+    if backend == "triton":
+        monkeypatch.setattr(kernels_torch, "csr_matvec", no_reference)
+        monkeypatch.setattr(kernels_torch, "edge_grad", no_reference)
+    connection = _SparseCell().connection.cuda().to(dtype=weight_dtype)
+    storage = torch.empty((4, 7), device="cuda", dtype=input_dtype)
+    x = storage[:, 1::2]
+    x.copy_(torch.arange(12, device="cuda").reshape(4, 3) / 8 + 2**-30)
+    if input_dtype == torch.float64:
+        x.add_(2**-30)
+    x.requires_grad_()
+    # The cuSPARSE cases exercise Torch's existing low-precision CUDA CSR
+    # support, while Triton cases cover direct/hash task propagation.
+    with use_backend(backend):
+        output = connection(x)
+
+    dtype = torch.promote_types(weight_dtype, input_dtype)
+    dense = torch.zeros((3, 3), device="cuda", dtype=dtype).index_put(
+        (connection.post, connection.pre),
+        connection.weight().to(dtype),
+        accumulate=True,
+    )
+    expected = x.to(dtype) @ dense.T
+    tolerance = {
+        torch.float16: 2e-3,
+        torch.bfloat16: 1e-2,
+        torch.float32: 3e-5,
+        torch.float64: 1e-12,
+    }[dtype]
+    torch.testing.assert_close(output, expected, atol=tolerance, rtol=tolerance)
+    cotangent = torch.linspace(
+        -0.7, 0.8, output.numel(), device="cuda", dtype=dtype
+    ).reshape_as(output)
+    roots = (x, *connection.parameters())
+    actual_gradients = torch.autograd.grad(output, roots, cotangent)
+    expected_gradients = torch.autograd.grad(expected, roots, cotangent)
+    for actual, reference in zip(actual_gradients, expected_gradients, strict=True):
+        torch.testing.assert_close(actual, reference, atol=tolerance, rtol=tolerance)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

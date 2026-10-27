@@ -12,13 +12,37 @@ import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from btorch.models.kernels import CellSpec, HistoryPlan, KernelOptions
+from btorch.models.kernels import HistoryPlan, KernelOptions, NeuronSpec
 from btorch.models.kernels.golden import python_module_sequence
 from btorch.models.kernels.operators import run_multi_step
 from btorch.models.kernels.templates import get_template
 
 
 GPU_BACKENDS = ("triton", "cupy", "tilelang")
+
+
+def validation_cases(cases, *, selected):
+    """Keep selected scenarios routine and reserve the rest for full
+    validation.
+
+    Cases describe the same numerical oracle. Selection belongs next to
+    that oracle, where the physics or renderer feature motivating each
+    case is clear. Full validation retains every original combination
+    without duplicating tests.
+    """
+    cases = tuple(cases)
+    selected = set(selected)
+    missing = selected.difference(cases)
+    if missing:
+        raise ValueError(
+            f"Selected validation cases are absent from the matrix: {missing}"
+        )
+    return [
+        pytest.param(
+            *case, marks=() if case in selected else pytest.mark.full_validation
+        )
+        for case in cases
+    ]
 
 
 def require_cuda_backend(backend: str) -> None:
@@ -55,7 +79,7 @@ class SequenceParityOptions:
 
 def assert_module_sequence(
     backend: str,
-    spec: CellSpec,
+    spec: NeuronSpec,
     x: torch.Tensor,
     states: tuple[torch.Tensor, ...],
     parameters: tuple[torch.Tensor, ...],
@@ -107,7 +131,7 @@ def assert_module_sequence(
 def cell_inputs(model, refractory=False):
     """Build heterogeneous state/parameter leaves for the shared cell
     contracts."""
-    spec = CellSpec(model, dt=1, refractory=refractory)
+    spec = NeuronSpec(model, dt=1, refractory=refractory)
     template = get_template(spec)
     values = dict(
         v_threshold=1.0,

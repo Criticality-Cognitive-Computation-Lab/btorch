@@ -4,7 +4,7 @@ models."""
 import pytest
 import torch
 
-from btorch.models.kernels.contracts import CellSpec, HistoryPlan
+from btorch.models.kernels.contracts import HistoryPlan, NeuronSpec
 from btorch.models.kernels.templates import get_template
 from btorch.models.kernels.torch_backend import forward_step
 from tests.models.kernels.helpers import cell_inputs
@@ -238,7 +238,7 @@ def test_low_precision_state_accumulation_and_multidimensional_batch(dtype):
         torch.ones(4),
         torch.full((4,), 20.0),
     )
-    spec = CellSpec("lif")
+    spec = NeuronSpec("lif")
     history = HistoryPlan(requested=("v",))
     result = run_multi_step(x, states, params, spec, history)
     reference = run_multi_step(
@@ -324,7 +324,7 @@ def test_external_model_declares_history_shapes_and_reference_derivatives(n_step
         x,
         (q_init,),
         (decay,),
-        CellSpec(template.name),
+        NeuronSpec(template.name),
         HistoryPlan(requested=("charged",)),
     )
     q, expected_steps = q_init, []
@@ -554,7 +554,7 @@ def test_replacement_rejects_outstanding_backward(registration, compiler):
         register_model_template(
             template, forward_step=forward_q, backward_step=backward_q, replace=True
         )
-        spec, states, parameters = CellSpec(template.name), (torch.zeros(2, 3),), ()
+        spec, states, parameters = NeuronSpec(template.name), (torch.zeros(2, 3),), ()
     else:
         spec, _, states, parameters = cell_inputs("lif")
         states = tuple(value.detach().float() for value in states)
@@ -668,13 +668,13 @@ def test_external_inference_only_model_rejects_training_before_execution():
     x = torch.ones(3, 2, 4, requires_grad=True)
     state = torch.zeros(2, 4)
     with torch.inference_mode():
-        output, final = run_multi_step(x, (state,), (), CellSpec(template.name))
+        output, final = run_multi_step(x, (state,), (), NeuronSpec(template.name))
     torch.testing.assert_close(
         output, torch.arange(1, 4).reshape(3, 1, 1).expand_as(x).float()
     )
     torch.testing.assert_close(final, torch.full_like(state, 3))
     with pytest.raises(NotImplementedError, match="does not provide a backward_step"):
-        run_multi_step(x, (state,), (), CellSpec(template.name))
+        run_multi_step(x, (state,), (), NeuronSpec(template.name))
 
 
 @pytest.mark.parametrize(
@@ -750,7 +750,7 @@ def test_external_template_without_reference_vjp_can_use_backend_vjp():
         x,
         (state,),
         (),
-        CellSpec(template.name),
+        NeuronSpec(template.name),
         HistoryPlan(requested=("q",)),
         backend="lab_integrator_vjp",
     )

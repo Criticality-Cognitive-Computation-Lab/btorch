@@ -23,6 +23,7 @@ from . import (
     surrogate,
     synapse,
 )
+from .gradients import BPTT
 from .kernels.options import KernelOptions
 from .neurons import (
     alif,
@@ -37,6 +38,7 @@ from .neurons.dlif import DBNN, DLIF, DendriticLIF
 
 
 __all__ = [
+    "BPTT",
     "KernelOptions",
     "base",
     "bilinear",

@@ -67,6 +67,11 @@ class SurrogateFunctionBase(torch.nn.Module):
     def primitive(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
+    @property
+    def support(self) -> float | None:
+        """Return a symmetric derivative-support half-width, if known."""
+        return None
+
     def derivative(
         self,
         x: torch.Tensor,

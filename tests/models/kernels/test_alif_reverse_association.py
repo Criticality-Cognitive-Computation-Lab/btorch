@@ -7,7 +7,7 @@ from btorch.models import environ, surrogate
 from btorch.models.kernels import KernelOptions
 from btorch.models.kernels.adapters import prepare_cell
 from btorch.models.kernels.backends.fragments import get_fragments
-from btorch.models.kernels.contracts import CellSpec
+from btorch.models.kernels.contracts import NeuronSpec
 from btorch.models.kernels.operators import run_multi_step
 from btorch.models.neurons.alif import ELIF
 
@@ -108,7 +108,7 @@ def test_elif_voltage_cotangents_follow_the_module_accumulation_order():
     (native_voltage,) = torch.autograd.grad(native[0], voltage)
     assert torch.equal(native_voltage, actual)
 
-    reverse = get_fragments(CellSpec("elif", dt=0.25, hard_reset=True)).backward
+    reverse = get_fragments(NeuronSpec("elif", dt=0.25, hard_reset=True)).backward
     passive_index = reverse.index("grad_v_dynamics = -grad_v_leak - grad_v_potassium")
     exponential_index = reverse.index(
         "grad_v_dynamics = grad_v_dynamics + grad_exp_difference"
@@ -193,7 +193,7 @@ def test_spike_cotangents_follow_the_module_accumulation_order():
     assert not torch.equal(spike.grad, former)
 
     reverse = get_fragments(
-        CellSpec("elif", dt=0.25, hard_reset=True, refractory=True)
+        NeuronSpec("elif", dt=0.25, hard_reset=True, refractory=True)
     ).backward
     refractory_index = reverse.index("gspike = gspike + grad_s_refractory * tau_ref")
     adaptation_index = reverse.index("gspike = gspike + grad_s_g_k * dg_k")

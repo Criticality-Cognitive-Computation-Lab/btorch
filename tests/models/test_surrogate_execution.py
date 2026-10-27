@@ -12,6 +12,7 @@ from btorch.models.surrogate import (
     Sigmoid,
     SuperSpike,
     Triangle,
+    Truncated,
 )
 
 
@@ -28,6 +29,28 @@ _SURROGATES = [
         id="poisson-deterministic",
     ),
 ]
+
+
+def test_truncated_surrogate_preserves_spikes_and_defines_boundary_vjp():
+    """Cut off only the requested derivative, including the exact boundary."""
+    base = Sigmoid(alpha=2.0, damping_factor=0.75)
+    function = Truncated(base, width=0.25)
+    x = torch.tensor([-0.5, -0.25, -0.249, 0.0, 0.249, 0.25, 0.5], dtype=torch.float64)
+    cotangent = torch.linspace(0.3, 1.2, x.numel(), dtype=x.dtype)
+    output, reverse = vjp(function, x)
+    torch.testing.assert_close(output, base(x))
+    expected = torch.where(
+        x.abs() < 0.25, base.derivative(x, cotangent, base.damping_factor), 0.0
+    )
+    torch.testing.assert_close(reverse(cotangent)[0], expected)
+    # Alpha still belongs to the wrapped surrogate: changing it changes the
+    # declared derivative inside support, without altering forward spikes.
+    base.alpha = 4.0
+    _, next_reverse = vjp(function, x)
+    expected = torch.where(
+        x.abs() < 0.25, base.derivative(x, cotangent, base.damping_factor), 0.0
+    )
+    torch.testing.assert_close(next_reverse(cotangent)[0], expected)
 
 
 @pytest.mark.parametrize(("surrogate", "kwargs"), _SURROGATES)

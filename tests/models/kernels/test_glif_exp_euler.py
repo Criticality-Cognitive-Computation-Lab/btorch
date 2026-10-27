@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from btorch.models.kernels import CellSpec
+from btorch.models.kernels import NeuronSpec
 from tests.models.kernels.helpers import (
     GPU_BACKENDS,
     assert_module_sequence,
@@ -51,7 +51,7 @@ def test_glif_small_updates_match_module_histories_and_vjps(backend, steps):
     # from block checkpoints using exactly the same exponential-Euler update.
     assert_module_sequence(
         backend,
-        CellSpec("glif3", dt=0.001, surrogate="atan"),
+        NeuronSpec("glif3", dt=0.001, surrogate="atan"),
         x,
         states,
         parameters,
@@ -74,7 +74,7 @@ def test_glif_zero_adaptation_rate_and_infinite_tau_match_module(backend):
     # former inf*0 target derivative and retain the Module's finite gradients.
     assert_module_sequence(
         backend,
-        CellSpec("glif3", dt=0.01, surrogate="atan"),
+        NeuronSpec("glif3", dt=0.01, surrogate="atan"),
         x,
         states,
         parameters,
@@ -100,7 +100,7 @@ def test_glif_sums_adaptation_modes_before_adding_external_current(backend):
     # this grouping matters even though the real-valued equations agree.
     assert_module_sequence(
         backend,
-        CellSpec("glif3", surrogate="atan"),
+        NeuronSpec("glif3", surrogate="atan"),
         x,
         states,
         parameters,

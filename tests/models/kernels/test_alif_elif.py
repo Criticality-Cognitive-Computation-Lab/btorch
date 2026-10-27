@@ -1,6 +1,7 @@
 """Validate ALIF/ELIF tensor sequences against their actual Modules."""
 
 from dataclasses import replace
+from itertools import product
 
 import pytest
 import torch
@@ -12,7 +13,11 @@ from btorch.models.kernels.golden import python_module_sequence
 from btorch.models.kernels.operators import run_multi_step
 from btorch.models.kernels.templates import get_template
 from btorch.models.neurons.alif import ALIF, ELIF
-from tests.models.kernels.helpers import GPU_BACKENDS, require_cuda_backend
+from tests.models.kernels.helpers import (
+    GPU_BACKENDS,
+    require_cuda_backend,
+    validation_cases,
+)
 
 
 def _module_inputs(
@@ -154,10 +159,19 @@ def _compare_with_module(
     return actual, gradients
 
 
-@pytest.mark.parametrize("neuron_cls", [ALIF, ELIF])
-@pytest.mark.parametrize("hard_reset", [False, True])
-@pytest.mark.parametrize("detach_reset", [False, True])
-@pytest.mark.parametrize("refractory", [False, True])
+# Cover reset, detach and refractory mechanisms without crossing every flag.
+@pytest.mark.parametrize(
+    "neuron_cls,hard_reset,detach_reset,refractory",
+    validation_cases(
+        product((ALIF, ELIF), (False, True), (False, True), (False, True)),
+        selected=(
+            (ALIF, False, False, False),
+            (ALIF, True, True, True),
+            (ELIF, False, True, False),
+            (ELIF, True, False, True),
+        ),
+    ),
+)
 def test_torch_sequence_matches_module_for_reset_and_refractory_options(
     neuron_cls, hard_reset, detach_reset, refractory
 ):
@@ -214,11 +228,26 @@ def test_elif_high_soft_threshold_reduces_to_alif_sequence_and_vjp():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("backend", GPU_BACKENDS)
-@pytest.mark.parametrize("neuron_cls", [ALIF, ELIF])
-@pytest.mark.parametrize("hard_reset", [False, True])
-@pytest.mark.parametrize("detach_reset", [False, True])
-@pytest.mark.parametrize("refractory", [False, True])
+# Full BPTT covers each shared mechanism on Triton; the two other renderers
+# check both neuron templates using distinct reset/refractory paths.
+@pytest.mark.parametrize(
+    "backend,neuron_cls,hard_reset,detach_reset,refractory",
+    validation_cases(
+        product(
+            GPU_BACKENDS, (ALIF, ELIF), (False, True), (False, True), (False, True)
+        ),
+        selected=(
+            ("triton", ALIF, False, False, False),
+            ("triton", ALIF, True, True, True),
+            ("triton", ELIF, False, True, False),
+            ("triton", ELIF, True, False, True),
+            ("cupy", ALIF, False, True, True),
+            ("cupy", ELIF, True, False, False),
+            ("tilelang", ALIF, True, True, False),
+            ("tilelang", ELIF, False, False, True),
+        ),
+    ),
+)
 def test_native_sequence_preserves_module_full_bptt(
     backend, neuron_cls, hard_reset, detach_reset, refractory
 ):
@@ -249,11 +278,23 @@ def test_native_sequence_preserves_module_full_bptt(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("backend", GPU_BACKENDS)
-@pytest.mark.parametrize("neuron_cls", [ALIF, ELIF])
+# All surrogate formulas have renderer coverage in test_backends. Here the
+# distinct contract is their coupling into adaptation and refractory adjoints.
 @pytest.mark.parametrize(
-    "surrogate_name",
-    ["sigmoid", "atan", "atan_approx", "erf", "superspike", "triangle"],
+    "backend,neuron_cls,surrogate_name",
+    validation_cases(
+        product(
+            GPU_BACKENDS,
+            (ALIF, ELIF),
+            ("sigmoid", "atan", "atan_approx", "erf", "superspike", "triangle"),
+        ),
+        selected=(
+            ("triton", ALIF, "sigmoid"),
+            ("triton", ELIF, "atan_approx"),
+            ("cupy", ALIF, "erf"),
+            ("tilelang", ELIF, "triangle"),
+        ),
+    ),
 )
 def test_native_surrogates_keep_normalized_module_derivatives(
     backend, neuron_cls, surrogate_name

@@ -185,6 +185,8 @@ def _tensor_data_ptrs(value: Any) -> set[int]:
         for field in fields(value):
             pointers.update(_tensor_data_ptrs(getattr(value, field.name)))
         return pointers
+    if isinstance(value, dict):
+        return _tensor_data_ptrs(tuple(value.values()))
     if isinstance(value, (tuple, list)):
         pointers = set()
         for child in value:
@@ -209,6 +211,55 @@ def test_task_queue_and_hash_aggregation_match_dense_and_aten(graph, kernel_cach
     state = _prepare(graph, kernel_cache, batch_size=graph["spikes"].shape[0])
     actual = _run_task(graph, state, kernel_cache)
     _assert_matches_references(graph, actual, silent_rows=(1,))
+
+
+@pytest.mark.parametrize(
+    "value_dtype,input_dtype",
+    [
+        (torch.float16, torch.float16),
+        (torch.float64, torch.float32),
+        (torch.float32, torch.float64),
+    ],
+)
+def test_typed_task_hash_accumulation(graph, kernel_cache, value_dtype, input_dtype):
+    """Reuse the direct/hash algorithm for half storage and double products.
+
+    The fixture contains duplicate destinations, a split hub and silent
+    samples. Quantize only the supplied operands, then form an
+    independent double-precision dense product to catch an FP32 hash
+    table on FP64 work.
+    """
+    topology = graph["representation"]
+    values = graph["csr_values"].to(value_dtype)
+    storage = torch.empty((4, 2 * N_SRC + 1), device=DEVICE, dtype=input_dtype)
+    x = storage[:, 1::2]
+    x.copy_(graph["spikes"])
+    if input_dtype == torch.float64:
+        x[0, HUB_SOURCE] += 2**-30
+    state = task_kernels.prepare(
+        kernel_cache, topology.t_crow, topology.t_col, topology.t_perm, 4, value_dtype
+    )
+    packed = task_kernels.pack_values(state, values)
+    actual = task_kernels.run(state, packed, x, N_DST, kernel_cache)
+    if input_dtype == torch.float64:
+        # Warm compilation and the promoted hash workspace first; capture
+        # then replay changed strided activity without rebuilding either.
+        torch.cuda.synchronize()
+        capture = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(capture):
+            actual = task_kernels.run(state, packed, x, N_DST, kernel_cache)
+        x[0, HUB_SOURCE] += 0.03125
+        capture.replay()
+    row = torch.repeat_interleave(
+        torch.arange(N_DST, device=DEVICE), topology.crow.diff()
+    )
+    dense = torch.zeros((N_DST, N_SRC), device=DEVICE, dtype=torch.float64).index_put(
+        (row, topology.col), values.double(), accumulate=True
+    )
+    dtype = torch.promote_types(value_dtype, input_dtype)
+    expected = (x.double() @ dense.T).to(dtype)
+    tolerance = 2e-3 if dtype == torch.float16 else 2e-12
+    torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
 
 
 def test_pack_values_composes_source_and_task_permutations(graph, kernel_cache):

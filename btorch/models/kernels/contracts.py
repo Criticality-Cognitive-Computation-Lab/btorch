@@ -17,7 +17,7 @@ class PoissonOptions:
 
 
 @dataclass(frozen=True)
-class CellSpec:
+class NeuronSpec:
     """Describe scalar cell choices without hiding tensor parameters.
 
     Args:
@@ -32,6 +32,8 @@ class CellSpec:
         refractory: Include a refractory state and duration parameter.
         poisson: Stochastic surrogate options, or None for deterministic
             surrogates.
+        surrogate_width: Optional explicit derivative cutoff in normalized
+            surrogate-input units, independent of its alpha/damping.
     """
 
     model: str
@@ -43,6 +45,20 @@ class CellSpec:
     damping: float = 1.0
     refractory: bool = False
     poisson: PoissonOptions | None = None
+    surrogate_width: float | None = None
+
+
+def surrogate_support(spec: NeuronSpec) -> float | None:
+    """Return known compact support in the surrogate's normalized input
+    units."""
+    natural = (
+        2.0 / abs(spec.alpha) if spec.surrogate == "triangle" and spec.alpha else None
+    )
+    if spec.surrogate_width is None:
+        return natural
+    return (
+        spec.surrogate_width if natural is None else min(spec.surrogate_width, natural)
+    )
 
 
 @dataclass(frozen=True)

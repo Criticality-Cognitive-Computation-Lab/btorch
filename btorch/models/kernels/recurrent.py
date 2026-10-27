@@ -8,6 +8,7 @@ from torch import nn
 from ..connection.sparse import SparseConnection
 from ..synapse import HeterSynapsePSC
 from .adapters import connection_scope, prepare_cell
+from .contracts import surrogate_support
 from .operators import (
     _validate_compile_policy,
     _validate_parameter_shapes,
@@ -70,8 +71,8 @@ def _prepare_connection(connection, options=None):
         return (
             {"connection": "linear"},
             (
-                connection.weight.float(),
-                *(() if connection.bias is None else (connection.bias.float(),)),
+                connection.weight,
+                *(() if connection.bias is None else (connection.bias,)),
             ),
             (),
         )
@@ -130,8 +131,8 @@ def _prepare_connection(connection, options=None):
                 else (None if use_fallback else connection._max_density),
             },
             (
-                values.float(),
-                *(() if connection.bias is None else (connection.bias.float(),)),
+                values,
+                *(() if connection.bias is None else (connection.bias,)),
             ),
             topology,
         )
@@ -226,7 +227,14 @@ def recurrent_sequence(
     if not _chunk and (
         module.chunk_size or module.grad_checkpoint or module.cpu_offload
     ):
-        with connection_scope(normalize_backend(module.backend)):
+        # Bind sparse execution before checkpoint snapshots are taken. Preparing
+        # it inside the first chunk would save a different topology/task-value
+        # input list than recomputation restores, and repeat preparation per
+        # chunk instead of owning it for the whole trajectory.
+        with (
+            connection_scope(normalize_backend(module.backend)),
+            _sparse_run_scope(module, x_seq),
+        ):
             return module._multi_step_forward_impl(
                 x_seq, *(() if x_syn is None else (x_syn,)), loop_args=loop_args
             )
@@ -261,7 +269,7 @@ def recurrent_sequence(
         states.append(
             synapse.delayed_spike.history.movedim(
                 -len(synapse.delayed_spike.n_neuron) - 1, 0
-            ).float()
+            )
         )
     state_names = [
         *(f"neuron.{name}" for name in neuron_names),
@@ -294,7 +302,11 @@ def recurrent_sequence(
         aliases[name] if name in aliases else all_record_names.index(name)
         for name in requested
     ]
-    x_syn_seq = torch.zeros_like(x_seq) if x_syn is None else x_syn
+    if x_syn is not None and (
+        x_syn.shape != x_seq.shape or x_syn.device != x_seq.device
+    ):
+        raise ValueError("x_syn must have the same time-first shape and device as x")
+    x_syn_seq = x_seq.new_empty(0) if x_syn is None else x_syn
     connection_tensors = tuple(
         (f"connection parameter {name}", value)
         for name, value in cell.linear.named_parameters()
@@ -413,7 +425,9 @@ def _execute(
         options.precise_division,
         options.precise_exp,
     )
-    if x_syn_seq.shape != x_seq.shape or x_syn_seq.device != x_seq.device:
+    if (x_syn_seq.shape != x_seq.shape and x_syn_seq.shape != (0,)) or (
+        x_syn_seq.device != x_seq.device
+    ):
         raise ValueError("x_syn must have the same time-first shape and device as x")
     # Resolve both implementations and all tensor broadcast layouts before a
     # stochastic neuron consumes the first global-generator draw. CUDA dt value
@@ -427,6 +441,20 @@ def _execute(
         x_seq.shape[1:],
         label="Neuron",
     )
+    # Autocast applies to the eligible linear operation, not to neuron/PSC
+    # memories or parameters. Cast once outside the opaque trajectory so
+    # autograd retains the master-weight cast and reverse/checkpoint replay
+    # consume exactly the forward dtype even outside the autocast context.
+    if connection_spec["connection"] == "linear" and torch.is_autocast_enabled(
+        x_seq.device.type
+    ):
+        dtype = torch.get_autocast_dtype(x_seq.device.type)
+        connection_parameters = [
+            value.to(dtype)
+            if value.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            else value
+            for value in connection_parameters
+        ]
     parameters = [*neuron_parameters, *synapse_parameters, *connection_parameters]
     needs_backward = torch.is_grad_enabled() and any(
         t.requires_grad for t in (x_seq, x_syn_seq, *states, *parameters)
@@ -437,10 +465,10 @@ def _execute(
         if needs_backward
         and options.neuron in _NATIVE_GPU_BACKENDS
         and x_seq.device.type == "cuda"
-        and neuron_spec.model == "lif"
+        and get_template(neuron_spec).recurrent_checkpoint
         and not (neuron_spec.poisson is not None and neuron_spec.poisson.spiking)
         and not neuron_spec.refractory
-        and synapse_spec.model == "exponential"
+        and get_template(synapse_spec).recurrent_checkpoint
         and len(neuron_names) == 1
         and len(synapse_names) == 1
         and not n_delay
@@ -471,6 +499,20 @@ def _execute(
             for offset, index in enumerate(charged_indices)
             if index not in history_indices
         )
+    gradient_activity = (
+        needs_backward
+        and module.gradient.sparse
+        and connection_spec["connection"] == "sparse"
+        and options.neuron in _NATIVE_GPU_BACKENDS
+        and x_seq.device.type == "cuda"
+        and get_template(neuron_spec).spike_gradient_input is not None
+        and surrogate_support(neuron_spec) is not None
+        and not n_delay
+        and not x_syn_seq.numel()
+    )
+    if gradient_activity:
+        activity_index = len(states) + len(charged_names)
+        history_indices.append(activity_index)
     recurrent_spec = {
         **connection_spec,
         "neuron": encode_spec(neuron_spec),
@@ -486,12 +528,33 @@ def _execute(
         else 0,
         "merge_receptors": module.synapse.n_receptor if options.merge_synapse else 0,
         "neuron_shape": list(module.neuron.n_neuron),
-        # Execution policy is deliberately outside both semantic CellSpec
+        # Execution policy is deliberately outside both semantic NeuronSpec
         # encodings, but remains part of this captured recurrent call.
         "enable_fp_fusion": options.enable_fp_fusion,
         "precise_division": options.precise_division,
         "precise_exp": options.precise_exp,
+        "gradient_activity": activity_index if gradient_activity else None,
+        "gradient_list": bool(
+            gradient_activity
+            and options.neuron == "triton"
+            and x_seq.numel() // max(1, x_seq.shape[0]) < 2**31
+            # Batched trainable weights reuse one edge traversal across
+            # samples. Keep that fused path rather than introducing a separate
+            # edge-gradient pass or racing per-sample parameter updates.
+            and (
+                not connection_parameters[0].requires_grad
+                or x_seq[0].numel() == topology[2].numel() - 1
+            )
+        ),
     }
+    if (
+        needs_backward
+        and x_seq.dtype != torch.float32
+        and (options.neuron in _NATIVE_GPU_BACKENDS or states[0].dtype == torch.float32)
+    ):
+        # The public raster follows input dtype, while reverse must consume
+        # the producer's existing calculation-precision output without recasts.
+        recurrent_spec["save_compute_spikes"] = True
     if checkpoint_interval:
         # This first residual slice is the native paired LIF + ExponentialPSC
         # schedule only. The encoded layout is part of operator specialization.

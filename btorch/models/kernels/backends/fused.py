@@ -8,22 +8,24 @@ cell launches.
 
 import functools
 import re
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 
 import torch
 
 from ..templates import get_template, model_template_revision
 from .engine import (
     _compile,
-    _fp32_parameters,
-    _kernel_arguments,
     _launch_kernel,
     _layout,
+    _load_prepared_parameters,
     _mode_name,
+    _parameter_buffers,
     _parameter_index,
     _prepare,
-    _prepare_glif_coefficients,
+    _prepare_parameters,
     _Source,
+    _storage_span,
+    _tensor_storage,
 )
 from .fragments import get_fragments, scalar_layout
 
@@ -34,7 +36,9 @@ def _prepare_psc_parameters(parameters, template, physical_target, logical_targe
         raise ValueError("PSC parameter count disagrees with the model template")
     buffers = {}
     layouts = []
-    for name, converted in zip(template.parameter_names, _fp32_parameters(parameters)):
+    for name, converted in zip(
+        template.parameter_names, _parameter_buffers(parameters)
+    ):
         try:
             layout = _layout(converted, logical_target)
         except ValueError as logical_error:
@@ -73,10 +77,14 @@ def _build_fused_source(
     modes=0,
     neuron_parameter_layouts=None,
     psc_parameter_layouts=None,
-    neuron_coefficient_layouts=None,
+    neuron_prepared_layouts=None,
+    psc_prepared_layouts=None,
     *,
     store_outputs=True,
     precise_exp=False,
+    storage=(),
+    spike_list=(),
+    gradient_activity=False,
 ):
     """Render one direct PSC-to-neuron pipeline stage using shared fragments.
 
@@ -85,7 +93,7 @@ def _build_fused_source(
     inputs and keeps intermediates in registers, without forward output stores
     or pointers in the generated kernel.
     """
-    source = _Source(backend, n, 1, modes, precise_exp=precise_exp)
+    source = _Source(backend, n, 1, modes, precise_exp=precise_exp, storage=storage)
     for prefix in ("neuron_", "psc_"):
         source.pointer(prefix + "dt", 1)
         source.load(prefix + "dt", prefix + "dt", "0")
@@ -152,7 +160,20 @@ def _build_fused_source(
                 "PSC state layout must retain every drive receptor or merge "
                 "them into one compatible state"
             )
-        source.statements(_prefix(get_fragments(psc_spec).forward, prefix))
+        psc_prepared_scalars = _load_prepared_parameters(
+            source,
+            psc,
+            psc_prepared_layouts,
+            pointer_prefix="psc_",
+            scalar_prefix=prefix,
+            index=index,
+        )
+        source.statements(
+            _prefix(
+                get_fragments(psc_spec, prepared_values=psc_prepared_scalars).forward,
+                prefix,
+            )
+        )
         source.lines.append("neuron_x = neuron_x + " + prefix + "output")
         if store_outputs:
             for name in psc.state_names:
@@ -162,7 +183,7 @@ def _build_fused_source(
             source.store("psc_" + name + "_seq", index, prefix + name + "_next")
     scalar_states, scalar_parameters = scalar_layout(neuron_spec, modes)
     for name in neuron.state_names:
-        size = n * modes if name == "Iasc" else n
+        size = n * modes if neuron.extra_dims(name) else n
         source.pointer("neuron_" + name + "_init", size)
         if store_outputs:
             source.pointer("neuron_" + name + "_final", size)
@@ -176,11 +197,7 @@ def _build_fused_source(
         size = (
             layout.span
             if layout is not None
-            else (
-                n * modes
-                if neuron_spec.model == "glif3" and name in ("k", "asc_amps")
-                else n
-            )
+            else (n * modes if neuron.extra_dims(name) else n)
         )
         source.pointer("neuron_" + name, size)
     for name in scalar_parameters:
@@ -192,24 +209,13 @@ def _build_fused_source(
             else source.index(name)
         )
         source.load("neuron_" + name, "neuron_" + base, index)
-    precomputed_glif_membrane = neuron_coefficient_layouts is not None
-    if precomputed_glif_membrane:
-        if neuron_spec.model != "glif3":
-            raise ValueError("Precomputed membrane coefficients require GLIF3")
-        coefficient_names = [("glif_phi_coefficient", "glif_phi")]
-        if len(neuron_coefficient_layouts) == 2:
-            coefficient_names.append(("glif_delta_coefficient", "glif_delta"))
-        elif len(neuron_coefficient_layouts) != 1:
-            raise ValueError("Invalid GLIF membrane coefficient count")
-        for (pointer_name, scalar_name), layout in zip(
-            coefficient_names, neuron_coefficient_layouts
-        ):
-            source.pointer("neuron_" + pointer_name, layout.span)
-            source.load(
-                "neuron_" + scalar_name,
-                "neuron_" + pointer_name,
-                _parameter_index("tau", layout, modes, backend),
-            )
+    prepared_scalars = _load_prepared_parameters(
+        source,
+        neuron,
+        neuron_prepared_layouts,
+        pointer_prefix="neuron_",
+        scalar_prefix="neuron_",
+    )
     if neuron_spec.surrogate == "poisson" and neuron_spec.poisson.spiking:
         pointer = "neuron_uniform" if store_outputs else "neuron_spike"
         source.pointer(pointer, n)
@@ -223,7 +229,7 @@ def _build_fused_source(
             get_fragments(
                 neuron_spec,
                 modes,
-                precomputed_glif_membrane=precomputed_glif_membrane,
+                prepared_values=prepared_scalars,
                 authoritative_output=(
                     not store_outputs
                     and neuron_spec.surrogate == "poisson"
@@ -235,6 +241,9 @@ def _build_fused_source(
     )
     if store_outputs:
         source.store("spike", "index", "neuron_output")
+        source.emit_spike_list("neuron_output", spike_list)
+        if gradient_activity:
+            source.emit_gradient_activity(neuron_spec, prefix="neuron_")
         for name in scalar_states:
             base, _ = _mode_name(name, modes)
             source.store(
@@ -268,11 +277,15 @@ def _cached_fused_source(
     modes,
     neuron_parameter_layouts,
     psc_parameter_layouts,
-    neuron_coefficient_layouts,
+    neuron_prepared_layouts,
+    psc_prepared_layouts,
     store_outputs,
     precise_exp,
     neuron_revision,
     psc_revision,
+    storage=(),
+    spike_list=(),
+    gradient_activity=False,
 ):
     del neuron_revision, psc_revision
     source = _build_fused_source(
@@ -287,9 +300,13 @@ def _cached_fused_source(
         modes,
         neuron_parameter_layouts,
         psc_parameter_layouts,
-        neuron_coefficient_layouts,
+        neuron_prepared_layouts,
+        psc_prepared_layouts,
         store_outputs=store_outputs,
         precise_exp=precise_exp,
+        storage=storage,
+        spike_list=spike_list,
+        gradient_activity=gradient_activity,
     )
     return source.render(), tuple(source.pointers)
 
@@ -309,7 +326,11 @@ def generate_fused_source(
     precise_exp=False,
     neuron_parameter_layouts=None,
     psc_parameter_layouts=None,
-    neuron_coefficient_layouts=None,
+    neuron_prepared_layouts=None,
+    psc_prepared_layouts=None,
+    storage=(),
+    spike_list=(),
+    gradient_activity=False,
 ):
     """Return inspectable source and buffer declarations for a paired stage."""
     neuron = get_template(neuron_spec)
@@ -334,17 +355,112 @@ def generate_fused_source(
         modes,
         None if neuron_parameter_layouts is None else tuple(neuron_parameter_layouts),
         None if psc_parameter_layouts is None else tuple(psc_parameter_layouts),
-        None
-        if neuron_coefficient_layouts is None
-        else tuple(neuron_coefficient_layouts),
+        None if neuron_prepared_layouts is None else tuple(neuron_prepared_layouts),
+        None if psc_prepared_layouts is None else tuple(psc_prepared_layouts),
         store_outputs,
         precise_exp,
         model_template_revision(neuron_spec.model),
         model_template_revision(psc_spec.model),
+        tuple(storage),
+        tuple(spike_list),
+        gradient_activity,
     )
 
 
-def fused_step_forward(
+@dataclass
+class _FusedStep:
+    """Invocation-local paired kernel bindings with caller-owned
+    destinations."""
+
+    backend: str
+    kernel: object
+    n: int
+    buffers: dict
+    declarations: tuple
+    strided_names: set[str]
+    output_shapes: dict[str, tuple[int, ...]]
+    enable_fp_fusion: bool
+    storage: tuple = ()
+    source_factory: object = None
+    precise_division: bool = False
+    variants: dict = field(default_factory=dict, init=False)
+    argument_indices: dict[str, int] = field(init=False)
+    arguments: list = field(init=False)
+
+    def __post_init__(self):
+        self.argument_indices = {
+            name: index for index, (name, _size) in enumerate(self.declarations)
+        }
+        self.arguments = [None] * len(self.declarations)
+        declared_inputs = tuple(
+            declaration
+            for declaration in self.declarations
+            if declaration[0] in self.buffers
+        )
+        inputs = tuple(
+            _storage_span(self.buffers[name], size) for name, size in declared_inputs
+        )
+        for (name, _size), value in zip(declared_inputs, inputs):
+            self.arguments[self.argument_indices[name]] = value
+
+    def allocate_outputs(self):
+        reference = self.buffers["neuron_input"]
+        return {
+            name: torch.empty(shape, device=reference.device, dtype=torch.float32)
+            for name, shape in self.output_shapes.items()
+        }
+
+    def launch_into(self, bindings):
+        """Launch into supplied storage, caching encountered storage
+        layouts."""
+        if self.source_factory is not None:
+            buffers = {**self.buffers, **bindings}
+            storage = _tensor_storage(buffers, self.strided_names)
+            if storage != self.storage:
+                variant = self.variants.get(storage)
+                if variant is None:
+                    source, declarations = self.source_factory(storage=storage)
+                    kernel = _compile(
+                        self.backend,
+                        source,
+                        self.enable_fp_fusion,
+                        self.precise_division,
+                        device=buffers["neuron_input"].device,
+                    )
+                    variant = _FusedStep(
+                        self.backend,
+                        kernel,
+                        self.n,
+                        buffers,
+                        declarations,
+                        self.strided_names,
+                        self.output_shapes,
+                        self.enable_fp_fusion,
+                        storage=storage,
+                    )
+                    self.variants[storage] = variant
+                variant.launch_into(bindings)
+                return
+        declarations = tuple(
+            declaration
+            for declaration in self.declarations
+            if declaration[0] in bindings
+        )
+        values = tuple(
+            _storage_span(bindings[name], size) for name, size in declarations
+        )
+        for (name, _size), value in zip(declarations, values):
+            self.arguments[self.argument_indices[name]] = value
+        _launch_kernel(
+            self.backend,
+            self.kernel,
+            tuple(self.arguments),
+            self.n,
+            enable_fp_fusion=self.enable_fp_fusion,
+        )
+
+
+def prepare_fused_step(
     neuron_input,
     drive,
     neuron_states,
@@ -360,10 +476,13 @@ def fused_step_forward(
     enable_fp_fusion=True,
     precise_division=False,
     precise_exp=False,
-    glif_membrane_coefficients=None,
+    neuron_prepared_parameters=None,
+    psc_prepared_parameters=None,
     uniform=None,
+    spike_list=None,
+    gradient_activity=None,
 ):
-    """Return a spike, both final states and requested one-step histories.
+    """Prepare one paired kernel and its input layouts outside the step loop.
 
     PSC states use an internal receptor layout while ``drive`` retains its
     receptor layout. A merged state has one internal PSC lane per neuron;
@@ -388,11 +507,9 @@ def fused_step_forward(
         neuron_spec,
         preserve_parameters=True,
     )
-    coefficient_buffers, neuron_coefficient_layouts = _prepare_glif_coefficients(
-        glif_membrane_coefficients, neuron_target, backward=False
+    coefficient_buffers, neuron_prepared_layouts = _prepare_parameters(
+        neuron_prepared_parameters, neuron, neuron_target
     )
-    if coefficient_buffers and neuron_spec.model != "glif3":
-        raise ValueError("Precomputed membrane coefficients require GLIF3")
     (
         psc,
         _,
@@ -416,20 +533,36 @@ def fused_step_forward(
         else neuron_input.shape,
     )
     psc_buffers.update(psc_parameter_buffers)
+    psc_computed_buffers, psc_prepared_layouts = _prepare_parameters(
+        psc_prepared_parameters,
+        psc,
+        lambda _name: (
+            (*neuron_input.shape, _state_receptors)
+            if _state_receptors != 1
+            else neuron_input.shape
+        ),
+    )
     buffers = {
         "neuron_dt": neuron_buffers["dt"],
         "psc_dt": psc_buffers["dt"],
-        "neuron_input": neuron_input.float().contiguous(),
-        "drive": drive.float().contiguous(),
-        "spike": torch.empty_like(neuron_input, dtype=torch.float32),
+        "neuron_input": neuron_input,
+        "drive": drive,
     }
     if neuron_spec.surrogate == "poisson" and neuron_spec.poisson.spiking:
         if uniform is None:
             raise ValueError("Spiking Poisson fused cells require an explicit uniform")
-        buffers["neuron_uniform"] = uniform.float().contiguous()
+        buffers["neuron_uniform"] = uniform
     buffers.update(
         {"neuron_" + name: value for name, value in coefficient_buffers.items()}
     )
+    buffers.update(
+        {"psc_" + name: value for name, value in psc_computed_buffers.items()}
+    )
+    if spike_list is not None:
+        buffers.update(spike_list.bindings())
+    if gradient_activity is not None:
+        buffers["gradient_activity"] = gradient_activity
+    output_shapes = {"spike": tuple(neuron_input.shape)}
     for prefix, template, prepared, target, history_names in (
         (
             "neuron_",
@@ -442,16 +575,19 @@ def fused_step_forward(
     ):
         for name in template.state_names:
             buffers[prefix + name + "_init"] = prepared[name + "_init"]
-            buffers[prefix + name + "_final"] = torch.empty(
-                target(name), device=neuron_input.device, dtype=torch.float32
-            )
+            output_shapes[prefix + name + "_final"] = target(name)
         for name in template.parameter_names:
             buffers[prefix + name] = prepared[name]
         for name in history_names:
-            buffers[prefix + name + "_seq"] = torch.empty(
-                (1, *target(name)), device=neuron_input.device, dtype=torch.float32
-            )
-    source, declarations = generate_fused_source(
+            output_shapes[prefix + name + "_seq"] = (1, *target(name))
+    strided_names = {
+        *("neuron_" + name for name in neuron.parameter_names),
+        *("psc_" + name for name in psc.parameter_names),
+        *("neuron_" + name for name in coefficient_buffers),
+        *("psc_" + name for name in psc_computed_buffers),
+    }
+    source_factory = functools.partial(
+        generate_fused_source,
         backend,
         neuron_spec,
         psc_spec,
@@ -463,36 +599,91 @@ def fused_step_forward(
         modes,
         neuron_parameter_layouts=neuron_parameter_layouts,
         psc_parameter_layouts=psc_parameter_layouts,
-        neuron_coefficient_layouts=neuron_coefficient_layouts,
+        neuron_prepared_layouts=neuron_prepared_layouts,
+        psc_prepared_layouts=psc_prepared_layouts,
         precise_exp=precise_exp,
+        spike_list=() if spike_list is None else spike_list.producer_layout,
+        gradient_activity=gradient_activity is not None,
     )
+    storage = _tensor_storage(buffers, strided_names)
+    source, declarations = source_factory(storage=storage)
     kernel = _compile(
         backend, source, enable_fp_fusion, precise_division, device=neuron_input.device
     )
-    strided_names = {
-        *("neuron_" + name for name in neuron.parameter_names),
-        *("psc_" + name for name in psc.parameter_names),
-        *("neuron_" + name for name in ("glif_phi_coefficient",)),
-    }
-    arguments = _kernel_arguments(buffers, declarations, strided_names)
-    _launch_kernel(backend, kernel, arguments, n, enable_fp_fusion=enable_fp_fusion)
-    return (
-        buffers["spike"],
-        tuple(buffers["neuron_" + name + "_final"] for name in neuron.state_names),
-        tuple(buffers["psc_" + name + "_final"] for name in psc.state_names),
-        tuple(buffers["neuron_" + name + "_seq"] for name in neuron_history_names),
-        tuple(buffers["psc_" + name + "_seq"] for name in psc_history_names),
+
+    return _FusedStep(
+        backend,
+        kernel,
+        n,
+        buffers,
+        declarations,
+        strided_names,
+        output_shapes,
+        enable_fp_fusion,
+        storage=storage,
+        source_factory=source_factory,
+        precise_division=precise_division,
     )
 
 
-def _reverse_statements(
-    spec, prefix, names, modes=0, *, precomputed_glif_membrane=False
+def fused_step_forward(
+    neuron_input,
+    drive,
+    neuron_states,
+    psc_states,
+    neuron_parameters,
+    psc_parameters,
+    neuron_spec,
+    psc_spec,
+    neuron_history_names=(),
+    psc_history_names=(),
+    *,
+    backend="triton",
+    enable_fp_fusion=True,
+    precise_division=False,
+    precise_exp=False,
+    neuron_prepared_parameters=None,
+    psc_prepared_parameters=None,
+    uniform=None,
 ):
+    """Execute a standalone paired step using the shared prepared launcher."""
+    prepared = prepare_fused_step(
+        neuron_input,
+        drive,
+        neuron_states,
+        psc_states,
+        neuron_parameters,
+        psc_parameters,
+        neuron_spec,
+        psc_spec,
+        neuron_history_names,
+        psc_history_names,
+        backend=backend,
+        enable_fp_fusion=enable_fp_fusion,
+        precise_division=precise_division,
+        precise_exp=precise_exp,
+        neuron_prepared_parameters=neuron_prepared_parameters,
+        psc_prepared_parameters=psc_prepared_parameters,
+        uniform=uniform,
+    )
+    outputs = prepared.allocate_outputs()
+    prepared.launch_into(outputs)
+    neuron, psc = get_template(neuron_spec), get_template(psc_spec)
+    return (
+        outputs["spike"],
+        tuple(outputs["neuron_" + name + "_final"] for name in neuron.state_names),
+        tuple(outputs["psc_" + name + "_final"] for name in psc.state_names),
+        tuple(outputs["neuron_" + name + "_seq"] for name in neuron_history_names),
+        tuple(outputs["psc_" + name + "_seq"] for name in psc_history_names),
+    )
+
+
+def _reverse_statements(spec, prefix, names, modes=0, *, prepared_values=()):
     statements = []
     for statement in get_fragments(
         spec,
         modes,
-        precomputed_glif_membrane=precomputed_glif_membrane,
+        prepared_values=prepared_values,
     ).backward:
         lhs = statement.split(" = ", 1)[0]
         if lhs.startswith("grad_p_"):
@@ -521,10 +712,12 @@ def _cached_fused_backward_source(
     grad_psc_records_present,
     neuron_parameter_layouts,
     psc_parameter_layouts,
-    neuron_coefficient_layouts,
+    neuron_prepared_layouts,
+    psc_prepared_layouts,
     precise_exp,
     neuron_revision,
     psc_revision,
+    storage=(),
 ):
     del neuron_revision, psc_revision
     neuron = get_template(neuron_spec)
@@ -546,18 +739,15 @@ def _cached_fused_backward_source(
         modes=modes,
         neuron_parameter_layouts=neuron_parameter_layouts,
         psc_parameter_layouts=psc_parameter_layouts,
-        neuron_coefficient_layouts=neuron_coefficient_layouts,
+        neuron_prepared_layouts=neuron_prepared_layouts,
+        psc_prepared_layouts=psc_prepared_layouts,
         store_outputs=False,
         precise_exp=precise_exp,
+        storage=storage,
     )
 
     def neuron_size(name):
-        return (
-            n * modes
-            if name == "Iasc"
-            or (neuron_spec.model == "glif3" and name in ("k", "asc_amps"))
-            else n
-        )
+        return n * modes if neuron.extra_dims(name) else n
 
     def psc_size(_name):
         return n * _state_receptors
@@ -635,7 +825,11 @@ def _cached_fused_backward_source(
             "neuron_",
             neuron_parameter_names,
             modes,
-            precomputed_glif_membrane=neuron_coefficient_layouts is not None,
+            prepared_values=tuple(
+                item.scalar_name
+                for item in neuron.prepared_parameters
+                if item.name in dict(neuron_prepared_layouts or ())
+            ),
         )
     )
     source.pointer("grad_neuron_input", n)
@@ -656,6 +850,7 @@ def _cached_fused_backward_source(
                 source.index(name),
                 "neuron_grad_p_" + name,
             )
+    record_vjp_after = dict(get_fragments(psc_spec).record_vjp_after)
     for receptor in range(_state_receptors):
         prefix = f"psc_{receptor}_"
         index = f"index * {_state_receptors} + {receptor}"
@@ -675,28 +870,39 @@ def _cached_fused_backward_source(
                 psc_size(name),
                 psc_record_presence.get(name, False),
             )
-            if psc_spec.model != "alpha" or name != "psc":
+            if name not in record_vjp_after:
                 source.lines.append(
                     f"{prefix}grad_s_{name} = "
                     f"{prefix}grad_s_{name} + {prefix}grad_r_{name}"
                 )
-        psc_reverse = list(_reverse_statements(psc_spec, prefix, psc_parameter_names))
-        if psc_spec.model == "alpha" and psc_record_presence.get("psc", False):
-            # The Module first joins the carried-state and next-neuron paths,
-            # then adds the public PSC record. Associating the record first
-            # introduces FP32 errors that grow through long recurrent VJPs.
-            output_update = (
-                f"{prefix}grad_s_psc = {prefix}grad_s_psc + {prefix}grad_output"
+        psc_reverse = list(
+            _reverse_statements(
+                psc_spec,
+                prefix,
+                psc_parameter_names,
+                prepared_values=tuple(
+                    item.scalar_name
+                    for item in psc.prepared_parameters
+                    if item.name in dict(psc_prepared_layouts or ())
+                ),
             )
+        )
+        for name, anchor in record_vjp_after.items():
+            if not psc_record_presence.get(name, False):
+                continue
+            # Association constraints belong to the mathematical fragments;
+            # pairing only inserts the declared record cotangent at that stage.
+            output_update = _prefix((anchor,), prefix)[0]
             try:
                 output_index = psc_reverse.index(output_update)
             except ValueError as error:
                 raise RuntimeError(
-                    "AlphaPSC reverse must add its output cotangent explicitly"
+                    f"Missing record VJP stage for {psc.name}.{name}: {anchor}"
                 ) from error
             psc_reverse.insert(
                 output_index + 1,
-                f"{prefix}grad_s_psc = {prefix}grad_s_psc + {prefix}grad_r_psc",
+                f"{prefix}grad_s_{name} = "
+                f"{prefix}grad_s_{name} + {prefix}grad_r_{name}",
             )
         source.statements(psc_reverse)
         for name in psc.state_names:
@@ -733,8 +939,10 @@ def _generate_fused_backward_source(
     grad_psc_records_present,
     neuron_parameter_layouts=None,
     psc_parameter_layouts=None,
-    neuron_coefficient_layouts=None,
+    neuron_prepared_layouts=None,
+    psc_prepared_layouts=None,
     precise_exp=False,
+    storage=(),
 ):
     neuron = get_template(neuron_spec)
     psc = get_template(psc_spec)
@@ -769,16 +977,113 @@ def _generate_fused_backward_source(
         grad_psc_records_present,
         None if neuron_parameter_layouts is None else tuple(neuron_parameter_layouts),
         None if psc_parameter_layouts is None else tuple(psc_parameter_layouts),
-        None
-        if neuron_coefficient_layouts is None
-        else tuple(neuron_coefficient_layouts),
+        None if neuron_prepared_layouts is None else tuple(neuron_prepared_layouts),
+        None if psc_prepared_layouts is None else tuple(psc_prepared_layouts),
         precise_exp,
         model_template_revision(neuron_spec.model),
         model_template_revision(psc_spec.model),
+        tuple(storage),
     )
 
 
-def fused_step_backward(
+@dataclass
+class _FusedBackwardStep:
+    """Own reverse working sets for one trajectory, independently of its
+    tape."""
+
+    step: _FusedStep
+    neuron: object
+    psc: object
+    neuron_parameters: tuple
+    psc_parameters: tuple
+    neuron_parameter_names: set[str]
+    psc_parameter_names: set[str]
+    outputs: tuple = field(init=False)
+    index: int = field(default=0, init=False)
+
+    def __post_init__(self):
+        # Alternate destinations: incoming adjoints remain readable throughout
+        # the launch that produces the preceding timestep's adjoints.
+        self.outputs = (self.step.allocate_outputs(), self.step.allocate_outputs())
+
+    def backward(
+        self,
+        neuron_input,
+        drive,
+        neuron_states,
+        psc_states,
+        grad_spike,
+        grad_neuron_states,
+        grad_psc_states,
+        *,
+        authoritative_spike=None,
+        grad_neuron_records=None,
+        grad_psc_records=None,
+        destinations=None,
+    ):
+        bindings = dict(self.outputs[self.index % 2])
+        bindings.update(destinations or {})
+        self.index += 1
+        bindings["neuron_input"] = neuron_input
+        bindings["drive"] = drive
+        if "neuron_spike" in self.step.buffers:
+            bindings["neuron_spike"] = authoritative_spike
+        if grad_spike is not None:
+            bindings["grad_spike"] = grad_spike
+        for prefix, template, states, gradients, records in (
+            (
+                "neuron_",
+                self.neuron,
+                neuron_states,
+                grad_neuron_states,
+                grad_neuron_records or {},
+            ),
+            ("psc_", self.psc, psc_states, grad_psc_states, grad_psc_records or {}),
+        ):
+            for name, state, gradient in zip(template.state_names, states, gradients):
+                key = prefix + name + "_init"
+                bindings[key] = state.expand(self.step.buffers[key].shape)
+                if gradient is not None:
+                    bindings[prefix + "grad_" + name] = gradient
+            for name, gradient in records.items():
+                if gradient is not None:
+                    bindings[prefix + "record_grad_" + name] = gradient
+        self.step.launch_into(bindings)
+
+        def reduce(name, value):
+            return bindings[name].sum_to_size(value.shape).to(value.dtype)
+
+        return (
+            bindings["grad_neuron_input"]
+            if destinations is not None
+            else bindings["grad_neuron_input"].to(neuron_input.dtype),
+            bindings["grad_drive"].to(drive.dtype),
+            tuple(
+                reduce("neuron_grad_" + name + "_init", value)
+                for name, value in zip(self.neuron.state_names, neuron_states)
+            ),
+            tuple(
+                reduce("psc_grad_" + name + "_init", value)
+                for name, value in zip(self.psc.state_names, psc_states)
+            ),
+            tuple(
+                reduce("neuron_grad_" + name, value)
+                if name in self.neuron_parameter_names
+                else None
+                for name, value in zip(
+                    self.neuron.parameter_names, self.neuron_parameters
+                )
+            ),
+            tuple(
+                reduce("psc_grad_" + name, value)
+                if name in self.psc_parameter_names
+                else None
+                for name, value in zip(self.psc.parameter_names, self.psc_parameters)
+            ),
+        )
+
+
+def prepare_fused_backward(
     neuron_input,
     drive,
     neuron_states,
@@ -800,14 +1105,10 @@ def fused_step_backward(
     enable_fp_fusion=True,
     precise_division=False,
     precise_exp=False,
-    glif_membrane_coefficients=None,
+    neuron_prepared_parameters=None,
+    psc_prepared_parameters=None,
 ):
-    """Reverse a paired stage in one launch with local charge recomputation.
-
-    Returns:
-        External-input, drive, neuron-state, PSC-state, neuron-parameter and
-        PSC-parameter cotangents in their original tensor shapes and dtypes.
-    """
+    """Prepare a paired reverse kernel and private gradient working sets."""
     n = neuron_input.numel()
     _state_receptors = psc_states[0].numel() // n
     _drive_receptors = drive.numel() // n
@@ -820,11 +1121,9 @@ def fused_step_backward(
             preserve_parameters=True,
         )
     )
-    coefficient_buffers, neuron_coefficient_layouts = _prepare_glif_coefficients(
-        glif_membrane_coefficients, neuron_target, backward=True
+    coefficient_buffers, neuron_prepared_layouts = _prepare_parameters(
+        neuron_prepared_parameters, neuron, neuron_target
     )
-    if coefficient_buffers and neuron_spec.model != "glif3":
-        raise ValueError("Precomputed membrane coefficients require GLIF3")
     psc, _, _, psc_target, psc_buffers, psc_parameter_layouts = _prepare(
         psc_states[0].unsqueeze(0),
         psc_states,
@@ -858,13 +1157,13 @@ def fused_step_backward(
         if need
     )
     buffers = {
-        "neuron_input": neuron_input.float().contiguous(),
-        "drive": drive.float().contiguous(),
+        "neuron_input": neuron_input,
+        "drive": drive,
     }
     if neuron_spec.surrogate == "poisson" and neuron_spec.poisson.spiking:
         if authoritative_spike is None:
             raise ValueError("Poisson fused reverse requires authoritative spikes")
-        buffers["neuron_spike"] = authoritative_spike.float().contiguous()
+        buffers["neuron_spike"] = authoritative_spike
     buffers.update(
         {
             "neuron_" + name: tensor
@@ -887,10 +1186,12 @@ def fused_step_backward(
         # Missing output losses are compile-time zero expressions, not GPU
         # zero allocations or unused pointer arguments in the generated ABI.
         if value is not None:
-            buffers[name] = value.float().contiguous()
+            buffers[name] = value
+
+    output_shapes = {}
 
     def output_gradient(name, like):
-        buffers[name] = torch.empty_like(like, dtype=torch.float32)
+        output_shapes[name] = tuple(like.shape)
 
     cotangent("grad_spike", grad_spike)
     neuron_record_grads, psc_record_grads = (
@@ -926,18 +1227,33 @@ def fused_step_backward(
             )
             if name in names:
                 layout = parameter_layouts[name]
-                buffers[prefix + "grad_" + name] = torch.empty(
-                    layout.target_shape,
-                    device=neuron_input.device,
-                    dtype=torch.float32,
-                )
+                output_shapes[prefix + "grad_" + name] = layout.target_shape
     for name in neuron.history_names:
         if not name.endswith("_charged"):
             continue
         cotangent("neuron_record_grad_" + name, neuron_record_grads.get(name))
     output_gradient("grad_neuron_input", neuron_input)
     output_gradient("grad_drive", drive)
-    source, declarations = _generate_fused_backward_source(
+    psc_computed_buffers, psc_prepared_layouts = _prepare_parameters(
+        psc_prepared_parameters,
+        psc,
+        lambda _name: (
+            (*neuron_input.shape, _state_receptors)
+            if _state_receptors != 1
+            else neuron_input.shape
+        ),
+    )
+    buffers.update(
+        {"psc_" + name: value for name, value in psc_computed_buffers.items()}
+    )
+    strided_names = {
+        *("neuron_" + name for name in neuron.parameter_names),
+        *("psc_" + name for name in psc.parameter_names),
+        *("neuron_" + name for name in coefficient_buffers),
+        *("psc_" + name for name in psc_computed_buffers),
+    }
+    source_factory = functools.partial(
+        _generate_fused_backward_source,
         backend,
         neuron_spec,
         psc_spec,
@@ -956,42 +1272,104 @@ def fused_step_backward(
         tuple(psc_record_grads.get(name) is not None for name in psc.history_names),
         neuron_parameter_layouts,
         psc_parameter_layouts,
-        neuron_coefficient_layouts,
+        neuron_prepared_layouts,
+        psc_prepared_layouts,
         precise_exp=precise_exp,
     )
+    storage = _tensor_storage(buffers, strided_names)
+    source, declarations = source_factory(storage=storage)
     kernel = _compile(
         backend, source, enable_fp_fusion, precise_division, device=neuron_input.device
     )
-    strided_names = {
-        *("neuron_" + name for name in neuron.parameter_names),
-        *("psc_" + name for name in psc.parameter_names),
-        *(
-            "neuron_" + name
-            for name in ("glif_phi_coefficient", "glif_delta_coefficient")
-        ),
-    }
-    arguments = _kernel_arguments(buffers, declarations, strided_names)
-    _launch_kernel(backend, kernel, arguments, n, enable_fp_fusion=enable_fp_fusion)
-    reduce = lambda name, value: buffers[name].sum_to_size(value.shape).to(value.dtype)
-    return (
-        buffers["grad_neuron_input"].to(neuron_input.dtype),
-        buffers["grad_drive"].to(drive.dtype),
-        tuple(
-            reduce("neuron_grad_" + name + "_init", value)
-            for name, value in zip(neuron.state_names, neuron_states)
-        ),
-        tuple(
-            reduce("psc_grad_" + name + "_init", value)
-            for name, value in zip(psc.state_names, psc_states)
-        ),
-        tuple(
-            reduce("neuron_grad_" + name, value)
-            if name in neuron_parameter_names
-            else None
-            for name, value in zip(neuron.parameter_names, neuron_parameters)
-        ),
-        tuple(
-            reduce("psc_grad_" + name, value) if name in psc_parameter_names else None
-            for name, value in zip(psc.parameter_names, psc_parameters)
-        ),
+
+    step = _FusedStep(
+        backend,
+        kernel,
+        n,
+        buffers,
+        declarations,
+        strided_names,
+        output_shapes,
+        enable_fp_fusion,
+        storage=storage,
+        source_factory=source_factory,
+        precise_division=precise_division,
+    )
+    return _FusedBackwardStep(
+        step,
+        neuron,
+        psc,
+        tuple(neuron_parameters),
+        tuple(psc_parameters),
+        neuron_parameter_names,
+        psc_parameter_names,
+    )
+
+
+def fused_step_backward(
+    neuron_input,
+    drive,
+    neuron_states,
+    psc_states,
+    neuron_parameters,
+    psc_parameters,
+    neuron_spec,
+    psc_spec,
+    grad_spike,
+    grad_neuron_states,
+    grad_psc_states,
+    *,
+    authoritative_spike=None,
+    grad_neuron_records=None,
+    grad_psc_records=None,
+    needs_neuron_parameters=None,
+    needs_psc_parameters=None,
+    backend="triton",
+    enable_fp_fusion=True,
+    precise_division=False,
+    precise_exp=False,
+    neuron_prepared_parameters=None,
+    psc_prepared_parameters=None,
+):
+    """Reverse a paired stage in one launch with local charge recomputation.
+
+    Returns:
+        External-input, drive, neuron-state, PSC-state, neuron-parameter and
+        PSC-parameter cotangents in their original tensor shapes and dtypes.
+    """
+    prepared = prepare_fused_backward(
+        neuron_input,
+        drive,
+        neuron_states,
+        psc_states,
+        neuron_parameters,
+        psc_parameters,
+        neuron_spec,
+        psc_spec,
+        grad_spike,
+        grad_neuron_states,
+        grad_psc_states,
+        authoritative_spike=authoritative_spike,
+        grad_neuron_records=grad_neuron_records,
+        grad_psc_records=grad_psc_records,
+        needs_neuron_parameters=needs_neuron_parameters,
+        needs_psc_parameters=needs_psc_parameters,
+        backend=backend,
+        enable_fp_fusion=enable_fp_fusion,
+        precise_division=precise_division,
+        precise_exp=precise_exp,
+        neuron_prepared_parameters=neuron_prepared_parameters,
+        psc_prepared_parameters=psc_prepared_parameters,
+    )
+    return prepared.backward(
+        neuron_input,
+        drive,
+        neuron_states,
+        psc_states,
+        grad_spike,
+        grad_neuron_states,
+        grad_psc_states,
+        authoritative_spike=authoritative_spike,
+        grad_neuron_records=grad_neuron_records,
+        grad_psc_records=grad_psc_records,
     )

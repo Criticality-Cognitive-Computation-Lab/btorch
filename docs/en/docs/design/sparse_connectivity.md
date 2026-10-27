@@ -372,6 +372,37 @@ intermediate exists in either direction. PyTorch sparse tensors never reach
 the tracer, and `forward` contains no planning: the plan is fixed when the
 connection is built or its hints change.
 
+Native recurrent custom operators can request an invocation-local forward
+workspace through the bound route's optional `prepare_forward` capability.
+The route snapshot binds this capability alongside its forward and backward
+kernels. Triton pull reuses its output, hub-reduction and sample-layout buffers;
+spike-list push reuses block-local source lists, degree prefixes, counts and
+output storage. The prepared propagation exposes an optional producer
+destination to the template renderer. An eligible Triton neuron epilogue writes
+the list and local prefix while producing spikes, and clears the accumulation
+slots whose drive it has consumed. The existing packed fanout consumes those
+lists directly. No host activity read or per-step route selection is introduced.
+
+Triton reverse has the corresponding `prepare_backward` capability and reuses
+edge-gradient and transposed-product destinations. Kernel implementations
+register their optional execution factory through
+`BackendRegistry.register(..., prepare_execution=...)`. The factory belongs to
+that implementation's revision; replacing a kernel cannot silently retain an
+older factory. Route snapshots bind execution and preparation together.
+
+When direct emission is unavailable, one Triton preparation kernel clears the
+output and compacts sources while scanning their degrees. Both paths use the
+same block-local emitter and packed fanout; neither needs a global CUB scan or
+its per-step scratch allocation. Full source capacity prevents overflow even
+when activity exceeds the firing-rate hint. Consumer parallelism is prepared
+from topology, independently of the current spike count.
+
+Standalone sparse calls retain independent functional outputs. The recurrent
+workspace stays inside the functional trajectory operator, whose inputs are
+unmodified and whose autograd outputs own their storage. Backends without this
+preparation capability retain their registered execution path. This capability
+does not change sparse format, explicit-method precedence or backward math.
+
 ## 8. Dynamic topology
 
 Structural plasticity is an update policy, not a format. A connection has a
@@ -453,9 +484,20 @@ weights select pull. Backend and determinism constraints still apply.
 | `"push"` | device spike list or prepared task queues | runs for every call once selected, even above hinted activity; no host count read; capturable; float atomics |
 | `"adaptive-push"` | Torch host-packed reference | falls back to pull above the density limit; not capturable |
 
-The current spike-list route consumes dense neuron outputs and compacts them
-at the connection boundary. Direct list emission by the neuron kernel is a
-separate pending optimization; it is not implemented by the low-rate hint.
+For native Triton recurrence without delays or external synaptic input, both
+the initial neuron and the fused PSC/next-neuron template emit lists directly.
+An interior step uses one packed fanout and one fused producer kernel. This is
+independent of the neuron/PSC model equations and requires no additional public
+option: explicit `method="push"` or a qualifying hint selects the same route.
+Other neuron renderers, delayed sources and `spikes + x_syn` use the combined
+preparation kernel, preserving source composition and cancellation semantics.
+
+Public raster outputs and training residuals remain dense. Reconstructing a
+dense history only at the end is not the default: a graph-safe, full-capacity
+int32 event history already costs as much as an FP32 raster, before counts or
+nonbinary amplitudes, and reconstruction still writes the whole dense result.
+Sparse-only inference output would be a separate recording/output interface,
+not a firing-rate or backend selection option.
 
 Two consequences of `"push"` differ from `"pull"`. Under
 `torch.use_deterministic_algorithms(True)` the planner plans `"pull"` instead
@@ -575,9 +617,13 @@ exist):
   "reduce-overhead")` has no such hook and must not be combined with rewiring
   or with loading a different pattern. Modules compiled with the default mode
   are unaffected.
-- **Triton kernels are `float32` only.** For any other dtype they call the
-  reference backend themselves, without a message, and `explain()` still
-  names `triton`.
+- **Floating precision.** Triton CSR pull, spike-list push and task queues
+  accept FP16, BF16, FP32 and FP64 storage. Mixed operands follow Torch dtype
+  promotion. Reductions and atomics accumulate in FP32 for FP16/BF16 output,
+  and FP64 for FP64 output; only the final result is rounded to its storage
+  dtype. cuSPARSE uses Torch's native CUDA CSR operation in the promoted dtype.
+  Unsupported non-floating CSR cases use the reference implementation;
+  `explain()` still names the planned backend.
 - **A shared-pattern batch on the reference backend** is executed as a Python
   loop over the batch members.
 - **`A @ x` and `A.matvec(x)` on a `Sparse`** use the gather reference path of

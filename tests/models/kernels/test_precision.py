@@ -4,7 +4,7 @@ recurrence."""
 import pytest
 import torch
 
-from btorch.models.kernels import CellSpec, KernelOptions
+from btorch.models.kernels import KernelOptions, NeuronSpec
 from btorch.models.kernels.backends import engine
 from btorch.models.kernels.backends.engine import backward, forward
 from btorch.models.kernels.golden import python_module_sequence
@@ -55,7 +55,7 @@ def izh_reference(request):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
     precise_division, neurons = request.param
-    spec = CellSpec("izhikevich", hard_reset=True, alpha=100.0)
+    spec = NeuronSpec("izhikevich", hard_reset=True, alpha=100.0)
     parameters = _parameters()
     x, v, u = _inputs(128, neurons)
     output, final, records = python_module_sequence(
@@ -118,7 +118,7 @@ def test_implicit_math_policy_matches_explicit_forward_and_reverse(
     backend, option, default
 ):
     require_cuda_backend(backend)
-    spec = CellSpec("izhikevich", hard_reset=True, alpha=100.0)
+    spec = NeuronSpec("izhikevich", hard_reset=True, alpha=100.0)
     parameters = _parameters()
     x, v, u = _inputs(64, 32)
     # Isolate division policy from contraction when comparing its default.
@@ -168,7 +168,7 @@ def test_math_policy_rejects_non_boolean_values(option):
 @pytest.mark.parametrize("backward", (False, True))
 def test_precise_exp_changes_source_policy_without_changing_default(backend, backward):
     """Keep historical lowering as the default and opt into accurate exp."""
-    spec = CellSpec("dual_exponential", dt=0.3)
+    spec = NeuronSpec("dual_exponential", dt=0.3)
     arguments = (backend, spec, 8, 4, get_template(spec).history_names)
 
     default, _ = engine.generate_source(*arguments, backward=backward)
@@ -193,7 +193,7 @@ def test_precise_exp_changes_source_policy_without_changing_default(backend, bac
 @pytest.mark.parametrize("backend", GPU_BACKENDS)
 def test_precise_exp_participates_in_generated_source_cache_key(backend):
     """Do not let default and opt-in requests share a source-cache entry."""
-    spec = CellSpec("dual_exponential", dt=0.3)
+    spec = NeuronSpec("dual_exponential", dt=0.3)
     engine._generate_source.cache_clear()
 
     engine.generate_source(backend, spec, 8, 4, (), precise_exp=False)

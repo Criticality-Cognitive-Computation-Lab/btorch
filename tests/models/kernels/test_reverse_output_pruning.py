@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from btorch.models.kernels import CellSpec, KernelOptions, get_template
+from btorch.models.kernels import KernelOptions, NeuronSpec, get_template
 from btorch.models.kernels.backends import engine
 from btorch.models.kernels.golden import python_module_sequence
 from btorch.models.kernels.operators import run_multi_step
@@ -113,7 +113,7 @@ def _differentiable(x, states, parameters):
 @pytest.mark.parametrize(("model", "scope"), MODEL_SCOPES)
 def test_selective_reverse_outputs_match_actual_module(backend, model, scope):
     require_cuda_backend(backend)
-    spec = CellSpec(
+    spec = NeuronSpec(
         model,
         dt=1.0,
         hard_reset=model in ("if", "lif", "glif3", "izhikevich"),
@@ -162,7 +162,7 @@ def test_selective_roots_omit_unrequested_reverse_allocations(
     backend, scope, monkeypatch
 ):
     require_cuda_backend(backend)
-    spec = CellSpec("lif", dt=0.5, hard_reset=True, surrogate="atan")
+    spec = NeuronSpec("lif", dt=0.5, hard_reset=True, surrogate="atan")
     x, states, parameters = _values(spec, scope)
     observed = []
     original = engine._launch
@@ -196,7 +196,7 @@ def test_selective_roots_omit_unrequested_reverse_allocations(
     "model", tuple(dict.fromkeys(model for model, _ in MODEL_SCOPES))
 )
 def test_reverse_source_abi_tracks_requested_gradient_targets(backend, model):
-    spec = CellSpec(model, hard_reset=True)
+    spec = NeuronSpec(model, hard_reset=True)
     template = get_template(spec)
     modes = 2 if model == "glif3" else 0
     no_outputs = engine.generate_source(
@@ -243,7 +243,7 @@ def test_reverse_source_abi_tracks_requested_gradient_targets(backend, model):
 
 
 def test_empty_sequence_returns_only_requested_identity_gradients(monkeypatch):
-    spec = CellSpec("dual_exponential", dt=0.5)
+    spec = NeuronSpec("dual_exponential", dt=0.5)
     x = torch.empty(0, 2, 3)
     states = (
         torch.randn(1, 3),

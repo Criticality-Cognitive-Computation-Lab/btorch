@@ -5,7 +5,7 @@ import inspect
 import pytest
 import torch
 
-from btorch.models.kernels import CellSpec, HistoryPlan, KernelOptions
+from btorch.models.kernels import HistoryPlan, KernelOptions, NeuronSpec
 from btorch.models.kernels.operators import run_multi_step
 from btorch.models.kernels.torch_backend import forward_step
 from tests.models.kernels.helpers import GPU_BACKENDS, cell_inputs, require_cuda_backend
@@ -393,7 +393,7 @@ def test_recurrent_capture_version_includes_compilation_policies():
 
 def _cuda_lif_inputs(n_step: int = 8):
     """Use scalar, neuron, strided, and batch-broadcast parameter layouts."""
-    spec = CellSpec("lif", dt=0.5, hard_reset=True)
+    spec = NeuronSpec("lif", dt=0.5, hard_reset=True)
     x_seq = (torch.rand(n_step, 2, 5, device="cuda") * 0.9 + 0.15).requires_grad_()
     states = ((torch.rand(2, 5, device="cuda") * 0.3).requires_grad_(),)
     c_m_storage = torch.linspace(0.8, 1.6, 11, device="cuda")

@@ -1003,7 +1003,7 @@ connection.method = "auto"   # restore hint-driven planning
 `method="push"` specifically requests the device spike-list route; it does not
 select the older task/hash implementation. Explicit methods override activity
 hints, and unsupported combinations raise rather than silently choosing another
-method. Push currently requires CUDA/Triton FP32 with unbatched weights and
+method. Push currently requires CUDA/Triton floating-point data with unbatched weights and
 nondeterministic accumulation. Construct on the target device when requesting it.
 For RSNNs, `KernelOptions(neuron="triton", connection_method="push")` supplies
 the same request. A `btorch.sparse.runtime.use_method("pull")` scope overrides
@@ -1011,8 +1011,19 @@ both the RSNN and connection method temporarily; an `"auto"` setting inherits.
 The numerical sparse-array products (`A @ x`, `sparse.matvec`) remain independent
 reference operations; these execution options apply to the connection runtime.
 
+With automatic method and backend selection, connections with both operator
+dimensions below **4,000** use dense matmul internally. The public interface,
+sparse topology and edge-weight parameters remain sparse; missing edges never
+become trainable parameters. Native recurrent execution materializes the dense
+operand once per trajectory and reuses it and its output storage across steps.
+Each new trajectory reads current weights, including after optimizer updates.
+Expanded receptor/delay/member dimensions count toward the limit to bound the
+dense operand's memory. Explicit `method="push"`, `method="pull"` or a backend
+override bypasses this automatic choice.
+
 For low-activity spiking networks, supply `Hints(firing_rate_hz=4.0)` on the
-`SparseConnection`. On CUDA, a rate **strictly below 5 Hz** selects the existing
+`SparseConnection`. Outside the small automatic dense route, a CUDA rate
+**strictly below 5 Hz** selects the existing
 Triton source-driven SpMSpV route. It compacts active source IDs on the device
 and reuses the packed, edge-balanced fanout kernel with source-major weights.
 Discovery scans neurons rather than every static edge task; this route does
@@ -1060,10 +1071,15 @@ Points to know before setting a hint:
 
 - **`"push"` is not bitwise reproducible.** Several sources add into the same
   target concurrently, so the order of the floating-point additions varies
-  between runs. Results agree with pull to about `4e-7` relative error. Under
-  `torch.use_deterministic_algorithms(True)` the planner plans `"pull"`
-  instead; the setting is read when the plan is made, so set it before the
-  connection is built or moved.
+  between runs, even with fixed inputs, weights, and random seeds. Error
+  depends on the number and magnitudes of contributions and their cancellation;
+  there is no universal relative-error bound. In a recurrent spiking network,
+  small rounding differences near a firing threshold can change later spikes.
+  Use `method="pull"` for reproducible sparse accumulation. Under
+  `torch.use_deterministic_algorithms(True)`, automatic planning selects
+  `"pull"`, and explicit CUDA `method="push"` raises an error. Ordinary
+  connection calls refresh the plan when this setting changes; set it before
+  compilation or CUDA graph capture.
 - **`"push"` takes the hint at its word.** It is used for every input, also
   for one that is far denser than the hint; it stays correct and becomes slower
   than pull.

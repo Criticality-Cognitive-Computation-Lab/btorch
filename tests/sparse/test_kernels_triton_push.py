@@ -296,13 +296,8 @@ def test_source_major_values(graph, kernel_cache, monkeypatch, mode, dtype):
     assert (dense.error(out, x) <= rounding_bound(dense, x)).all()
 
 
-def test_fallback_for_unsupported_inputs(graph, kernel_cache):
-    """Non-float32 or CPU inputs are forwarded to the ATen kernel unchanged.
-
-    The Triton kernels are float32/CUDA only. Float64 goes through the very
-    same ATen code as the reference, so (up to the atomics of ``index_add_``)
-    the results agree to float64 precision, and nothing is cached.
-    """
+def test_float64_native_and_cpu_reference(graph, kernel_cache):
+    """FP64 native kernels retain double accuracy; CPU uses the reference."""
     cache, values, dense = graph
     x = make_input("sparse", 2).double()
     active_idx, ptr = kernels_torch.pack_spikes(x)
@@ -313,7 +308,6 @@ def test_fallback_for_unsupported_inputs(graph, kernel_cache):
     np.testing.assert_allclose(out.cpu().numpy(), exact, rtol=1e-10, atol=1e-10)
     out = ktp.spike_push_dense(*args, N_DST, cache=kernel_cache)
     np.testing.assert_allclose(out.cpu().numpy(), exact, rtol=1e-10, atol=1e-10)
-    assert ("triton_push", "layouts") not in kernel_cache._store
 
     # CPU tensors: same forwarding.
     cpu = [t.cpu() for t in (cache.t_crow, cache.t_col, cache.t_perm, values)]
@@ -564,3 +558,48 @@ def test_register_on_private_registry(graph):
     assert (dense.error(dense_out, x) <= rounding_bound(dense, x)).all()
     # The derived layout went into *this* registry's kernel cache.
     assert len(registry.kernels.get(("triton_push", "layouts"), dict)) == 1
+
+
+def test_spike_list_promotes_mixed_activity_without_input_upcast(graph, kernel_cache):
+    """Specialize one packed fanout on typed storage without input upcasts.
+
+    Alternate pointer dtypes under one handle cache and use strided
+    views. The double-precision CSR reference uses the quantized
+    supplied weights and activity; half output is rounded once after
+    FP32 accumulation.
+    """
+    from btorch.sparse.runtime.kernels_triton_spikelist import spike_push_list
+
+    topology, original_values, _ = graph
+    original = make_input("sparse", 3, seed=672)
+    for value_dtype, input_dtype in (
+        (torch.float32, torch.float32),
+        (torch.float32, torch.bfloat16),
+        (torch.float16, torch.float16),
+        (torch.float64, torch.float32),
+        (torch.float32, torch.float64),
+        (torch.float32, torch.float32),
+    ):
+        values = original_values.to(value_dtype)
+        storage = torch.empty((3, 2 * N_SRC + 1), device=DEVICE, dtype=input_dtype)
+        x = storage[:, 1::2]
+        x.copy_(original)
+        output = spike_push_list(
+            topology.t_crow,
+            topology.t_col,
+            topology.t_perm,
+            values,
+            x,
+            N_DST,
+            cache=kernel_cache,
+        )
+        dtype = torch.promote_types(value_dtype, input_dtype)
+        expected = kernels_torch.csr_matvec(
+            topology.crow, topology.col, values.double(), x.double()
+        ).to(dtype)
+        tolerance = (
+            2e-3
+            if dtype == torch.float16
+            else (2e-12 if dtype == torch.float64 else 3e-5)
+        )
+        torch.testing.assert_close(output, expected, atol=tolerance, rtol=tolerance)

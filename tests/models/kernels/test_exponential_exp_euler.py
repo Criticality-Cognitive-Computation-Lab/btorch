@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from btorch.models.kernels import CellSpec
+from btorch.models.kernels import NeuronSpec
 from tests.models.kernels.helpers import (
     GPU_BACKENDS,
     assert_module_sequence,
@@ -73,7 +73,7 @@ def test_exponential_tiny_step_matches_module_operation_graph(backend, layout):
     # The long sequence also exercises history and reverse replay semantics.
     assert_module_sequence(
         backend,
-        CellSpec("exponential", dt=1e-06),
+        NeuronSpec("exponential", dt=1e-06),
         x,
         states,
         parameters,
@@ -92,7 +92,7 @@ def test_exponential_infinite_tau_matches_zero_linear_limit(backend):
     # still accumulated, and the tau VJP must retain the Module's finite limit.
     actual = assert_module_sequence(
         backend,
-        CellSpec("exponential", dt=0.01),
+        NeuronSpec("exponential", dt=0.01),
         x,
         states,
         parameters,
@@ -117,7 +117,7 @@ def test_exponential_nonzero_state_and_events_preserve_delivery_order(backend):
     # accidental input delay or input-before-decay schedule observable.
     actual = assert_module_sequence(
         backend,
-        CellSpec("exponential", dt=0.25),
+        NeuronSpec("exponential", dt=0.25),
         x,
         states,
         parameters,

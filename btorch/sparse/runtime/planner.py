@@ -30,6 +30,7 @@ class PlanningContext:
     capture: bool = False
     firing_rate_hz: float | None = None
     method: PropagationMethod = "auto"
+    shape: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,7 @@ class Planner:
         hints: Hints,
         dtype: torch.dtype,
         method: PropagationMethod = "auto",
+        shape: tuple[int, int] | None = None,
     ) -> _Plan:
         validate_method(method)
         limit = self.push_max_density.get(device, 0.0)
@@ -106,6 +108,7 @@ class Planner:
             dtype=dtype,
             firing_rate_hz=hints.firing_rate_hz,
             method=method,
+            shape=shape,
         )
         if method != "auto":
             algorithm, reason = method, f"explicit method={method!r}"
@@ -119,6 +122,13 @@ class Planner:
                     f"dtype={dtype}, batched_values={value_batched}, "
                     f"backend={registry.override or 'auto'!r}"
                 )
+        elif (
+            shape is not None
+            and max(shape) < 4000
+            and registry.override is None
+            and dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+        ):
+            algorithm, reason = "pull", "fewer than 4000 neurons: dense matmul"
         elif value_batched:
             algorithm, reason = "pull", "shared-pattern batch of values"
         elif density is None and not low_rate:
@@ -151,7 +161,9 @@ class Planner:
         route = registry.resolve_route(algorithm, device, context)
         return _Plan(
             representation=(
-                "device spike list + source CSR"
+                "dense matrix (sparse edge parameters)"
+                if route.key.representation == "dense"
+                else "device spike list + source CSR"
                 if route.key.representation == "spike_list_csr"
                 else "destination CSR + source CSR"
             ),

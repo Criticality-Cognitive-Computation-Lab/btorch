@@ -283,3 +283,63 @@ def _local_override():
             registry._restore_override(previous)
 
     return override
+
+
+def test_replacing_sparse_kernel_does_not_reuse_its_old_workspace_factory():
+    """Keep execution and preparation on the same registered implementation."""
+    from btorch.sparse.runtime import kernels_torch
+    from btorch.sparse.runtime.ops import _build_pull
+
+    registry = BackendRegistry()
+    crow = torch.tensor([0, 2, 3])
+    col = torch.tensor([0, 2, 1])
+    values = torch.tensor([0.5, -0.25, 2.0])
+    x = torch.tensor([[1.0, 3.0, 5.0], [-2.0, 4.0, 0.0]])
+    expected = torch.tensor([[-0.75, 6.0], [-1.0, 8.0]])
+
+    def prepare(crow, col, values, sample):
+        output = sample.new_empty((*sample.shape[:-1], crow.numel() - 1))
+
+        def forward(input):
+            output.copy_(kernels_torch.csr_matvec(crow, col, values, input))
+            return output
+
+        return forward
+
+    registry.register(
+        "csr_matvec",
+        "demo",
+        kernels_torch.csr_matvec,
+        device="cpu",
+        prepare_execution=prepare,
+    )
+    registry.register("edge_grad", "demo", kernels_torch.edge_grad, device="cpu")
+    registry.register_route(
+        RouteSpec(
+            key=RouteKey("propagate", "post_pre_csr", "pull", "demo"),
+            kernel_bindings=(("csr_matvec", "demo"), ("edge_grad", "demo")),
+            build=_build_pull,
+        ),
+        device="cpu",
+    )
+    snapshot = registry.resolve_route("pull", "cpu")
+    old = registry.bind_route(snapshot).implementation
+    arguments = (crow, col, values, x, None, None, None, None, None)
+    execute = old.prepare_forward(*arguments)
+    torch.testing.assert_close(execute(x), expected)
+    torch.testing.assert_close(execute(-x), -expected)
+
+    # A backend can replace its kernel without offering prepared execution.
+    # Reusing its predecessor's factory would silently execute the old math.
+    def replacement(crow, col, values, input):
+        return 2 * kernels_torch.csr_matvec(crow, col, values, input)
+
+    registry.register("csr_matvec", "demo", replacement, device="cpu")
+    with pytest.raises(RuntimeError, match="stale"):
+        registry.bind_route(snapshot)
+    current = registry.bind_route(registry.resolve_route("pull", "cpu")).implementation
+    forward = current.prepare_forward(*arguments) if current.prepare_forward else None
+    actual = forward(x) if forward is not None else current.forward(*arguments)
+    torch.testing.assert_close(actual, 2 * expected)
+    # An outstanding invocation still owns its original implementation/storage.
+    torch.testing.assert_close(execute(x), expected)

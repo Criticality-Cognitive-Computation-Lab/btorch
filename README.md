@@ -132,6 +132,25 @@ pip install git+https://gitee.com/alexfanqi/btorch.git
 For setup instructions, see [docs/installation.md](docs/en/docs/installation.md).  
 For development workflow and contributing guidelines, see [docs/development.md](docs/en/docs/development.md).
 
+## Tests
+
+Run focused checks while developing, then the routine suite:
+
+```bash
+pytest tests/models/kernels/test_low_rate_recurrent.py
+pytest tests
+```
+
+Routine kernel coverage uses selected numerical, state, gradient and renderer
+scenarios. Exhaustive model/options combinations are marked `full_validation`.
+For explicit full validation, including those combinations:
+
+```bash
+pytest tests -o addopts='' --durations=20
+```
+
+See [kernel test structure](tests/models/kernels/README.md) for case selection.
+
 ## Documentation
 
 **Live docs:** [https://criticality-cognitive-computation-lab.github.io/btorch/](https://criticality-cognitive-computation-lab.github.io/btorch/)

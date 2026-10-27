@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from btorch.models.kernels.backends.engine import generate_source
-from btorch.models.kernels.contracts import CellSpec, HistoryPlan
+from btorch.models.kernels.contracts import HistoryPlan, NeuronSpec
 from btorch.models.kernels.golden import python_module_sequence
 from btorch.models.kernels.operators import run_multi_step
 from btorch.models.kernels.templates import residual_template
@@ -14,7 +14,7 @@ from tests.models.kernels.helpers import GPU_BACKENDS, require_cuda_backend
 def _case(device, steps=20, refractory=False, hard_reset=False):
     torch.manual_seed(1204)
     shape = (2, 5)
-    spec = CellSpec(
+    spec = NeuronSpec(
         "glif3",
         dt=0.5,
         refractory=refractory,

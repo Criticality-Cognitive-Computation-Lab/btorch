@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from btorch.models.kernels.backends.engine import generate_source
-from btorch.models.kernels.contracts import CellSpec
+from btorch.models.kernels.contracts import NeuronSpec
 from btorch.models.kernels.operators import run_multi_step
 from tests.models.kernels.helpers import GPU_BACKENDS, require_cuda_backend
 
@@ -23,7 +23,7 @@ def _assert_device_asserted(result):
 
 @pytest.mark.parametrize("backend", GPU_BACKENDS)
 def test_primitive_source_contains_backend_device_timestep_assertions(backend):
-    source, _ = generate_source(backend, CellSpec("if"), 4, 3, ())
+    source, _ = generate_source(backend, NeuronSpec("if"), 4, 3, ())
     if backend == "triton":
         assert "tl.device_assert" in source
         assert 'dt < float("inf")' in source
@@ -46,7 +46,7 @@ def test_torch_fallback_rejects_invalid_timestep(dt):
             x,
             state,
             parameters,
-            CellSpec("if", dt=torch.tensor(dt)),
+            NeuronSpec("if", dt=torch.tensor(dt)),
             backend="torch",
         )
 
@@ -55,7 +55,7 @@ _DEVICE_ASSERT_SCRIPT = r"""
 import sys
 import torch
 
-from btorch.models.kernels.contracts import CellSpec
+from btorch.models.kernels.contracts import NeuronSpec
 from btorch.models.kernels.operators import run_multi_step
 
 backend, value, model, mode = sys.argv[1:]
@@ -78,7 +78,7 @@ else:
 if mode == "zero_neuron":
     states = tuple(state[:0] for state in states)
 
-spec = CellSpec(model, dt=dt)
+spec = NeuronSpec(model, dt=dt)
 if mode == "replaced":
     from dataclasses import replace
     from btorch.models.kernels import registry

@@ -1,6 +1,6 @@
 # Kernel test structure
 
-Use `helpers.py` for the backend parameter matrix (`GPU_BACKENDS`), optional
+Use `helpers.py` for backend names (`GPU_BACKENDS`), optional
 CUDA availability checks, the common cell input layouts, `NewEmptyShapes`, and
 whole-sequence output/VJP comparison against the actual Module. Numerical
 options for that oracle are grouped in `SequenceParityOptions`; callers with
@@ -14,8 +14,9 @@ actual Module schedule oracle. Importing a test should not register an
 otherwise unused reference backend.
 
 Keep model-specific drives, time units, reset/delivery expectations, gradients,
-and numerical regression values next to their tests. Parameterize independent
-model/backend/layout choices; avoid creating one copy of a test per backend.
+and numerical regression values next to their tests. Use selected scenario tables instead of crossing independent
+model/backend/layout options. Cover shared equations and state/gradient behavior
+once, and choose additional cases for features that differ between renderers.
 Do not merge distinct physical edge cases merely to shorten the files.
 
 Use `require_cuda_backend` for optional backend availability, including mixed
@@ -43,3 +44,25 @@ semantics (`tests/models/test_conductance_sequence.py`), native standalone
 kernels (`test_conductance_sequence.py` here), and the network scheduler
 (`tests/models/rnn/test_conductance.py`). These are complementary contracts,
 not interchangeable golden implementations.
+
+## Routine and full validation
+
+`pytest tests/models/kernels` runs selected numerical/state/gradient and renderer
+cases, together with focused regressions. Each selected table explains which
+physical or rendering feature it exercises. `validation_cases` marks the other
+combinations `full_validation`; those combinations use the same oracle and
+assertions, and are excluded by the default pytest marker expression.
+
+For a change, first run its affected files or `-k` selection. Run the routine
+kernel suite once after implementation settles. Use the exhaustive matrix for
+an explicitly requested full validation, rather than after every local edit:
+
+```bash
+pytest tests/models/kernels/test_low_rate_recurrent.py
+pytest tests/models/kernels --durations=20
+pytest tests -o addopts='' --durations=20  # includes routine and exhaustive cases
+```
+
+Do not weaken tolerances or replace numerical checks with forwarding/attribute
+checks when selecting cases. Keep distinct failure mechanisms, such as a
+noncontiguous input, outstanding tapes, AMP, delay state and checkpoint/offload.

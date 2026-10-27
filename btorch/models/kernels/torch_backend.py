@@ -3,7 +3,7 @@
 import torch
 from torch import Tensor
 
-from .contracts import CellSpec
+from .contracts import NeuronSpec
 from .templates import get_reference_callbacks, get_template
 
 
@@ -11,7 +11,7 @@ def forward_step(
     x: Tensor,
     states: tuple[Tensor, ...],
     parameters: tuple[Tensor, ...],
-    spec: CellSpec,
+    spec: NeuronSpec,
 ):
     """Execute the existing Python module, or an external model's callback."""
     callbacks = get_reference_callbacks(spec)
@@ -26,7 +26,7 @@ def backward_step(
     x: Tensor,
     states: tuple[Tensor, ...],
     parameters: tuple[Tensor, ...],
-    spec: CellSpec,
+    spec: NeuronSpec,
     grad_output: Tensor,
     grad_states: tuple[Tensor, ...],
     grad_records: dict[str, Tensor],
@@ -105,7 +105,7 @@ def forward_sequence(
     x_seq: Tensor,
     states: tuple[Tensor, ...],
     parameters: tuple[Tensor, ...],
-    spec: CellSpec,
+    spec: NeuronSpec,
     history_names: tuple[str, ...],
 ):
     """Evaluate a complete sequence with only the requested history storage."""
@@ -140,7 +140,7 @@ def backward_sequence(
     x_seq: Tensor,
     initial_states: tuple[Tensor, ...],
     parameters: tuple[Tensor, ...],
-    spec: CellSpec,
+    spec: NeuronSpec,
     history_names: tuple[str, ...],
     histories: tuple[Tensor, ...],
     grad_output: Tensor,

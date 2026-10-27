@@ -1,6 +1,7 @@
 """Verify public stateful adapters against the original step recurrence."""
 
 import copy
+from itertools import product
 
 import pytest
 import torch
@@ -11,7 +12,11 @@ from btorch.models.kernels.options import KernelOptions
 from btorch.models.neurons.lif import LIF
 from btorch.models.rnn import RecurrentNN
 from btorch.models.synapse import AlphaPSC
-from tests.models.kernels.helpers import GPU_BACKENDS, require_cuda_backend
+from tests.models.kernels.helpers import (
+    GPU_BACKENDS,
+    require_cuda_backend,
+    validation_cases,
+)
 
 
 def test_compiled_cell_reads_changed_environment_dt_without_retracing():
@@ -536,15 +541,32 @@ def test_gpu_sparse_fullgraph_training_and_cudagraph_replay(backend):
         assert rnn._cudagraph_runner.n_captures == 3
 
 
-@pytest.mark.parametrize("cell_backend", ("torch", *GPU_BACKENDS))
-@pytest.mark.parametrize("neuron_model", ["if", "lif", "glif3", "izhikevich"])
+# Module adaptation needs scalar/mode/multi-state pairs, not every pairing
+# of independent equations. Keep CPU operator and all native renderers covered.
 @pytest.mark.parametrize(
-    "psc_model", ["exponential", "alpha", "alpha_billeh", "dual_exponential"]
+    "cell_backend,neuron_model,psc_model",
+    validation_cases(
+        product(
+            ("torch", *GPU_BACKENDS),
+            ("if", "lif", "glif3", "izhikevich"),
+            ("exponential", "alpha", "alpha_billeh", "dual_exponential"),
+        ),
+        selected=(
+            ("torch", "if", "exponential"),
+            ("torch", "glif3", "dual_exponential"),
+            ("triton", "if", "exponential"),
+            ("triton", "lif", "alpha"),
+            ("triton", "glif3", "alpha_billeh"),
+            ("triton", "izhikevich", "dual_exponential"),
+            ("cupy", "glif3", "alpha"),
+            ("tilelang", "izhikevich", "dual_exponential"),
+        ),
+    ),
 )
 def test_recurrent_model_pairs_all_float_and_initial_state_gradients(
     neuron_model, psc_model, cell_backend
 ):
-    # Exercise every declared cell pair as an actual recurrent network. Losses
+    # Exercise the selected cell pair as an actual recurrent network. Losses
     # on every recorded state require all adjoints, rather than only the spike
     # surrogate path. Floating buffers are made trainable deliberately so PSC
     # time constants and gain coefficients participate in the same comparison.
@@ -770,12 +792,12 @@ def test_external_backend_default_single_step_uses_registered_dynamics():
     # Module path silently falls back to Torch, both voltage and its upstream
     # derivative disagree with the independently stepped reference.
     from btorch.models.kernels import (
-        CellSpec,
+        NeuronSpec,
         register_cell_backend,
         resolve_cell_backend,
     )
 
-    torch_backend = resolve_cell_backend("torch", CellSpec("lif"), "cpu")
+    torch_backend = resolve_cell_backend("torch", NeuronSpec("lif"), "cpu")
     forward_sequence = torch_backend.forward
     backward_sequence = torch_backend.backward
 
@@ -885,12 +907,12 @@ def test_replaced_external_backend_invalidates_recurrent_capture():
     # a previously captured callback. Compare against eager continuation and
     # inspect voltage so zero spikes cannot hide a stale implementation.
     from btorch.models.kernels import (
-        CellSpec,
+        NeuronSpec,
         register_cell_backend,
         resolve_cell_backend,
     )
 
-    forward_sequence = resolve_cell_backend("torch", CellSpec("lif"), "cpu").forward
+    forward_sequence = resolve_cell_backend("torch", NeuronSpec("lif"), "cpu").forward
 
     name = "integration_capture_replacement"
     register_cell_backend(name, forward=forward_sequence, replace=True)
@@ -935,12 +957,12 @@ def test_recurrent_refuses_replaced_backend_before_backward(compiled):
     # Replacing the registration must not silently use a new VJP, including
     # when AOTAutograd has compiled the backward custom operator already.
     from btorch.models.kernels import (
-        CellSpec,
+        NeuronSpec,
         register_cell_backend,
         resolve_cell_backend,
     )
 
-    torch_backend = resolve_cell_backend("torch", CellSpec("lif"), "cpu")
+    torch_backend = resolve_cell_backend("torch", NeuronSpec("lif"), "cpu")
     forward_sequence = torch_backend.forward
     backward_sequence = torch_backend.backward
 

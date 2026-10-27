@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from btorch.models.kernels import CellSpec
+from btorch.models.kernels import NeuronSpec
 from tests.models.kernels.helpers import (
     GPU_BACKENDS,
     assert_module_sequence,
@@ -61,7 +61,7 @@ def test_alpha_tiny_step_long_sequence_matches_module_vjp(backend, layout):
     # Small dt makes ``1 - exp(-dt/tau)`` lose the update that the Module
     # computes through expm1. T=128 also exercises reverse replay/history use.
     assert_module_sequence(
-        backend, CellSpec("alpha", dt=0.0001), x, states, parameters, ("psc", "h")
+        backend, NeuronSpec("alpha", dt=0.0001), x, states, parameters, ("psc", "h")
     )
 
 
@@ -74,7 +74,7 @@ def test_alpha_infinite_tau_matches_module_limit_and_vjp(backend):
     # zero. The exp-Euler coefficient takes its finite dt limit, while input
     # still updates h in the delivery step.
     actual = assert_module_sequence(
-        backend, CellSpec("alpha", dt=0.01), x, states, parameters, ("psc", "h")
+        backend, NeuronSpec("alpha", dt=0.01), x, states, parameters, ("psc", "h")
     )
     assert torch.isfinite(actual[0]).all()
 
@@ -91,6 +91,6 @@ def test_alpha_input_affects_psc_in_delivery_step(backend):
     # AlphaPSC first adds the connection input to h, then advances psc from
     # that updated h. A spike therefore produces nonzero current immediately.
     actual = assert_module_sequence(
-        backend, CellSpec("alpha", dt=0.25), x, states, parameters, ("psc", "h")
+        backend, NeuronSpec("alpha", dt=0.25), x, states, parameters, ("psc", "h")
     )
     assert torch.count_nonzero(actual[0][0]) == actual[0][0].numel()

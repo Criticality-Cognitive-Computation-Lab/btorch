@@ -40,7 +40,14 @@ _consume_csr_warnings()
 
 # Entry-times-sample budget for temporaries of the gather-based kernels.
 _CHUNK_ELEMENTS = 1 << 25
-_NATIVE_CSR_DTYPES = (torch.float32, torch.float64)
+_CPU_CSR_DTYPES = (torch.float32, torch.float64)
+_FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+
+
+def _accumulation_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Accumulate reduced-precision storage in FP32 and retain FP64
+    precision."""
+    return torch.float64 if dtype == torch.float64 else torch.float32
 
 
 _ROW_CACHE: dict = {}
@@ -76,7 +83,7 @@ def _csr_mm(crow: Tensor, col: Tensor, values: Tensor, x: Tensor, n_out: int) ->
     M]``."""
     n_in = x.shape[-1]
     lead = x.shape[:-1]
-    if values.dtype in _NATIVE_CSR_DTYPES:
+    if values.dtype in (_FLOAT_DTYPES if values.is_cuda else _CPU_CSR_DTYPES):
         # The CUDA CSR product reads the value buffer as if it were dense and
         # contiguous; an expanded or strided view would give wrong results.
         values = values.contiguous()
@@ -91,7 +98,7 @@ def _csr_mm(crow: Tensor, col: Tensor, values: Tensor, x: Tensor, n_out: int) ->
         # strided transpose view for the batched product.
         flat = x.reshape(math.prod(lead), n_in).T.contiguous()
         return (mat @ flat).T.contiguous().reshape(*lead, n_out)
-    # Dtypes without a native CSR product (half, bfloat16, integers).
+    # CPU half/BF16 and non-floating dtypes use the reference reduction.
     row = _row_indices(crow)
     flat = x.reshape(math.prod(lead), n_in)
     out = flat.new_zeros(flat.shape[0], n_out)
@@ -102,6 +109,19 @@ def _csr_mm(crow: Tensor, col: Tensor, values: Tensor, x: Tensor, n_out: int) ->
 
 
 def csr_matvec(crow: Tensor, col: Tensor, values: Tensor, x: Tensor) -> Tensor:
+    """Apply CSR propagation in the promoted operand dtype, including under
+    AMP."""
+    # Bound/prepared routes can call this implementation without the raw-op
+    # dispatcher. Keep their precision consistent with the fake operator and
+    # Triton routes: Torch's native CSR product is otherwise autocast eligible.
+    device = x.device.type
+    if torch.is_autocast_enabled(device):
+        with torch.autocast(device_type=device, enabled=False):
+            return _csr_matvec(crow, col, values, x)
+    return _csr_matvec(crow, col, values, x)
+
+
+def _csr_matvec(crow: Tensor, col: Tensor, values: Tensor, x: Tensor) -> Tensor:
     """``y[..., m] = sum_k values[..., k] * x[..., col[k]]`` over row ``m``."""
     n_out = crow.shape[0] - 1
     dtype = torch.promote_types(values.dtype, x.dtype)
@@ -136,8 +156,8 @@ def csr_matvec_cusparse(crow: Tensor, col: Tensor, values: Tensor, x: Tensor) ->
     """
     if values.device.type != "cuda" or x.device.type != "cuda":
         raise ValueError("The cusparse backend requires CUDA tensors")
-    if torch.promote_types(values.dtype, x.dtype) not in _NATIVE_CSR_DTYPES:
-        raise ValueError("The cusparse backend requires FP32 or FP64 products")
+    if torch.promote_types(values.dtype, x.dtype) not in _FLOAT_DTYPES:
+        raise ValueError("The cusparse backend requires floating-point products")
     return csr_matvec(crow, col, values, x)
 
 

@@ -18,7 +18,7 @@ def _model_layout(module):
     from ..neurons.izhikevich import Izhikevich
     from ..neurons.lif import IF, LIF
     from ..synapse import AlphaPSC, AlphaPSCBilleh, DualExponentialPSC, ExponentialPSC
-    from .contracts import CellSpec
+    from .contracts import NeuronSpec
     from .templates import get_template
 
     models = {
@@ -39,7 +39,7 @@ def _model_layout(module):
         )
     model = models[type(module)]
     template = get_template(
-        CellSpec(model, refractory=getattr(module, "_use_refractory", False))
+        NeuronSpec(model, refractory=getattr(module, "_use_refractory", False))
     )
     return model, template.state_names, template.parameter_names
 
@@ -81,7 +81,7 @@ def connection_scope(options: KernelOptions):
 
 def _prepare_cell_from_layout(module, x_seq: Tensor, layout):
     """Normalize tensors for one explicitly selected cell layout."""
-    from .contracts import CellSpec
+    from .contracts import NeuronSpec
     from .operators import environment_dt
 
     model, state_names, parameter_names = layout
@@ -90,6 +90,10 @@ def _prepare_cell_from_layout(module, x_seq: Tensor, layout):
         from .. import surrogate
 
         function = module.surrogate_function
+        if isinstance(function, surrogate.Truncated):
+            kwargs["surrogate_width"] = function.support
+            while isinstance(function, surrogate.Truncated):
+                function = function.surrogate
         names = {
             surrogate.Sigmoid: "sigmoid",
             surrogate.ATan: "atan",
@@ -161,7 +165,7 @@ def _prepare_cell_from_layout(module, x_seq: Tensor, layout):
         getattr(module, name).to(device=x_seq.device, dtype=torch.float32)
         for name in parameter_names
     )
-    return CellSpec(**kwargs), state_names, tuple(states), parameters
+    return NeuronSpec(**kwargs), state_names, tuple(states), parameters
 
 
 def prepare_cell(module, x_seq: Tensor):

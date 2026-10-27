@@ -7,7 +7,7 @@ from functools import partial
 
 import torch
 
-from .contracts import CellSpec
+from .contracts import NeuronSpec
 
 
 @dataclass(frozen=True)
@@ -25,7 +25,7 @@ class CellBackendEntry:
     name: str
     forward: Callable
     backward: Callable | None
-    supports: Callable[[CellSpec, torch.device], bool] | None = None
+    supports: Callable[[NeuronSpec, torch.device], bool] | None = None
     revision: int = 1
 
 
@@ -59,7 +59,7 @@ def register_cell_backend(
     *,
     forward: Callable,
     backward: Callable | None = None,
-    supports: Callable[[CellSpec, torch.device], bool] | None = None,
+    supports: Callable[[NeuronSpec, torch.device], bool] | None = None,
     replace: bool = False,
 ) -> CellBackendEntry:
     """Register an out-of-tree cell backend without modifying btorch.
@@ -113,7 +113,7 @@ def register_cell_backend(
 
 
 def resolve_cell_backend(
-    name: str, spec: CellSpec, device: torch.device | str
+    name: str, spec: NeuronSpec, device: torch.device | str
 ) -> CellBackendEntry:
     """Resolve a backend and reject unsupported execution without fallback.
 

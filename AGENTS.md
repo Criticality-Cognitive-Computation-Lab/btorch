@@ -94,7 +94,8 @@ Key patterns:
 - Use pre-commit formatting before PRs: `pre-commit install --install-hooks`.
 - Keep changes modular; avoid mixing refactors with feature work.
 
-## Design principles
+## Design principles for public interface and models
 
 - Usability over performance; simple over clever; customizability over abstraction.
 - Keep network models cohesive (single file/folder principle).
+- not applicable to internals that is hidden from non-professionals

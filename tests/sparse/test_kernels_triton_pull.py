@@ -314,9 +314,9 @@ def test_deterministic(variant, sample):
         assert torch.equal(kernels_triton.edge_grad(crow, col, grad, x, 0), first_grad)
 
 
-def test_fallback_dtypes_and_cpu():
-    # Anything the Triton kernels do not implement is delegated to the ATen
-    # kernel: float64 keeps its dtype, CPU tensors stay on the CPU.
+def test_float64_native_and_cpu_reference():
+    # FP64 uses the same native kernel with double accumulation, while CPU
+    # tensors retain the reference path.
     crow, col, m, n = make_csr("plain")
     gen = torch.Generator(device=DEVICE).manual_seed(10)
     values = torch.randn(col.shape[0], device=DEVICE, generator=gen)
@@ -779,6 +779,143 @@ def test_csr_backward_equals_the_separate_kernels(variant, sample, batched):
     assert only_values[1] is None and torch.equal(only_values[0], grad_values)
 
 
+@pytest.mark.parametrize(
+    "samples,weight_dtype,source_dtype",
+    (
+        (1, torch.float64, torch.float64),
+        (4, torch.float16, torch.float32),
+        (40, torch.bfloat16, torch.bfloat16),
+    ),
+)
+def test_prepared_sparse_reverse_accumulates_live_edge_vjp(
+    samples, weight_dtype, source_dtype
+):
+    """Share masked input VJP and accumulation without losing hub edges."""
+    # The transpose contains a 4097-edge source row, so both fused execution
+    # and the >32-sample fallback must combine split rows correctly. Distinct
+    # storage types and strided sources catch accidental blanket FP32 casts.
+    from btorch.models.kernels.backends.engine import forward
+    from btorch.models.kernels.contracts import NeuronSpec
+    from btorch.sparse.runtime.activity import BLOCK_SIZE, GradientList
+
+    m, n = 4097, 137
+    crow = torch.arange(m + 1, device=DEVICE)
+    col = torch.zeros(m, device=DEVICE, dtype=torch.long)
+    t_crow = torch.full((n + 1,), m, device=DEVICE, dtype=torch.long)
+    t_crow[0] = 0
+    t_col = torch.arange(m, device=DEVICE)
+    t_perm = torch.arange(m, device=DEVICE)
+    values = ((torch.arange(m, device=DEVICE) % 8 - 3) / 8).to(weight_dtype)
+    source = torch.empty(samples, n, 2, device=DEVICE, dtype=source_dtype)[..., 0]
+    source.copy_(torch.arange(samples * n, device=DEVICE).reshape(samples, n) % 2)
+    gradient = (
+        ((torch.arange(samples * m, device=DEVICE) % 5 - 2) / 8)
+        .reshape(samples, m)
+        .to(source_dtype)
+    )
+    tape = torch.empty(GradientList.size(samples * n), device=DEVICE, dtype=torch.int32)
+    activity = GradientList(tape, samples * n)
+    mask = activity.mask.reshape(samples, n)
+    spec = NeuronSpec("if", surrogate_width=0.25)
+    parameters = tuple(torch.tensor(v, device=DEVICE) for v in (1.0, 0.0, 1.0))
+
+    def produce(step):
+        # The real shared neuron template emits the lists directly. Include
+        # exact cutoff boundaries, near-but-silent neurons, and far-above-
+        # threshold firing neurons, which still own weight gradients.
+        norm = torch.tensor([-1.0, -0.125, 0.125, 0.25, 1.0], device=DEVICE)
+        index = (torch.arange(samples * n, device=DEVICE) + step) % norm.numel()
+        current = (1.0 + norm[index]).reshape(1, samples, n)
+        if step == 3:
+            current.fill_(-1.0)  # empty queues must overwrite old counts
+        elif step == 4:
+            current.fill_(1.125)  # full capacity, including the final partial block
+        raster, _, _ = forward(
+            "triton",
+            current,
+            (torch.zeros_like(current[0]),),
+            parameters,
+            spec,
+            (),
+            gradient_activity=tape,
+        )
+        source.copy_(raster[0])
+        expected_mask = (current.flatten() - 1.0).abs() < 0.25
+        torch.testing.assert_close(activity.mask.bool(), expected_mask)
+        for union in (False, True):
+            indices, counts = activity.work(union)
+            selected = (
+                expected_mask | source.flatten().bool() if union else expected_mask
+            )
+            for block, count in enumerate(counts.cpu().tolist()):
+                start = block * BLOCK_SIZE
+                expected_rows = (
+                    selected[start : start + BLOCK_SIZE].nonzero().flatten() + start
+                )
+                torch.testing.assert_close(
+                    indices[start : start + count].long(), expected_rows
+                )
+
+    produce(0)
+    destination = torch.zeros_like(values)
+    expected = torch.zeros_like(values)
+    cache = KernelCache()
+    execute = kernels_triton._prepare_backward(
+        cache,
+        crow,
+        col,
+        t_crow,
+        t_col,
+        t_perm,
+        values,
+        source,
+        gradient,
+        True,
+        True,
+        input_mask=activity,
+        grad_values=destination,
+    )
+    for step in range(4):
+        # Change operands after binding. Silent sources still receive an input
+        # adjoint inside support; outside support only that adjoint is elided,
+        # not the weight gradient or any physical-state gradient.
+        produce(step + 1)
+        gradient.neg_()
+        increment = kernels_triton.edge_grad(crow, col, gradient, source, 0).to(
+            weight_dtype
+        )
+        expected.add_(increment)
+        full = kernels_triton.csr_matvec(t_crow, t_col, values, gradient)
+        returned, actual = execute(source, gradient, activity)
+        assert returned is None
+        torch.testing.assert_close(destination, expected, atol=0, rtol=0)
+        torch.testing.assert_close(
+            actual, torch.where(mask.bool(), full, 0), atol=1e-12, rtol=0
+        )
+    # Without a requested weight VJP, traversal consumes the near-threshold
+    # list alone, not the union containing far-from-threshold firing rows.
+    produce(2)
+    full = kernels_triton.csr_matvec(t_crow, t_col, values, gradient)
+    only_input = kernels_triton._prepare_backward(
+        cache,
+        crow,
+        col,
+        t_crow,
+        t_col,
+        t_perm,
+        values,
+        source,
+        gradient,
+        False,
+        True,
+        input_mask=activity,
+    )
+    _, actual = only_input(source, gradient, activity)
+    torch.testing.assert_close(
+        actual, torch.where(mask.bool(), full, 0), atol=1e-12, rtol=0
+    )
+
+
 @pytest.mark.parametrize("batched", (False, True))
 def test_fused_backward_operator(batched):
     # ``btorch::csr_propagate_backward`` is the registered operator compiled
@@ -822,3 +959,46 @@ def test_fused_backward_operator(batched):
     grad_values, grad_x = ops.csr_propagate_backward(*args)
     assert torch.equal(grad_values, expected_values)
     assert torch.equal(grad_x, expected_x)
+
+
+def test_matvec_reuses_cache_across_operand_storage_dtypes(monkeypatch):
+    """A prepared/direct launch must not reuse another pointer dtype's binary.
+
+    Keep topology, tiles and tensor shapes unchanged while alternating
+    which operand has low precision. The sliced source also checks that
+    sample-minor packing retains its dtype rather than masking cache
+    mistakes with FP32.
+    """
+    reference = kernels_torch.csr_matvec
+
+    def no_reference(*args, **kwargs):
+        pytest.fail("Supported floating operands must use the native CSR kernel")
+
+    monkeypatch.setattr(kernels_torch, "csr_matvec", no_reference)
+    # One split hub alongside short/empty rows also exercises typed partial
+    # sums and the shared combine kernel without another options matrix.
+    crow, col, _, n = make_csr("hub")
+    generator = torch.Generator(device=DEVICE).manual_seed(962)
+    original_values = torch.randn(col.numel(), device=DEVICE, generator=generator)
+    original_x = torch.randn((5, 2 * n + 1), device=DEVICE, generator=generator)
+    cache = KernelCache()
+    for value_dtype, input_dtype in (
+        (torch.float32, torch.float32),
+        (torch.float32, torch.bfloat16),
+        (torch.float16, torch.float32),
+        (torch.float16, torch.float16),
+        (torch.float64, torch.float32),
+        (torch.float32, torch.float64),
+        (torch.float32, torch.float32),
+    ):
+        values = original_values.to(value_dtype)
+        x = original_x.to(input_dtype)[:, 1::2]
+        actual = kernels_triton._prepare_matvec(cache, crow, col, values, x)(x)
+        dtype = torch.promote_types(values.dtype, x.dtype)
+        expected = reference(crow, col, values.double(), x.double()).to(dtype)
+        atol = (
+            2e-3
+            if dtype == torch.float16
+            else (2e-12 if dtype == torch.float64 else 3e-5)
+        )
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=atol)

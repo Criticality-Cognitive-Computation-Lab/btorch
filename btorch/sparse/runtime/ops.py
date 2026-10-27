@@ -14,6 +14,7 @@ N]``; the logical spike tensor stays dense so surrogate gradients are exact.
 
 from __future__ import annotations
 
+import math
 from itertools import count
 
 import torch
@@ -27,6 +28,7 @@ from . import (
     kernels_triton_spikelist,
 )
 from .backend import (
+    PreparedPropagation,
     RegisteredOperator,
     RouteBinding,
     RouteImplementation,
@@ -306,6 +308,11 @@ def _apply_backward(
             grad_values = edge_grad(crow, col, grad, x, values.ndim - 1)
         if need_x:
             grad_x = matvec(t_crow, t_col, values.index_select(-1, t_perm), grad)
+    return _restore_gradients(grad_values, grad_x, values, x)
+
+
+def _restore_gradients(grad_values, grad_x, values, x):
+    """Restore original broadcast shapes and dtypes after sparse reverse."""
     if grad_values is not None:
         if grad_values.shape != values.shape:
             grad_values = grad_values.sum_to_size(values.shape)
@@ -342,6 +349,50 @@ def _build_backward(kernels: dict[str, object]):
     return backward
 
 
+def _build_prepared_backward(kernels):
+    prepare = kernels.get("prepare_csr_backward")
+    if prepare is None:
+        return None
+
+    def prepare_backward(
+        crow,
+        col,
+        values,
+        x,
+        t_crow,
+        t_col,
+        t_perm,
+        grad,
+        need_values,
+        need_x,
+        *,
+        input_mask=None,
+        grad_values=None,
+    ):
+        execute = prepare(
+            crow,
+            col,
+            t_crow,
+            t_col,
+            t_perm,
+            values,
+            x,
+            grad,
+            need_values,
+            need_x,
+            input_mask=input_mask,
+            grad_values=grad_values,
+        )
+
+        def backward(input, gradient, mask=None):
+            grad_values, grad_x = execute(input, gradient, mask)
+            return _restore_gradients(grad_values, grad_x, values, input)
+
+        return backward
+
+    return prepare_backward
+
+
 def _build_pull(kernels: dict[str, object]) -> RouteImplementation:
     matvec = kernels["csr_matvec"]
     prepare = kernels.get("prepare_pull")
@@ -349,7 +400,74 @@ def _build_pull(kernels: dict[str, object]) -> RouteImplementation:
     def forward(crow, col, values, x, t_crow, t_col, t_perm, max_density, task_values):
         return matvec(crow, col, values, x)
 
-    return RouteImplementation(forward, _build_backward(kernels), prepare)
+    prepare_matvec = kernels.get("prepare_csr_matvec")
+
+    def prepare_forward(crow, col, values, x, *unused):
+        return PreparedPropagation(prepare_matvec(crow, col, values, x))
+
+    return RouteImplementation(
+        forward,
+        _build_backward(kernels),
+        prepare,
+        prepare_forward=prepare_forward if prepare_matvec is not None else None,
+        prepare_backward=_build_prepared_backward(kernels),
+    )
+
+
+def _build_dense(kernels: dict[str, object]) -> RouteImplementation:
+    """Use dense GEMM without changing the canonical sparse parameters.
+
+    Materialization belongs to preparation, once per trajectory, so optimizer
+    updates are visible and no dense matrix is rebuilt inside the time loop.
+    Reverse keeps the shared sparse VJP: only existing edges own parameters.
+    """
+
+    def prepare(crow, col, t_crow, t_col, t_perm):
+        kernels_torch._row_indices(crow)
+        sparse_prepare = kernels.get("prepare_pull")
+        return (
+            sparse_prepare(crow, col, t_crow, t_col, t_perm)
+            if sparse_prepare is not None
+            else None
+        )
+
+    def prepare_forward(crow, col, values, x, *unused):
+        n_out, n_in = crow.numel() - 1, x.shape[-1]
+        n_vb = values.ndim - 1
+        batch = torch.broadcast_shapes(values.shape[:-1], x.shape[:n_vb])
+        sample = x.shape[n_vb:-1]
+        sample_count = math.prod(sample)
+        dtype = torch.promote_types(values.dtype, x.dtype)
+        # scatter_add also preserves duplicate-edge semantics. The expanded
+        # indices are views; the only quadratic allocation is the GEMM operand.
+        index = kernels_torch._row_indices(crow) * n_in + col
+        matrix = torch.zeros(
+            (*values.shape[:-1], n_out * n_in), device=x.device, dtype=dtype
+        )
+        matrix.scatter_add_(-1, index.expand_as(values), values.to(dtype))
+        matrix = matrix.reshape(*values.shape[:-1], n_out, n_in)
+        output = torch.empty((*batch, *sample, n_out), device=x.device, dtype=dtype)
+        flat_output = output.reshape(*batch, sample_count, n_out)
+
+        def forward(source):
+            # Torch operations with out= do not participate in autocast. Reuse
+            # the promoted destination without entering a context every step.
+            flat = source.to(dtype).reshape(*source.shape[:n_vb], sample_count, n_in)
+            torch.matmul(flat, matrix.transpose(-1, -2), out=flat_output)
+            return output
+
+        return PreparedPropagation(forward)
+
+    def forward(crow, col, values, x, *unused):
+        return prepare_forward(crow, col, values, x)(x)
+
+    return RouteImplementation(
+        forward,
+        _build_backward(kernels),
+        prepare=prepare,
+        prepare_forward=prepare_forward,
+        prepare_backward=_build_prepared_backward(kernels),
+    )
 
 
 def _build_adaptive_push(kernels: dict[str, object]) -> RouteImplementation:
@@ -401,8 +519,47 @@ def _build_source_push(
         )
         return out if x.ndim == 2 else out.reshape(*x.shape[:-1], crow.shape[0] - 1)
 
+    prepare_execution = kernels.get("prepare_" + push_kernel)
+
+    def prepare_forward(
+        crow, col, values, x, t_crow, t_col, t_perm, max_density, task_values
+    ):
+        if values.ndim != 1 or not x.numel():
+            return PreparedPropagation(lambda input: matvec(crow, col, values, input))
+        flat = x.reshape(-1, x.shape[-1])
+        execute = prepare_execution(
+            t_crow,
+            t_col,
+            t_perm,
+            values,
+            flat,
+            crow.shape[0] - 1,
+            task_values=task_values
+            if task_values is not None and task_values.numel()
+            else None,
+            require_task=True,
+        )
+
+        def restore_shape(callback):
+            return lambda input: callback(input.reshape(flat.shape)).reshape(
+                *input.shape[:-1], crow.shape[0] - 1
+            )
+
+        return PreparedPropagation(
+            restore_shape(execute),
+            execute.spikes if push_kernel == "spike_push_list" else None,
+            restore_shape(execute.from_spikes)
+            if push_kernel == "spike_push_list"
+            else None,
+        )
+
     return RouteImplementation(
-        forward, _build_backward(kernels), prepare, prepare_values
+        forward,
+        _build_backward(kernels),
+        prepare,
+        prepare_values,
+        prepare_forward if prepare_execution is not None else None,
+        prepare_backward=_build_prepared_backward(kernels),
     )
 
 
@@ -668,6 +825,24 @@ def _route(token: int) -> RouteBinding:
         return _BOUND_ROUTES[token]
     except KeyError as error:
         raise RuntimeError(f"Unknown sparse route token {token}.") from error
+
+
+def prepare_bound_forward(route_token, arguments):
+    """Prepare invocation-owned sparse destinations through the bound route."""
+    prepare = _route(route_token).implementation.prepare_forward
+    return None if prepare is None else prepare(*arguments)
+
+
+def prepare_bound_backward(
+    route_token, arguments, *, input_mask=None, grad_values=None
+):
+    """Prepare invocation-owned reverse storage through the bound route."""
+    prepare = _route(route_token).implementation.prepare_backward
+    return (
+        None
+        if prepare is None
+        else prepare(*arguments, input_mask=input_mask, grad_values=grad_values)
+    )
 
 
 @custom_op("btorch::route_propagate_backward", mutates_args=())
@@ -959,13 +1134,44 @@ def propagate_binding(
 
 def _register_route_specs() -> None:
     """Register complete built-in routes after all low-level kernels exist."""
+    for device, reverse_backend in (
+        ("cpu", "torch"),
+        ("cuda", "torch"),
+        ("cuda", "triton"),
+    ):
+        bindings = (
+            ("csr_matvec", reverse_backend),
+            ("edge_grad", reverse_backend),
+        )
+        if reverse_backend == "triton":
+            bindings += (("csr_backward", "triton"), ("prepare_pull", "triton"))
+        registry.register_route(
+            RouteSpec(
+                key=RouteKey("propagate", "dense", "pull", reverse_backend),
+                kernel_bindings=bindings,
+                build=_build_dense,
+                supports=lambda context: (
+                    context is not None
+                    and context.method == "auto"
+                    and registry.override is None
+                    and context.shape is not None
+                    and max(context.shape) < 4000
+                    and context.dtype in kernels_torch._FLOAT_DTYPES
+                ),
+            ),
+            device=device,
+            priority=31 if reverse_backend == "triton" else 30,
+            available=kernels_triton.is_available
+            if reverse_backend == "triton"
+            else None,
+        )
     registry.register_route(
         RouteSpec(
             key=RouteKey("propagate", "post_pre_csr", "pull", "cusparse"),
             kernel_bindings=(("csr_matvec", "cusparse"), ("edge_grad", "torch")),
             build=_build_pull,
             supports=lambda context: (
-                context is not None and context.dtype in (torch.float32, torch.float64)
+                context is not None and context.dtype in kernels_torch._FLOAT_DTYPES
             ),
         ),
         device="cuda",
@@ -986,7 +1192,7 @@ def _register_route_specs() -> None:
             build=_build_spike_list,
             supports=lambda context: (
                 context is not None
-                and context.dtype == torch.float32
+                and context.dtype in kernels_torch._FLOAT_DTYPES
                 and not context.value_batched
                 and (
                     context.method == "push"
@@ -1068,7 +1274,7 @@ def _register_route_specs() -> None:
             supports=lambda context: (
                 context is not None
                 and context.method == "auto"
-                and context.dtype == torch.float32
+                and context.dtype in kernels_torch._FLOAT_DTYPES
                 and not context.value_batched
             ),
         ),

@@ -21,6 +21,19 @@ pytest tests
 python scripts/docs.py command=build-all
 ```
 
+Routine kernel tests use selected numerical, state, gradient and renderer
+scenarios. Start with the affected file or a `-k` selection, then run the routine
+suite once after the implementation settles. Default pytest options exclude
+exhaustive combinations marked `full_validation`; request those explicitly:
+
+```bash
+pytest tests -o addopts='' --durations=20
+```
+
+Keep full matrices for explicit validation. Avoid multiplying independent model,
+backend, precision and lifecycle options in routine coverage; retain focused
+regressions for distinct failure mechanisms and explain each selected scenario.
+
 ## Documentation Workflow
 
 Before relying on CI/CD, the entire docs pipeline can be verified locally in ~5 minutes.

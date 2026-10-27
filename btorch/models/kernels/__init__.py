@@ -1,6 +1,6 @@
 """Public cell backend extension and pure tensor sequence interfaces."""
 
-from .contracts import CellSpec, HistoryPlan, PoissonOptions
+from .contracts import HistoryPlan, NeuronSpec, PoissonOptions
 from .options import KernelOptions
 from .registry import (
     CellBackendEntry,
@@ -19,7 +19,7 @@ from .templates import (
 __all__ = [
     "BackendFragments",
     "CellBackendEntry",
-    "CellSpec",
+    "NeuronSpec",
     "HistoryPlan",
     "KernelOptions",
     "ModelTemplate",
@@ -83,7 +83,7 @@ def generate_cell_source(*args, **kwargs):
     """Render inspectable DSL source using the shared backend templates.
 
     Args:
-        *args: Backend, CellSpec, flattened batch/neuron lane count, sequence
+        *args: Backend, NeuronSpec, flattened batch/neuron lane count, sequence
             length and history names, in that order.
         **kwargs: Optional adaptation component count ``modes``, ``backward``
             selection and ``parameter_mask`` for gradient buffers.
@@ -101,7 +101,7 @@ def run_multi_step(*args, **kwargs):
     """Execute the public pure tensor sequence operator lazily.
 
     Args:
-        *args: Input sequence, initial states, floating parameters, CellSpec and
+        *args: Input sequence, initial states, floating parameters, NeuronSpec and
             optional HistoryPlan, in that order.
         **kwargs: Registered ``backend`` name.
 

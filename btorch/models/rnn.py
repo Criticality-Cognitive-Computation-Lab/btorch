@@ -14,6 +14,7 @@ from . import base, environ, synapse
 from .base import StepMode
 from .cudagraph import CudaGraphRunner
 from .functional import filter_hidden_states, named_hidden_states, set_hidden_states
+from .gradients import BPTT
 
 
 _sparse_scope_states: ContextVar[dict[int, tuple[int, tuple[int, torch.dtype]]]] = (
@@ -724,6 +725,23 @@ def make_rnn(
 
 
 class RecurrentNN(RecurrentNNAbstract):
+    """Run a stateful neuron population coupled through a synapse.
+
+    Neuron and synapse modules retain their ordinary memory interface.
+    Execution and recording options follow :class:`RecurrentNNAbstract`.
+
+    Args:
+        neuron: Population implementing the neuron dynamics.
+        synapse: Recurrent connection and postsynaptic dynamics.
+        syn_inp_module: Optional transformation of external synaptic input.
+        neuron_inp_module: Optional transformation of external neuron input.
+        backend: Kernel selection, independent of gradient mathematics.
+        gradient: Recurrent gradient algorithm. ``BPTT(sparse=True)`` exploits
+            compact surrogate support where dependency analysis permits it;
+            it never silently truncates an unbounded surrogate.
+        **kwargs: Recording, chunking, checkpointing and memory options.
+    """
+
     def __init__(
         self,
         neuron: nn.Module,
@@ -738,6 +756,7 @@ class RecurrentNN(RecurrentNNAbstract):
         grad_checkpoint: bool = False,
         allow_buffer: bool = False,
         backend: base.Backend = "torch",
+        gradient: BPTT = BPTT(),
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -755,7 +774,20 @@ class RecurrentNN(RecurrentNNAbstract):
         self.syn_inp_module = syn_inp_module
         self.allow_buffer = allow_buffer
         self.backend = backend
+        self.gradient = gradient
         self.register_load_state_dict_post_hook(self._refresh_merge_validation)
+
+    @property
+    def gradient(self) -> BPTT:
+        """Return the recurrent gradient method, independent of kernel
+        selection."""
+        return self._gradient
+
+    @gradient.setter
+    def gradient(self, value: BPTT) -> None:
+        if not isinstance(value, BPTT):
+            raise TypeError("gradient must be a supported recurrent gradient method")
+        self._gradient = value
 
     def _refresh_merge_validation(self, module, incompatible_keys):
         from .kernels.options import normalize_backend
@@ -806,6 +838,7 @@ class RecurrentNN(RecurrentNNAbstract):
             self.backend, *(() if neuron_model is None else (neuron_model,))
         )
         return (
+            self.gradient,
             options.neuron,
             options.connection,
             options.merge_synapse,

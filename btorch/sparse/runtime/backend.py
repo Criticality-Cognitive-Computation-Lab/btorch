@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
+    from .kernels_triton_spikelist import SpikeList
     from .planner import PlanningContext
 
 
@@ -66,6 +67,23 @@ class BackendResolutionSnapshot:
 
 
 @dataclass(frozen=True)
+class PreparedPropagation:
+    """Invocation-local propagation and its optional producer destination.
+
+    ``forward`` accepts ordinary activity. When ``spikes`` is present, a
+    compatible generated producer may fill it and clear its accumulation
+    buffer, then call ``from_spikes`` without packing the dense activity.
+    """
+
+    forward: Callable
+    spikes: SpikeList | None = None
+    from_spikes: Callable | None = None
+
+    def __call__(self, source):
+        return self.forward(source)
+
+
+@dataclass(frozen=True)
 class RouteImplementation:
     """The immutable execution callbacks bound to one route revision."""
 
@@ -73,6 +91,8 @@ class RouteImplementation:
     backward: Callable
     prepare: Callable | None = None
     prepare_values: Callable | None = None
+    prepare_forward: Callable | None = None
+    prepare_backward: Callable | None = None
 
 
 @dataclass(frozen=True)
@@ -222,6 +242,7 @@ class _Entry:
     priority: int
     available: Callable[[], bool]
     revision: int
+    prepare_execution: Callable | None = None
 
 
 @dataclass
@@ -324,6 +345,7 @@ class BackendRegistry:
         device: str | tuple[str, ...] = ("cpu", "cuda"),
         priority: int = 0,
         available: Callable[[], bool] | None = None,
+        prepare_execution: Callable | None = None,
     ) -> None:
         """Register ``fn`` as backend ``name`` of ``kernel``.
 
@@ -334,6 +356,8 @@ class BackendRegistry:
             device: Device type(s) the implementation supports.
             priority: Higher wins when several backends are available.
             available: Optional lazy availability check.
+            prepare_execution: Optional factory for invocation-owned execution
+                storage. It is bound and invalidated with this implementation.
         """
         devices = (device,) if isinstance(device, str) else device
         for dev in devices:
@@ -354,6 +378,7 @@ class BackendRegistry:
                     priority,
                     available or (lambda: True),
                     revision,
+                    prepare_execution,
                 )
             )
             entries.sort(key=lambda entry: -entry.priority)
@@ -483,6 +508,8 @@ class BackendRegistry:
                     "implementation before it was bound."
                 )
             callbacks[kernel] = current.fn
+            if current.prepare_execution is not None:
+                callbacks["prepare_" + kernel] = current.prepare_execution
         return RouteBinding(snapshot, entry.spec.build(callbacks))
 
     def route_revision(self, key: RouteKey, device: str) -> int:

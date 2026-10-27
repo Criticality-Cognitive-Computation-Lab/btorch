@@ -9,11 +9,11 @@ import pytest
 import torch
 
 from btorch.models.kernels.backends import engine, fused
-from btorch.models.kernels.contracts import CellSpec
+from btorch.models.kernels.contracts import NeuronSpec
 from btorch.models.kernels.templates import get_template
 
 
-def _scalar_layouts(spec: CellSpec, neurons: int):
+def _scalar_layouts(spec: NeuronSpec, neurons: int):
     return tuple(
         engine._ParameterLayout((), (), (neurons,), 1)
         for _ in get_template(spec).parameter_names
@@ -22,7 +22,7 @@ def _scalar_layouts(spec: CellSpec, neurons: int):
 
 def test_source_cache_uses_semantics_and_does_not_retain_runtime_dt(monkeypatch):
     engine._generate_source.cache_clear()
-    spec = CellSpec("izhikevich", dt=torch.tensor(0.25), hard_reset=True)
+    spec = NeuronSpec("izhikevich", dt=torch.tensor(0.25), hard_reset=True)
     dt_reference = weakref.ref(spec.dt)
     layouts = _scalar_layouts(spec, 17)
 
@@ -37,7 +37,7 @@ def test_source_cache_uses_semantics_and_does_not_retain_runtime_dt(monkeypatch)
     assert dt_reference() is None
     second = engine.generate_source(
         "triton",
-        CellSpec("izhikevich", dt=0.75, hard_reset=True),
+        NeuronSpec("izhikevich", dt=0.75, hard_reset=True),
         17,
         23,
         ("v",),
@@ -51,7 +51,7 @@ def test_source_cache_uses_semantics_and_does_not_retain_runtime_dt(monkeypatch)
     # likewise change concrete load expressions and the reverse pointer ABI.
     soft = engine.generate_source(
         "triton",
-        CellSpec("izhikevich", dt=0.75),
+        NeuronSpec("izhikevich", dt=0.75),
         17,
         23,
         ("v",),
@@ -63,7 +63,7 @@ def test_source_cache_uses_semantics_and_does_not_retain_runtime_dt(monkeypatch)
     )
     dense = engine.generate_source(
         "triton",
-        CellSpec("izhikevich", hard_reset=True),
+        NeuronSpec("izhikevich", hard_reset=True),
         17,
         23,
         ("v",),
@@ -72,7 +72,7 @@ def test_source_cache_uses_semantics_and_does_not_retain_runtime_dt(monkeypatch)
     assert dense[0] != first[0]
     reverse_all = engine.generate_source(
         "triton",
-        CellSpec("izhikevich", hard_reset=True),
+        NeuronSpec("izhikevich", hard_reset=True),
         17,
         23,
         ("v",),
@@ -81,7 +81,7 @@ def test_source_cache_uses_semantics_and_does_not_retain_runtime_dt(monkeypatch)
     )
     reverse_partial = engine.generate_source(
         "triton",
-        CellSpec("izhikevich", hard_reset=True),
+        NeuronSpec("izhikevich", hard_reset=True),
         17,
         23,
         ("v",),
@@ -99,7 +99,7 @@ def test_source_cache_uses_semantics_and_does_not_retain_runtime_dt(monkeypatch)
     assert (
         engine.generate_source(
             "triton",
-            CellSpec("izhikevich", hard_reset=True),
+            NeuronSpec("izhikevich", hard_reset=True),
             17,
             23,
             ("v",),
@@ -113,8 +113,8 @@ def test_source_cache_uses_semantics_and_does_not_retain_runtime_dt(monkeypatch)
 def test_fused_source_caches_final_abis_without_retaining_runtime_dt(monkeypatch):
     fused._cached_fused_source.cache_clear()
     fused._cached_fused_backward_source.cache_clear()
-    neuron_spec = CellSpec("lif", dt=torch.tensor(0.25), hard_reset=True)
-    psc_spec = CellSpec("alpha", dt=torch.tensor(0.25))
+    neuron_spec = NeuronSpec("lif", dt=torch.tensor(0.25), hard_reset=True)
+    psc_spec = NeuronSpec("alpha", dt=torch.tensor(0.25))
     neuron_dt = weakref.ref(neuron_spec.dt)
     psc_dt = weakref.ref(psc_spec.dt)
 
@@ -136,8 +136,8 @@ def test_fused_source_caches_final_abis_without_retaining_runtime_dt(monkeypatch
     assert (
         fused.generate_fused_source(
             "triton",
-            CellSpec("lif", dt=0.75, hard_reset=True),
-            CellSpec("alpha", dt=0.75),
+            NeuronSpec("lif", dt=0.75, hard_reset=True),
+            NeuronSpec("alpha", dt=0.75),
             17,
             2,
             2,
@@ -151,10 +151,10 @@ def test_fused_source_caches_final_abis_without_retaining_runtime_dt(monkeypatch
     # History stores and merged receptor topology change executable stores and
     # declaration sizes, so neither may collide with the cached dense stage.
     no_histories = fused.generate_fused_source(
-        "triton", CellSpec("lif", hard_reset=True), CellSpec("alpha"), 17, 2, 2
+        "triton", NeuronSpec("lif", hard_reset=True), NeuronSpec("alpha"), 17, 2, 2
     )
     merged = fused.generate_fused_source(
-        "triton", CellSpec("lif", hard_reset=True), CellSpec("alpha"), 17, 1, 3
+        "triton", NeuronSpec("lif", hard_reset=True), NeuronSpec("alpha"), 17, 1, 3
     )
     assert no_histories[1] != forward[1]
     assert merged[0] != no_histories[0]
@@ -163,8 +163,8 @@ def test_fused_source_caches_final_abis_without_retaining_runtime_dt(monkeypatch
     assert (
         fused.generate_fused_source(
             "triton",
-            CellSpec("lif", hard_reset=True),
-            CellSpec("alpha"),
+            NeuronSpec("lif", hard_reset=True),
+            NeuronSpec("alpha"),
             17,
             2,
             2,
@@ -178,10 +178,10 @@ def test_fused_source_caches_final_abis_without_retaining_runtime_dt(monkeypatch
     # Reverse source is cached only after optional cotangents and trainable
     # parameter leaves have changed its ABI. A partial loss must remove those
     # pointers rather than reuse the dense reverse declaration.
-    neuron = get_template(CellSpec("lif"))
-    psc = get_template(CellSpec("alpha"))
-    reverse_neuron_spec = CellSpec("lif", dt=torch.tensor(0.5), hard_reset=True)
-    reverse_psc_spec = CellSpec("alpha", dt=torch.tensor(0.5))
+    neuron = get_template(NeuronSpec("lif"))
+    psc = get_template(NeuronSpec("alpha"))
+    reverse_neuron_spec = NeuronSpec("lif", dt=torch.tensor(0.5), hard_reset=True)
+    reverse_psc_spec = NeuronSpec("alpha", dt=torch.tensor(0.5))
     reverse_neuron_dt = weakref.ref(reverse_neuron_spec.dt)
     reverse_psc_dt = weakref.ref(reverse_psc_spec.dt)
     full_reverse = fused._generate_fused_backward_source(
@@ -207,8 +207,8 @@ def test_fused_source_caches_final_abis_without_retaining_runtime_dt(monkeypatch
     assert (
         fused._generate_fused_backward_source(
             "triton",
-            CellSpec("lif", dt=0.75, hard_reset=True),
-            CellSpec("alpha", dt=0.75),
+            NeuronSpec("lif", dt=0.75, hard_reset=True),
+            NeuronSpec("alpha", dt=0.75),
             17,
             2,
             2,
@@ -226,8 +226,8 @@ def test_fused_source_caches_final_abis_without_retaining_runtime_dt(monkeypatch
     assert fused._cached_fused_backward_source.cache_info().hits == reverse_hits + 1
     partial_reverse = fused._generate_fused_backward_source(
         "triton",
-        CellSpec("lif", dt=0.75, hard_reset=True),
-        CellSpec("alpha", dt=0.75),
+        NeuronSpec("lif", dt=0.75, hard_reset=True),
+        NeuronSpec("alpha", dt=0.75),
         17,
         2,
         2,

@@ -172,3 +172,9 @@ combine-as-imports = true
 lines-after-imports = 2
 extra-standard-library = ["typing_extensions"]
 order-by-type = true
+
+[tool.pytest.ini_options]
+addopts = "-m 'not full_validation'"
+markers = [
+  "full_validation: exhaustive model/options combinations beyond the selected routine numerical and renderer cases",
+]

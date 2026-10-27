@@ -6,8 +6,8 @@ import torch
 
 from btorch.models import environ
 from btorch.models.kernels import (
-    CellSpec,
     HistoryPlan,
+    NeuronSpec,
     register_cell_backend,
     run_multi_step,
 )
@@ -76,7 +76,7 @@ def _case():
         x_seq,
         states,
         parameters,
-        CellSpec("lif"),
+        NeuronSpec("lif"),
         HistoryPlan(requested=("v", "v_charged")),
         name="charged_loss",
     )
@@ -200,7 +200,7 @@ def test_simulation_only_extension_fails_before_training_execution():
             torch.ones(2, 1, 2, dtype=torch.float32),
             (torch.zeros(1, 2),),
             (torch.tensor(2.0),),
-            CellSpec("exponential"),
+            NeuronSpec("exponential"),
             backend="oot_inference",
         )
 

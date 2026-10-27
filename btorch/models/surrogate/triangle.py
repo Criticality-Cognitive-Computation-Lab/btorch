@@ -51,6 +51,10 @@ class Triangle(SurrogateFunctionBase):
     def primitive(self, x: torch.Tensor) -> torch.Tensor:
         return _triangle_primitive(x, self.alpha)
 
+    @property
+    def support(self) -> float | None:
+        return 2.0 / abs(self.alpha) if self.alpha else None
+
     def derivative(
         self,
         x: torch.Tensor,

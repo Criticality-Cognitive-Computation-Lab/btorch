@@ -7,7 +7,7 @@ from dataclasses import dataclass, field, replace
 import torch
 from torch import Tensor
 
-from .contracts import CellSpec, HistoryPlan
+from .contracts import HistoryPlan, NeuronSpec
 from .golden import python_module_sequence
 from .operators import run_multi_step
 from .templates import get_template
@@ -31,7 +31,7 @@ class ParityCase:
     x_seq: Tensor
     states: tuple[Tensor, ...]
     parameters: tuple[Tensor, ...]
-    spec: CellSpec
+    spec: NeuronSpec
     history: HistoryPlan = HistoryPlan()
     name: str = "trajectory"
     golden: Callable | None = None

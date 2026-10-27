@@ -1,6 +1,7 @@
 """Validate recurrent native ALIF and ELIF execution against their Modules."""
 
 import copy
+from itertools import product
 
 import pytest
 import torch
@@ -16,6 +17,7 @@ from tests.models.kernels.helpers import (
     GPU_BACKENDS,
     NewEmptyShapes,
     require_cuda_backend,
+    validation_cases,
 )
 
 
@@ -129,10 +131,29 @@ def _run(model, drive, events, split):
     return (output, *(records[name] for name in RECORDS), *_final_states(model))
 
 
-@pytest.mark.parametrize("backend", GPU_BACKENDS)
-@pytest.mark.parametrize("connection_kind", ("dense", "sparse"))
-@pytest.mark.parametrize("neuron_type", (ALIF, ELIF))
-@pytest.mark.parametrize("fp_policy", ("default", "strict", "precise_exp"))
+# Select connection scheduling and precision-lowering features independently;
+# all model/policy pairs are available only in explicit full validation.
+@pytest.mark.parametrize(
+    "backend,connection_kind,neuron_type,fp_policy",
+    validation_cases(
+        product(
+            GPU_BACKENDS,
+            ("dense", "sparse"),
+            (ALIF, ELIF),
+            ("default", "strict", "precise_exp"),
+        ),
+        selected=(
+            ("triton", "dense", ALIF, "default"),
+            ("triton", "sparse", ELIF, "default"),
+            ("triton", "sparse", ALIF, "strict"),
+            ("triton", "dense", ELIF, "precise_exp"),
+            ("cupy", "dense", ALIF, "strict"),
+            ("cupy", "sparse", ELIF, "precise_exp"),
+            ("tilelang", "sparse", ALIF, "default"),
+            ("tilelang", "dense", ELIF, "strict"),
+        ),
+    ),
+)
 def test_recurrent_whole_and_two_forward_bptt_match_actual_modules(
     backend, connection_kind, neuron_type, fp_policy
 ):

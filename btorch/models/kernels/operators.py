@@ -7,7 +7,7 @@ import math
 import torch
 from torch import Tensor
 
-from .contracts import CellSpec, HistoryPlan, PoissonOptions
+from .contracts import HistoryPlan, NeuronSpec, PoissonOptions
 from .options import KernelOptions, resolve_model_options
 from .registry import _NATIVE_GPU_BACKENDS, cell_backend_revision
 from .templates import (
@@ -94,7 +94,7 @@ torch.library.register_autograd(
 poisson_uniforms = torch.ops.btorch_cells.poisson_uniforms.default
 
 
-def encode_spec(spec: CellSpec) -> str:
+def encode_spec(spec: NeuronSpec) -> str:
     """Encode immutable compile-specialized scalar choices."""
     values = (
         spec.model,
@@ -104,6 +104,7 @@ def encode_spec(spec: CellSpec) -> str:
         str(spec.alpha),
         str(spec.damping),
         str(int(spec.refractory)),
+        "" if spec.surrogate_width is None else repr(spec.surrogate_width),
     )
     if spec.poisson is None:
         return "|".join(values)
@@ -120,24 +121,26 @@ def encode_spec(spec: CellSpec) -> str:
     )
 
 
-def decode_spec(encoded: str, dt: float | Tensor = 1.0) -> CellSpec:
+def decode_spec(encoded: str, dt: float | Tensor = 1.0) -> NeuronSpec:
     """Restore a cell specification inside the tensor operator boundary."""
     values = encoded.split("|")
-    if len(values) not in (7, 12):
+    if len(values) not in (8, 13):
         raise ValueError("Invalid encoded cell specification")
-    model, hard_reset, detach_reset, surrogate, alpha, damping, refractory = values[:7]
+    model, hard_reset, detach_reset, surrogate, alpha, damping, refractory, width = (
+        values[:8]
+    )
     poisson = (
         None
-        if len(values) == 7
+        if len(values) == 8
         else PoissonOptions(
-            bool(int(values[7])),
-            float(values[8]),
+            bool(int(values[8])),
             float(values[9]),
             float(values[10]),
             float(values[11]),
+            float(values[12]),
         )
     )
-    return CellSpec(
+    return NeuronSpec(
         model,
         dt,
         bool(int(hard_reset)),
@@ -147,6 +150,7 @@ def decode_spec(encoded: str, dt: float | Tensor = 1.0) -> CellSpec:
         float(damping),
         bool(int(refractory)),
         poisson,
+        None if not width else float(width),
     )
 
 
@@ -651,7 +655,7 @@ def run_multi_step(
     x_seq: Tensor,
     states: tuple[Tensor, ...],
     parameters: tuple[Tensor, ...],
-    spec: CellSpec,
+    spec: NeuronSpec,
     history: HistoryPlan = HistoryPlan(),
     *,
     backend: str | KernelOptions = "torch",

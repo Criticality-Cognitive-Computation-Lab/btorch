@@ -291,6 +291,7 @@ class SparseConnection(Connection):
             hints=self.hints,
             dtype=self.weight().dtype,
             method=resolve_method(self.method) if method is None else method,
+            shape=(self.cache.crow.numel() - 1, self.cache.t_crow.numel() - 1),
         )
 
     @torch.compiler.assume_constant_result
@@ -298,7 +299,15 @@ class SparseConnection(Connection):
         """Bind a static method without changing the standalone default
         plan."""
         plan = self._execution_plan(method)
-        token = ops.bind_route(registry.bind_route(plan.route))
+        route = registry.bind_route(plan.route)
+        # Explicit compiled execution can differ from the standalone default
+        # (auto dense versus push). Build derived topology before CUDA Graph
+        # Trees owns the allocator; shared caches must not pin its private pool.
+        prepare = route.implementation.prepare
+        if prepare is not None:
+            cache = self.cache
+            prepare(cache.crow, cache.col, cache.t_crow, cache.t_col, cache.t_perm)
+        token = ops.bind_route(route)
         return token, None if plan.algorithm == "pull" else plan.max_density
 
     def _replan(self) -> None:
@@ -745,11 +754,9 @@ class SparseConnection(Connection):
             object.__setattr__(self, "_run_weight", weight)
             if self._max_density is None or self._value_batch_dim or self._member_shape:
                 return
-            if weight.dtype != dtype:
-                raise ValueError(
-                    "SparseConnection input dtype must match its weight dtype; "
-                    f"got input {dtype} and weight {weight.dtype}."
-                )
+            # Packing depends on edge storage, not the outer sequence dtype.
+            # The spike producer may use another dtype; propagation owns its
+            # operand promotion and native-kernel eligibility.
             signature = self._task_value_signature(batch_size, dtype)
             if (
                 self._prepared_task_values is not None

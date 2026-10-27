@@ -13,7 +13,7 @@ from btorch.models.kernels.backends.fused import (
     fused_step_forward,
     generate_fused_source,
 )
-from btorch.models.kernels.contracts import CellSpec
+from btorch.models.kernels.contracts import NeuronSpec
 from btorch.models.kernels.templates import get_template
 from btorch.models.kernels.torch_backend import forward_step
 from tests.models.kernels.helpers import GPU_BACKENDS, require_cuda_backend
@@ -24,7 +24,7 @@ def _leaf(value):
 
 
 def test_fused_source_specializes_parameter_storage_and_receptor_coordinates():
-    neuron_spec, psc_spec = CellSpec("lif"), CellSpec("alpha")
+    neuron_spec, psc_spec = NeuronSpec("lif"), NeuronSpec("alpha")
     neuron_parameters = (
         torch.tensor(0.8),
         torch.arange(7.0)[1::2],
@@ -88,8 +88,8 @@ def test_fused_cell_broadcast_views_match_eager_forward_and_vjp(backend):
     require_cuda_backend(backend)
     torch.manual_seed(811)
     batch, neurons, receptors = 2, 3, 2
-    neuron_spec = CellSpec("lif", dt=0.25, hard_reset=True)
-    psc_spec = CellSpec("alpha", dt=0.5)
+    neuron_spec = NeuronSpec("lif", dt=0.25, hard_reset=True)
+    psc_spec = NeuronSpec("alpha", dt=0.5)
     external = _leaf(torch.rand(batch, neurons, device="cuda") * 0.2)
     drive = _leaf(torch.randn(batch, neurons * receptors, device="cuda") * 0.15)
     neuron_states = (_leaf(torch.rand(batch, neurons, device="cuda") * 0.2),)

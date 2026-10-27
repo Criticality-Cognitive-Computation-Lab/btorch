@@ -46,6 +46,13 @@ def _build(connection_kind, backend):
                 )
             )
             connection.bias.copy_(bias)
+    if connection_kind == "dense":
+        # The GEMM backend accepts strided weights directly. Leave padding
+        # between columns to expose accidental flattening or storage coercion.
+        storage = connection.weight.new_empty((neurons, 2 * neurons + 1))
+        weight = storage[:, 1::2]
+        weight.copy_(connection.weight.detach())
+        connection.weight = torch.nn.Parameter(weight)
     model = RecurrentNN(
         LIF(
             neurons,
@@ -77,9 +84,12 @@ def _build(connection_kind, backend):
     if model.synapse.delayed_spike is not None:
         history = model.synapse.delayed_spike.history
         phase = torch.arange(history.numel(), device="cuda").reshape(history.shape)
+        # Delay.update preserves incoming ring storage precision even when
+        # the spike producer computes in FP32. Exercise its quantization and
+        # its BF16 VJP across both recurrent calls, against the actual Module.
         model.synapse.delayed_spike.history = (
-            0.04 * torch.sin(phase * 0.3)
-        ).requires_grad_()
+            (0.04 * torch.sin(phase * 0.3)).to(torch.bfloat16).requires_grad_()
+        )
     return model
 
 

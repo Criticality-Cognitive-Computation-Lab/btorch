@@ -13,8 +13,8 @@ import torch
 from btorch.models import KernelOptions, environ, functional
 from btorch.models.connection import SparseConnection
 from btorch.models.kernels import (
-    CellSpec,
     HistoryPlan,
+    NeuronSpec,
     register_cell_backend,
     resolve_cell_backend,
 )
@@ -39,7 +39,7 @@ def run_example(
     """Validate a separately registered implementation before neuron
     training."""
     device = torch.device(device)
-    spec = CellSpec("lif", dt=1.0)
+    spec = NeuronSpec("lif", dt=1.0)
     implementation = resolve_cell_backend(backend, spec, device)
     # An external package can reuse the shared generator/runtime while evolving
     # scheduling independently. Registering does not mutate model semantics or
@@ -79,7 +79,7 @@ def run_example(
                 x_seq,
                 (torch.zeros_like(states[0]), torch.zeros_like(states[0])),
                 (parameters[3], parameters[2]),
-                CellSpec("alpha"),
+                NeuronSpec("alpha"),
                 HistoryPlan(requested=("h",)),
                 name="psc",
             ),

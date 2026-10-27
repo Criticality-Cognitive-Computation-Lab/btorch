@@ -31,10 +31,10 @@ always falls back, which lets small tests reach both branches.
 import numpy as np
 import pytest
 import torch
-from torch import nn
 
 from btorch import sparse
 from btorch.models.connection import SparseConnection, Synapse
+from btorch.models.connection.weight import EdgeWeight
 from btorch.sparse import Hints
 from btorch.sparse.operator import (
     ConstantOperator,
@@ -42,7 +42,7 @@ from btorch.sparse.operator import (
     ImplicitOperator,
     is_linear_operator,
 )
-from btorch.sparse.runtime import ops, registry
+from btorch.sparse.runtime import ops, registry, use_backend
 from tests.sparse.helpers import DEVICES
 
 
@@ -418,6 +418,14 @@ WEIGHT = torch.randn(N_EDGE, generator=_gen, dtype=torch.float64)
 KINDS = {"pull": None, "push": Hints(expected_density=0.001)}
 
 
+@pytest.fixture
+def sparse_reference_backend():
+    # Keep the sparse operator ABI under test even for a small fixture: auto
+    # intentionally selects dense multiplication below 4000 dimensions.
+    with use_backend("torch"):
+        yield
+
+
 def build_connection(kind, device):
     """A trainable connection whose plan is pull or (hinted) adaptive push."""
     conn = SparseConnection.from_edges(
@@ -425,20 +433,13 @@ def build_connection(kind, device):
         POST,
         N_PRE,
         N_POST,
-        Synapse(weight=nn.Parameter(WEIGHT.clone())),
+        Synapse(weight=EdgeWeight(trainable=True)),
+        values=WEIGHT.clone(),
         hints=KINDS[kind],
         device=device,
     )
-    # Guard against a planner change that would silently turn the push case
-    # into a second pull case.
-    # The name depends on the selected backend, not on the device name.
-    device_type = torch.device(device).type
-    source_driven = "adaptive-push"
-    if registry.has("spike_push_dense", device_type) and WEIGHT.dtype == torch.float32:
-        source_driven = "push"
-    elif device_type == "cuda":
-        source_driven = "pull"
-    algorithm = source_driven if kind == "push" else "pull"
+    # The fixture explicitly selects the reference backend on both devices.
+    algorithm = "adaptive-push" if kind == "push" else "pull"
     assert f"algorithm = {algorithm} (" in conn.explain()
     return conn
 
@@ -461,7 +462,7 @@ def make_spikes(density, device):
     return x.to(device)
 
 
-def test_compiled_connection_calls_the_registered_operator():
+def test_compiled_connection_calls_the_registered_operator(sparse_reference_backend):
     """Dynamo sees exactly one call per forward: the registered operator of
     the planned algorithm. The eager module uses the light autograd node.
 
@@ -493,7 +494,9 @@ def test_compiled_connection_calls_the_registered_operator():
     [(True, True), (True, False), (False, True), (False, False)],
     ids=["both", "only_input", "only_weights", "neither"],
 )
-def test_connection_eager_equals_compiled(kind, device, x_grad, weight_grad):
+def test_connection_eager_equals_compiled(
+    kind, device, x_grad, weight_grad, sparse_reference_backend
+):
     """``torch.compile(conn)`` and ``conn`` give the same output and the same
     gradients, for sparse and for dense activity, whichever of input and
     weights asks for a gradient.
@@ -536,7 +539,9 @@ def test_connection_eager_equals_compiled(kind, device, x_grad, weight_grad):
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("kind", list(KINDS))
 @pytest.mark.parametrize("context", [torch.no_grad, torch.inference_mode])
-def test_connection_eager_equals_compiled_without_grad_mode(context, kind, device):
+def test_connection_eager_equals_compiled_without_grad_mode(
+    context, kind, device, sparse_reference_backend
+):
     """Inference: under ``no_grad`` / ``inference_mode`` the eager and the
     compiled connection agree and neither builds a graph, although the
     weights are trainable."""
@@ -653,3 +658,83 @@ def test_sparse_arrays_still_take_the_sparse_path():
     torch.testing.assert_close(sparse.matvec(A, x), x @ dense.T, **TOL)
     torch.testing.assert_close(sparse.rmatvec(A, y), y @ dense, **TOL)
     torch.testing.assert_close(sparse.matmul(A, B), dense @ B, **TOL)
+
+
+@pytest.mark.parametrize(
+    "device,dtype",
+    (
+        ("cpu", torch.float64),
+        pytest.param(
+            "cuda",
+            torch.float16,
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ),
+)
+def test_small_auto_dense_preserves_sparse_training_and_weight_updates(device, dtype):
+    """Reuse a dense trajectory operand without caching stale edge weights."""
+    from btorch.sparse.runtime import use_method
+
+    # Rectangular connectivity with an empty destination catches accidental
+    # transposition and uninitialized entries. Keep FP64 and a strided input:
+    # the internal representation must not impose a new storage contract.
+    connection = SparseConnection.from_edges(
+        torch.tensor([0, 2, 1], device=device),
+        torch.tensor([1, 1, 3], device=device),
+        3,
+        4,
+        values=torch.tensor([0.5, -0.25, 0.75], dtype=dtype, device=device),
+        hints=Hints(firing_rate_hz=1),
+    )
+    weights = connection.weight.value
+    weights.requires_grad_()
+    input_dtype = torch.float64 if device == "cpu" else torch.float32
+    x = torch.arange(12, dtype=input_dtype, device=device).reshape(2, 3, 2)[..., 0]
+    x.requires_grad_()
+    compiled = torch.compile(connection, backend="eager", fullgraph=True)
+    for factor in (1.0, 2.0):
+        with torch.no_grad():
+            weights.mul_(factor)
+        matrix = x.new_zeros(4, 3)
+        matrix[connection.post, connection.pre] = weights.to(x.dtype)
+        expected = x @ matrix.T
+        # The selected CUDA case combines mixed storage and AMP. Sparse
+        # propagation retains its promoted dtype, including during capture.
+        with torch.autocast(
+            device_type=device, dtype=torch.float16, enabled=device == "cuda"
+        ):
+            actual = compiled(x)
+        torch.testing.assert_close(actual, expected)
+        actual_grad = torch.autograd.grad(actual.square().sum(), (x, weights))
+        expected_grad = torch.autograd.grad(expected.square().sum(), (x, weights))
+        for value, oracle in zip(actual_grad, expected_grad):
+            torch.testing.assert_close(value, oracle)
+
+    # Prepared recurrence must not rebuild the matrix or allocate an output
+    # each step. A later explicit request still selects a real sparse route.
+    connection._ensure_plan_current()
+    assert connection._plan.route.key.representation == "dense"
+    cache = connection.cache
+    arguments = (
+        cache.crow,
+        cache.col,
+        weights,
+        x,
+        cache.t_crow,
+        cache.t_col,
+        cache.t_perm,
+        None,
+        None,
+    )
+    prepared = ops.prepare_bound_forward(connection._route_token, arguments)
+    with torch.no_grad():
+        first = prepared(x)
+        address = first.data_ptr()
+        second = prepared(x * 2)
+        assert second.data_ptr() == address
+        torch.testing.assert_close(second, expected * 2)
+        with use_method("pull"):
+            torch.testing.assert_close(connection(x), expected)
+            assert connection._plan.route.key.representation == "post_pre_csr"

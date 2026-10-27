@@ -8,6 +8,7 @@ intermediate is created.
 
 import ast
 import functools
+import gc
 import hashlib
 import linecache
 import re
@@ -20,6 +21,7 @@ from pathlib import Path
 
 import torch
 
+from ..contracts import surrogate_support
 from ..templates import _MODELS, ResidualTemplate, get_template, model_template_revision
 from .fragments import _exp_euler_forward, get_fragments, scalar_layout
 
@@ -30,6 +32,39 @@ class _ParameterLayout:
     stride: tuple[int, ...]
     target_shape: tuple[int, ...]
     span: int
+
+
+@dataclass(frozen=True)
+class _TensorStorage:
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    dtype: str
+    span: int
+    physical_index: bool = False
+
+
+def _tensor_storage(buffers, physical_names=()):
+    """Describe views requiring typed pointers or noncanonical addressing."""
+    return tuple(
+        (
+            name,
+            _TensorStorage(
+                tuple(value.shape),
+                tuple(value.stride()),
+                str(value.dtype).removeprefix("torch."),
+                0
+                if not value.numel()
+                else 1
+                + sum(
+                    (size - 1) * stride
+                    for size, stride in zip(value.shape, value.stride())
+                ),
+                name in physical_names,
+            ),
+        )
+        for name, value in sorted(buffers.items())
+        if value.dtype != torch.float32 or not value.is_contiguous()
+    )
 
 
 @dataclass(frozen=True)
@@ -126,13 +161,18 @@ def _parameter_index(scalar, layout, modes, backend):
 
 
 class _Source:
-    def __init__(self, backend, n, n_step, modes, precise_exp=False):
+    def __init__(self, backend, n, n_step, modes, precise_exp=False, storage=()):
         self.backend, self.n, self.n_step, self.modes = backend, n, n_step, modes
         self.precise_exp = precise_exp
+        self.storage = dict(storage)
         self.pointers = []
         self.lines = []
+        self.has_spike_list = False
+        self.has_gradient_list = False
 
     def pointer(self, name, size):
+        if name in self.storage:
+            size = self.storage[name].span
         if (name, size) not in self.pointers:
             self.pointers.append((name, size))
 
@@ -144,7 +184,23 @@ class _Source:
             index = f"({time}) * {stride} + {index}"
         return index
 
+    def storage_index(self, pointer, index):
+        layout = self.storage.get(pointer)
+        if layout is None or layout.physical_index:
+            return index
+        terms = []
+        trailing = 1
+        division = "/" if self.backend == "cupy" else "//"
+        for size, stride in reversed(tuple(zip(layout.shape, layout.stride))):
+            if size > 1 and stride:
+                coordinate = f"(({index}) {division} {trailing}) % {size}"
+                terms.append(f"({coordinate}) * {stride}")
+            trailing *= size
+        return " + ".join(reversed(terms)) or "0"
+
     def load(self, local, pointer, index):
+        lane_index = "index" in index
+        index = self.storage_index(pointer, index)
         if self.backend == "cupy":
             # Clamp addresses with integer intrinsics; fminf would turn an
             # index into a float and lose precision for large trajectories.
@@ -159,9 +215,25 @@ class _Source:
             if self.backend == "triton"
             else f"{pointer}_ptr[{index}]"
         )
+        layout = self.storage.get(pointer)
+        if layout is not None and layout.dtype != "float32":
+            # Storage precision is independent of the existing FP32 scalar
+            # equations. Convert in registers, never by copying input tensors.
+            expr = (
+                f"({expr}).to(tl.float32)"
+                if self.backend == "triton"
+                else f"float({expr})"
+                if self.backend == "cupy"
+                else f'T.Cast("float32", {expr})'
+            )
+        if self.backend == "triton" and lane_index and "index" not in index:
+            # An expanded scalar has one storage address but remains one
+            # logical value per lane, including loop-carried state adjoints.
+            expr = f"tl.broadcast_to({expr}, (BLOCK,))"
         self.lines.append(f"{local} = {expr}")
 
     def store(self, pointer, index, local):
+        index = self.storage_index(pointer, index)
         self.lines.append(
             f"tl.store({pointer}_ptr + {index}, {local}, mask=mask)"
             if self.backend == "triton"
@@ -170,6 +242,83 @@ class _Source:
 
     def statements(self, lines):
         self.lines.extend(lines)
+
+    def emit_spike_list(self, value, layout):
+        """Append an optional sparse output sink after shared model math."""
+        if not layout:
+            return
+        if self.backend != "triton":
+            raise ValueError("Direct spike-list emission requires the Triton renderer")
+        n_source, n_output, capacity = layout
+        if n_output % self.n:
+            raise ValueError(
+                "Producer output must have whole receptor lanes per neuron"
+            )
+        self.has_spike_list = True
+        for name, size in (
+            ("spike_indices", capacity),
+            ("spike_cumulative", capacity),
+            ("spike_counts", capacity // 128),
+            ("spike_degree", n_source),
+            ("spike_accumulation", n_output),
+        ):
+            self.pointer(name, size)
+        self.lines.append("tl.static_assert(BLOCK == 128)")
+        self.lines.append(
+            f"_emit_spike_list({value}, index, mask, spike_degree_ptr, "
+            "spike_indices_ptr, spike_cumulative_ptr, spike_counts_ptr, "
+            f"{n_source}, BLOCK)"
+        )
+        # Each lane clears exactly the receptor slots whose drive it consumed.
+        # Other CTAs may still be reading their own slots: clearing by a flat
+        # output index instead would race when there are multiple receptors.
+        receptors = n_output // self.n
+        for receptor in range(receptors):
+            self.lines.append(
+                f"tl.store(spike_accumulation_ptr + index * {receptors} + {receptor}, "
+                "0.0, mask=mask)"
+            )
+
+    def emit_gradient_activity(self, spec, *, prefix="", time=None):
+        """Store exact output-adjoint support declared by the model
+        template."""
+        scalar = get_template(spec).spike_gradient_input
+        width = surrogate_support(spec)
+        if scalar is None or width is None:
+            raise ValueError(
+                "Gradient activity requires declared compact spike support"
+            )
+        self.pointer("gradient_activity", self.n * self.n_step)
+        # Keep NaNs active conservatively; they are not known derivative zeros.
+        expression = f"where(abs({prefix}{scalar}) >= {width!r}, 0.0, 1.0)"
+        layout = self.storage.get("gradient_activity")
+        if self.backend == "triton" and layout is not None and layout.dtype == "int32":
+            from ....sparse.runtime.activity import GradientList
+
+            capacity = ((self.n + 127) // 128) * 128
+            blocks = capacity // 128
+            size = GradientList.size(self.n)
+            base = "gradient_activity_ptr"
+            if time is not None:
+                base += f" + {time} * {size}"
+            self.has_gradient_list = True
+            self.lines.extend(
+                [
+                    "tl.static_assert(BLOCK == 128)",
+                    f"gradient_tape = {base}",
+                    f"gradient_active = mask & ~ (abs({prefix}{scalar}) >= {width!r})",
+                    "tl.store(gradient_tape + index, gradient_active, mask=mask)",
+                    "_emit_active_list(gradient_active, index, "
+                    f"gradient_tape + {capacity}, "
+                    f"gradient_tape + {3 * capacity}, BLOCK)",
+                    "_emit_active_list(gradient_active | "
+                    f"(mask & ({prefix}output != 0.0)), "
+                    f"index, gradient_tape + {2 * capacity}, "
+                    f"gradient_tape + {3 * capacity + blocks}, BLOCK)",
+                ]
+            )
+            return
+        self.store("gradient_activity", self.index("output", time), expression)
 
     def render(self):
         if self.backend == "triton":
@@ -197,7 +346,19 @@ class _Source:
             return (
                 "import triton\nimport triton.language as tl\n"
                 "from triton.language.extra import libdevice\n"
-                "@triton.jit\n"
+                + (
+                    "from btorch.sparse.runtime.kernels_triton_spikelist "
+                    "import _emit_active_list\n"
+                    if self.has_gradient_list
+                    else ""
+                )
+                + (
+                    "from btorch.sparse.runtime.kernels_triton_spikelist "
+                    "import _emit_spike_list\n"
+                    if self.has_spike_list
+                    else ""
+                )
+                + "@triton.jit\n"
                 f"def cell_kernel({args}, BLOCK: tl.constexpr):\n"
                 "    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n"
                 f"    mask = index < {self.n}\n"
@@ -251,8 +412,25 @@ class _Source:
                     line += ";"
                 line = line.replace("//", "/")
                 lines.append(" " * indentation + line)
-            args = ", ".join("float* " + name + "_ptr" for name, _ in self.pointers)
+            types = {
+                "float16": "__half",
+                "bfloat16": "__nv_bfloat16",
+                "float64": "double",
+                "bool": "bool",
+                "uint8": "unsigned char",
+                "int8": "signed char",
+                "int16": "short",
+                "int32": "int",
+                "int64": "long long",
+            }
+            args = ", ".join(
+                types.get(self.storage[name].dtype, "float") + "* " + name + "_ptr"
+                if name in self.storage
+                else "float* " + name + "_ptr"
+                for name, _ in self.pointers
+            )
             return (
+                "#include <cuda_fp16.h>\n#include <cuda_bf16.h>\n"
                 "__device__ __forceinline__ float where(\n"
                 "    bool condition, float x, float y) { return condition ? x : y; }\n"
                 f'extern "C" __global__ void cell_kernel({args}) {{\n'
@@ -300,7 +478,8 @@ class _Source:
                 line = re.sub(rf"\b{name}\b", name + "[0]", line)
             lines.append(line)
         args = ", ".join(
-            f'{name}_ptr: T.Tensor(({size},), "float32")'
+            f'{name}_ptr: T.Tensor(({size},), "'
+            f'{self.storage[name].dtype if name in self.storage else "float32"}")'
             for name, size in self.pointers
         )
         return (
@@ -335,31 +514,28 @@ def _generate_source(
     gradient_presence=None,
     template_revision=1,
     residual_template=None,
-    glif_coefficient_layouts=None,
+    prepared_parameter_layouts=None,
     gradient_targets=None,
     precise_exp=False,
+    storage=(),
+    spike_list=(),
+    gradient_activity=False,
 ):
     # The revision participates in the cache key even though current built-in
     # templates are immutable within a revision.
     del template_revision
     template = get_template(spec)
     states, parameters = scalar_layout(spec, modes)
-    precomputed_glif_membrane = glif_coefficient_layouts is not None
-    if precomputed_glif_membrane and spec.model != "glif3":
-        raise ValueError("Precomputed membrane coefficients require GLIF3")
-    expected_coefficients = 2 if backward else 1
-    if (
-        precomputed_glif_membrane
-        and len(glif_coefficient_layouts) != expected_coefficients
-    ):
-        raise ValueError(
-            "GLIF membrane coefficient count disagrees with the generated pass"
-        )
+    prepared_declarations = {item.name: item for item in template.prepared_parameters}
+    prepared_scalars = tuple(
+        prepared_declarations[name].scalar_name
+        for name, _ in (prepared_parameter_layouts or ())
+    )
     residual = residual_template or ResidualTemplate(template.state_names)
     fragments = get_fragments(
         spec,
         modes,
-        precomputed_glif_membrane=precomputed_glif_membrane,
+        prepared_values=prepared_scalars,
         authoritative_output=backward and residual.save_output,
     )
     checkpoint_state = residual.checkpoint_state
@@ -374,7 +550,7 @@ def _generate_source(
         max((n_step - 1) // checkpoint_interval, 0) if checkpoint_state else 0
     )
     checkpoint_block = "(time >> 4)"
-    source = _Source(backend, n, n_step, modes, precise_exp)
+    source = _Source(backend, n, n_step, modes, precise_exp, storage)
     source.pointer("dt", 1)
     source.load("dt", "dt", "0")
     if backend == "triton":
@@ -411,11 +587,7 @@ def _generate_source(
                 "T.device_assert(index != 0 or dt == 1.0, "
                 '"AlphaPSCBilleh requires dt == 1")'
             )
-    size = lambda name: (
-        n * modes
-        if name == "Iasc" or (spec.model == "glif3" and name in ("k", "asc_amps"))
-        else n
-    )
+    size = lambda name: n * modes if template.extra_dims(name) else n
     source.pointer("x_seq", n * n_step)
     if spec.surrogate == "poisson" and spec.poisson.spiking and not backward:
         source.pointer("uniform_seq", n * n_step)
@@ -440,19 +612,7 @@ def _generate_source(
             else source.index(name)
         )
         source.load(name, base, index)
-    if precomputed_glif_membrane:
-        coefficient_names = [("glif_phi_coefficient", "glif_phi")]
-        if backward:
-            coefficient_names.append(("glif_delta_coefficient", "glif_delta"))
-        for (pointer_name, scalar_name), layout in zip(
-            coefficient_names, glif_coefficient_layouts
-        ):
-            source.pointer(pointer_name, layout.span)
-            source.load(
-                scalar_name,
-                pointer_name,
-                _parameter_index("tau", layout, modes, backend),
-            )
+    _load_prepared_parameters(source, template, prepared_parameter_layouts)
     if not backward:
         forward_fragments = fragments.forward
         source.pointer("output_seq", n * n_step)
@@ -475,6 +635,12 @@ def _generate_source(
             source.load("uniform", "uniform_seq", source.index("x", "time"))
         source.statements(forward_fragments)
         source.store("output_seq", source.index("output", "time"), "output")
+        if gradient_activity:
+            source.emit_gradient_activity(spec, time="time")
+        if spike_list:
+            if n_step != 1:
+                raise ValueError("A recurrent spike sink belongs to one producer step")
+            source.emit_spike_list("output", spike_list)
         for name in history_names:
             scalars = (
                 tuple(f"Iasc_{i}" for i in range(modes)) if name == "Iasc" else (name,)
@@ -557,6 +723,9 @@ def _generate_source(
                 )
             else:
                 source.lines.append("grad_s_" + name + " = 0.0")
+        for name in states:
+            base, _ = _mode_name(name, modes)
+            source.load("initial_" + name, base + "_init", source.index(name))
         source.lines.append(f"for time in range({n_step - 1}, -1, -1):")
         start = len(source.lines)
         source.load("x", "x_seq", source.index("x", "time"))
@@ -573,29 +742,18 @@ def _generate_source(
                 if not checkpoint_count:
                     source.load(name + "_prev", base + "_init", index)
                 else:
-                    checkpoint_index = source.index(name, checkpoint_block + " - 1")
-                    if backend == "triton":
-                        source.lines += [
-                            f"{name}_prev = tl.load({base}_checkpoint_ptr + "
-                            f"{checkpoint_index}, mask=mask & "
-                            f"(time >= {checkpoint_interval}), other=0.0)",
-                            f"{name}_prev = tl.where(time >= {checkpoint_interval}, "
-                            f"{name}_prev, tl.load({base}_init_ptr + {index}, "
-                            "mask=mask, other=0.0))",
-                        ]
-                    elif backend == "cupy":
-                        source.lines.append(
-                            f"{name}_prev = (time >= {checkpoint_interval} ? "
-                            f"{base}_checkpoint_ptr[{checkpoint_index}] : "
-                            f"{base}_init_ptr[{index}])"
-                        )
-                    else:
-                        source.lines.append(
-                            f"{name}_prev = where(time >= {checkpoint_interval}, "
-                            f"{base}_checkpoint_ptr[maximum({checkpoint_block} - 1, 0) "
-                            f"* {size(base)} + {index}], "
-                            f"{base}_init_ptr[{index}])"
-                        )
+                    checkpoint_index = source.index(
+                        name, f"maximum({checkpoint_block} - 1, 0)"
+                    )
+                    source.load(
+                        name + "_checkpoint_value",
+                        base + "_checkpoint",
+                        checkpoint_index,
+                    )
+                    source.lines.append(
+                        f"{name}_prev = where(time >= {checkpoint_interval}, "
+                        f"{name}_checkpoint_value, initial_{name})"
+                    )
                 replay_start = len(source.lines)
                 source.lines.append(
                     f"for replay_offset in range({checkpoint_interval - 1}):"
@@ -625,27 +783,11 @@ def _generate_source(
                 ]
                 source.lines.append("END_REPLAY")
                 continue
-            history_index = source.index(name, "time - 1")
-            if backend == "triton":
-                source.lines += [
-                    f"{name}_prev = tl.load({base}_seq_ptr + {history_index}, "
-                    "mask=mask & (time > 0), other=0.0)",
-                    f"{name}_prev = tl.where(time > 0, {name}_prev, "
-                    f"tl.load({base}_init_ptr + {index}, mask=mask, other=0.0))",
-                ]
-            elif backend == "cupy":
-                source.lines += [
-                    f"{name}_prev = (time > 0 ? {base}_seq_ptr[{history_index}] "
-                    f": {base}_init_ptr[{index}])"
-                ]
-            else:
-                # Clamp the unused branch index so either evaluation strategy
-                # remains within the history allocation.
-                source.lines += [
-                    f"{name}_prev = where(time > 0, {base}_seq_ptr["
-                    f"maximum(time - 1, 0) * {size(base)} + {index}], "
-                    f"{base}_init_ptr[{index}])"
-                ]
+            history_index = source.index(name, "maximum(time - 1, 0)")
+            source.load(name + "_history_value", base + "_seq", history_index)
+            source.lines.append(
+                f"{name}_prev = where(time > 0, {name}_history_value, initial_{name})"
+            )
             if base in history_names:
                 if history_presence[base]:
                     source.load(
@@ -717,9 +859,12 @@ def generate_source(
     parameter_layouts=None,
     gradient_presence=None,
     residual_template=None,
-    glif_coefficient_layouts=None,
+    prepared_parameter_layouts=None,
     gradient_targets=None,
     precise_exp=False,
+    storage=(),
+    spike_list=(),
+    gradient_activity=False,
 ):
     """Generate inspectable direct DSL source for a static cell sequence.
 
@@ -733,8 +878,10 @@ def generate_source(
     template = get_template(spec)
     history_names = tuple(history_names)
     parameter_layouts = None if parameter_layouts is None else tuple(parameter_layouts)
-    glif_coefficient_layouts = (
-        None if glif_coefficient_layouts is None else tuple(glif_coefficient_layouts)
+    prepared_parameter_layouts = (
+        None
+        if prepared_parameter_layouts is None
+        else tuple(prepared_parameter_layouts)
     )
     if backward:
         if parameter_mask is not None:
@@ -765,9 +912,12 @@ def generate_source(
         gradient_presence,
         model_template_revision(spec.model),
         residual_template,
-        glif_coefficient_layouts,
+        prepared_parameter_layouts,
         gradient_targets,
         precise_exp,
+        tuple(storage),
+        tuple(spike_list),
+        gradient_activity,
     )
 
 
@@ -849,6 +999,11 @@ def _compile_cached(
             if backend == "triton"
             else namespace["build_kernel"]()
         )
+        if backend == "tilelang":
+            # TileLang's Python builder leaves temporary frame cycles holding
+            # its caller. Release them at cold compilation, before CUDA Graph
+            # Trees checkpoint the trajectory's saved-tensor lifetimes.
+            gc.collect()
         # Eviction may leave a kernel alive in a caller or the backend cache.
         # Keep inspectable source until that object itself is released.
         weakref.finalize(kernel, linecache.cache.pop, filename, None)
@@ -1016,12 +1171,17 @@ def _launch(
     enable_fp_fusion=True,
     precise_division=False,
     residual_template=None,
-    glif_coefficient_layouts=None,
+    prepared_parameter_layouts=None,
     gradient_targets=None,
     precise_exp=False,
+    spike_list=(),
+    gradient_activity=False,
 ):
     if not n:
         return
+    strided_names = set(get_template(spec).parameter_names)
+    if prepared_parameter_layouts is not None:
+        strided_names.update(name for name, _ in prepared_parameter_layouts)
     source, pointers = generate_source(
         backend,
         spec,
@@ -1032,11 +1192,14 @@ def _launch(
         backward,
         parameter_mask,
         parameter_layouts,
-        glif_coefficient_layouts=glif_coefficient_layouts,
+        prepared_parameter_layouts=prepared_parameter_layouts,
         gradient_presence=gradient_presence,
         gradient_targets=gradient_targets,
         residual_template=residual_template,
         precise_exp=precise_exp,
+        storage=_tensor_storage(buffers, strided_names),
+        spike_list=spike_list,
+        gradient_activity=gradient_activity,
     )
     kernel = _compile(
         backend,
@@ -1045,16 +1208,7 @@ def _launch(
         precise_division,
         device=buffers["x_seq"].device,
     )
-    strided_names = set(get_template(spec).parameter_names)
-    if glif_coefficient_layouts is not None:
-        strided_names.update(("glif_phi_coefficient", "glif_delta_coefficient"))
-    args = _kernel_arguments(
-        buffers,
-        pointers,
-        strided_names
-        if parameter_layouts is not None or glif_coefficient_layouts is not None
-        else (),
-    )
+    args = tuple(_storage_span(buffers[name], size) for name, size in pointers)
     num_warps = None
     if backend == "triton" and backward and spec.model == "alpha":
         targets = _normalize_gradient_targets(get_template(spec), gradient_targets)
@@ -1129,13 +1283,13 @@ def _layout(value, target_shape):
     )
 
 
-def _fp32_parameters(parameters):
-    """Convert floating parameters once per identity, preserving storage
-    views."""
+def _parameter_buffers(parameters):
+    """Resolve lazy metadata once per identity while preserving storage
+    dtype."""
     converted = {}
     for tensor in parameters:
         if id(tensor) not in converted:
-            converted[id(tensor)] = tensor.float().resolve_neg()
+            converted[id(tensor)] = tensor.resolve_neg()
     return tuple(converted[id(tensor)] for tensor in parameters)
 
 
@@ -1145,25 +1299,21 @@ def _prepare(x_seq, states, parameters, spec, *, preserve_parameters=False):
     template = get_template(spec)
     shape = x_seq.shape[1:]
     modes = (
-        states[template.state_names.index("Iasc")].shape[-1]
-        if spec.model == "glif3"
+        states[template.state_names.index(template.state_extra_dims[0][0])].shape[-1]
+        if template.state_extra_dims
         else 0
     )
-    target = lambda name: (
-        (*shape, modes)
-        if name == "Iasc" or (spec.model == "glif3" and name in ("k", "asc_amps"))
-        else shape
-    )
-    buffers = {"x_seq": x_seq.float().contiguous(), "dt": _dt_buffer(spec.dt, x_seq)}
+    target = lambda name: (*shape, modes) if template.extra_dims(name) else shape
+    buffers = {"x_seq": x_seq, "dt": _dt_buffer(spec.dt, x_seq)}
     buffers.update(
         {
-            name + "_init": tensor.float().expand(target(name)).contiguous()
+            name + "_init": tensor.expand(target(name))
             for name, tensor in zip(template.state_names, states)
         }
     )
     parameter_layouts = None
     if preserve_parameters:
-        converted = _fp32_parameters(parameters)
+        converted = _parameter_buffers(parameters)
         parameter_layouts = tuple(
             _layout(tensor, target(name))
             for name, tensor in zip(template.parameter_names, converted)
@@ -1172,7 +1322,7 @@ def _prepare(x_seq, states, parameters, spec, *, preserve_parameters=False):
     else:
         buffers.update(
             {
-                name: tensor.float().expand(target(name)).contiguous()
+                name: tensor.expand(target(name))
                 for name, tensor in zip(template.parameter_names, parameters)
             }
         )
@@ -1180,20 +1330,39 @@ def _prepare(x_seq, states, parameters, spec, *, preserve_parameters=False):
     return (*prepared, parameter_layouts) if preserve_parameters else prepared
 
 
-def _prepare_glif_coefficients(coefficients, target, *, backward):
-    if coefficients is None:
-        return {}, None
-    expected = 2 if backward else 1
-    if len(coefficients) != expected:
-        raise ValueError(
-            "GLIF membrane coefficient count disagrees with the requested pass"
+def _load_prepared_parameters(
+    source, template, layouts, *, pointer_prefix="", scalar_prefix="", index="index"
+):
+    """Bind template-declared computed values in primitive or paired source."""
+    declarations = {item.name: item for item in template.prepared_parameters}
+    scalars = []
+    for name, layout in layouts or ():
+        declaration = declarations[name]
+        source.pointer(pointer_prefix + name, layout.span)
+        offset = _parameter_index(
+            declaration.shape_source, layout, source.modes, source.backend
         )
-    names = ["glif_phi_coefficient"]
-    if backward:
-        names.append("glif_delta_coefficient")
-    converted = tuple(value.float().resolve_neg() for value in coefficients)
-    layouts = tuple(_layout(value, target("tau")) for value in converted)
-    return dict(zip(names, converted)), layouts
+        offset = re.sub(r"\bindex\b", f"({index})", offset)
+        source.load(
+            scalar_prefix + declaration.scalar_name, pointer_prefix + name, offset
+        )
+        scalars.append(declaration.scalar_name)
+    return tuple(scalars)
+
+
+def _prepare_parameters(values, template, target):
+    if not values:
+        return {}, None
+    declarations = {item.name: item for item in template.prepared_parameters}
+    undeclared = values.keys() - declarations.keys()
+    if undeclared:
+        raise ValueError(f"Undeclared prepared parameters: {sorted(undeclared)}")
+    converted = {name: value.resolve_neg() for name, value in values.items()}
+    layouts = tuple(
+        (name, _layout(value, target(declarations[name].shape_source)))
+        for name, value in converted.items()
+    )
+    return converted, layouts
 
 
 def forward(
@@ -1207,25 +1376,29 @@ def forward(
     enable_fp_fusion=True,
     precise_division=False,
     residual_template=None,
-    glif_membrane_coefficients=None,
+    prepared_parameters=None,
     uniform_seq=None,
     precise_exp=False,
+    spike_list=None,
+    gradient_activity=None,
 ):
     """Execute inference or training forward using exactly requested
     storage."""
     template, shape, modes, target, buffers, parameter_layouts = _prepare(
         x_seq, states, parameters, spec, preserve_parameters=True
     )
-    coefficient_buffers, glif_coefficient_layouts = _prepare_glif_coefficients(
-        glif_membrane_coefficients, target, backward=False
+    coefficient_buffers, prepared_parameter_layouts = _prepare_parameters(
+        prepared_parameters, template, target
     )
-    if coefficient_buffers and spec.model != "glif3":
-        raise ValueError("Precomputed membrane coefficients require GLIF3")
     buffers.update(coefficient_buffers)
+    if spike_list is not None:
+        buffers.update(spike_list.bindings())
+    if gradient_activity is not None:
+        buffers["gradient_activity"] = gradient_activity
     if spec.surrogate == "poisson" and spec.poisson.spiking:
         if uniform_seq is None:
             raise ValueError("Spiking Poisson kernels require explicit uniforms")
-        buffers["uniform_seq"] = uniform_seq.float().contiguous()
+        buffers["uniform_seq"] = uniform_seq
     n_step = x_seq.shape[0]
     residual = residual_template or ResidualTemplate(template.state_names)
     checkpoint_count = (
@@ -1246,7 +1419,7 @@ def forward(
             else ()
         )
         return (
-            x_seq.float().clone(),
+            torch.empty(x_seq.shape, device=x_seq.device, dtype=torch.float32),
             tuple(buffers[name + "_init"].clone() for name in template.state_names),
             tuple(
                 x_seq.new_empty((0, *target(name)), dtype=torch.float32)
@@ -1254,7 +1427,9 @@ def forward(
             )
             + checkpoint,
         )
-    buffers["output_seq"] = torch.empty_like(x_seq, dtype=torch.float32)
+    buffers["output_seq"] = torch.empty(
+        x_seq.shape, device=x_seq.device, dtype=torch.float32
+    )
     for name in template.state_names:
         buffers[name + "_final"] = torch.empty(
             target(name), device=x_seq.device, dtype=torch.float32
@@ -1278,11 +1453,13 @@ def forward(
         history_names,
         modes,
         parameter_layouts=parameter_layouts,
-        glif_coefficient_layouts=glif_coefficient_layouts,
+        prepared_parameter_layouts=prepared_parameter_layouts,
         enable_fp_fusion=enable_fp_fusion,
         precise_division=precise_division,
         residual_template=residual,
         precise_exp=precise_exp,
+        spike_list=() if spike_list is None else spike_list.producer_layout,
+        gradient_activity=gradient_activity is not None,
     )
     return (
         buffers["output_seq"],
@@ -1314,7 +1491,7 @@ def backward(
     residual_template=None,
     residual_output=None,
     residuals=(),
-    glif_membrane_coefficients=None,
+    prepared_parameters=None,
     precise_exp=False,
 ):
     """Reverse a sequence with local charge recomputation and state
@@ -1334,7 +1511,7 @@ def backward(
             (
                 torch.zeros_like(state)
                 if gradient is None
-                else gradient.float().sum_to_size(state.shape).to(state.dtype)
+                else gradient.sum_to_size(state.shape).to(state.dtype)
             )
             if needs[1 + index]
             else None
@@ -1354,11 +1531,9 @@ def backward(
     template, shape, modes, target, buffers, parameter_layouts = _prepare(
         x_seq, states, parameters, spec, preserve_parameters=True
     )
-    coefficient_buffers, glif_coefficient_layouts = _prepare_glif_coefficients(
-        glif_membrane_coefficients, target, backward=True
+    coefficient_buffers, prepared_parameter_layouts = _prepare_parameters(
+        prepared_parameters, template, target
     )
-    if coefficient_buffers and spec.model != "glif3":
-        raise ValueError("Precomputed membrane coefficients require GLIF3")
     buffers.update(coefficient_buffers)
     residual = residual_template or ResidualTemplate(template.state_names)
     gradient_presence = _GradientPresence(
@@ -1371,18 +1546,20 @@ def backward(
     )
     n_step, n = x_seq.shape[0], buffers["x_seq"].numel() // max(x_seq.shape[0], 1)
     if grad_output is not None:
-        buffers["grad_output_seq"] = grad_output.float().contiguous()
+        buffers["grad_output_seq"] = grad_output
     if gradient_targets.input:
-        buffers["grad_x_seq"] = torch.empty_like(x_seq, dtype=torch.float32)
+        buffers["grad_x_seq"] = torch.empty(
+            x_seq.shape, device=x_seq.device, dtype=torch.float32
+        )
     for name, history, grad in zip(history_names, histories, grad_histories):
-        buffers[name + "_seq"] = history.contiguous()
+        buffers[name + "_seq"] = history
         if grad is not None:
-            buffers["grad_" + name + "_seq"] = grad.float().contiguous()
+            buffers["grad_" + name + "_seq"] = grad
     for name, grad in zip(template.state_names, grad_final_states):
         if name + "_seq" not in buffers and name != residual.checkpoint_state:
             raise RuntimeError(f"Training history must include state {name!r}")
         if grad is not None:
-            buffers["grad_" + name + "_final"] = grad.float().contiguous()
+            buffers["grad_" + name + "_final"] = grad
         if gradient_targets.states[template.state_names.index(name)]:
             buffers["grad_" + name + "_init"] = torch.empty(
                 target(name), device=x_seq.device, dtype=torch.float32
@@ -1390,13 +1567,13 @@ def backward(
     if residual.save_output:
         if residual_output is None:
             raise RuntimeError("Stochastic reverse requires authoritative output")
-        buffers["output_seq"] = residual_output.float().contiguous()
+        buffers["output_seq"] = residual_output
     if residual.checkpoint_state is not None:
         if len(residuals) != 1:
             raise RuntimeError(
                 "Checkpointed GLIF reverse requires output and checkpoint residuals"
             )
-        buffers[residual.checkpoint_state + "_checkpoint"] = residuals[0].contiguous()
+        buffers[residual.checkpoint_state + "_checkpoint"] = residuals[0]
     parameter_mask = tuple(
         name
         for i, name in enumerate(template.parameter_names)
@@ -1422,7 +1599,7 @@ def backward(
         enable_fp_fusion=enable_fp_fusion,
         precise_division=precise_division,
         residual_template=residual,
-        glif_coefficient_layouts=glif_coefficient_layouts,
+        prepared_parameter_layouts=prepared_parameter_layouts,
         precise_exp=precise_exp,
     )
     grad_states = tuple(

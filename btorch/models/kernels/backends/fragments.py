@@ -11,11 +11,11 @@ import math
 from ...ode import _EXP_EULER_SERIES_CUTOFF
 from ...surrogate.sigmoid import _SIG_K
 from ...surrogate.superspike import _SS_K
-from ..contracts import CellSpec
+from ..contracts import NeuronSpec
 from ..templates import _MODELS, BackendFragments, get_template
 
 
-def scalar_layout(spec: CellSpec, modes: int = 0):
+def scalar_layout(spec: NeuronSpec, modes: int = 0):
     """Expand the small GLIF mode axis into named scalar registers."""
     template = get_template(spec)
     states = tuple(
@@ -113,10 +113,10 @@ def _exp_euler_backward(prefix: str, linear: str, dt: str) -> tuple[str, ...]:
 
 
 def get_fragments(
-    spec: CellSpec,
+    spec: NeuronSpec,
     modes: int = 0,
     *,
-    precomputed_glif_membrane: bool = False,
+    prepared_values: tuple[str, ...] = (),
     authoritative_output: bool = False,
 ) -> BackendFragments:
     """Compose fixed charge, adapt, fire, reset and reverse stages."""
@@ -278,7 +278,7 @@ def get_fragments(
                 f"glif_series_z = where({glif_small}, glif_z, 0.0)",
                 f"glif_safe_linear = where({glif_small}, 1.0, glif_linear)",
             ]
-            if not precomputed_glif_membrane:
+            if "glif_phi" not in prepared_values:
                 f += _exp_euler_forward("glif", "glif_linear", dt)
             f += ["v_charged = v_prev + glif_phi * glif_derivative"]
             for i in range(modes):
@@ -481,6 +481,8 @@ def get_fragments(
         else:
             gnorm = f"gspike * {spec.damping!r} * surrogate_grad"
         b += [f"gnorm = {gnorm}"]
+        if spec.surrogate_width is not None:
+            b += [f"gnorm = where(abs(norm) < {spec.surrogate_width!r}, gnorm, 0.0)"]
         if model in ("alif", "elif"):
             b += _lines("""
                 grad_norm_numerator = gnorm / gap
@@ -629,4 +631,7 @@ def get_fragments(
                 grad_s_v = gcharged + grad_x * k * (2.0 * v_prev - v_rest - v_threshold)
                 grad_s_u = gu_prev - grad_x
             """)
-    return BackendFragments(tuple(f), tuple(b))
+    record_vjp_after = (
+        (("psc", "grad_s_psc = grad_s_psc + grad_output"),) if model == "alpha" else ()
+    )
+    return BackendFragments(tuple(f), tuple(b), record_vjp_after)

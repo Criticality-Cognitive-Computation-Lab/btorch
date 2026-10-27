@@ -1,15 +1,20 @@
 """Register whole recurrent trajectories with explicit cell reverse passes."""
 
 import json
+from dataclasses import replace
 
 import torch
 from torch import Tensor
 from torch.nn import functional as F
 
-from ..ode import _exp_euler_coefficient
 from .operators import decode_spec
 from .registry import _NATIVE_GPU_BACKENDS, cell_backend_revision, resolve_cell_backend
-from .templates import ResidualTemplate, get_template, model_template_revision
+from .templates import (
+    ResidualTemplate,
+    get_template,
+    model_template_revision,
+    prepare_parameters,
+)
 
 
 def _connection(source, parameters, topology, spec):
@@ -18,7 +23,9 @@ def _connection(source, parameters, topology, spec):
         return source
     if kind == "linear":
         return F.linear(
-            source, parameters[0], parameters[1] if len(parameters) > 1 else None
+            source.to(parameters[0].dtype),
+            parameters[0],
+            parameters[1] if len(parameters) > 1 else None,
         )
     from ...sparse.runtime.ops import propagate_bound
 
@@ -39,19 +46,136 @@ def _connection(source, parameters, topology, spec):
     return output + parameters[1] if len(parameters) > 1 else output
 
 
-def _connection_backward(source, parameters, topology, spec, grad_drive, needs):
-    if spec["connection"] == "identity":
-        return grad_drive, ()
-    if spec["connection"] == "linear":
-        grad_source = grad_drive @ parameters[0]
-        grad_weight = (
-            grad_drive.flatten(0, -2).T @ source.flatten(0, -2) if needs[0] else None
-        )
-    else:
-        from ...sparse.runtime.ops import route_propagate_backward
+def _prepare_linear_operand(value, dtype):
+    """Reuse conversion storage when a trajectory operand changes precision."""
+    workspace = (
+        None if value.dtype == dtype else value.new_empty(value.shape, dtype=dtype)
+    )
 
-        crow, col, t_crow, t_col, t_perm = topology[:5]
-        grad_weight, grad_source = route_propagate_backward(
+    def operand(input):
+        nonlocal workspace
+        if input.dtype == dtype:
+            return input
+        # A standalone tail VJP can follow storage precision while paired
+        # interior VJPs use calculation precision. Allocate at most once.
+        if workspace is None:
+            workspace = input.new_empty(input.shape, dtype=dtype)
+        workspace.copy_(input)
+        return workspace
+
+    return operand
+
+
+def _prepare_connection_forward(source, parameters, topology, spec):
+    from ...sparse.runtime.backend import PreparedPropagation
+
+    if spec["connection"] == "linear":
+        weight = parameters[0]
+        operand = _prepare_linear_operand(source, weight.dtype)
+        output = source.new_empty(
+            (*source.shape[:-1], weight.shape[0]), dtype=weight.dtype
+        )
+        flat_output = output.view(-1, weight.shape[0])
+
+        def forward(input):
+            input = operand(input).reshape(-1, weight.shape[1])
+            if len(parameters) > 1:
+                torch.addmm(parameters[1], input, weight.T, out=flat_output)
+            else:
+                torch.mm(input, weight.T, out=flat_output)
+            return output
+
+        return PreparedPropagation(forward)
+    if spec["connection"] != "sparse":
+        return None
+    from ...sparse.runtime.ops import prepare_bound_forward
+
+    crow, col, t_crow, t_col, t_perm = topology[:5]
+    forward = prepare_bound_forward(
+        spec["route"],
+        (
+            crow,
+            col,
+            parameters[0],
+            source,
+            t_crow,
+            t_col,
+            t_perm,
+            spec.get("max_density"),
+            topology[5] if len(topology) > 5 else None,
+        ),
+    )
+    if forward is None or len(parameters) == 1:
+        return forward
+
+    def with_bias(callback):
+        def biased(input):
+            output = callback(input)
+            output.add_(parameters[1])
+            return output
+
+        return biased
+
+    return replace(
+        forward,
+        forward=with_bias(forward.forward),
+        from_spikes=with_bias(forward.from_spikes)
+        if forward.from_spikes is not None
+        else None,
+    )
+
+
+def _prepare_connection_backward(
+    source,
+    parameters,
+    topology,
+    spec,
+    grad_drive,
+    needs,
+    *,
+    activity=None,
+    grad_values=None,
+):
+    if spec["connection"] == "linear":
+        weight = parameters[0]
+        input_operand = _prepare_linear_operand(source, weight.dtype)
+        grad_operand = _prepare_linear_operand(grad_drive, weight.dtype)
+        grad_source_storage = source.new_empty(source.shape, dtype=weight.dtype)
+        grad_source = (
+            grad_source_storage
+            if source.dtype == weight.dtype
+            else source.new_empty(source.shape)
+        )
+        grad_weight = (
+            (torch.empty_like(weight) if grad_values is None else grad_values)
+            if needs[0]
+            else None
+        )
+
+        def backward(input, gradient, activity=None):
+            input = input_operand(input).reshape(-1, weight.shape[1])
+            gradient = grad_operand(gradient).reshape(-1, weight.shape[0])
+            torch.mm(
+                gradient, weight, out=grad_source_storage.view(-1, weight.shape[1])
+            )
+            if grad_source is not grad_source_storage:
+                grad_source.copy_(grad_source_storage)
+            if grad_weight is not None:
+                if grad_values is None:
+                    torch.mm(gradient.T, input, out=grad_weight)
+                else:
+                    torch.addmm(grad_values, gradient.T, input, out=grad_values)
+            return grad_weight if grad_values is None else None, grad_source
+
+        return backward
+    if spec["connection"] != "sparse":
+        return None
+    from ...sparse.runtime.ops import prepare_bound_backward
+
+    crow, col, t_crow, t_col, t_perm = topology[:5]
+    return prepare_bound_backward(
+        spec["route"],
+        (
             crow,
             col,
             parameters[0],
@@ -62,14 +186,69 @@ def _connection_backward(source, parameters, topology, spec, grad_drive, needs):
             grad_drive,
             needs[0],
             True,
-            spec["route"],
-        )
+        ),
+        input_mask=activity,
+        grad_values=grad_values,
+    )
+
+
+def _connection_backward(
+    source,
+    parameters,
+    topology,
+    spec,
+    grad_drive,
+    needs,
+    prepared=None,
+    *,
+    activity=None,
+):
+    if spec["connection"] == "identity":
+        return grad_drive, ()
+    if spec["connection"] == "linear":
+        if prepared is not None:
+            grad_weight, grad_source = prepared(source, grad_drive, activity)
+        else:
+            weight = parameters[0]
+            gradient = grad_drive.to(weight.dtype)
+            grad_source = (gradient @ weight).to(source.dtype)
+            grad_weight = (
+                gradient.flatten(0, -2).T @ source.to(weight.dtype).flatten(0, -2)
+                if needs[0]
+                else None
+            )
+    else:
+        from ...sparse.runtime.ops import route_propagate_backward
+
+        crow, col, t_crow, t_col, t_perm = topology[:5]
+        if prepared is not None:
+            grad_weight, grad_source = prepared(source, grad_drive, activity)
+        else:
+            grad_weight, grad_source = route_propagate_backward(
+                crow,
+                col,
+                parameters[0],
+                source,
+                t_crow,
+                t_col,
+                t_perm,
+                grad_drive,
+                needs[0],
+                True,
+                spec["route"],
+            )
         if not needs[0]:
             grad_weight = None
     grad_parameters = [grad_weight]
     if len(parameters) > 1:
         grad_parameters.append(
-            grad_drive.sum_to_size(parameters[1].shape) if needs[1] else None
+            (
+                grad_drive.to(parameters[0].dtype)
+                if spec["connection"] == "linear"
+                else grad_drive
+            ).sum_to_size(parameters[1].shape)
+            if needs[1]
+            else None
         )
     return grad_source, grad_parameters
 
@@ -89,11 +268,65 @@ def _parts(states, parameters, spec):
     )
 
 
+def _spike_input(spikes, x_syn_seq, time_index):
+    """Keep absent synaptic input absent instead of adding a zero sequence."""
+    return spikes + x_syn_seq[time_index] if x_syn_seq.numel() else spikes
+
+
 def _source(spikes, ring, n_delay):
     if not n_delay:
         return spikes, ring
-    next_ring = torch.cat((spikes.unsqueeze(0), ring[:-1]), dim=0)
+    next_ring = torch.cat((spikes.to(ring.dtype).unsqueeze(0), ring[:-1]), dim=0)
     return next_ring.movedim(0, -1).flatten(-2), next_ring
+
+
+def _prepare_source(spikes, x_syn_seq, ring, spec, ring_history):
+    """Prepare invocation-owned synaptic input and delay destinations."""
+    neuron_dims = len(spec["neuron_shape"])
+    source_dtype = (
+        torch.promote_types(spikes.dtype, x_syn_seq.dtype)
+        if x_syn_seq.numel()
+        else spikes.dtype
+    )
+    combined = (
+        spikes.new_empty(spikes.shape, dtype=source_dtype)
+        if x_syn_seq.numel()
+        else None
+    )
+    delayed = bool(spec["delay"])
+    if delayed:
+        source_dtype = ring.dtype
+    rings = (
+        tuple(ring.new_empty(ring.shape, dtype=source_dtype) for _ in range(2))
+        if delayed and ring_history is None
+        else None
+    )
+    flat = spikes.flatten(-neuron_dims)
+    source = (
+        flat.new_empty(
+            (*flat.shape[:-1], flat.shape[-1] * spec["delay"]), dtype=source_dtype
+        )
+        if delayed
+        else None
+    )
+
+    def forward(spikes, ring, time_index):
+        if combined is not None:
+            torch.add(spikes, x_syn_seq[time_index], out=combined)
+            spikes = combined
+        flat = spikes.flatten(-neuron_dims)
+        if not delayed:
+            return flat, ring
+        next_ring = (
+            ring_history[time_index]
+            if ring_history is not None
+            else rings[time_index % 2]
+        )
+        torch.cat((flat.unsqueeze(0), ring[:-1]), dim=0, out=next_ring)
+        source.view(*flat.shape, spec["delay"]).copy_(next_ring.movedim(0, -1))
+        return source, next_ring
+
+    return forward
 
 
 def _current(psc, spec):
@@ -107,15 +340,6 @@ def _current(psc, spec):
         if psc.shape[-len(neuron_shape) :] == neuron_shape
         else psc.reshape(*psc.shape[:-1], *neuron_shape)
     )
-
-
-def _glif_membrane_coefficients(spec, parameters, *, backward):
-    if spec.model != "glif3":
-        return None
-    names = get_template(spec).parameter_names
-    tau = parameters[names.index("tau")]
-    phi, delta = _exp_euler_coefficient(-1.0 / tau, spec.dt)
-    return (phi, delta) if backward else (phi,)
 
 
 def _checkpoint_count(steps, interval):
@@ -133,8 +357,10 @@ def _cell_forward(
     enable_fp_fusion=True,
     precise_division=False,
     precise_exp=False,
-    glif_membrane_coefficients=None,
+    prepared_parameters=None,
     uniform=None,
+    spike_list=None,
+    gradient_activity=None,
 ):
     impl = resolve_cell_backend(backend, cell_spec, x.device)
     arguments = (
@@ -150,8 +376,14 @@ def _cell_forward(
             enable_fp_fusion=enable_fp_fusion,
             precise_division=precise_division,
             precise_exp=precise_exp,
-            glif_membrane_coefficients=glif_membrane_coefficients,
+            prepared_parameters=prepared_parameters,
             uniform_seq=None if uniform is None else uniform.unsqueeze(0),
+            **({"spike_list": spike_list} if spike_list is not None else {}),
+            **(
+                {"gradient_activity": gradient_activity}
+                if gradient_activity is not None
+                else {}
+            ),
         )
     else:
         output, final, histories = impl.forward(*arguments)
@@ -173,7 +405,7 @@ def _cell_backward(
     enable_fp_fusion=True,
     precise_division=False,
     precise_exp=False,
-    glif_membrane_coefficients=None,
+    prepared_parameters=None,
     authoritative_output=None,
 ):
     impl = resolve_cell_backend(backend, cell_spec, x.device)
@@ -219,7 +451,7 @@ def _cell_backward(
             enable_fp_fusion=enable_fp_fusion,
             precise_division=precise_division,
             precise_exp=precise_exp,
-            glif_membrane_coefficients=glif_membrane_coefficients,
+            prepared_parameters=prepared_parameters,
             residual_template=(
                 ResidualTemplate(template.state_names, save_output=True)
                 if authoritative_output is not None
@@ -287,6 +519,8 @@ def _trajectory(
         synapse_parameters,
         connection_parameters,
     ) = _parts(initial_states, parameters, spec)
+    neuron_template = get_template(neuron_spec)
+    synapse_template = get_template(synapse_spec)
     ring = initial_states[-1] if spec["delay"] else x_seq.new_empty(0)
     histories = {}
     output_seq = torch.empty_like(x_seq)
@@ -295,10 +529,28 @@ def _trajectory(
     precise_division = bool(spec.get("precise_division", False))
     precise_exp = bool(spec.get("precise_exp", False))
     use_fused = backend in _NATIVE_GPU_BACKENDS and x_seq.device.type == "cuda"
-    glif_membrane_coefficients = (
-        _glif_membrane_coefficients(neuron_spec, neuron_parameters, backward=False)
+    output_dtype = x_seq.dtype
+    if use_fused or spec.get("save_compute_spikes"):
+        output_seq = torch.empty(x_seq.shape, device=x_seq.device, dtype=torch.float32)
+    activity_index = spec.get("gradient_activity")
+    gradient_activity = (
+        torch.empty_like(output_seq) if activity_index is not None else None
+    )
+    if spec.get("gradient_list"):
+        from ...sparse.runtime.activity import GradientList
+
+        gradient_activity = torch.empty(
+            (x_seq.shape[0], GradientList.size(output_seq[0].numel())),
+            dtype=torch.int32,
+            device=x_seq.device,
+        )
+    prepared_parameters = (
+        prepare_parameters(neuron_spec, neuron_parameters, backward=False)
         if use_fused
         else None
+    )
+    synapse_prepared_parameters = (
+        prepare_parameters(synapse_spec, synapse_parameters) if use_fused else {}
     )
     checkpoint_interval = int(spec.get("paired_checkpoint_interval", 0))
     if checkpoint_interval and not use_fused:
@@ -306,14 +558,33 @@ def _trajectory(
     n_checkpoints = _checkpoint_count(x_seq.shape[0], checkpoint_interval)
     checkpoints = (
         [
-            state.new_empty((n_checkpoints, *state.shape))
+            state.new_empty((n_checkpoints, *state.shape), dtype=torch.float32)
             for state in (*neuron_states, *synapse_states)
         ]
         if checkpoint_interval
         else []
     )
+    prepared_step = None
+    step_outputs = None
+    prepared_connection = None
+    spike_list = None
+    if (
+        use_fused
+        and backend == "triton"
+        and spec["connection"] == "sparse"
+        and not spec["delay"]
+        and not x_syn_seq.numel()
+    ):
+        prepared_connection = _prepare_connection_forward(
+            output_seq[0].flatten(-len(spec["neuron_shape"])),
+            connection_parameters,
+            topology,
+            spec,
+        )
+        if prepared_connection is not None:
+            spike_list = prepared_connection.spikes
     if use_fused:
-        from .backends.fused import fused_step_forward
+        from .backends.fused import prepare_fused_step
 
         spikes, neuron_states, neuron_charged = _cell_forward(
             x_seq[0] + _current(synapse_states[0], spec),
@@ -325,9 +596,52 @@ def _trajectory(
             enable_fp_fusion=enable_fp_fusion,
             precise_division=precise_division,
             precise_exp=precise_exp,
-            glif_membrane_coefficients=glif_membrane_coefficients,
+            prepared_parameters=prepared_parameters,
             uniform=None if uniform_seq is None else uniform_seq[0],
+            spike_list=spike_list,
+            gradient_activity=None
+            if gradient_activity is None
+            else gradient_activity[0],
         )
+    if use_fused:
+        # Templates determine state/record shapes. The trajectory owns these
+        # destinations, so neither an earlier forward nor a saved input is
+        # overwritten by this invocation's private working state.
+        samples = (
+            *neuron_states,
+            *synapse_states,
+            *([ring] if spec["delay"] else []),
+            *neuron_charged,
+        )
+        histories = {}
+        for name in history_names:
+            if name < 0:
+                continue
+            if name == activity_index:
+                histories[name] = gradient_activity
+                continue
+            sample = samples[name]
+            dtype = (
+                torch.float32
+                if len(neuron_states) <= name < len(neuron_states) + len(synapse_states)
+                else sample.dtype
+            )
+            if spec["delay"] and name == len(initial_states) - 1:
+                dtype = ring.dtype
+            histories[name] = sample.new_empty(
+                (x_seq.shape[0], *sample.shape), dtype=dtype
+            )
+    prepared_source = (
+        _prepare_source(
+            spikes,
+            x_syn_seq,
+            ring,
+            spec,
+            histories.get(len(initial_states) - 1) if spec["delay"] else None,
+        )
+        if use_fused
+        else None
+    )
     for time_index in range(x_seq.shape[0]):
         if not use_fused:
             spikes, neuron_states, neuron_charged = _cell_forward(
@@ -340,42 +654,116 @@ def _trajectory(
                 enable_fp_fusion=enable_fp_fusion,
                 precise_division=precise_division,
                 precise_exp=precise_exp,
-                glif_membrane_coefficients=glif_membrane_coefficients,
+                prepared_parameters=prepared_parameters,
                 uniform=None if uniform_seq is None else uniform_seq[time_index],
             )
-        source, ring = _source(
-            (spikes.float() + x_syn_seq[time_index].float()).flatten(
-                -len(spec["neuron_shape"])
-            ),
-            ring,
-            spec["delay"],
+        if prepared_source is not None:
+            source, ring = prepared_source(spikes, ring, time_index)
+        else:
+            source, ring = _source(
+                _spike_input(spikes, x_syn_seq, time_index).flatten(
+                    -len(spec["neuron_shape"])
+                ),
+                ring,
+                spec["delay"],
+            )
+        if use_fused and time_index == 0 and prepared_connection is None:
+            prepared_connection = _prepare_connection_forward(
+                source, connection_parameters, topology, spec
+            )
+        drive = (
+            prepared_connection.from_spikes(source)
+            if spike_list is not None
+            else prepared_connection(source)
+            if prepared_connection is not None
+            else _connection(source, connection_parameters, topology, spec)
         )
-        drive = _connection(source, connection_parameters, topology, spec)
         drive_shape = synapse_states[0].shape
         if not spec.get("merge_receptors", 0):
             drive = drive.reshape(drive_shape)
         current_spikes, current_neuron_states = spikes, neuron_states
         current_neuron_charged = neuron_charged
         if use_fused and time_index + 1 < x_seq.shape[0]:
-            spikes, neuron_states, synapse_states, next_charged, _ = fused_step_forward(
-                x_seq[time_index + 1],
-                drive,
-                tuple(neuron_states),
-                tuple(synapse_states),
-                tuple(neuron_parameters),
-                tuple(synapse_parameters),
-                neuron_spec,
-                synapse_spec,
-                backend=backend,
-                neuron_history_names=charged_names,
-                enable_fp_fusion=enable_fp_fusion,
-                precise_division=precise_division,
-                precise_exp=precise_exp,
-                glif_membrane_coefficients=glif_membrane_coefficients,
-                uniform=(None if uniform_seq is None else uniform_seq[time_index + 1]),
+            if prepared_step is None:
+                prepared_step = prepare_fused_step(
+                    x_seq[time_index + 1],
+                    drive,
+                    tuple(neuron_states),
+                    tuple(synapse_states),
+                    tuple(neuron_parameters),
+                    tuple(synapse_parameters),
+                    neuron_spec,
+                    synapse_spec,
+                    backend=backend,
+                    neuron_history_names=charged_names,
+                    enable_fp_fusion=enable_fp_fusion,
+                    precise_division=precise_division,
+                    precise_exp=precise_exp,
+                    neuron_prepared_parameters=prepared_parameters,
+                    psc_prepared_parameters=synapse_prepared_parameters,
+                    spike_list=spike_list,
+                    gradient_activity=(
+                        None
+                        if gradient_activity is None
+                        else gradient_activity[time_index + 1]
+                    ),
+                    uniform=(
+                        None if uniform_seq is None else uniform_seq[time_index + 1]
+                    ),
+                )
+                # Two working sets preserve the previous step until its
+                # records/checkpoint boundary has been consumed. Recorded
+                # states instead bind directly to their sequence destinations.
+                step_outputs = (
+                    prepared_step.allocate_outputs(),
+                    prepared_step.allocate_outputs(),
+                )
+            outputs = dict(step_outputs[time_index % 2])
+            outputs["spike"] = output_seq[time_index + 1]
+            bindings = {
+                "neuron_input": x_seq[time_index + 1],
+                "drive": drive,
+            }
+            if gradient_activity is not None:
+                bindings["gradient_activity"] = gradient_activity[time_index + 1]
+            for prefix, template, values, offset, record_time in (
+                ("neuron_", neuron_template, neuron_states, 0, time_index + 1),
+                (
+                    "psc_",
+                    synapse_template,
+                    synapse_states,
+                    len(neuron_states),
+                    time_index,
+                ),
+            ):
+                for index, (name, value) in enumerate(
+                    zip(template.state_names, values)
+                ):
+                    bindings[prefix + name + "_init"] = value
+                    record = histories.get(offset + index)
+                    if record is not None:
+                        outputs[prefix + name + "_final"] = record[record_time]
+            for index, name in enumerate(charged_names):
+                record = histories.get(len(initial_states) + index)
+                if record is not None:
+                    outputs["neuron_" + name + "_seq"] = record[
+                        time_index + 1
+                    ].unsqueeze(0)
+            if uniform_seq is not None:
+                bindings["neuron_uniform"] = uniform_seq[time_index + 1]
+            prepared_step.launch_into({**outputs, **bindings})
+            spikes = outputs["spike"]
+            neuron_states = [
+                outputs["neuron_" + name + "_final"]
+                for name in neuron_template.state_names
+            ]
+            synapse_states = [
+                outputs["psc_" + name + "_final"]
+                for name in synapse_template.state_names
+            ]
+            neuron_charged = tuple(
+                outputs["neuron_" + name + "_seq"][0] for name in charged_names
             )
-            neuron_states, synapse_states = list(neuron_states), list(synapse_states)
-            neuron_charged = tuple(value[0] for value in next_charged)
         else:
             if spec.get("merge_receptors", 0):
                 drive = drive.reshape(
@@ -391,6 +779,7 @@ def _trajectory(
                 enable_fp_fusion=enable_fp_fusion,
                 precise_division=precise_division,
                 precise_exp=precise_exp,
+                prepared_parameters=synapse_prepared_parameters,
             )
         states = [
             *current_neuron_states,
@@ -408,27 +797,45 @@ def _trajectory(
             # fused schedule without replaying a threshold decision.
             for target, value in zip(checkpoints, (*neuron_states, *synapse_states)):
                 target[checkpoint_index].copy_(value)
-        output_seq[time_index].copy_(current_spikes)
+        if not use_fused or time_index == 0:
+            output_seq[time_index].copy_(current_spikes)
         for name in history_names:
             if name < 0:
+                continue
+            if name == activity_index:
                 continue
             history_values = (*states, *current_neuron_charged)
             value = history_values[int(name)]
             if name not in histories:
                 histories[name] = value.new_empty((x_seq.shape[0], *value.shape))
-            histories[name][time_index].copy_(value)
+            # Native interior stages already wrote these records. Only
+            # the leading neuron and trailing PSC need copies.
+            ns, ss = len(neuron_states), len(synapse_states)
+            direct = use_fused and (
+                (name < ns and time_index > 0)
+                or (ns <= name < ns + ss and time_index + 1 < x_seq.shape[0])
+                or (name >= len(initial_states) and time_index > 0)
+                or (spec["delay"] and name == len(initial_states) - 1)
+            )
+            if not direct:
+                histories[name][time_index].copy_(value)
     # Custom operators must not alias their input or another output. Final
     # states are already independent tensor allocations for nonempty runs;
     # histories own one preallocated sequence allocation throughout forward.
     final = [*neuron_states, *synapse_states, *([ring] if spec["delay"] else [])]
+    if use_fused:
+        # Final outputs cannot alias a recorded trajectory under the functional
+        # custom-op schema. Copy once at the trajectory boundary, never per step.
+        final = [value.clone() for value in final]
     return [
-        output_seq,
+        output_seq.to(output_dtype),
         *final,
         *(
             histories[name] if name >= 0 else current_neuron_charged[-name - 1]
             for name in history_names
         ),
         *checkpoints,
+        *([output_seq] if spec.get("save_compute_spikes") else []),
     ]
 
 
@@ -502,18 +909,42 @@ def _fake(
     charged_names = spec.get("charged_names", ())
     template = get_template(decode_spec(spec["neuron"]))
     state_names = template.state_names
+    native = backend in _NATIVE_GPU_BACKENDS and x_seq.device.type == "cuda"
+    if native:
+        state_outputs = [
+            state.new_empty(state.shape, dtype=torch.float32) for state in states
+        ]
+        if spec["delay"]:
+            state_outputs[-1] = torch.empty_like(states[-1])
+    else:
+        state_outputs = [torch.empty_like(state) for state in states]
     history_sources = [
-        *states,
+        *state_outputs,
         *(
-            states[state_names.index(template.history_state_name(name))]
+            state_outputs[state_names.index(template.history_state_name(name))]
             for name in charged_names
         ),
     ]
+    if spec.get("gradient_activity") is not None:
+        if spec.get("gradient_list"):
+            from ...sparse.runtime.activity import GradientList
+
+            history_sources.append(
+                torch.empty(
+                    (GradientList.size(x_seq[0].numel()),),
+                    dtype=torch.int32,
+                    device=x_seq.device,
+                )
+            )
+        else:
+            history_sources.append(state_outputs[0])
     checkpoint_interval = int(spec.get("paired_checkpoint_interval", 0))
     n_checkpoints = _checkpoint_count(x_seq.shape[0], checkpoint_interval)
     return [
-        torch.empty_like(x_seq),
-        *(torch.empty_like(s) for s in states),
+        x_seq.new_empty(x_seq.shape)
+        if native or spec.get("save_compute_spikes")
+        else torch.empty_like(x_seq),
+        *state_outputs,
         *(
             history_sources[int(name)].new_empty(
                 (x_seq.shape[0], *history_sources[int(name)].shape)
@@ -524,8 +955,13 @@ def _fake(
         ),
         *(
             state.new_empty((n_checkpoints, *state.shape))
-            for state in states
+            for state in state_outputs
             if checkpoint_interval
+        ),
+        *(
+            [torch.empty(x_seq.shape, device=x_seq.device, dtype=torch.float32)]
+            if spec.get("save_compute_spikes")
+            else []
         ),
     ]
 
@@ -547,18 +983,19 @@ def _paired_checkpoint_state_reader(
     neuron_spec,
     psc_spec,
 ):
-    """Replay one native LIF + ExponentialPSC block at a time.
+    """Replay one template-qualified paired block at a time.
 
-    This is intentionally the first narrow recurrent residual layout: one
-    neuron state, one PSC state, no refractory state, delay or receptor merge.
-    Checkpoints hold the paired loop boundary ``(v[s], psc[s - 1])``.
+    The current representation excludes stochastic draws, refractory
+    state, delay and receptor merge. Template capabilities select
+    eligible cells. Checkpoints hold the staggered neuron/PSC boundary
+    between paired stages.
     """
-    from .backends.fused import fused_step_forward
+    from .backends.fused import prepare_fused_step
 
     interval = int(spec["paired_checkpoint_interval"])
     ns, ss = spec["neuron_states"], spec["synapse_states"]
-    if ns != 1 or ss != 1 or len(checkpoints) != ns + ss:
-        raise RuntimeError("Invalid paired LIF + ExponentialPSC checkpoint layout")
+    if len(checkpoints) != ns + ss:
+        raise RuntimeError("Paired checkpoint state count disagrees with the templates")
     (
         _,
         _,
@@ -569,6 +1006,23 @@ def _paired_checkpoint_state_reader(
     enable_fp_fusion = bool(spec.get("enable_fp_fusion", True))
     precise_division = bool(spec.get("precise_division", False))
     precise_exp = bool(spec.get("precise_exp", False))
+    neuron_prepared = prepare_parameters(neuron_spec, neuron_parameters)
+    psc_prepared = prepare_parameters(psc_spec, psc_parameters)
+    neuron_template = get_template(neuron_spec)
+    psc_template = get_template(psc_spec)
+    source_spikes = spikes_seq
+    source_workspace = _prepare_source(source_spikes[0], x_syn_seq, None, spec, None)
+    prepared_connection = _prepare_connection_forward(
+        source_workspace(source_spikes[0], None, 0)[0],
+        connection_parameters,
+        topology,
+        spec,
+    )
+    prepared_step = None
+    working_outputs = None
+    block_states = None
+    block_drives = None
+    replay_count = 0
     cached_block = -1
     cached_start = 0
     cached_states = ()
@@ -576,6 +1030,12 @@ def _paired_checkpoint_state_reader(
 
     def replay(block):
         nonlocal cached_block, cached_start, cached_states, cached_drives
+        nonlocal \
+            prepared_step, \
+            working_outputs, \
+            block_states, \
+            block_drives, \
+            replay_count
         start = block * interval
         stop = min(start + interval, x_seq.shape[0])
         if block == 0:
@@ -588,6 +1048,7 @@ def _paired_checkpoint_state_reader(
                 enable_fp_fusion=enable_fp_fusion,
                 precise_division=precise_division,
                 precise_exp=precise_exp,
+                prepared_parameters=neuron_prepared,
             )
             psc_states = list(initial_states[ns : ns + ss])
         else:
@@ -598,39 +1059,83 @@ def _paired_checkpoint_state_reader(
             psc_states = [
                 checkpoints[ns + index][checkpoint_index] for index in range(ss)
             ]
-        values = [[] for _ in range(ns + ss)]
-        drives = []
+        if block_states is None:
+            # A reverse stage may read neuron state from one block and PSC
+            # state from its predecessor. Two slots preserve both until the
+            # consuming launch completes, without retaining the full replay.
+            samples = (*neuron_states, *psc_states)
+            block_states = tuple(
+                tuple(value.new_empty((interval, *value.shape)) for value in samples)
+                for _ in range(2)
+            )
+            block_drives = tuple(
+                psc_states[0].new_empty((interval, *psc_states[0].shape))
+                for _ in range(2)
+            )
+        slot = replay_count % 2
+        replay_count += 1
+        values = block_states[slot]
+        drives = block_drives[slot]
+        for target, value in zip(values[:ns], neuron_states):
+            target[0].copy_(value)
+        neuron_states = [value[0] for value in values[:ns]]
         for time_index in range(start, stop):
-            source = (
-                spikes_seq[time_index].float() + x_syn_seq[time_index].float()
-            ).flatten(-len(spec["neuron_shape"]))
-            drive = _connection(source, connection_parameters, topology, spec)
-            drive = drive.reshape(psc_states[0].shape)
-            drives.append(drive)
-            current_neuron_states = tuple(neuron_states)
+            local_time = time_index - start
+            source = source_workspace(source_spikes[time_index], None, time_index)[0]
+            drive = (
+                prepared_connection(source)
+                if prepared_connection is not None
+                else _connection(source, connection_parameters, topology, spec)
+            )
+            # Reverse consumes these drives after replay. Preserve each once
+            # in the bounded block, rather than redoing sparse propagation.
+            drives[local_time].copy_(drive.reshape(psc_states[0].shape))
+            drive = drives[local_time]
             if time_index + 1 < x_seq.shape[0]:
-                (
-                    _,
-                    next_neuron_states,
-                    next_psc_states,
-                    _,
-                    _,
-                ) = fused_step_forward(
-                    x_seq[time_index + 1],
-                    drive,
-                    current_neuron_states,
-                    tuple(psc_states),
-                    tuple(neuron_parameters),
-                    tuple(psc_parameters),
-                    neuron_spec,
-                    psc_spec,
-                    backend=backend,
-                    enable_fp_fusion=enable_fp_fusion,
-                    precise_division=precise_division,
-                    precise_exp=precise_exp,
-                )
-                neuron_states = list(next_neuron_states)
-                psc_states = list(next_psc_states)
+                if prepared_step is None:
+                    prepared_step = prepare_fused_step(
+                        x_seq[time_index + 1],
+                        drive,
+                        tuple(neuron_states),
+                        tuple(psc_states),
+                        tuple(neuron_parameters),
+                        tuple(psc_parameters),
+                        neuron_spec,
+                        psc_spec,
+                        backend=backend,
+                        enable_fp_fusion=enable_fp_fusion,
+                        precise_division=precise_division,
+                        precise_exp=precise_exp,
+                        neuron_prepared_parameters=neuron_prepared,
+                        psc_prepared_parameters=psc_prepared,
+                    )
+                    working_outputs = (
+                        prepared_step.allocate_outputs(),
+                        prepared_step.allocate_outputs(),
+                    )
+                outputs = dict(working_outputs[slot])
+                bindings = {"neuron_input": x_seq[time_index + 1], "drive": drive}
+                for prefix, template, states, offset, record_time in (
+                    ("neuron_", neuron_template, neuron_states, 0, local_time + 1),
+                    ("psc_", psc_template, psc_states, ns, local_time),
+                ):
+                    for index, (name, value) in enumerate(
+                        zip(template.state_names, states)
+                    ):
+                        bindings[prefix + name + "_init"] = value
+                        if record_time < stop - start:
+                            outputs[prefix + name + "_final"] = values[offset + index][
+                                record_time
+                            ]
+                prepared_step.launch_into({**outputs, **bindings})
+                neuron_states = [
+                    outputs["neuron_" + name + "_final"]
+                    for name in neuron_template.state_names
+                ]
+                psc_states = [
+                    outputs["psc_" + name + "_final"]
+                    for name in psc_template.state_names
+                ]
             else:
                 _, psc_states, _ = _cell_forward(
                     drive,
@@ -641,13 +1146,14 @@ def _paired_checkpoint_state_reader(
                     enable_fp_fusion=enable_fp_fusion,
                     precise_division=precise_division,
                     precise_exp=precise_exp,
+                    prepared_parameters=psc_prepared,
                 )
-            for target, value in zip(values, (*current_neuron_states, *psc_states)):
-                target.append(value)
+                for target, value in zip(values[ns:], psc_states):
+                    target[local_time].copy_(value)
         cached_block = block
         cached_start = start
-        cached_states = tuple(tuple(state_values) for state_values in values)
-        cached_drives = tuple(drives)
+        cached_states = tuple(value[: stop - start] for value in values)
+        cached_drives = drives[: stop - start]
 
     def state(index, time_index):
         if time_index < 0:
@@ -684,8 +1190,9 @@ def _reverse_paired(
     backend,
 ):
     """Reverse the tail PSC, paired stages, and leading neuron in order."""
-    from .backends.fused import fused_step_backward
+    from .backends.fused import prepare_fused_backward
 
+    input_dtype = x_seq.dtype
     neuron_spec, psc_spec = (
         decode_spec(spec["neuron"], spec["dt"]),
         decode_spec(spec["synapse"], spec["dt"]),
@@ -697,8 +1204,11 @@ def _reverse_paired(
     _, _, neuron_parameters, psc_parameters, connection_parameters = _parts(
         initial_states, parameters, spec
     )
-    glif_membrane_coefficients = _glif_membrane_coefficients(
+    prepared_parameters = prepare_parameters(
         neuron_spec, neuron_parameters, backward=True
+    )
+    psc_prepared_parameters = prepare_parameters(
+        psc_spec, psc_parameters, backward=True
     )
     ns, ss, n_initial = (
         spec["neuron_states"],
@@ -714,7 +1224,10 @@ def _reverse_paired(
         torch.zeros_like(p) if need else None
         for p, need in zip(parameters, needs[2 + n_initial :])
     ]
-    grad_x, grad_x_syn = torch.empty_like(x_seq), torch.empty_like(x_syn_seq)
+    grad_x = torch.empty(x_seq.shape, device=x_seq.device, dtype=torch.float32)
+    grad_x_syn = torch.empty(
+        x_syn_seq.shape, device=x_syn_seq.device, dtype=x_syn_seq.dtype
+    )
     records = {int(name): value for name, value in zip(history_names, histories)}
     grad_records = {
         int(name): value for name, value in zip(history_names, grad_history)
@@ -752,15 +1265,18 @@ def _reverse_paired(
             zero_record_gradients[index] if gradient is None else gradient[time_index]
         )
 
+    source_spikes = spikes_seq
+    source_workspace = _prepare_source(
+        source_spikes[0],
+        x_syn_seq,
+        initial_states[-1] if spec["delay"] else x_seq.new_empty(0),
+        spec,
+        None,
+    )
+
     def source(time_index):
-        raw_spikes = spikes_seq[time_index].float() + x_syn_seq[time_index].float()
-        raw_spikes = raw_spikes.flatten(-len(spec["neuron_shape"]))
-        ring = (
-            state(n_initial - 1, time_index - 1)
-            if spec["delay"]
-            else x_seq.new_empty(0)
-        )
-        return _source(raw_spikes, ring, spec["delay"])[0]
+        ring = state(n_initial - 1, time_index - 1) if spec["delay"] else None
+        return source_workspace(source_spikes[time_index], ring, time_index)[0]
 
     def add_parameters(values, start):
         for i, value in enumerate(values):
@@ -771,7 +1287,31 @@ def _reverse_paired(
     grad_psc_states = list(grad_states[ns : ns + ss])
     grad_ring = grad_states[-1] if spec["delay"] else None
     last_source = source(last)
-    drive = _connection(last_source, connection_parameters, topology, spec)
+    activity_seq = records.get(spec.get("gradient_activity"))
+
+    def activity(time_index):
+        if activity_seq is not None and spec.get("gradient_list"):
+            from ...sparse.runtime.activity import GradientList
+
+            return GradientList(activity_seq[time_index], last_source.numel())
+        return (
+            None
+            if activity_seq is None
+            else activity_seq[time_index].reshape(last_source.shape)
+        )
+
+    prepared_connection = _prepare_connection_forward(
+        last_source, connection_parameters, topology, spec
+    )
+
+    def connection(source):
+        return (
+            prepared_connection(source)
+            if prepared_connection is not None
+            else _connection(source, connection_parameters, topology, spec)
+        )
+
+    drive = connection(last_source)
     if spec.get("merge_receptors", 0):
         drive = drive.reshape(*drive.shape[:-1], -1, spec["merge_receptors"]).sum(-1)
     previous_psc = tuple(state(ns + i, last - 1) for i in range(ss))
@@ -809,6 +1349,7 @@ def _reverse_paired(
         enable_fp_fusion=enable_fp_fusion,
         precise_division=precise_division,
         precise_exp=precise_exp,
+        prepared_parameters=psc_prepared_parameters,
     )
     add_parameters(grad_psc_parameters, np)
     if spec.get("merge_receptors", 0):
@@ -821,6 +1362,17 @@ def _reverse_paired(
             )
             .flatten(-2)
         )
+    prepared_connection_backward = _prepare_connection_backward(
+        last_source,
+        connection_parameters,
+        topology,
+        spec,
+        grad_drive.reshape(*last_source.shape[:-1], -1),
+        connection_needs,
+        activity=activity(last),
+        grad_values=gradients[offset] if connection_parameters else None,
+    )
+    prepared_backward = None
     for time_index in range(last, -1, -1):
         step_source = source(time_index)
         grad_source, connection_gradients = _connection_backward(
@@ -830,6 +1382,8 @@ def _reverse_paired(
             spec,
             grad_drive.reshape(*step_source.shape[:-1], -1),
             connection_needs,
+            prepared=prepared_connection_backward,
+            activity=activity(time_index),
         )
         add_parameters(connection_gradients, offset)
         if spec["delay"]:
@@ -840,13 +1394,18 @@ def _reverse_paired(
                 + grad_ring
                 + record_gradient(n_initial - 1, time_index)
             )
-            grad_spikes = grad_ring_next[0].reshape(spikes_seq[time_index].shape)
+            grad_spikes = (
+                grad_ring_next[0]
+                .to(spikes_seq.dtype)
+                .reshape(spikes_seq[time_index].shape)
+            )
             grad_ring = torch.cat(
                 (grad_ring_next[1:], torch.zeros_like(grad_ring_next[:1])), dim=0
             )
         else:
             grad_spikes = grad_source.reshape(spikes_seq[time_index].shape)
-        grad_x_syn[time_index] = grad_spikes
+        if x_syn_seq.numel():
+            grad_x_syn[time_index] = grad_spikes
         grad_neuron_states = [
             value + record_gradient(i, time_index)
             for i, value in enumerate(grad_neuron_states)
@@ -861,7 +1420,7 @@ def _reverse_paired(
             previous_drive = (
                 replayed_drive(time_index - 1)
                 if replayed_drive is not None
-                else _connection(previous_source, connection_parameters, topology, spec)
+                else connection(previous_source)
             )
             previous_psc = tuple(state(ns + i, time_index - 2) for i in range(ss))
             grad_psc_records = {
@@ -869,6 +1428,31 @@ def _reverse_paired(
                 for i, name in enumerate(psc_state_names)
                 if (gradient := grad_records.get(ns + i)) is not None
             }
+            if prepared_backward is None:
+                prepared_backward = prepare_fused_backward(
+                    x_seq[time_index],
+                    previous_drive,
+                    previous_neuron,
+                    previous_psc,
+                    tuple(neuron_parameters),
+                    tuple(psc_parameters),
+                    neuron_spec,
+                    psc_spec,
+                    grad_output[time_index] + grad_spikes,
+                    tuple(grad_neuron_states),
+                    tuple(grad_psc_states),
+                    authoritative_spike=spikes_seq[time_index],
+                    grad_neuron_records=neuron_records,
+                    grad_psc_records=grad_psc_records,
+                    needs_neuron_parameters=neuron_needs,
+                    needs_psc_parameters=psc_needs,
+                    backend=backend,
+                    enable_fp_fusion=enable_fp_fusion,
+                    precise_division=precise_division,
+                    precise_exp=precise_exp,
+                    neuron_prepared_parameters=prepared_parameters,
+                    psc_prepared_parameters=psc_prepared_parameters,
+                )
             (
                 gx,
                 grad_drive,
@@ -876,32 +1460,22 @@ def _reverse_paired(
                 grad_psc_states,
                 grad_neuron_parameters,
                 grad_psc_parameters,
-            ) = fused_step_backward(
-                x_seq[time_index].float(),
+            ) = prepared_backward.backward(
+                x_seq[time_index],
                 previous_drive,
                 previous_neuron,
                 previous_psc,
-                tuple(neuron_parameters),
-                tuple(psc_parameters),
-                neuron_spec,
-                psc_spec,
                 grad_output[time_index] + grad_spikes,
                 tuple(grad_neuron_states),
                 tuple(grad_psc_states),
                 authoritative_spike=spikes_seq[time_index],
                 grad_neuron_records=neuron_records,
                 grad_psc_records=grad_psc_records,
-                needs_neuron_parameters=neuron_needs,
-                needs_psc_parameters=psc_needs,
-                backend=backend,
-                enable_fp_fusion=enable_fp_fusion,
-                precise_division=precise_division,
-                precise_exp=precise_exp,
-                glif_membrane_coefficients=glif_membrane_coefficients,
+                destinations={"grad_neuron_input": grad_x[time_index]},
             )
             add_parameters(grad_psc_parameters, np)
         else:
-            current = x_seq[0].float() + _current(initial_states[ns], spec)
+            current = x_seq[0] + _current(initial_states[ns], spec)
             gx, grad_neuron_states, grad_neuron_parameters = _cell_backward(
                 current,
                 previous_neuron,
@@ -916,7 +1490,7 @@ def _reverse_paired(
                 enable_fp_fusion=enable_fp_fusion,
                 precise_division=precise_division,
                 precise_exp=precise_exp,
-                glif_membrane_coefficients=glif_membrane_coefficients,
+                prepared_parameters=prepared_parameters,
                 authoritative_output=spikes_seq[0],
             )
             grad_current = gx
@@ -931,10 +1505,11 @@ def _reverse_paired(
             grad_psc_states[0] = grad_psc_states[0] + grad_current.reshape(
                 grad_psc_states[0].shape
             )
-        grad_x[time_index] = gx
+        if time_index == 0:
+            grad_x[time_index].copy_(gx)
         add_parameters(grad_neuron_parameters, 0)
     result = [
-        grad_x,
+        grad_x.to(input_dtype),
         grad_x_syn,
         *grad_neuron_states,
         *grad_psc_states,
@@ -1012,7 +1587,7 @@ def _reverse_impl(
         current = x_seq[time_index] + _current(previous[ns], spec)
         spikes = spikes_seq[time_index]
         source, _ = _source(
-            (spikes.float() + x_syn_seq[time_index].float()).flatten(
+            _spike_input(spikes, x_syn_seq, time_index).flatten(
                 -len(spec["neuron_shape"])
             ),
             previous[-1] if spec["delay"] else x_seq.new_empty(0),
@@ -1068,14 +1643,15 @@ def _reverse_impl(
                 )
                 + grad_states[-1]
             )
-            grad_spikes = grad_ring_next[0]
+            grad_spikes = grad_ring_next[0].to(spikes.dtype)
             grad_ring = torch.cat(
                 (grad_ring_next[1:], torch.zeros_like(grad_ring_next[:1])), dim=0
             )
         else:
             grad_spikes, grad_ring = grad_source, None
         grad_spikes = grad_spikes.reshape(spikes.shape)
-        grad_x_syn[time_index] = grad_spikes
+        if x_syn_seq.numel():
+            grad_x_syn[time_index] = grad_spikes
         gx, grad_neuron_previous, grad_neuron_parameters = _cell_backward(
             current,
             previous[:ns],
@@ -1168,7 +1744,7 @@ def reverse(
             "Cell backend or model registration changed between forward and backward; "
             "complete outstanding backward passes before replacing registrations"
         )
-    return _reverse_impl(
+    gradients = _reverse_impl(
         x_seq,
         x_syn_seq,
         spikes_seq,
@@ -1185,6 +1761,14 @@ def reverse(
         needs,
         backend,
     )
+    # The custom-op boundary returns cotangents in the original storage dtype.
+    # Calculation buffers remain private; no forward inputs are coerced.
+    return [
+        gradient.to(original.dtype) if gradient is not None else None
+        for gradient, original in zip(
+            gradients, (x_seq, x_syn_seq, *states, *parameters)
+        )
+    ]
 
 
 @reverse.register_fake
@@ -1241,14 +1825,28 @@ def _setup(ctx, inputs, output):
         model_template_revision(decode_spec(spec[name]).model)
         for name in ("neuron", "synapse")
     ]
+    activity_index = spec.get("gradient_activity")
+    nondifferentiable = []
+    if activity_index is not None:
+        position = history_names.index(activity_index)
+        nondifferentiable.append(output[1 + len(states) + position])
+    if spec.get("save_compute_spikes"):
+        compute_spikes = output[-1]
+        recorded_outputs = output[:-1]
+        nondifferentiable.append(compute_spikes)
+    else:
+        compute_spikes = output[0]
+        recorded_outputs = output
+    if nondifferentiable:
+        ctx.mark_non_differentiable(*nondifferentiable)
     ctx.save_for_backward(
         x_seq,
         x_syn_seq,
         *states,
         *parameters,
         *topology,
-        *output[1 + len(states) :],
-        output[0],
+        *recorded_outputs[1 + len(states) :],
+        compute_spikes,
         dt,
     )
     ctx.set_materialize_grads(False)

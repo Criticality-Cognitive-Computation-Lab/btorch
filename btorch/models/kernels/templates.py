@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .contracts import CellSpec
+from .contracts import NeuronSpec
 
 
 @dataclass(frozen=True)
@@ -17,10 +17,28 @@ class BackendFragments:
     Args:
         forward: Statements in the fixed charge, adapt, fire, reset order.
         backward: Statements in the reverse reset, fire, adapt, charge order.
+        record_vjp_after: State-record cotangents that must be joined after a
+            declared reverse statement to preserve floating-point association.
     """
 
     forward: tuple[str, ...]
     backward: tuple[str, ...]
+    record_vjp_after: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class PreparedParameter:
+    """Declare a reusable computed value and its scalar-template binding.
+
+    Args:
+        name: Tensor name returned by the template's preparation callback.
+        scalar_name: Scalar register consumed by the existing math fragments.
+        shape_source: Declared parameter supplying its logical tensor layout.
+    """
+
+    name: str
+    scalar_name: str
+    shape_source: str
 
 
 @dataclass(frozen=True)
@@ -36,6 +54,20 @@ class ModelTemplate:
             axes, as pairs of state names and axis counts.
         history_sources: Shape sources for non-state records, as pairs of
             history names and state names.
+        parameter_extra_dims: Extra trailing parameter axes, beyond the shared
+            batch/neuron layout, declared like state_extra_dims.
+        prepared_parameters: Optional computed tensor declarations shared by
+            primitive and recurrent kernel binding.
+        prepare_parameters: Optional callback accepting the specification,
+            named live parameters and a backward flag. Return declared tensor
+            values without changing Module memories or parameter ownership.
+        recurrent_checkpoint: Whether this template supports the current paired
+            recurrent checkpoint representation. This is a capability, not a
+            request to enable checkpointing for every use of the template.
+        spike_gradient_input: Forward scalar register passed to the spike
+            surrogate, if its output adjoint enters only through that
+            surrogate. This permits exact support masking without suppressing
+            physical-state adjoints or interpreting model-specific equations.
     """
 
     name: str
@@ -44,6 +76,15 @@ class ModelTemplate:
     history_names: tuple[str, ...]
     state_extra_dims: tuple[tuple[str, int], ...] = ()
     history_sources: tuple[tuple[str, str], ...] = ()
+    parameter_extra_dims: tuple[tuple[str, int], ...] = ()
+    prepared_parameters: tuple[PreparedParameter, ...] = ()
+    prepare_parameters: Callable | None = None
+    recurrent_checkpoint: bool = False
+    spike_gradient_input: str | None = None
+
+    def extra_dims(self, name: str) -> int:
+        """Return the declared trailing state/parameter axis count."""
+        return dict((*self.state_extra_dims, *self.parameter_extra_dims)).get(name, 0)
 
     def history_state_name(self, name: str) -> str:
         """Look up the state supplying a declared history's shape.
@@ -82,7 +123,7 @@ class ResidualTemplate:
     @property
     def encoded(self) -> str:
         """Return stable lowering metadata independent from
-        :class:`CellSpec`."""
+        :class:`NeuronSpec`."""
         checkpoint = self.checkpoint_state or ""
         histories = ",".join(self.histories)
         return (
@@ -103,7 +144,7 @@ def decode_residual_template(encoded: str) -> ResidualTemplate:
     )
 
 
-def residual_template(spec: CellSpec, requested: tuple[str, ...]) -> ResidualTemplate:
+def residual_template(spec: NeuronSpec, requested: tuple[str, ...]) -> ResidualTemplate:
     """Select the built-in primitive reverse representation.
 
     GLIF adaptation is replayed from block checkpoints unless the caller
@@ -253,13 +294,35 @@ def register_model_template(
     _MODEL_REVISIONS[template.name] = _MODEL_REVISIONS.get(template.name, 0) + 1
 
 
-def get_reference_callbacks(spec: CellSpec):
+def get_reference_callbacks(spec: NeuronSpec):
     """Look up explicit external recurrences without parsing their code."""
     entry = _EXTERNAL_MODELS.get(spec.model)
     return None if entry is None else entry[1:]
 
 
-def get_template(spec: CellSpec) -> ModelTemplate:
+def _prepare_glif_parameters(spec, parameters, *, backward):
+    from ..ode import _exp_euler_coefficient
+
+    tau = parameters["tau"]
+    phi, delta = _exp_euler_coefficient(-1.0 / tau, spec.dt)
+    values = {"glif_phi_coefficient": phi}
+    if backward:
+        values["glif_delta_coefficient"] = delta
+    return values
+
+
+def prepare_parameters(spec, parameters, *, backward=False):
+    """Prepare template-declared values once for the requested execution
+    pass."""
+    template = get_template(spec)
+    if template.prepare_parameters is None:
+        return {}
+    return template.prepare_parameters(
+        spec, dict(zip(template.parameter_names, parameters)), backward=backward
+    )
+
+
+def get_template(spec: NeuronSpec) -> ModelTemplate:
     """Resolve a named cell and validate its static supported options."""
     if spec.model in _EXTERNAL_MODELS:
         return _EXTERNAL_MODELS[spec.model][0]
@@ -277,6 +340,14 @@ def get_template(spec: CellSpec) -> ModelTemplate:
         raise NotImplementedError(f"Unsupported surrogate: {spec.surrogate!r}")
     if (spec.surrogate == "poisson") != (spec.poisson is not None):
         raise ValueError("Poisson surrogate and options must be selected together")
+    if spec.surrogate_width is not None and (
+        not math.isfinite(spec.surrogate_width)
+        or spec.surrogate_width <= 0
+        or spec.surrogate == "poisson"
+    ):
+        raise ValueError(
+            "surrogate_width requires a finite positive deterministic support"
+        )
     state_names, parameter_names = _MODELS[spec.model]
     if spec.poisson is not None:
         if "v" not in state_names and "u" not in state_names:
@@ -329,4 +400,16 @@ def get_template(spec: CellSpec) -> ModelTemplate:
             for name in history_names
             if name.endswith("_charged")
         ),
+        parameter_extra_dims=(("k", 1), ("asc_amps", 1))
+        if spec.model == "glif3"
+        else (),
+        prepared_parameters=(
+            PreparedParameter("glif_phi_coefficient", "glif_phi", "tau"),
+            PreparedParameter("glif_delta_coefficient", "glif_delta", "tau"),
+        )
+        if spec.model == "glif3"
+        else (),
+        prepare_parameters=_prepare_glif_parameters if spec.model == "glif3" else None,
+        recurrent_checkpoint=spec.model in ("lif", "exponential"),
+        spike_gradient_input="norm" if "v" in state_names else None,
     )

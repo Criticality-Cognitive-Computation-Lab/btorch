@@ -269,6 +269,11 @@ class CudaGraphRunner:
         return (
             tuple(describe(a) for a in args),
             tuple(sorted((k, describe(v)) for k, v in kwargs.items())),
+            # Identical FP32 inputs can capture different GEMMs under AMP.
+            # Replaying a graph from another policy silently changes results.
+            torch.get_autocast_dtype("cuda")
+            if torch.is_autocast_enabled("cuda")
+            else None,
         )
 
     @staticmethod

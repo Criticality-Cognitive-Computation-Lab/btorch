@@ -7,7 +7,8 @@ direct queue or a hash queue; consumer kernels then execute those queues.  The
 hash consumer aggregates destinations in a worker-local table before merging
 the table into the output.
 
-Only float32 CUDA tensors with a two-dimensional dense input are supported.
+Floating CUDA operands retain their storage dtype and use promoted output
+precision. FP16/BF16 contributions accumulate in FP32; FP64 stays FP64.
 All topology and workspace construction belongs in :func:`prepare`, so a
 prepared state can be used from a CUDA-graph-captured region without allocating
 or synchronising on the forward path.
@@ -23,6 +24,7 @@ from dataclasses import dataclass, field
 import torch
 from torch import Tensor
 
+from . import kernels_torch, kernels_triton
 from .backend import KernelCache
 
 
@@ -67,7 +69,7 @@ class TaskQueueWorkspace:
     hash_queue: Tensor
     counts: Tensor
     hash_keys: Tensor
-    hash_values: Tensor
+    hash_values: dict[torch.dtype, Tensor]
 
 
 @dataclass
@@ -127,7 +129,8 @@ if _TRITON_AVAILABLE:
         hash_queue_ptr,
         counts_ptr,
         n_tasks: tl.constexpr,
-        n_sources: tl.constexpr,
+        x_batch_stride: tl.constexpr,
+        x_source_stride: tl.constexpr,
         block_sources: tl.constexpr,
         enable_hash: tl.constexpr,
     ):
@@ -140,7 +143,9 @@ if _TRITON_AVAILABLE:
         )
         source_mask = sources >= 0
         safe_sources = tl.where(source_mask, sources, 0)
-        spikes = tl.load(x_ptr + bucket * n_sources + safe_sources)
+        spikes = tl.load(
+            x_ptr + bucket * x_batch_stride + safe_sources * x_source_stride
+        )
         active = tl.sum(tl.where(source_mask & (spikes != 0.0), 1, 0), axis=0) > 0
         use_hash = enable_hash & tl.load(task_hashable_ptr + task)
 
@@ -165,7 +170,8 @@ if _TRITON_AVAILABLE:
         queue_ptr,
         count_ptr,
         output_ptr,
-        n_sources: tl.constexpr,
+        x_batch_stride: tl.constexpr,
+        x_source_stride: tl.constexpr,
         n_destinations: tl.constexpr,
         block_edges: tl.constexpr,
         num_programs: tl.constexpr,
@@ -184,10 +190,12 @@ if _TRITON_AVAILABLE:
             sources = tl.load(source_ptr + edges, mask=edge_mask, other=0)
             destinations = tl.load(destination_ptr + edges, mask=edge_mask, other=0)
             weights = tl.load(weight_ptr + edges, mask=edge_mask, other=0.0)
-            spikes = tl.load(x_ptr + bucket * n_sources + sources)
+            spikes = tl.load(
+                x_ptr + bucket * x_batch_stride + sources * x_source_stride
+            )
             tl.atomic_add(
                 output_ptr + bucket * n_destinations + destinations,
-                spikes * weights,
+                kernels_triton._multiply(spikes, weights),
                 mask=edge_mask & (spikes != 0.0),
             )
             task_slot += num_programs
@@ -204,7 +212,8 @@ if _TRITON_AVAILABLE:
         hash_keys_ptr,
         hash_values_ptr,
         output_ptr,
-        n_sources: tl.constexpr,
+        x_batch_stride: tl.constexpr,
+        x_source_stride: tl.constexpr,
         n_destinations: tl.constexpr,
         block_edges: tl.constexpr,
         hash_capacity: tl.constexpr,
@@ -232,8 +241,10 @@ if _TRITON_AVAILABLE:
             sources = tl.load(source_ptr + edges, mask=edge_mask, other=0)
             destinations = tl.load(destination_ptr + edges, mask=edge_mask, other=-2)
             weights = tl.load(weight_ptr + edges, mask=edge_mask, other=0.0)
-            spikes = tl.load(x_ptr + bucket * n_sources + sources)
-            contributions = spikes * weights
+            spikes = tl.load(
+                x_ptr + bucket * x_batch_stride + sources * x_source_stride
+            )
+            contributions = kernels_triton._multiply(spikes, weights)
             valid = edge_mask & (spikes != 0.0)
 
             unsigned_destinations = destinations.to(tl.uint32)
@@ -331,7 +342,7 @@ def _compatible_workspace(
         workspace is not None
         and workspace.queue_capacity >= queue_capacity
         and workspace.direct_queue.device == device
-        and workspace.hash_values.dtype == dtype
+        and kernels_torch._accumulation_dtype(dtype) in workspace.hash_values
         and workspace.hash_keys.shape[1] == _HASH_CAPACITY
         and workspace.worker_count >= min(_MAX_WORKERS, max(1, queue_capacity))
     )
@@ -363,9 +374,13 @@ def _ensure_workspace(
         hash_keys=torch.empty(
             (worker_count, _HASH_CAPACITY), device=device, dtype=torch.int32
         ),
-        hash_values=torch.empty(
-            (worker_count, _HASH_CAPACITY), device=device, dtype=dtype
-        ),
+        hash_values={
+            kernels_torch._accumulation_dtype(dtype): torch.empty(
+                (worker_count, _HASH_CAPACITY),
+                device=device,
+                dtype=kernels_torch._accumulation_dtype(dtype),
+            )
+        },
     )
 
 
@@ -484,7 +499,7 @@ def _task_state(
         or not t_crow.is_cuda
         or t_crow.device != t_col.device
         or t_crow.device != t_perm.device
-        or dtype != torch.float32
+        or dtype not in kernels_torch._FLOAT_DTYPES
         or batch_size <= 0
         or t_crow.ndim != 1
         or t_col.ndim != 1
@@ -595,7 +610,7 @@ def prepare(
         t_col: Source-major destination ids, ``[nnz]``.
         t_perm: Destination-CSR position of each source-major edge.
         batch_size: Maximum batch size for the reusable queue workspace.
-        dtype: Dense value dtype; only ``torch.float32`` is supported.
+        dtype: Floating edge storage dtype, independent of activity dtype.
 
     Returns:
         A prepared :class:`PreparedTaskState`, or ``None`` when the task backend cannot
@@ -802,12 +817,12 @@ def run(
     Args:
         state: Prepared task state for the sparse pattern and batch capacity.
         packed_values: Edge values in ``state`` task order.
-        x: Float32 CUDA input with shape ``[batch, n_source]``.
+        x: Floating CUDA input with shape ``[batch, n_source]``.
         n_out: Number of destination neurons.
         cache: Runtime cache holding compiled Triton launch artefacts.
 
     Returns:
-        Float32 CUDA output with shape ``[batch, n_out]``.
+        Promoted floating CUDA output with shape ``[batch, n_out]``.
 
     Raises:
         TypeError: If the input contract is not supported by this kernel.
@@ -818,10 +833,10 @@ def run(
     if (
         x.ndim != 2
         or not x.is_cuda
-        or x.dtype != torch.float32
+        or x.dtype not in kernels_torch._FLOAT_DTYPES
         or x.device != state.task_pre_indices.device
     ):
-        raise TypeError("task kernels require a float32 CUDA x with shape [B, N].")
+        raise TypeError("task kernels require a floating CUDA x with shape [B, N].")
     if x.shape[1] != state.n_pre:
         raise ValueError(f"expected x.shape[1] == {state.n_pre}, got {x.shape[1]}.")
     if x.shape[0] > state.batch_capacity:
@@ -831,22 +846,31 @@ def run(
     if (
         packed_values.ndim != 1
         or packed_values.numel() != state.edge_count
-        or packed_values.dtype != torch.float32
+        or packed_values.dtype not in kernels_torch._FLOAT_DTYPES
         or packed_values.device != x.device
     ):
-        raise TypeError("packed_values must be a float32 CUDA tensor in task order.")
-    if not x.is_contiguous() or not packed_values.is_contiguous():
-        raise ValueError("task kernels require contiguous x and packed_values.")
+        raise TypeError("packed_values must be a floating CUDA tensor in task order.")
+    if not packed_values.is_contiguous():
+        raise ValueError("task values must be contiguous in their prepared edge order.")
     if n_out <= 0 or n_out > _INT32_MAX:
         raise ValueError(f"n_out must be in [1, {_INT32_MAX}], got {n_out}.")
 
     n_buckets = x.shape[0]
     n_tasks = state.task_count
-    output = torch.zeros((n_buckets, n_out), device=x.device, dtype=x.dtype)
+    output_dtype = torch.promote_types(x.dtype, packed_values.dtype)
+    compute_dtype = kernels_torch._accumulation_dtype(output_dtype)
+    output = torch.zeros((n_buckets, n_out), device=x.device, dtype=compute_dtype)
     if n_buckets == 0 or n_tasks == 0:
-        return output
+        return output.to(output_dtype)
 
     workspace = state.workspace if workspace is None else workspace
+    # A live producer can have greater precision than the packed weights.
+    # Retain each precision's hash storage instead of reallocating on steps
+    # or when a caller returns to a previously captured input dtype.
+    hash_values = workspace.hash_values.get(compute_dtype)
+    if hash_values is None:
+        hash_values = torch.empty_like(workspace.hash_keys, dtype=compute_dtype)
+        workspace.hash_values[compute_dtype] = hash_values
     counts = workspace.counts
     counts.zero_()
     queue_records = n_buckets * n_tasks
@@ -858,7 +882,8 @@ def run(
         workspace.hash_queue,
         counts,
         n_tasks=n_tasks,
-        n_sources=state.n_pre,
+        x_batch_stride=x.stride(0),
+        x_source_stride=x.stride(1),
         block_sources=_BLOCK_SOURCES,
         enable_hash=True,
         num_warps=1,
@@ -874,7 +899,8 @@ def run(
         workspace.direct_queue,
         counts,
         output,
-        n_sources=state.n_pre,
+        x_batch_stride=x.stride(0),
+        x_source_stride=x.stride(1),
         n_destinations=n_out,
         block_edges=_EDGE_BLOCK,
         num_programs=worker_count,
@@ -889,9 +915,10 @@ def run(
         workspace.hash_queue,
         counts[1:],
         workspace.hash_keys,
-        workspace.hash_values,
+        hash_values,
         output,
-        n_sources=state.n_pre,
+        x_batch_stride=x.stride(0),
+        x_source_stride=x.stride(1),
         n_destinations=n_out,
         block_edges=_EDGE_BLOCK,
         hash_capacity=_HASH_CAPACITY,
@@ -899,7 +926,7 @@ def run(
         num_programs=worker_count,
         num_warps=4,
     )
-    return output
+    return output.to(output_dtype)
 
 
 __all__ = [

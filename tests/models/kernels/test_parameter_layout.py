@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from btorch.models.kernels.backends.engine import _prepare, backward, forward
-from btorch.models.kernels.contracts import CellSpec
+from btorch.models.kernels.contracts import NeuronSpec
 from btorch.models.kernels.golden import python_module_sequence
 from btorch.models.kernels.templates import get_template
 from tests.models.kernels.helpers import GPU_BACKENDS, require_cuda_backend
@@ -64,7 +64,7 @@ def test_lif_reads_original_scalar_strided_offset_and_broadcast_storage(backend)
     require_cuda_backend(backend)
     torch.manual_seed(74)
     batch, neurons = 2, 5
-    spec = CellSpec("lif", dt=0.25, hard_reset=True)
+    spec = NeuronSpec("lif", dt=0.25, hard_reset=True)
     x_seq = (torch.rand(9, batch, neurons, device="cuda") * 0.7).requires_grad_()
     states = ((torch.rand(batch, neurons, device="cuda") * 0.2).requires_grad_(),)
 
@@ -124,7 +124,7 @@ def test_glif_mode_parameters_broadcast_with_original_strides(backend):
     require_cuda_backend(backend)
     torch.manual_seed(75)
     batch, neurons, modes = 2, 4, 3
-    spec = CellSpec("glif3", dt=0.5, hard_reset=True)
+    spec = NeuronSpec("glif3", dt=0.5, hard_reset=True)
     x_seq = (torch.rand(7, batch, neurons, device="cuda") * 0.4).requires_grad_()
     states = (
         (torch.rand(batch, neurons, device="cuda") * 0.1).requires_grad_(),
@@ -167,7 +167,7 @@ def test_lazy_negative_and_shared_low_precision_parameters(backend):
     require_cuda_backend(backend)
     torch.manual_seed(76)
     batch, neurons = 2, 4
-    spec = CellSpec("lif", dt=0.2, hard_reset=True)
+    spec = NeuronSpec("lif", dt=0.2, hard_reset=True)
     template = get_template(spec)
     history_names = template.history_names
     x_seq = (torch.rand(8, batch, neurons, device="cuda") * 0.6).requires_grad_()
@@ -180,13 +180,13 @@ def test_lazy_negative_and_shared_low_precision_parameters(backend):
 
     # A lazy negative view shares positive physical storage. Direct pointer
     # kernels must resolve that metadata before reading, and the one shared
-    # FP16 leaf used for c_m and tau should produce one reusable FP32 buffer.
+    # FP16 leaf used for c_m and tau stays in its original storage dtype.
     assert reset.is_neg() and reset.data_ptr() == positive_reset.data_ptr()
     prepared = _prepare(x_seq, states, parameters, spec, preserve_parameters=True)
     buffers = prepared[-2]
     assert not buffers["v_reset"].is_neg()
     assert buffers["c_m"] is buffers["tau"]
-    assert buffers["c_m"].dtype == torch.float32
+    assert buffers["c_m"].dtype == shared.dtype
 
     expected = python_module_sequence(x_seq, states, parameters, spec, history_names)
     actual = forward(backend, x_seq, states, parameters, spec, history_names)
