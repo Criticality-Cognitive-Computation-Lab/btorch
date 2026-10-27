@@ -55,3 +55,6 @@ coverage.xml
 .kilocode/
 .kilo/
 .playwright-mcp/
+
+# Local model benchmarks are not maintained source.
+/benchmarks/models/
