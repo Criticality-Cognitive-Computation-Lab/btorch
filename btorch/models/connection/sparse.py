@@ -105,11 +105,26 @@ class SparseConnection(Connection):
         method: Execution request independent of storage and hints: ``auto``
             uses planning policy, ``pull`` requests destination-driven execution,
             and ``push`` requests spike-list SpMSpV. Unsupported explicit
-            requests raise rather than silently falling back.
+            requests raise rather than silently falling back. CUDA push uses
+            nondeterministic floating-point atomic accumulation: fixed seeds
+            and CUDA graphs do not guarantee identical recurrent spikes or
+            states. Select ``pull`` for reproducible sparse accumulation.
         device: Target device.
         dtype: Weight dtype. Defaults to the matrix dtype for btorch and
             PyTorch input, and to the PyTorch default dtype for SciPy input
             and for integer matrices.
+
+    Notes:
+        CUDA push reproducibility measurement: in a 1000-step FP32
+        Izhikevich/ExponentialPSC RSNN (60,000 neurons, 33,072,348 synthetic
+        edges, batch 1, dt=1 ms, approximately 5 Hz, RTX 5090), two repeat
+        comparisons reached a maximum voltage difference of 0.676 mV at
+        step 1000. Transient differences anywhere in the window approached
+        95 mV when reset times differed. One comparison had 12 differing
+        spike bins out of 60 million; the other had no spike differences
+        but did have state differences. Seeds and CUDA graphs do not remove
+        this nondeterminism. These are workload-specific observations, not
+        error bounds; longer recurrent trajectories can diverge substantially.
 
     Examples:
         >>> conn = SparseConnection(A)                         # doctest: +SKIP
@@ -1316,7 +1331,16 @@ class SparseConnection(Connection):
 
     @property
     def method(self) -> PropagationMethod:
-        """Explicit execution request; independent of activity hints."""
+        """Select execution independently of hints.
+
+        CUDA ``push`` uses nondeterministic atomic sums; recurrent spikes and
+        gradients can diverge even with fixed seeds or CUDA Graph replay.
+        Select ``pull`` for reproducible sparse accumulation. In one 1000-step
+        FP32 Izhikevich experiment, repeat differences reached 0.676 mV at
+        step 1000 and approximately 95 mV transiently at differing resets;
+        one repeat had 12 differing spike bins out of 60 million. See the
+        class notes for conditions; these values are not error bounds.
+        """
         return self._method
 
     @method.setter

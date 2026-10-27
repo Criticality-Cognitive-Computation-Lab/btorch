@@ -1214,8 +1214,14 @@ class HeterSynapsePSC(BasePSC):
         if receptor_type is None:
             result = psc
         else:
+            if (
+                isinstance(receptor_type, (str, tuple))
+                and self.receptor_type_index is None
+            ):
+                raise ValueError("Named receptor access requires receptor_type_index")
             has_pre_post = (
-                "pre_receptor_type" in self.receptor_type_index.columns
+                self.receptor_type_index is not None
+                and "pre_receptor_type" in self.receptor_type_index.columns
                 and "post_receptor_type" in self.receptor_type_index.columns
             )
 

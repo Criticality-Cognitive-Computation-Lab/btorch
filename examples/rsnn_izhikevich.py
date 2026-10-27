@@ -1,15 +1,25 @@
-"""Train/infer an Izhikevich + heterogeneous dual-exponential PSC RSNN.
+"""Run a recorded, low-rate Izhikevich RSNN and compare sparse execution.
 
     python -m examples.rsnn_izhikevich
-    python -m examples.rsnn_izhikevich --mode both --export-sonata /tmp/izh-circuit
-    python -m examples.rsnn_izhikevich --import-sonata \
-        /tmp/izh-circuit/circuit_config.json
 
-Two signed receptor channels have distinct rise/decay times, with no additional
-transmission delays. Connectivity is built sparsely; the larger reference
-configuration is --neurons 50000 --density 0.05. Use --device cuda
---neuron-backend triton --sparse-backend triton --method push for native push.
+Defaults: CUDA/Triton, 60,000 neurons, exactly 33,072,348 edges, 5000 steps
+at 1 ms, calibrated 5 Hz mean activity, and CUDA Graph inference. The script
+prints matched push-eager / pull-graph / push-graph timings with all recordings
+on, then saves v, u, spike, total PSC, signed EPSC and IPSC under fig/.
+FP32 push is not bitwise reproducible, even with fixed seeds or CUDA Graphs.
+
+The two heterogeneous dual-exponential receptors retain independent dynamics.
+For a small training run (inference capture is disabled during training):
+
+    python -m examples.rsnn_izhikevich --neurons 256 --density .05 \
+        --steps 256 --mode train --compile
+
+Use --no-compare to skip timing comparisons, --no-cudagraph for eager final
+inference, and --recordings PATH to choose the saved tensor archive. SONATA
+circuit import/export is available through --import-sonata/--export-sonata.
 """
+
+from dataclasses import replace
 
 import torch
 
@@ -18,14 +28,16 @@ from btorch.models.neurons import Izhikevich
 from btorch.models.rnn import RecurrentNN
 from btorch.models.surrogate import Sigmoid, Truncated
 from btorch.models.synapse import DualExponentialPSC, HeterSynapsePSC
-from examples.rsnn_common import ExampleOptions, build_connection, main
+from examples.rsnn_common import ExampleOptions, RunOptions, build_connection, main
 
 
 def build_model(options: ExampleOptions) -> RecurrentNN:
     """Build the Izhikevich/DualExponentialPSC circuit with two receptor
     channels."""
     n = options.neurons
-    connection = build_connection(options, weight_scale=0.04)
+    if options.edges is None:
+        options = replace(options, edges=round(n * n * options.density))
+    connection = build_connection(options, weight_scale=100 / 13, inhibitory_ratio=4.0)
     # Sparse BPTT uses the same truncated surrogate: zero derivative outside
     # the declared support in normalized threshold-distance units.
     function = Truncated(Sigmoid(alpha=100.0), width=0.25)
@@ -60,8 +72,7 @@ def build_model(options: ExampleOptions) -> RecurrentNN:
         "neuron.v",
         "neuron.u",
         "synapse.base_psc.psc",
-        "synapse.base_psc.g_rise",
-        "synapse.base_psc.g_decay",
+        "synapse.psc",
     )
     return RecurrentNN(
         neuron,
@@ -77,5 +88,44 @@ def build_model(options: ExampleOptions) -> RecurrentNN:
     ).to(options.device)
 
 
+def recording_view(
+    network: RecurrentNN, spikes: torch.Tensor, records: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """Keep signed receptor histories as EPSC/IPSC views of one CPU
+    transfer."""
+    receptor_psc = records["synapse.base_psc.psc"].cpu()
+    return {
+        "v": records["neuron.v"].cpu(),
+        "u": records["neuron.u"].cpu(),
+        "spike": spikes.cpu(),
+        "psc": records["synapse.psc"].cpu(),
+        "epsc": network.synapse.get_psc(0, psc=receptor_psc, validate_nan=False),
+        "ipsc": network.synapse.get_psc(1, psc=receptor_psc, validate_nan=False),
+    }
+
+
 if __name__ == "__main__":
-    main("izhikevich", build_model)
+    from pathlib import Path
+
+    main(
+        "izhikevich",
+        build_model,
+        defaults=ExampleOptions(
+            neurons=60_000,
+            density=33_072_348 / 60_000**2,
+            seed=42,
+            device="cuda",
+            neuron_backend="triton",
+            sparse_backend="triton",
+            method="push",
+            cudagraph=True,
+        ),
+        execution=RunOptions(
+            steps=5000,
+            target_rate_hz=5.0,
+            mode="inference",
+            compare=True,
+            recordings=Path("fig/rsnn_izhikevich/recordings.pt"),
+        ),
+        recording_view=recording_view,
+    )

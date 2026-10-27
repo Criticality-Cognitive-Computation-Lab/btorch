@@ -26,7 +26,7 @@
 - 对稀疏/连接组风格网络结构的实用支持
 - 原生 PyTorch 训练特性（`torch.compile`、检查点保存、截断时间反向传播）
 - 稳定的运行时性能和 ONNX 导出支持
-- 网络专用 SONATA 导入/导出（[Izhikevich RSNN 示例](examples/sonata_izhikevich.py)），灵活网络定义待推出
+- 网络专用 SONATA 导入/导出（[Izhikevich RSNN 示例](examples/rsnn_izhikevich.py)），灵活网络定义待推出
 
 深受 [brainstate](https://github.com/chaobrain/brainstate) 影响，
 从 [spikingjelly](https://github.com/fangwei123456/spikingjelly) 演化而来。
@@ -42,6 +42,10 @@
 - 更多神经元和突触模型
 - 具有静态大小并由 torch buffer 管理的记忆状态
   - 易于导出 onnx（注意：稀疏矩阵不受 onnx 支持）
+
+在 CUDA 上直接运行 `python -m examples.rsnn_izhikevich`，即可运行记录完整状态的
+6 万神经元、33,072,348 条边、约 5 Hz 示例，并对比 push/pull 和 eager/CUDA Graph，
+无需额外参数。见[示例指南](docs/zh/docs/examples.md)。
 
 ## Cell 后端与外部 kernel
 

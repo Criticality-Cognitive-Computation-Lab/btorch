@@ -1091,7 +1091,40 @@ Points to know before setting a hint:
 - **`"adaptive-push"` cannot be captured in a CUDA graph**, because it
   synchronises with the host to pack the spikes (see
   [CUDA graphs](#cuda-graphs-and-reduce-overhead)).
-- The gradient is the same deterministic one for all three algorithms.
+- Sparse-product backward uses the same derivative rule across algorithms;
+  different forward trajectories can still produce different gradients.
+
+### Measured recurrent reproducibility of FP32 push
+
+Fixed seeds and CUDA Graph replay do not make CUDA push bitwise reproducible.
+In one RTX 5090 experiment using btorch Izhikevich + ExponentialPSC,
+60,000 neurons, 33,072,348 synthetic edges, batch 1, `dt=1 ms`, and measured
+activity near 5 Hz, two independent FP32 push repeat comparisons gave:
+
+| Observation step | Largest voltage difference at that step, across the two comparisons |
+|---|---:|
+| 100 | 0.00257 mV |
+| 500 | 0.04715 mV |
+| 1000 | 0.67584 mV |
+
+These are differences **at each listed step**, not cumulative maxima or general
+error bounds. One comparison first differed in spikes at zero-based step 904,
+with 12 differing spike bins over all 1000 steps (60 million bins); the other had
+no spike differences but did have state differences. The maximum instantaneous
+voltage difference anywhere in the window approached 95 mV when one trajectory
+had reset and the other had not. Across-neuron voltage MAE at step 1000 was
+0.000103 mV in the first comparison. CUDA Graph/eager comparison also diverged.
+Longer runs can disagree substantially in individual spikes despite similar
+population firing rates. Results depend on weights, input, timestep and dynamics;
+these measurements are not a promised tolerance for another network.
+
+Holding spike input fixed, the largest repeated propagation difference was
+1.91e-6 pA. Both FP64 connection accumulation and a separate, exactly summable
+FP32-weight control eliminated all 1000-step differences in the measured cases.
+These controls support rounding amplification; they do not prove the absence of
+all races or recommend silently changing model weights or precision.
+Use `method="pull"` when reproducible sparse accumulation is required; other
+backend and precision differences can still affect whole-model parity.
 
 `conn.explain(x)` (also available as `sparse.explain(conn, x)`) returns a text
 report: the measured density of `x`, the edge count, the chosen algorithm with

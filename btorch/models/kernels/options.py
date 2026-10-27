@@ -24,7 +24,15 @@ class KernelOptions:
         connection_method: Explicit sparse execution method. ``auto`` inherits
             connection settings and hints; ``push`` requests spike-list SpMSpV,
             and ``pull`` requests destination-driven execution. Unsupported
-            explicit requests raise instead of falling back.
+            explicit requests raise instead of falling back. CUDA push is not
+            bitwise reproducible, including under CUDA Graph replay: rounding
+            differences can change later recurrent spikes and gradients. Use
+            ``pull`` when reproducible sparse accumulation is required. In a
+            1000-step FP32 Izhikevich/ExponentialPSC experiment (60k neurons,
+            33,072,348 edges, batch 1, dt=1 ms, about 5 Hz, RTX 5090), repeat
+            differences reached 0.676 mV at step 1000 and about 95 mV
+            transiently at differing resets; one repeat had 12 differing
+            spike bins out of 60 million. These are observations, not bounds.
         merge_synapse: Combine compatible linear receptor states explicitly.
             Independent trainable parameters cannot be merged by value.
         enable_fp_fusion: Permit the GPU compiler to contract compatible

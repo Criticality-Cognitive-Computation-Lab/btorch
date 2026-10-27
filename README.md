@@ -28,7 +28,7 @@ Use `btorch` if you need:
 - torch native training features (`torch.compile`, checkpointing,
   truncated BPTT)
 - solid runtime performance and ONNX export support
-- network-specific SONATA import/export ([Izhikevich RSNN example](examples/sonata_izhikevich.py)); flexible network definition coming soon
+- network-specific SONATA import/export ([Izhikevich RSNN example](examples/rsnn_izhikevich.py)); flexible network definition coming soon
 
 Heavily influenced by [brainstate](https://github.com/chaobrain/brainstate).
 Evolved from [spikingjelly](https://github.com/fangwei123456/spikingjelly).
@@ -44,6 +44,10 @@ We thank the developers of both libraries for the inspirations.
 - More neuron and synapse models
 - Memory state with static size and managed by torch buffer
   - onnx export is easy (note: sparse matrix is not supported by onnx)
+
+Run `python -m examples.rsnn_izhikevich` on CUDA for the recorded 60k-neuron,
+33,072,348-edge, ~5 Hz example. It compares push/pull and eager/CUDA Graph
+execution with no extra parameters; see [the examples guide](docs/en/docs/examples.md).
 
 ## Cell backends and external kernels
 

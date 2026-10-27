@@ -246,6 +246,15 @@ class RecurrentNNAbstract(base.MemoryModule):
         self.cudagraph = cudagraph
         self._cudagraph_runner = CudaGraphRunner(warmup=cudagraph_warmup)
 
+    def clear_cudagraph(self) -> None:
+        """Release cached CUDA graphs without resetting model memories.
+
+        Existing returned outputs remain independent of the replay pool.
+        Use this before comparing execution policies to release old
+        captures.
+        """
+        self._cudagraph_runner.reset()
+
     def _detect_loop_args(self, *args: Any) -> tuple[int, tuple[int, ...]]:
         """Infer ``(T, loop_args)`` from the first positional argument.
 
@@ -839,6 +848,8 @@ class RecurrentNN(RecurrentNNAbstract):
         )
         return (
             self.gradient,
+            None if self.update_state_names is None else tuple(self.update_state_names),
+            self.allow_buffer,
             options.neuron,
             options.connection,
             options.merge_synapse,
@@ -937,6 +948,23 @@ class RecurrentNN(RecurrentNNAbstract):
         from .kernels.recurrent import recurrent_sequence
 
         return recurrent_sequence(self, *args, loop_args=loop_args, **kwargs)
+
+    @partial(torch.compiler.disable, recursive=False)
+    def _stacked_chunk_forward(
+        self, *chunk_args, loop_args=(0,), unroll_size=1, **kwargs
+    ):
+        """Capture native trajectories without unbinding and restacking
+        records."""
+        if self.backend == "torch":
+            return super()._stacked_chunk_forward(
+                *chunk_args, loop_args=loop_args, unroll_size=unroll_size, **kwargs
+            )
+        self._reject_native_conductance_recurrence()
+        from .kernels.recurrent import recurrent_sequence
+
+        return recurrent_sequence(
+            self, *chunk_args, loop_args=loop_args, _chunk=True, **kwargs
+        )
 
     def _run_chunk_steps(self, *chunk_args, loop_args=(0,), unroll_size=1, **kwargs):
         self._reject_native_conductance_recurrence()

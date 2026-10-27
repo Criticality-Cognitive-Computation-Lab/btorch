@@ -36,6 +36,13 @@ def use_method(method: PropagationMethod):
 
     Args:
         method: ``auto``, destination-driven ``pull``, or spike-list ``push``.
+            CUDA push uses nondeterministic floating-point atomic sums; seeds
+            and CUDA graphs do not ensure identical recurrent trajectories.
+            Select ``pull`` for reproducible sparse accumulation. A measured
+            1000-step FP32 Izhikevich RSNN repeat reached 0.676 mV voltage
+            difference at step 1000 and about 95 mV transiently at differing
+            resets. These are not error bounds; see SparseConnection's class
+            notes for the workload and measured spike-bin differences.
     """
     validate_method(method)
     previous = getattr(_scope, "method", "auto")

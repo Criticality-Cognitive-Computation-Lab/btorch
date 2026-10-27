@@ -2,66 +2,90 @@
 
 `examples/` 目录包含可运行的脚本，演示了 btorch 的核心模式。本页面对每个示例进行了注解，并链接到相关的测试和 API 文档。
 
-## 两个 RSNN 示例：推理、训练和 SONATA
+## 两个 RSNN 示例：训练、推理与 SONATA
 
-| 脚本 | 神经元 / PSC | 连接 |
+| 脚本 | 模型 | 默认运行 |
 |---|---|---|
-| `rsnn.py` | GLIF3 + AlphaPSC | 两个异质 receptor 通道，0–3 个时间步的传播延迟 |
-| `rsnn_izhikevich.py` | Izhikevich + DualExponentialPSC | 两个不同上升/衰减时间的 receptor 通道，无额外传播延迟 |
+| `rsnn.py` | GLIF3 + 异质 AlphaPSC，延迟与 Dale 约束 | 256 个神经元，CPU，推理和训练，目标 7.5 Hz |
+| `rsnn_izhikevich.py` | Izhikevich + 异质双指数 PSC | 60,000 个神经元、33,072,348 条边，CUDA/Triton，CUDA Graph 推理，目标 5 Hz |
 
-在仓库根目录运行任一 CPU 示例：
+有 CUDA GPU 时，在仓库根目录直接运行：
 
 ```bash
-python -m examples.rsnn
 python -m examples.rsnn_izhikevich
 ```
 
-默认使用 256 个神经元，先推理，再训练三个 epoch。每个脚本的 `build_model`
-直接展示神经元、异质 PSC、状态记录和 `RecurrentNN` 的组合。
-`rsnn_common.py` 共享稀疏连接、状态初始化和执行循环；
-`rsnn_sonata.py` 提供显式的网络映射。
+无需额外设置。脚本复用 btorch 的 `FixedIndegree` 采样器生成精确边数，校准持续异质
+输入，运行 5000 步、每步 1 ms，并输出相同记录策略下 push eager、pull CUDA Graph、
+push CUDA Graph 的计时。构图、编译、校准、保存不计入稳态时间；公共 replay 的
+输入/状态复制和返回结果的所有权复制计入时间。一次 RTX 5090 实测平均 5.035 Hz：
+push eager 338 ms、pull Graph 1571 ms、push Graph 74 ms，分别加速约 4.6×、21.3×。
+这是该合成示例的一次实测，不保证其他硬件或网络达到同样加速比。
 
-输入和脉冲的形状均为 `[time, batch, neuron]`，示例的 batch size 为 1。
-时间单位为 ms，电压为 mV，输入电流为 pA。receptor 0 初始为兴奋性，
-receptor 1 初始为抑制性。GLIF 示例在每次 optimizer 更新后调用
-`constrain_net(network)`，通过 Dale 约束保持每个源神经元的 E/I 符号；
-Izhikevich 示例的可训练权重没有符号约束。PSC 按
-`post * 2 + receptor` 展平，每个神经元使用同一对不同的 receptor 时间常数，
-神经元自身参数也随神经元变化。
+默认保存 `fig/rsnn_izhikevich/recordings.pt`（本配置约 6.7 GiB），旁边的 JSON
+保存配置、实测率和计时。六个张量形状均为 `[time, batch, neuron]`：
 
-用 `--mode inference` 或 `--mode train` 可分别运行。每个训练 epoch
-视为独立试验并重新初始化物理状态，目标是合成的 20 Hz 放电率及电压惩罚，
-用于演示神经元参数和循环权重的梯度，不是科学模型拟合任务。
-连续推理时应只初始化一次，在连续输入块之间保留 memories。
+| 键 | 含义 | 单位 |
+|---|---|---|
+| `v` | reset 后膜电位 | mV |
+| `u` | Izhikevich 恢复状态 | pA |
+| `spike` | 发射的二值脉冲 | 无量纲 |
+| `psc` | 本步突触更新后的总带符号 PSC | pA |
+| `epsc` | receptor 0 的兴奋性电流 | pA |
+| `ipsc` | receptor 1 的抑制性电流 | pA |
 
-原生 CUDA 执行可独立选择神经元 / PSC 和连接后端：
+`psc = epsc + ipsc`，IPSC 为负。遵循 `RecurrentNN` 的前一 PSC 调度，step t
+记录的电流驱动 step t+1 神经元。EPSC/IPSC 是同一份传回 CPU 的 receptor 历史的
+视图，不额外启动逐步 kernel；三种执行策略都开启全部记录。完整历史及独立返回的
+Graph 输出需要较多显存，默认配置在 32 GiB RTX 5090 验证；小显存设备请显式缩小规模。
 
-```bash
-python -m examples.rsnn --device cuda --neuron-backend triton --sparse-backend triton --compile
-python -m examples.rsnn_izhikevich --device cuda --neuron-backend triton --sparse-backend triton --method push --compile
+```python
+import torch
+
+traces = torch.load("fig/rsnn_izhikevich/recordings.pt", weights_only=True, mmap=True)
+v = traces["v"][:, 0]  # CPU 上的 [time, neuron]
 ```
 
-`--method push` 显式使用 spike-list 传播，`pull` 使用相反的遍历方向。
-auto 模式在少于 4,000 个神经元时可使用稠密乘法，同时保持稀疏接口。
-`--compile` 支持训练；显式 `--cudagraph` 要求 `--device cuda --mode inference`。
+`--no-compare` 跳过计时对比，`--no-cudagraph` 将最终推理改为 eager，
+`--recordings PATH` 指定保存位置。对比过程会独立测试三种策略，与最终推理选择分开。
+**FP32 push 不保证逐位复现**，CUDA Graph 也不会消除这一限制；相近平均率不能代替
+脉冲、状态或梯度一致性。见[1000 步量化误差](guides/sparse_connectivity.md#push)。
 
-安装可选 IO 依赖后，可导出和导入两个网络：
+小规模训练：
+
+```bash
+python -m examples.rsnn
+python -m examples.rsnn_izhikevich --neurons 256 --density .05 --steps 256 --mode train --compile
+```
+
+`--mode both` 先推理再训练；训练阶段关闭显式推理 capture，`--compile` 使用 Torch
+自己的训练图机制。每个 epoch 重置物理 memories，优化 `--target-rate-hz` 和电压惩罚。
+GLIF 在 optimizer 更新后通过 `constrain_net(network)` 保持 Dale 符号，Izhikevich
+权重不受符号约束。`--edges E` 可覆盖 density，指定精确总边数。
+
+模型组合直接放在各脚本的 `build_model`；公共 CLI/执行逻辑位于 `rsnn_common.py`。
+通用校准复用 `btorch.analysis.compute_input_scale`，恢复 memories、记录及 Graph 配置，
+不改变模型参数。校准窗口最多 512 步，完整推理再检查实测率；不保证单神经元、稳态或
+训练参数更新后的放电率。持续推理只初始化一次并保留 memories；`clear_cudagraph()`
+清除缓存图但不重置状态，改变 native 记录策略会自动使旧 capture 失效。
+
+神经元/PSC 与连接后端独立选择。`--method push` 显式请求 spike-list SpMSpV，
+`pull` 使用目标驱动遍历；auto 可在展开算子维度均小于 4000 时内部使用 dense matmul，
+外部仍保持稀疏接口。
+
+两个示例都有 SONATA 导入/导出：
 
 ```bash
 pip install 'btorch[io]' libsonata
 python -m examples.rsnn --export-sonata /tmp/glif-circuit
 python -m examples.rsnn --import-sonata /tmp/glif-circuit/circuit_config.json
-python -m examples.rsnn_izhikevich --export-sonata /tmp/izh-circuit
-python -m examples.rsnn_izhikevich --import-sonata /tmp/izh-circuit/circuit_config.json
+python -m examples.rsnn_izhikevich --neurons 256 --density .05 --steps 256 --no-compare --export-sonata /tmp/izh-circuit
+python -m examples.rsnn_izhikevich --steps 256 --no-compare --import-sonata /tmp/izh-circuit/circuit_config.json
 ```
 
-导入恢复网络、梯度设置及时间步；`--neurons`、`--density`、`--seed` 和 `--dt`
-仅配置新构建的网络。执行后端仍由调用者选择。训练后的导出包含更新的参数，
-不保存 optimizer 或运行中的 memories。参见 [SONATA 映射说明](guides/sonata_io.md)。
-
-较大的 Izhikevich 配置为 `--neurons 50000 --density 0.05`。
-构建使用稀疏边数组，但该规模的完整状态记录和训练仍需要大量内存；
-默认的小规模配置用于学习。
+导入恢复网络、梯度设置和 timestep；规模、边数、density、seed、`--dt` 只配置新网络。
+执行后端由调用者选择，校准只缩放输入，不改变导入的权重。导出保存更新后的模型参数，
+不保存 optimizer 或运行状态。见 [SONATA 映射](guides/sonata_io.md)。
 
 ## `rsnn_brain.py` — 脑-环境交互
 

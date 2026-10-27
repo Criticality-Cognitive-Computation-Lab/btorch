@@ -8,6 +8,7 @@ from .aggregation import (
     group_values,
 )
 from .branching import compute_branching_ratio
+from .calibration import compute_input_scale
 from .connectivity import HopDistanceModel, compute_ie_ratio
 from .metrics import indices_to_mask, select_on_metric
 from .spiking import (
@@ -44,6 +45,7 @@ __all__ = [
     "group_summary",
     "group_ecdf",
     "compute_branching_ratio",
+    "compute_input_scale",
     "HopDistanceModel",
     "compute_ie_ratio",
     "indices_to_mask",

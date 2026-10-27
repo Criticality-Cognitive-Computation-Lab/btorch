@@ -6,7 +6,7 @@ import copy
 import pytest
 import torch
 
-from btorch.models import environ
+from btorch.models import environ, functional
 from btorch.models.connection import SparseConnection, Synapse
 from btorch.models.functional import init_net_state
 from btorch.models.kernels import KernelOptions
@@ -190,3 +190,88 @@ def test_two_forwards_preserve_full_bptt_through_all_dual_memories(
             assert bool(gradient[:4].abs().sum() > 0), name
         if root is getattr(actual.synapse.linear.weight, "value", None):
             assert gradient.numel() == actual.synapse.linear.nnz
+
+
+@pytest.mark.parametrize("backend", GPU_BACKENDS)
+def test_native_recorded_cudagraph_continuation_and_record_policy(backend):
+    """Keep native trajectories stacked while preserving replay ownership."""
+    require_cuda_backend(backend)
+    from examples.rsnn_common import ExampleOptions, initialize
+    from examples.rsnn_izhikevich import build_model
+
+    options = ExampleOptions(
+        neurons=8,
+        density=0.25,
+        device="cuda",
+        neuron_backend=backend,
+        sparse_backend="triton",
+        method="pull",
+    )
+    eager, captured = build_model(options), build_model(options)
+    captured.cudagraph = True
+    for network in (eager, captured):
+        # Match arithmetic choices so this test isolates capture/state routing,
+        # rather than testing long-horizon sensitivity to transcendental math.
+        network.backend = KernelOptions(
+            neuron=backend,
+            connection="triton",
+            connection_method="pull",
+            enable_fp_fusion=False,
+            precise_division=True,
+            precise_exp=True,
+        )
+        initialize(network, "cuda")
+    inputs = torch.linspace(280.0, 340.0, 8, device="cuda").expand(24, 1, 8)
+    with torch.inference_mode(), environ.context(dt=1.0):
+        first = None
+        frozen = None
+        for offset in (0.0, 5.0):
+            expected = eager(inputs + offset)
+            actual = captured(inputs + offset)
+            torch.testing.assert_close(actual, expected, atol=1e-3, rtol=2e-5)
+            for name, value in functional.named_hidden_states(eager).items():
+                torch.testing.assert_close(
+                    functional.named_hidden_states(captured)[name],
+                    value,
+                    atol=1e-3,
+                    rtol=2e-5,
+                )
+            # Numeric receptor access needs no optional label DataFrame. The
+            # signed histories must add back to the recorded total current.
+            psc = actual[1]["synapse.base_psc.psc"]
+            epsc = captured.synapse.get_psc(0, psc=psc, validate_nan=False)
+            ipsc = captured.synapse.get_psc(1, psc=psc, validate_nan=False)
+            torch.testing.assert_close(epsc + ipsc, actual[1]["synapse.psc"])
+            if first is None:
+                first = actual
+                frozen = (
+                    actual[0].clone(),
+                    {k: v.clone() for k, v in actual[1].items()},
+                )
+            else:
+                # Returning borrowed graph-pool tensors would mutate the
+                # caller's first result on this continuation replay.
+                torch.testing.assert_close(first, frozen, atol=0, rtol=0)
+        assert captured._cudagraph_runner.n_captures == 1
+
+        # Same input shape with a different recording request must recapture;
+        # serving an old graph would silently return the wrong record schema.
+        eager.update_state_names = captured.update_state_names = ("neuron.v",)
+        torch.testing.assert_close(
+            captured(inputs), eager(inputs), atol=1e-3, rtol=2e-5
+        )
+        assert captured._cudagraph_runner.n_captures == 2
+        captured.clear_cudagraph()
+        # Clearing graph handles cannot invalidate results already returned.
+        torch.testing.assert_close(first, frozen, atol=0, rtol=0)
+
+        if backend == "triton":
+            # Chunk/offload scheduling is shared across renderers, so exercise
+            # one ragged case rather than multiplying the renderer matrix.
+            # Both paths must preserve continuation while returning CPU records.
+            for network in (eager, captured):
+                network.chunk_size = 16
+                network.cpu_offload = True
+            torch.testing.assert_close(
+                captured(inputs), eager(inputs), atol=1e-3, rtol=2e-5
+            )

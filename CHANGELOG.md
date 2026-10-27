@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `btorch.analysis.compute_input_scale` calibrates external drive using the
+  actual recurrent model while restoring its memories and recording policy.
+- The Izhikevich example defaults to 60k neurons, 33,072,348 edges, ~5 Hz and
+  CUDA Graph inference, records v/u/spikes/total PSC/EPSC/IPSC, and compares
+  matched push/pull/eager execution without extra CLI settings.
+- Native recurrent CUDA Graph capture retains stacked trajectories directly;
+  recording-policy changes invalidate captures. `clear_cudagraph()` releases
+  cached graphs without resetting physical memories.
+- Push API documentation includes nondeterministic accumulation warnings and
+  measured, workload-specific 1000-step errors.
+- Numeric receptor PSC access works without an optional receptor label table.
+- Both API doc generators discover the current source tree without importing
+  an older installed btorch; removed modules no longer appear in references.
+
 - **`btorch.sparse`** — sparse arrays with a SciPy/PyTorch-like API: `Sparse`,
   `COO`, `CSR`, `CSC`; constructors `sparse.coo/csr/csc/from_edges/from_dense`;
   conversion `sparse.asarray` (`as_sparse`), `from_torch`, `from_scipy`,
