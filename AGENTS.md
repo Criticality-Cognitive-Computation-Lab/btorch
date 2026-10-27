@@ -1,23 +1,23 @@
 # AGENT.md
 
-Btorch is a brain-inspired Torch library for neuromorphic research. Follow the patterns in the codebase: stateful Modules, careful tensor shape/dtype handling, and practical usability over over-engineering.
+Btorch is a brain-inspired Torch library for neuromorphic research. Follow the patterns in the codebase: stateful MemoryModules, careful tensor shape/dtype handling, and practical usability.
 
 ## Repo focus
 
 - Primary package: `btorch/` (models, connectome tools, analysis, visualization).
-- Docs live in `docs/en/docs/`; examples in `examples/`.
+- Docs live in `docs/<lang>/docs/`, multilingual translations should be kept consistent; examples in `examples/`.
 - Avoid adding new heavy dependencies unless explicitly requested.
 - Connectome tooling lives under `btorch/connectome/`; keep data transforms explicit and reversible.
-- Neuron models live under `btorch/models/neurons/`; follow existing parameter/state patterns.
+- Neuron models live under `btorch/models/neurons/`
 
 ## Coding guidelines
 
 - Match existing module structure and naming.
 - Use `jaxtyping` for tensor shapes where it clarifies intent.
 - Use modern Python type annotations (`|`, `list`, `dict`); avoid
-  `typing.Optional`/`typing.Union` unless absolutely required.
+  `typing.Optional`/`typing.Union`.
 - Be explicit about device, dtype, and batch/time dimensions.
-- Preserve torch.compile compatibility and ONNX friendliness where applicable.
+- Preserve torch.compile compatibility and ONNX friendliness.
 - Prefer buffers/register_memory for stateful tensors; validate shapes/dtypes.
 - Use English for code, comments, and docstrings; conversation can be in other languages.
 - Analysis naming (`btorch/analysis/`): estimators and pipelines are `compute_*`;
@@ -86,7 +86,7 @@ Key patterns:
 - Update `docs/en/docs/` for user-facing changes.
 - Never touch the auto generated `docs/en/docs/api`.
 - Update `README.md` for installation or workflow changes.
-- Label only computational model behavior changes (equations, dynamics, event
+- Maintain `CHANGELOG.md`. Label only computational model behavior changes (equations, dynamics, event
   timing) **Breaking**. API renames and code-interface changes are ordinary changes.
 
 ## Contribution workflow
@@ -96,6 +96,6 @@ Key patterns:
 
 ## Design principles for public interface and models
 
+- Not applicable to internals that is hidden from non-professionals
 - Usability over performance; simple over clever; customizability over abstraction.
 - Keep network models cohesive (single file/folder principle).
-- not applicable to internals that is hidden from non-professionals
