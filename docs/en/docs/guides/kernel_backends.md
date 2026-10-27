@@ -49,17 +49,19 @@ choice. Configure runtime scopes outside compiled execution, like backend
 scopes. Scoped method changes are guarded by `torch.compile` and select a new
 route as needed. Compiled native RSNNs bind explicit kernel options at trace time;
 the standalone connection's default plan is not modified by that binding.
-Changing RSNN options invalidates CUDA graph capture. Push currently compacts
-dense output on the device; direct neuron-emitted lists remain pending.
+Changing RSNN options invalidates CUDA graph capture. Eligible native Triton
+recurrence emits forward spike lists directly; standalone products and
+unsupported compositions use the device compaction path.
 
-The standalone simulation in `examples/rsnn_izhikevich.py` defaults to 50,000
-Izhikevich neurons, 2,500 incoming sources each (5% connectivity), an
-ExponentialPSC, and explicit Triton spike-list push. It builds CPU CSR directly
-and moves the connection to CUDA. For a short run and a backend comparison:
+The training/inference example in `examples/rsnn_izhikevich.py` supports the
+50,000-neuron/2,500-indegree reference size through `--neurons 50000 --density 0.05`,
+heterogeneous dual-exponential PSCs, and explicit Triton spike-list push.
+Connectivity is constructed from sparse edge arrays and moved to the selected
+device. For a short run and a backend comparison:
 
 ```bash
-python -m examples.rsnn_izhikevich --neurons 256 --steps 32 --cudagraph
-python -m examples.rsnn_izhikevich --neurons 256 --steps 32 --method pull --sparse-backend cusparse
+python -m examples.rsnn_izhikevich --neurons 256 --steps 32 --mode inference --device cuda --neuron-backend triton --method push --cudagraph
+python -m examples.rsnn_izhikevich --neurons 256 --steps 32 --device cuda --neuron-backend triton --method pull --sparse-backend cusparse
 ```
 
 The example prints realized firing rate. Connectivity density is independent
@@ -96,6 +98,57 @@ template and its non-trainable alpha/damping values. Custom Python surrogates
 remain available with Torch, but require an explicit native implementation to
 use the GPU cell kernels. Unsupported native surrogates and trainable surrogate
 hyperparameters raise instead of silently changing semantics.
+
+Recurrent gradient algorithms are independent of kernel selection. Enable
+exact compact-support execution with `gradient=BPTT(sparse=True)`:
+
+```python
+from btorch.models import BPTT, KernelOptions, RecurrentNN
+from btorch.models.surrogate import Sigmoid, Truncated
+
+neuron.surrogate_function = Truncated(Sigmoid(alpha=2.0), width=0.4)
+network = RecurrentNN(
+    neuron, synapse,
+    gradient=BPTT(sparse=True),
+    backend=KernelOptions(neuron="triton", connection_method="push"),
+)
+```
+
+`Truncated` explicitly changes the derivative to zero outside
+`abs(surrogate_input) < width`, including the boundary; forward spikes are
+unchanged. Width uses the neuron's normalized threshold-distance units, not
+raw voltage. Triangle already has compact support and needs no wrapper.
+`BPTT(sparse=True)` exploits that support without changing the chosen derivative,
+reset gradients, or physical-state adjoints. The default `BPTT()` evaluates the
+full gradient. An unbounded surrogate is never silently truncated.
+
+Generated Triton neuron templates emit a compact near-threshold list directly
+in their existing forward launch, using the same block-local compaction helper
+as forward spike lists. Every block writes its count, including zero for a
+silent block; preallocated capacity covers all neurons. There is no standalone
+backward-activity compaction kernel or host-side count read.
+
+The training tape keeps the near-threshold list separately from a combined
+list containing near-threshold **or firing** neurons. Single-sample joint
+input/weight reverse consumes the combined list: firing neurons outside the
+surrogate window can still contribute weight gradients. Input-only reverse
+consumes the near-threshold list, including across samples. Both reuse the
+existing source-major CSR reduction kernel; a small output kernel materializes
+zero adjoints for inactive rows and combines the existing 512-edge row partials.
+The partition grid depends on topology shapes, not live activity, and programs
+stride over additional segments of unusually long rows. Physical-state adjoints
+remain complete.
+
+Batched trainable weights retain the existing masked, sample-sharing fused
+reverse because separate per-sample list traversal would add an edge-gradient
+pass or require competing updates to shared parameters. That choice uses only
+static shapes and gradient requirements, never per-step profiling. Other native
+renderers retain the support mask and their existing execution paths.
+Delay queues and external synaptic inputs currently retain full propagation
+adjoints because their dependencies extend beyond the surrogate. Checkpointing,
+CPU offload and compiled training keep the same public state interface;
+`torch.compile(mode="reduce-overhead")` can capture training, while the explicit
+`cudagraph=True` option remains for inference.
 
 Surrogate primitives and derivatives are plain Torch functions, compatible
 with the existing autograd and `torch.compile` paths. The former `btorch.jit`
@@ -137,6 +190,34 @@ limitation, not a settled precision/promotion policy. Time is first, normally
 no time axis. Model adaptation and receptor axes remain explicit. Integer topology,
 receptors and delays receive no gradients.
 
+Native cell pointer bindings retain input and parameter storage dtype and
+strides, including sliced or transposed views with nonzero offsets. Register
+loads perform the calculation-precision conversion inside the kernel. They do
+not require an FP32 contiguous copy of each input. Low-precision training keeps
+the producer's existing spike buffer as a private residual, independently of
+the public raster's dtype.
+
+Use standard Torch AMP without converting the model or its memories:
+
+```python
+scaler = torch.amp.GradScaler("cuda")  # normally needed for FP16, not BF16
+with torch.autocast("cuda", dtype=torch.float16):
+    spikes, records = network(inputs)
+    loss = loss_fn(spikes)
+scaler.scale(loss).backward()
+scaler.step(optimizer)
+scaler.update()
+```
+
+For native recurrent execution, dense linear connections use the selected
+FP16/BF16 autocast dtype. The differentiable master-weight conversion happens
+once at trajectory entry; backward and checkpoint replay retain that forward
+precision even when run outside autocast. Neuron/PSC parameters and memories
+are not implicitly downcast. Sparse pull and push keep their operand-promotion
+policy under autocast; an FP32 edge tensor with BF16 spikes therefore produces
+FP32 current. Autocast does not itself request lower-precision sparse weights.
+Delay history retains its incoming storage dtype, matching `Delay.update()`.
+
 Native Poisson surrogate lowering is currently narrower: inputs, physical
 states, participating parameters, and explicit uniform tensors must all be
 FP32. Invalid reduced-precision calls fail before the default Torch generator
@@ -166,7 +247,7 @@ for long nonlinear recurrences where small division errors accumulate, but it ca
 reduce throughput. It does not promise bitwise equality in general and does not
 control exponential or square-root approximations, denormal handling, or
 flush-to-zero behavior. Division precision and floating-point contraction are
-independent options and neither changes `CellSpec` or the model equations.
+independent options and neither changes `NeuronSpec` or the model equations.
 
 `KernelOptions(precise_exp=True)` requests accurate exponential evaluation.
 It is opt-in and defaults to `False`; no model shorthand enables it. It affects
@@ -213,6 +294,26 @@ Initialize modules with `init_state` or `functional.init_net_state`. Final state
 remains differentiable across calls until you explicitly reset or detach it.
 Returned RSNN records can contribute an auxiliary loss. Each invocation owns the
 saved data it needs, so two forwards followed by one backward are supported.
+
+Native recurrent chunks prepare paired neuron/PSC kernel bindings and supported
+Triton sparse workspaces once per invocation. Interior kernels write spikes and
+requested histories directly into their sequence destinations. Working storage
+belongs to that invocation; it does not overwrite earlier windows or the inputs
+saved for backward. Final-state ownership and chunk-boundary transfers remain
+explicit, preserving the existing `MemoryModule` reset/detach interface.
+
+Paired backward likewise prepares its kernel and static parameter bindings once
+per trajectory, alternating gradient destinations so incoming adjoints remain
+readable and writing interior input gradients directly into their sequence.
+Checkpoint replay reuses two bounded block buffers. Parameter-gradient
+reductions and replay retain their existing numerical semantics.
+Explicit synaptic inputs and delay updates use
+invocation-owned forward buffers rather than allocating new tensors each step.
+
+This uses the existing `RecurrentNN` options for chunking, gradient checkpointing
+and CPU offload. Explicit `cudagraph=True` remains inference-only; supported
+compiled training capture uses `torch.compile(mode="reduce-overhead")`. There is
+no additional user-facing workspace or preparation API.
 
 Explicit kernel options select a stateful PSC sequence recurrence. The historical
 plain `backend="torch"` PSC multi-step convolution starts from rest, truncates its
@@ -320,10 +421,17 @@ operator carries the prepared connection route into each timestep. Higher
 rates use the existing density policy. Deterministic execution and unsupported
 layouts retain their fallback behavior. The hint never caps actual spikes.
 
-This compacts active source IDs on the device and reuses the existing packed,
-edge-balanced fanout kernel. It avoids scanning the full static task list and
-the task route's destination hash tables. Only active-source fanout is read;
-source-major weights are prepared once per trajectory. The implementation
-does not introduce a CUDA C++ dependency or a new whole-network persistent
-megakernel. See [sparse connectivity](sparse_connectivity.md) for hint precedence
-and numerical behavior.
+The initial neuron and fused PSC/next-neuron Triton templates emit active IDs
+and local degree prefixes directly when there are no delays or external
+synaptic inputs. The existing packed fanout consumes these invocation-owned
+lists, giving two interior forward launches: propagation and the fused
+producer. This capability is shared by model templates, not specific to one
+neuron or synapse equation. Explicit push uses the same path.
+
+For composed/delayed sources or other neuron renderers, one Triton kernel
+combines output clearing, compaction and the local degree scan before the same
+fanout. There is no global CUB scan. Only active-source fanout is read, and
+source-major weights are prepared once per trajectory. Public spike rasters
+and training residuals retain their existing representation. See
+[sparse connectivity](sparse_connectivity.md) for hint precedence, recording
+tradeoffs and numerical behavior.

@@ -1,52 +1,34 @@
-"""Simulate an Izhikevich RSNN with device spike-list sparse propagation.
+"""Train/infer an Izhikevich + heterogeneous dual-exponential PSC RSNN.
 
-The default population has 50,000 neurons and 2,500 distinct incoming sources
-per neuron: 125 million edges, or 5% connectivity. Construction uses CPU CSR
-storage, without a dense N-by-N matrix. Run a smaller example with::
+    python -m examples.rsnn_izhikevich
+    python -m examples.rsnn_izhikevich --mode both --export-sonata /tmp/izh-circuit
+    python -m examples.rsnn_izhikevich --import-sonata \
+        /tmp/izh-circuit/circuit_config.json
 
-    python -m examples.rsnn_izhikevich --neurons 256 --density 0.05 --steps 32
-
-The default execution uses Triton neurons and explicit device spike-list push.
-Select CSR pull with ``--method pull --sparse-backend cusparse``. These are
-execution choices independent of the adjacency storage format. This is a
-simulation example, not a cross-implementation benchmark.
+Two signed receptor channels have distinct rise/decay times, with no additional
+transmission delays. Connectivity is built sparsely; the larger reference
+configuration is --neurons 50000 --density 0.05. Use --device cuda
+--neuron-backend triton --sparse-backend triton --method push for native push.
 """
 
-import argparse
-
-import numpy as np
 import torch
 
-from btorch.models import environ
-from btorch.models.connection import SparseConnection
-from btorch.models.functional import init_net_state
-from btorch.models.kernels import KernelOptions
-from btorch.models.neurons.izhikevich import Izhikevich
+from btorch.models import BPTT, KernelOptions
+from btorch.models.neurons import Izhikevich
 from btorch.models.rnn import RecurrentNN
-from btorch.models.surrogate import Sigmoid
-from btorch.models.synapse import ExponentialPSC
-from btorch.sparse import CSR
+from btorch.models.surrogate import Sigmoid, Truncated
+from btorch.models.synapse import DualExponentialPSC, HeterSynapsePSC
+from examples.rsnn_common import ExampleOptions, build_connection, main
 
 
-def build_model(args) -> RecurrentNN:
-    """Build fixed-indegree connectivity and the ordinary btorch recurrence."""
-    n = args.neurons
-    indegree = round(n * args.density)
-    # Sampling one row at a time bounds scratch space by the population size.
-    # Distinct sources preserve the requested edge count; self-edges are allowed.
-    rng = np.random.default_rng(args.seed)
-    sources = np.empty((n, indegree), dtype=np.int32)
-    for row in sources:
-        row[:] = np.sort(rng.choice(n, size=indegree, replace=False))
-    adjacency = CSR(
-        torch.arange(n + 1, dtype=torch.int64) * indegree,
-        torch.from_numpy(sources.reshape(-1)),
-        torch.full((n * indegree,), 0.04, dtype=torch.float32),
-        (n, n),
-    )
-    connection = SparseConnection.from_adjacency(adjacency, orientation="post_pre").to(
-        args.device
-    )
+def build_model(options: ExampleOptions) -> RecurrentNN:
+    """Build the Izhikevich/DualExponentialPSC circuit with two receptor
+    channels."""
+    n = options.neurons
+    connection = build_connection(options, weight_scale=0.04)
+    # Sparse BPTT uses the same truncated surrogate: zero derivative outside
+    # the declared support in normalized threshold-distance units.
+    function = Truncated(Sigmoid(alpha=100.0), width=0.25)
     neuron = Izhikevich(
         n,
         v_threshold=-40.0,
@@ -55,71 +37,45 @@ def build_model(args) -> RecurrentNN:
         v_peak=30.0,
         c_m=100.0,
         k=2.0,
-        a=0.02,
+        a=torch.linspace(0.018, 0.022, n),
         b=0.2,
         d=8.0,
-        trainable_param=set(),
-        surrogate_function=Sigmoid(alpha=100.0),
+        trainable_param={"a"},
+        surrogate_function=function,
         hard_reset=True,
     )
-    model = (
-        RecurrentNN(
-            neuron,
-            ExponentialPSC(n, tau_syn=5.0, linear=connection),
-            backend=KernelOptions(
-                neuron=args.neuron_backend,
-                connection=args.sparse_backend,
-                connection_method=args.method,
-            ),
-            update_state_names=(),
-            cudagraph=args.cudagraph,
-        )
-        .to(args.device)
-        .eval()
+    # PSC lanes are flattened as post * 2 + receptor: repeat each
+    # receptor pair once per neuron to match the connection output layout.
+    psc = HeterSynapsePSC(
+        n,
+        n_receptor=2,
+        receptor_type_index=None,
+        linear=connection,
+        base_psc=DualExponentialPSC,
+        tau_decay=torch.tensor([5.0, 10.0]).repeat(n),
+        tau_rise=torch.tensor([1.0, 2.0]).repeat(n),
+        A=1.0,
     )
-    init_net_state(model, batch_size=1, device=args.device, dtype=torch.float32)
-    model.neuron.v.fill_(-60.0)
-    return model
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--neurons", type=int, default=50_000)
-    parser.add_argument("--density", type=float, default=0.05)
-    parser.add_argument("--steps", type=int, default=5_000)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument(
-        "--neuron-backend",
-        choices=("torch", "triton", "cupy", "tilelang"),
-        default="triton",
+    records = (
+        "neuron.v",
+        "neuron.u",
+        "synapse.base_psc.psc",
+        "synapse.base_psc.g_rise",
+        "synapse.base_psc.g_decay",
     )
-    parser.add_argument(
-        "--sparse-backend",
-        choices=("auto", "torch", "cusparse", "triton"),
-        default="triton",
-    )
-    parser.add_argument("--method", choices=("auto", "pull", "push"), default="push")
-    parser.add_argument("--cudagraph", action="store_true")
-    args = parser.parse_args()
-    if args.neurons < 1 or args.steps < 1 or not 0 < args.density <= 1:
-        parser.error("positive neurons/steps and density in (0, 1] required")
-    model = build_model(args)
-    time = torch.arange(args.steps, device=args.device, dtype=torch.float32)
-    lanes = torch.arange(args.neurons, device=args.device, dtype=torch.float32)
-    drive = (
-        300.0
-        + 30.0 * torch.sin(lanes[None, None, :] * 0.01)
-        + 30.0 * torch.sin(time[:, None, None] * 0.01)
-    )
-    with torch.inference_mode(), environ.context(dt=1.0):
-        spikes, _ = model(drive)
-    # Report realized activity, not the connectivity density or a firing hint.
-    rate_hz = spikes.float().mean().item() * 1000.0
-    print(
-        f"N={args.neurons}, edges={model.synapse.linear.nnz}, firing={rate_hz:.3f} Hz"
-    )
+    return RecurrentNN(
+        neuron,
+        psc,
+        gradient=BPTT(sparse=True),
+        backend=KernelOptions(
+            neuron=options.neuron_backend,
+            connection=options.sparse_backend,
+            connection_method=options.method,
+        ),
+        update_state_names=records,
+        cudagraph=options.cudagraph,
+    ).to(options.device)
 
 
 if __name__ == "__main__":
-    main()
+    main("izhikevich", build_model)

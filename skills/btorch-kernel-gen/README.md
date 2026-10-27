@@ -45,7 +45,7 @@ OOT output directories are unrestricted. For [upstream](references/workflow.md),
 
 See the [English tutorial](../../docs/en/docs/tutorials/kernel_generation.md) or [中文教程](../../docs/zh/docs/tutorials/kernel_generation.md), and the input-prompt provenance below.
 
-For SONATA import/export, or network-definition serialization without an IO format/backend specified, invoke [sonata-io](../sonata-io/SKILL.md). Each network supplies its own traversal and model mapping; shared repository helpers handle file layout and edge indices. See the [Izhikevich RSNN round-trip](../../examples/sonata_izhikevich.py) and [IO guide](../../docs/en/docs/guides/sonata_io.md).
+For SONATA import/export, or network-definition serialization without an IO format/backend specified, invoke [sonata-io](../sonata-io/SKILL.md). Each network supplies its own traversal and model mapping; shared repository helpers handle file layout and edge indices. See the [RSNN adapter](../../examples/rsnn_sonata.py) and [IO guide](../../docs/en/docs/guides/sonata_io.md).
 
 ## Source prompts and adaptations
 

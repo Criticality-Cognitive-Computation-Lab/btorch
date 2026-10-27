@@ -1,0 +1,15 @@
+{
+  "manifest": {"$NETWORK_DIR": "."},
+  "networks": {
+    "nodes": [{
+      "nodes_file": "$NETWORK_DIR/nodes.h5",
+      "node_types_file": "$NETWORK_DIR/node_types.csv",
+      "populations": {"glif3": {"type": "point"}}
+    }],
+    "edges": [{
+      "edges_file": "$NETWORK_DIR/edges.h5",
+      "edge_types_file": "$NETWORK_DIR/edge_types.csv",
+      "populations": {"recurrent": {"type": "chemical"}}
+    }]
+  }
+}

@@ -1,37 +1,90 @@
 # Network-specific SONATA IO
 
-A network supplies its own SONATA adapter. btorch does not infer a network definition by walking arbitrary Modules. User agents implement traversal, model construction, ID/edge mapping and units; shared `btorch.io.sonata` helpers handle single-group HDF5 populations and native edge-index generation.
-
-The common `SonataNetworkIO` calling interface is structural: no inheritance or registration is required. `export_network(network, directory, dt=...)` returns a circuit config path; `import_network(config, ...)` returns `SonataImport(network, dt)`. Import neither sets environ nor initializes state.
+The two [RSNN examples](../examples.md) share an explicit adapter in
+`examples/rsnn_sonata.py`. It follows `SonataNetworkIO` structurally and reuses
+`SonataPopulation`, `write_population`, `read_population`, and
+`write_edge_indices` from `btorch.io.sonata`. There is no generic Module walker
+or model registry: this adapter reconstructs exactly these two concrete circuits.
 
 ```python
-from examples.sonata_izhikevich import IzhikevichSonataIO, make_example
-from btorch.models import environ, functional
+from pathlib import Path
+from examples.rsnn import build_model
+from examples.rsnn_common import ExampleOptions, initialize
+from examples.rsnn_sonata import RSNNSonataIO
+from btorch.models import environ
 
-adapter = IzhikevichSonataIO()
-config = adapter.export_network(make_example(), directory, dt=0.25)
-loaded = adapter.import_network(config, device="cpu", backend="torch")
+network = build_model(ExampleOptions(neurons=32))
+adapter = RSNNSonataIO()
+circuit_config = adapter.export_network(network, Path("/tmp/glif-circuit"), dt=1.0)
+loaded = adapter.import_network(circuit_config, device="cpu", backend="torch")
 with environ.context(dt=loaded.dt):
-    functional.init_net_state(loaded.network, batch_size=1)
-    spikes, records = loaded.network(x_seq)  # [time, batch, neuron]
+    initialize(loaded.network, "cpu")
+    spikes, records = loaded.network(x_seq)
 ```
 
-Run the complete export/import/activity comparison:
+## Mapping scope
+
+- One population, local node IDs equal tensor positions; source=pre, target=post.
+- GLIF3 + heterogeneous AlphaPSC: two signed receptor channels and discrete
+  delay bins, including zero and the final bin. Dale reference signs are
+  preserved separately from current weights, including weights projected to zero.
+- Izhikevich + heterogeneous DualExponentialPSC: signed receptor channels and
+  distinct rise/decay times, with no additional transmission delay.
+- Node templates `btorch:GLIF3AlphaPSC` and
+  `btorch:IzhikevichDualExponentialPSC` denote the **composite point mechanisms**.
+  Their scalar dynamics columns encode both neuron and receptor-filter
+  parameters. These are custom model namespaces, not simulator built-ins.
+- Edge type IDs identify receptor channels. Parallel source/target pairs with
+  distinct receptor/delay mechanisms remain distinct. Signed weights are pA;
+  voltage mV, time ms, capacitance pF, and conductance nS. Additional coefficient
+  units are declared in the config extension. Optional `dale_sign` edge columns
+  retain the projection constraint across export/import.
+- SONATA `delay = delay_bin * dt` in ms. Import rejects fractional-bin,
+  negative, or out-of-range delays. This is additional transmission delay;
+  RecurrentNN still consumes previous-step PSC.
+- The versioned `btorch.mapping = "example-rsnn-v2"` extension records original
+  scalar/shared/per-neuron/adaptation-mode/receptor tensor shapes, parameter
+  ownership/trainability, surrogate cutoff, BPTT setting, reset and record policy.
+  An edit inconsistent with shared scalar metadata is rejected.
+
+HDF5 scalar columns retain heterogeneous values; config metadata retains their
+Torch broadcast shapes and trainability. Cross-field parameter aliases, custom
+models, batched connectivity, extra input modules and arbitrary receptor-table
+metadata are rejected. Import neither initializes memories nor changes environ;
+execution backends are caller-selected. Circuit IO does not save membrane,
+adaptation, PSC, delay-ring or optimizer continuation state. Use normal btorch
+checkpoints for those.
+
+## Run and verify
 
 ```bash
 pip install 'btorch[io]' libsonata
-python examples/sonata_izhikevich.py --directory ./sonata-izh
+python -m examples.rsnn --export-sonata /tmp/glif-circuit
+python -m examples.rsnn_izhikevich --export-sonata /tmp/izh-circuit
+python -m pytest tests/io/test_sonata.py
 ```
 
-The example maps one Izhikevich population, AlphaPSC, plain sparse per-edge weights and scalar/per-neuron parameters. It preserves reset/surrogate settings, trainability and requested records in a versioned `btorch` config extension. Nodes use population-local IDs; edge source is pre, target is post. Parameter units are explicit. Edge delay is zero additional transmission delay; the existing RecurrentNN schedule still consumes previous-step PSC. Other models, receptors, delays, parameter sharing and custom mechanisms need their own mapping. Unsupported configurations raise rather than silently lose information.
+The files use SONATA HDF5 magic/version, group ID/index mappings, population
+endpoint attributes, whitespace type CSVs and portable circuit config paths.
+Tests compare inference spikes, membrane/adaptation/PSC histories and complete
+input/parameter gradients after round-trip. They cover isolated nodes,
+self-loops, mechanism-distinct parallel edges, empty edges, heterogeneous
+parameters and delay boundaries. Sparse gradient reductions admit normal FP32
+rounding; state/activity comparisons remain strict.
 
-The files follow the [SONATA specification](https://github.com/AllenInstitute/sonata/blob/master/docs/SONATA_DEVELOPER_GUIDE.md): HDF5 populations/dynamics, whitespace type tables and JSON circuit config. Native indices come from [libSONATA](https://libsonata.readthedocs.io/en/latest/api.html); hard-link aliases accommodate pySONATA's index spelling. Tests read topology, attributes and edge lookups with both libraries, and compare original/restored activity and gradients. Install official [pySONATA](https://github.com/AllenInstitute/sonata/tree/master/src/pysonata) for that optional check:
+Both libSONATA and AllenInstitute pySONATA independently read IDs, topology,
+receptors, weights and indexed incoming/outgoing edges. libSONATA checks every
+node dynamics component; pySONATA's node dynamics accessor is unimplemented.
+Tested reader distributions: libsonata 0.2.2, h5py 3.16.0 and the AllenInstitute
+pySONATA implementation (distribution version 0.0.1). Install that implementation
+rather than relying on an unrelated package with the same name:
 
 ```bash
 pip install 'git+https://github.com/AllenInstitute/sonata.git#subdirectory=src/pysonata'
-PYTHONPATH=. python -m pytest tests/io/test_sonata.py
 ```
 
-pySONATA's node dynamics accessor is unimplemented; those values are checked with libSONATA. Reader compatibility does not make `btorch:Izhikevich` an executable model in every simulator. Circuit files hold network definitions; membrane/PSC/delay state and optimizer continuation use separate btorch checkpoints.
-
-For agent-generated custom networks, invoke [sonata-io](../../../../skills/sonata-io/SKILL.md) when SONATA is requested or network-definition serialization has no specified IO format/backend. Keep the same calls and shared helpers; the network's agent supplies the specific implementation. Upstream shared helpers/interface and reusable checks only; generated network-specific implementations stay in the user's project/OOT package.
+Reader compatibility does not establish executable equivalence in another
+simulator. See the [SONATA specification](https://github.com/AllenInstitute/sonata/blob/master/docs/SONATA_DEVELOPER_GUIDE.md)
+and [libSONATA API](https://libsonata.readthedocs.io/en/latest/api.html).
+For a custom circuit, follow [the SONATA IO skill](https://github.com/Criticality-Cognitive-Computation-Lab/btorch/blob/dev/skills/sonata-io/SKILL.md)
+and provide its own explicit mapping.

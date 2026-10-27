@@ -1,7 +1,9 @@
 # Tutorial 1: Building an RSNN
 
 **Author:** btorch contributors  
-**Based on:** [`examples/rsnn.py`](https://github.com/Criticality-Cognitive-Computation-Lab/btorch/blob/main/examples/rsnn.py)
+The minimal composition below introduces the building blocks. For runnable
+heterogeneous circuits with training, delays and SONATA IO, see
+[the two RSNN examples](../examples.md).
 
 This tutorial walks through building a minimal Recurrent Spiking Neural Network (RSNN) with btorch.
 

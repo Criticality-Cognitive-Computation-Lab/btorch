@@ -1,4 +1,4 @@
-# Cell 与 connection 后端
+# Neuron 与 connection 后端
 
 分别选择 neuron/PSC dynamics 和 sparse propagation：
 
@@ -7,7 +7,7 @@ from btorch.models import KernelOptions
 from btorch.models.rnn import RecurrentNN
 
 rnn = RecurrentNN(neuron, synapse, backend=KernelOptions(
-    cell="triton", connection="auto", merge_synapse=False,
+    neuron="triton", connection="auto", merge_synapse=False,
 ))
 ```
 
@@ -22,6 +22,21 @@ Cell 后端复用现有 sparse runtime，不重复实现 sparse 算法。
 首批模型包括 IF、LIF、GLIF3、Izhikevich，以及 ExponentialPSC、AlphaPSC、
 AlphaPSCBilleh、DualExponentialPSC。六种确定性的内置 surrogate 保持 btorch
 本身的归一化导数。暂不支持的自定义 surrogate 或可训练超参数会明确报错。
+
+## 运行 RSNN 示例
+
+`examples/rsnn.py` 展示含传播延迟的 GLIF3 + 异质 AlphaPSC；
+`examples/rsnn_izhikevich.py` 展示 Izhikevich + 异质 DualExponentialPSC。
+两者均支持推理、训练和 SONATA 导入/导出，默认在 CPU 上运行小规模网络。
+
+```bash
+python -m examples.rsnn --device cuda --neuron-backend triton --sparse-backend triton --compile
+python -m examples.rsnn_izhikevich --device cuda --neuron-backend triton --sparse-backend triton --method push --compile
+```
+
+`--method push` 显式选择 spike-list 传播；`--method pull` 选择 pull。
+`--compile` 支持训练，显式 `--cudagraph` 要求 `--mode inference --device cuda`。
+参见 [示例说明](../examples.md) 了解张量形状、状态初始化及模型映射。
 
 ## 梯度与精度
 

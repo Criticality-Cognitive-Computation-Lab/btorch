@@ -46,7 +46,7 @@ class SonataNetworkIO(Protocol[NetworkT]):
 
     def import_network(
         self,
-        config: Path,
+        circuit_config: Path,
         *,
         device: torch.device | str = "cpu",
         dtype: torch.dtype | None = None,

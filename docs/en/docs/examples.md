@@ -1,52 +1,70 @@
 # Examples Gallery
 
-The `examples/` directory contains production-quality scripts that demonstrate core btorch patterns. This page annotates each example and links to the relevant tests and API docs.
+The `examples/` directory contains runnable scripts that demonstrate core btorch patterns. This page annotates each example and links to the relevant tests and API docs.
 
-## `rsnn.py` — Minimal RSNN
+## Two RSNN examples: training, inference and SONATA
 
-A self-contained demonstration of a recurrent spiking neural network using
-`GLIF3`, `AlphaPSC`, and `RecurrentNN`. The recurrent layer now uses
-`SparseConnection` by default and supplies an expected spike-density hint,
-allowing CUDA models to select the source-driven Triton push backend. Dense and
-sparse networks can be constructed from identical weights for numerical and
-performance comparisons.
+| Script | Neuron/PSC | Connectivity |
+|---|---|---|
+| `rsnn.py` | GLIF3 + AlphaPSC | Two heterogeneous receptor channels; 0–3 delay bins |
+| `rsnn_izhikevich.py` | Izhikevich + DualExponentialPSC | Two heterogeneous rise/decay channels; no extra delay |
 
-Run the small plotting and training demo with the default sparse connection:
+Start from the repository root with either CPU example:
 
 ```bash
-PYTHONPATH=. python examples/rsnn.py
+python -m examples.rsnn
+python -m examples.rsnn_izhikevich
 ```
 
-Compare identical dense and sparse GLIF networks on a larger CUDA workload:
+Defaults run inference and three training epochs on 256 neurons. Each script
+shows its neuron, heterogeneous PSC, recorded states and `RecurrentNN` composition
+in `build_model`. `rsnn_common.py` shares sparse connectivity, memory initialization
+and the execution loop; `rsnn_sonata.py` contains the explicit circuit mapping.
+
+Inputs and spikes have shape `[time, batch, neuron]`; examples use batch size 1.
+Time is ms, voltage mV and input current pA. Receptor 0 starts excitatory and
+receptor 1 inhibitory. GLIF uses Dale constraints: `constrain_net(network)`
+after each optimizer update preserves each source neuron's E/I sign.
+Izhikevich keeps unconstrained trainable weights. PSC lanes
+use `post * 2 + receptor`, so each neuron receives the same pair of distinct
+receptor time constants. Neuron parameters also vary across neurons.
+
+Use `--mode inference` or `--mode train` independently. Training resets physical
+memories before each independent trial and fits a synthetic 20 Hz target plus a
+voltage penalty. This demonstrates gradients through neuron parameters and
+recurrent weights; it is not a scientific fitting task. For continuous inference,
+initialize once and retain memories between successive input chunks.
+
+Native CUDA execution selects neuron/PSC and connection backends independently:
 
 ```bash
-PYTHONPATH=. python examples/rsnn.py --mode compare --device cuda --benchmark \
-  --num-hidden 16384 --timesteps 20 --batch-size 4 \
-  --recurrent-density 0.001 --expected-spike-density 0.015 --input-scale 6
+python -m examples.rsnn --device cuda --neuron-backend triton --sparse-backend triton --compile
+python -m examples.rsnn_izhikevich --device cuda --neuron-backend triton --sparse-backend triton --method push --compile
 ```
 
-The comparison checks outputs and spike agreement before timing and prints the
-runtime plan selected for the sparse recurrent connection. Reported timings are
-end-to-end wall-clock latency, including state reset and synchronized CUDA
-execution; they are not isolated sparse-kernel timings.
+`--method push` explicitly selects spike-list propagation; `pull` selects the
+opposite traversal. Auto mode can use dense multiplication below 4,000 neurons
+while preserving the sparse public interface. `--compile` supports training;
+explicit `--cudagraph` requires `--device cuda --mode inference`.
 
-On October 7, 2026, this command selected the Triton push backend on an RTX
-5090, produced 1.76% spike activity, matched the dense network exactly, and
-measured 23.535 ms dense versus 17.751 ms sparse (1.33x end-to-end). Results
-depend on the GPU, software versions, and network activity.
+To export and import either circuit, install the optional IO dependencies:
 
-**Key patterns:**
-- `functional.init_net_state` and `functional.reset_net`
-- `SparseConnection` with `Hints(expected_density=...)`
-- Dense/sparse output-equivalence and benchmark mode
-- `environ.context(dt=1.0)`
-- `update_state_names` for state recording
-- `plot_raster` and `plot_neuron_traces` from `btorch.visualisation`
+```bash
+pip install 'btorch[io]' libsonata
+python -m examples.rsnn --export-sonata /tmp/glif-circuit
+python -m examples.rsnn --import-sonata /tmp/glif-circuit/circuit_config.json
+python -m examples.rsnn_izhikevich --export-sonata /tmp/izh-circuit
+python -m examples.rsnn_izhikevich --import-sonata /tmp/izh-circuit/circuit_config.json
+```
 
-**See also:**
-- [Tutorial 1: Building an RSNN](tutorials/building_rsnn.md)
-- [Tutorial 2: Training an SNN](tutorials/training.md)
-- [Tutorial: Heterogeneous Multi-Receptor E/I RSNN](tutorials/heterogeneous_ei_rsnn.md)
+Import restores circuit/gradient settings and its timestep; `--neurons`,
+`--density`, `--seed` and `--dt` configure newly constructed circuits only.
+Execution backends remain caller-selected. Export after training writes updated
+parameters, not optimizer or runtime memories. See [the SONATA mapping](guides/sonata_io.md).
+
+The larger Izhikevich configuration is `--neurons 50000 --density 0.05`.
+Construction uses sparse edge arrays. Full state recording and training at that
+size still consume substantial memory; the defaults are intended for learning.
 
 ## `rsnn_brain.py` — Brain-Environment Interaction
 
