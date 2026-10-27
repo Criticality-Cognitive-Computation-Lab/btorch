@@ -8,73 +8,17 @@ Discovery rules:
 - Top-level modules (depth 1) become standalone pages.
 """
 
-import ast
+import sys
 from pathlib import Path
 
 import mkdocs_gen_files
 
 
-EXCLUDES = {
-    "btorch.backend",
-    "btorch.types",
-    "btorch.config",
-}
-
-# Deep prefixes that get their own dedicated page instead of being grouped.
-DEEP_PAGES = {
-    "btorch.analysis.dynamic_tools.": (
-        "api/analysis_dynamic_tools.md",
-        "Analysis — Dynamic Tools",
-    ),
-    "btorch.models.neurons": (
-        "api/neurons.md",
-        "Neurons",
-    ),
-}
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from api_reference import DEEP_PAGES, discover  # noqa: E402
 
 
-def _is_public(name: str) -> bool:
-    return all(not part.startswith("_") for part in name.split("."))
-
-
-def _has_public_api(file_path: Path) -> bool:
-    try:
-        tree = ast.parse(file_path.read_text(encoding="utf-8"))
-    except SyntaxError:
-        return False
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if not node.name.startswith("_"):
-                return True
-        if isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                if not alias.name.startswith("_"):
-                    return True
-    return False
-
-
-def _discover(package: str) -> list[str]:
-    base_path = Path(__file__).parent.parent / package
-    modules: list[str] = []
-    for path in sorted(base_path.rglob("*.py")):
-        rel = path.relative_to(base_path.parent)
-        parts = (
-            rel.parts[:-1] if path.name == "__init__.py" else rel.with_suffix("").parts
-        )
-        name = ".".join(parts)
-        depth = len(name.split(".")) - 1
-        if depth == 0:
-            continue
-        if not _is_public(name) or name in EXCLUDES:
-            continue
-        if depth >= 3 and not any(name.startswith(p) for p in DEEP_PAGES):
-            continue
-        if _has_public_api(path):
-            modules.append(name)
-    return sorted(set(modules))
-
-
-all_modules = _discover("btorch")
+all_modules = discover(Path(__file__).resolve().parents[1] / "btorch")
 grouped: dict[str, list[str]] = {}
 standalone: list[str] = []
 
@@ -140,7 +84,8 @@ with mkdocs_gen_files.open("api/index.md", "w") as fd:
         slug = mod.replace("btorch.", "") + ".md"
         fd.write(f"- [{mod.replace('btorch.', '').title()}]({Path(slug).name})\n")
     for prefix, (path, title) in DEEP_PAGES.items():
-        fd.write(f"- [{title}]({Path(path).name})\n")
+        if any(mod.startswith(prefix) for mod in all_modules):
+            fd.write(f"- [{title}]({Path(path).name})\n")
     fd.write("\n")
 
 nav["API Reference", "Index"] = "api/index.md"

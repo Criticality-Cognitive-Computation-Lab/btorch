@@ -34,6 +34,7 @@ nav:
   - api/index.md
   - api/models.md
   - api/neurons.md
+  - api/fitting.md
   - api/analysis.md
   - api/analysis_dynamic_tools.md
   - api/connectome.md

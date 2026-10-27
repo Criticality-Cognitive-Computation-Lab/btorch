@@ -76,7 +76,7 @@ def build_lang(cfg: DocsConf) -> None:
 
     api_script = Path(__file__).resolve().parent / "gen_api_pages.py"
     print("Generating API reference pages...")
-    subprocess.run(["python", str(api_script)], check=True)
+    subprocess.run([sys.executable, str(api_script)], check=True)
 
     cmd = [
         "zensical",

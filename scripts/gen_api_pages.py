@@ -5,70 +5,14 @@ docs/en/docs/api/ and docs/zh/docs/api/ instead of using mkdocs-gen-
 files.
 """
 
-import ast
-import importlib
-import pkgutil
 import shutil
+import sys
 from pathlib import Path
 
 
-EXCLUDES = {
-    "btorch.backend",
-    "btorch.types",
-    "btorch.config",
-}
-
-DEEP_PAGES = {
-    "btorch.analysis.dynamic_tools.": (
-        "api/analysis_dynamic_tools.md",
-        "Analysis — Dynamic Tools",
-    ),
-    "btorch.models.neurons": (
-        "api/neurons.md",
-        "Neurons",
-    ),
-}
-
-
-def _is_public(name: str) -> bool:
-    return all(not part.startswith("_") for part in name.split("."))
-
-
-def _has_public_api(file_path: Path) -> bool:
-    try:
-        tree = ast.parse(file_path.read_text(encoding="utf-8"))
-    except SyntaxError:
-        return False
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if not node.name.startswith("_"):
-                return True
-        if isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                if not alias.name.startswith("_"):
-                    return True
-    return False
-
-
-def _discover(package: str) -> list[str]:
-    pkg = importlib.import_module(package)
-    base_path = Path(pkg.__file__).parent
-    modules: list[str] = []
-    for _, name, ispkg in pkgutil.walk_packages([str(base_path)], prefix=f"{package}."):
-        if not _is_public(name) or name in EXCLUDES:
-            continue
-        depth = len(name.split(".")) - 1
-        if depth >= 3 and not any(name.startswith(p) for p in DEEP_PAGES):
-            continue
-        rel = name.split(".")[1:]
-        file_path = (
-            base_path / "/".join(rel) / "__init__.py"
-            if ispkg
-            else base_path / ("/".join(rel) + ".py")
-        )
-        if file_path.exists() and _has_public_api(file_path):
-            modules.append(name)
-    return sorted(set(modules))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "docs"))
+from api_reference import DEEP_PAGES, discover  # noqa: E402
 
 
 def _write_page_disk(base_dir: Path, path: str, title: str, modules: list[str]):
@@ -90,7 +34,7 @@ def generate(lang: str = "en"):
         shutil.rmtree(api_dir)
     api_dir.mkdir(parents=True, exist_ok=True)
 
-    all_modules = _discover("btorch")
+    all_modules = discover(REPO_ROOT / "btorch")
     grouped: dict[str, list[str]] = {}
     standalone: list[str] = []
 
@@ -147,7 +91,8 @@ def generate(lang: str = "en"):
         slug = mod.replace("btorch.", "") + ".md"
         lines.append(f"- [{mod.replace('btorch.', '').title()}]({Path(slug).name})\n")
     for prefix, (path, title) in DEEP_PAGES.items():
-        lines.append(f"- [{title}]({Path(path).name})\n")
+        if any(mod.startswith(prefix) for mod in all_modules):
+            lines.append(f"- [{title}]({Path(path).name})\n")
     lines.append("\n")
     index_path.write_text("".join(lines), encoding="utf-8")
 
