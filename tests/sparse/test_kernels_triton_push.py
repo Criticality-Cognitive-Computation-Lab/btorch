@@ -23,7 +23,11 @@ import numpy as np
 import pytest
 import torch
 
-from btorch.sparse.runtime import kernels_torch, kernels_triton_push as ktp
+from btorch.sparse.runtime import (
+    kernels_torch,
+    kernels_triton_push as ktp,
+    source_layout,
+)
 from btorch.sparse.runtime.backend import BackendRegistry, KernelCache
 from btorch.sparse.runtime.cache import RepresentationCache
 
@@ -150,7 +154,7 @@ def force_kernel(monkeypatch, mode):
     kernel is exercised on every input.
     """
     packed = mode == "packed"
-    monkeypatch.setattr(ktp, "_prefer_dense", lambda *_: not packed)
+    monkeypatch.setattr(source_layout, "_prefer_dense", lambda *_: not packed)
 
 
 def run(mode, cache, values, x, kernel_cache, monkeypatch):
@@ -237,7 +241,9 @@ def test_hub_is_fully_delivered(graph, kernel_cache, monkeypatch, mode):
     or mis-aligned changes the sum of the delivered weights.
     """
     cache, values, dense = graph
-    assert HUB_DEGREE > max(ktp._BLOCK, ktp._TILE_BLOCK, ktp._HUB_DEGREE)
+    assert HUB_DEGREE > max(
+        source_layout.EDGE_BLOCK, source_layout._TILE_BLOCK, source_layout._HUB_DEGREE
+    )
     x = torch.zeros(1, N_SRC, device=DEVICE)
     x[0, HUB] = 1.0
     out = run(mode, cache, values, x, kernel_cache, monkeypatch)
@@ -247,7 +253,9 @@ def test_hub_is_fully_delivered(graph, kernel_cache, monkeypatch, mode):
     assert (error <= rounding_bound(dense, x)).all(), f"max error {error.max():.3e}"
 
 
-@pytest.mark.parametrize("hub_degree", [ktp._HUB_DEGREE, ktp._HUB_DEGREE + 1])
+@pytest.mark.parametrize(
+    "hub_degree", [source_layout._HUB_DEGREE, source_layout._HUB_DEGREE + 1]
+)
 def test_hub_threshold_boundary(kernel_cache, hub_degree):
     """Dense kernel: a source is served by its tile *or* by hub tasks.
 
@@ -259,8 +267,10 @@ def test_hub_threshold_boundary(kernel_cache, hub_degree):
     cache, values, dense = make_graph(seed=1, hub_degree=hub_degree)
     degree = int(cache.t_crow[HUB + 1] - cache.t_crow[HUB])
     assert degree == hub_degree
-    layout = ktp._layout(kernel_cache, cache.t_crow, cache.t_col, cache.t_perm)
-    assert (layout.n_hub > 0) == (degree > ktp._HUB_DEGREE)
+    layout = source_layout._layout(
+        kernel_cache, cache.t_crow, cache.t_col, cache.t_perm
+    )
+    assert (layout.n_hub > 0) == (degree > source_layout._HUB_DEGREE)
     x = make_input("sparse", 2)
     out = ktp.spike_push_dense(
         cache.t_crow, cache.t_col, cache.t_perm, values, x, N_DST, cache=kernel_cache
@@ -345,7 +355,9 @@ def test_layout_follows_in_place_rewiring(kernel_cache, monkeypatch):
     """
     cache, values, dense = make_graph(seed=2)
     x = make_input("sparse", 3)
-    before = ktp._layout(kernel_cache, cache.t_crow, cache.t_col, cache.t_perm)
+    before = source_layout._layout(
+        kernel_cache, cache.t_crow, cache.t_col, cache.t_perm
+    )
     col_buffer = before.col
 
     # Rewire: reverse the destination of every edge (M - 1 - dst). The edge
@@ -367,7 +379,7 @@ def test_layout_follows_in_place_rewiring(kernel_cache, monkeypatch):
         out = run(mode, cache, values, x, kernel_cache, monkeypatch)
         assert (dense.error(out, x) <= rounding_bound(dense, x)).all(), mode
 
-    after = ktp._layout(kernel_cache, cache.t_crow, cache.t_col, cache.t_perm)
+    after = source_layout._layout(kernel_cache, cache.t_crow, cache.t_col, cache.t_perm)
     # Same holder and same int32 buffer, refreshed in place: tensors captured
     # by a compiled graph or a CUDA graph stay valid across rewiring.
     assert after is before and after.col is col_buffer
@@ -377,10 +389,10 @@ def test_layout_follows_in_place_rewiring(kernel_cache, monkeypatch):
 def test_layout_cache_is_bounded(kernel_cache, monkeypatch):
     """Layouts of dead connections are dropped; unchanged ones are re-used."""
     cache, values, _ = make_graph(seed=3)
-    first = ktp._layout(kernel_cache, cache.t_crow, cache.t_col, cache.t_perm)
-    again = ktp._layout(kernel_cache, cache.t_crow, cache.t_col, cache.t_perm)
+    first = source_layout._layout(kernel_cache, cache.t_crow, cache.t_col, cache.t_perm)
+    again = source_layout._layout(kernel_cache, cache.t_crow, cache.t_col, cache.t_perm)
     assert again is first  # hit: nothing rebuilt
-    holders = kernel_cache.get(("triton_push", "layouts"), dict)
+    holders = kernel_cache.get(("source_csr", "layouts"), dict)
     assert len(holders) == 1
     # Free the connection: its holder (and with it the int32 copies on the
     # device) goes away at once, not only when another layout is built.
@@ -390,19 +402,19 @@ def test_layout_cache_is_bounded(kernel_cache, monkeypatch):
     # Then build another one: the new buffers may land on the old addresses
     # and must get their own holder.
     other, _, _ = make_graph(seed=4)
-    ktp._layout(kernel_cache, other.t_crow, other.t_col, other.t_perm)
+    source_layout._layout(kernel_cache, other.t_crow, other.t_col, other.t_perm)
     assert len(holders) == 1
 
     # Graphs that stay alive are bounded by ``_MAX_LAYOUTS`` (oldest first);
     # an evicted layout is rebuilt on its next use.
-    monkeypatch.setattr(ktp, "_MAX_LAYOUTS", 3)
+    monkeypatch.setattr(source_layout, "_MAX_LAYOUTS", 3)
     alive = [make_graph(seed=10 + i)[0] for i in range(5)]
     for c in alive:
-        ktp._layout(kernel_cache, c.t_crow, c.t_col, c.t_perm)
+        source_layout._layout(kernel_cache, c.t_crow, c.t_col, c.t_perm)
         assert len(holders) <= 3
     c = alive[0]
     assert (id(c.t_crow), id(c.t_col), id(c.t_perm)) not in holders
-    rebuilt = ktp._layout(kernel_cache, c.t_crow, c.t_col, c.t_perm)
+    rebuilt = source_layout._layout(kernel_cache, c.t_crow, c.t_col, c.t_perm)
     assert torch.equal(rebuilt.col, c.t_col.to(torch.int32))
 
 
@@ -466,7 +478,7 @@ def test_mismatched_sizes_and_index_types_fall_back(graph, kernel_cache, monkeyp
         raise AssertionError("a Triton kernel was launched")
 
     monkeypatch.setattr(ktp.kernels_triton, "_launch", tripwire)
-    monkeypatch.setattr(ktp, "_reference", lambda *a: "reference")
+    monkeypatch.setattr(source_layout, "_reference", lambda *a: "reference")
     buffers = (cache.t_crow, cache.t_col, cache.t_perm)
 
     def packed(*args):
@@ -511,24 +523,6 @@ def test_non_contiguous_packed_indices(graph, kernel_cache, monkeypatch):
     assert (dense.error(out, x) <= rounding_bound(dense, x)).all()
 
 
-@pytest.mark.parametrize("mode", MODES)
-def test_direct_launch_matches_public_launch(graph, kernel_cache, monkeypatch, mode):
-    """The cached-handle launch runs the same kernels as Triton's own path.
-
-    With a known Triton version the kernels are launched through a
-    cached compiled handle (no per-call argument specialisation). Both
-    launch paths must give correct results, also on the second (steady-
-    state) call.
-    """
-    cache, values, dense = graph
-    x = make_input("sparse", 3)
-    for direct in (True, False):
-        monkeypatch.setattr(ktp.kernels_triton, "_DIRECT_LAUNCH", direct)
-        for _ in range(2):
-            out = run(mode, cache, values, x, kernel_cache, monkeypatch)
-            assert (dense.error(out, x) <= rounding_bound(dense, x)).all()
-
-
 def test_register_on_private_registry(graph):
     """``register`` adds a preferred CUDA backend and leaves the CPU alone.
 
@@ -557,7 +551,7 @@ def test_register_on_private_registry(graph):
     )
     assert (dense.error(dense_out, x) <= rounding_bound(dense, x)).all()
     # The derived layout went into *this* registry's kernel cache.
-    assert len(registry.kernels.get(("triton_push", "layouts"), dict)) == 1
+    assert len(registry.kernels.get(("source_csr", "layouts"), dict)) == 1
 
 
 def test_spike_list_promotes_mixed_activity_without_input_upcast(graph, kernel_cache):

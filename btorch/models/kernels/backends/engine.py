@@ -15,6 +15,7 @@ from pathlib import Path
 
 import torch
 
+from ....utils.kernel import storage_span
 from ..contracts import surrogate_support
 from ..program import substitute_expression
 from ..templates import (
@@ -930,7 +931,7 @@ def _launch(
         precise_division,
         device=buffers["x_seq"].device,
     )
-    args = tuple(_storage_span(buffers[name], size) for name, size in pointers)
+    args = tuple(storage_span(buffers[name], size) for name, size in pointers)
     num_warps = None
     if backward and get_template(spec).reverse_parameter_warps:
         targets = _normalize_gradient_targets(get_template(spec), gradient_targets)
@@ -965,25 +966,11 @@ def _dt_buffer(dt, reference):
 def _kernel_arguments(buffers, declarations, strided_names):
     """Bind the declared ABI while preserving broadcast parameter storage."""
     return tuple(
-        _storage_span(buffers[name], size)
+        storage_span(buffers[name], size)
         if name in strided_names
         else buffers[name].reshape(-1)
         for name, size in declarations
     )
-
-
-def _storage_span(value, span):
-    """Expose reachable storage without changing logical parameter offsets."""
-    if span is None:
-        span = (
-            0
-            if not value.numel()
-            else 1
-            + sum(
-                (size - 1) * stride for size, stride in zip(value.shape, value.stride())
-            )
-        )
-    return value.as_strided((span,), (1,), value.storage_offset())
 
 
 def _layout(value, target_shape):

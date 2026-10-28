@@ -22,6 +22,7 @@ from torch import Tensor
 from torch.library import custom_op
 
 from . import (
+    kernels_tilelang,
     kernels_torch,
     kernels_triton,
     kernels_triton_push,
@@ -62,6 +63,7 @@ registry.register(
 kernels_triton.register(registry)
 kernels_triton_push.register(registry)
 kernels_triton_spikelist.register(registry)
+kernels_tilelang.register(registry)
 
 
 def _out_shape(values: Tensor, x: Tensor, n_out: int) -> tuple[int, ...]:
@@ -1132,6 +1134,68 @@ def propagate_binding(
     )
 
 
+def _register_cuda_routes(backend, available, priority):
+    """Register identical algorithm contracts for each sparse CUDA renderer."""
+    reverse = tuple(
+        (name, backend) for name in ("csr_matvec", "edge_grad", "csr_backward")
+    )
+    for representation, algorithm, builder, preparation, supports, offset in (
+        (
+            "post_pre_csr",
+            "pull",
+            _build_pull,
+            ("prepare_pull",),
+            lambda c: True,
+            0,
+        ),
+        (
+            "spike_list_csr",
+            "push",
+            _build_spike_list,
+            ("spike_push_list", "prepare_spike_list_values", "prepare_push"),
+            lambda c: (
+                c is not None
+                and c.dtype in kernels_torch._FLOAT_DTYPES
+                and not c.value_batched
+                and (
+                    c.method == "push"
+                    or (
+                        c.method == "auto"
+                        and c.firing_rate_hz is not None
+                        and c.firing_rate_hz < 5.0
+                    )
+                )
+            ),
+            10,
+        ),
+        (
+            "post_pre_csr",
+            "push",
+            _build_source_push,
+            ("spike_push_dense", "prepare_push", "prepare_task_values"),
+            lambda c: (
+                c is not None
+                and c.method == "auto"
+                and c.dtype in kernels_torch._FLOAT_DTYPES
+                and not c.value_batched
+            ),
+            0,
+        ),
+    ):
+        registry.register_route(
+            RouteSpec(
+                key=RouteKey("propagate", representation, algorithm, backend),
+                kernel_bindings=reverse
+                + tuple((name, backend) for name in preparation),
+                build=builder,
+                supports=supports,
+            ),
+            device="cuda",
+            priority=priority + offset,
+            available=available,
+        )
+
+
 def _register_route_specs() -> None:
     """Register complete built-in routes after all low-level kernels exist."""
     for device, reverse_backend in (
@@ -1165,6 +1229,8 @@ def _register_route_specs() -> None:
             if reverse_backend == "triton"
             else None,
         )
+    _register_cuda_routes("triton", kernels_triton.is_available, 10)
+    _register_cuda_routes("tilelang", kernels_tilelang.is_available, 5)
     registry.register_route(
         RouteSpec(
             key=RouteKey("propagate", "post_pre_csr", "pull", "cusparse"),
@@ -1177,36 +1243,6 @@ def _register_route_specs() -> None:
         device="cuda",
         priority=1,
         available=torch.cuda.is_available,
-    )
-    registry.register_route(
-        RouteSpec(
-            key=RouteKey("propagate", "spike_list_csr", "push", "triton"),
-            kernel_bindings=(
-                ("spike_push_list", "triton"),
-                ("prepare_spike_list_values", "triton"),
-                ("csr_matvec", "triton"),
-                ("edge_grad", "triton"),
-                ("csr_backward", "triton"),
-                ("prepare_push", "triton"),
-            ),
-            build=_build_spike_list,
-            supports=lambda context: (
-                context is not None
-                and context.dtype in kernels_torch._FLOAT_DTYPES
-                and not context.value_batched
-                and (
-                    context.method == "push"
-                    or (
-                        context.method == "auto"
-                        and context.firing_rate_hz is not None
-                        and context.firing_rate_hz < 5.0
-                    )
-                )
-            ),
-        ),
-        device="cuda",
-        priority=20,
-        available=kernels_triton_push.is_available,
     )
     registry.register_route(
         RouteSpec(
@@ -1232,21 +1268,6 @@ def _register_route_specs() -> None:
     )
     registry.register_route(
         RouteSpec(
-            key=RouteKey("propagate", "post_pre_csr", "pull", "triton"),
-            kernel_bindings=(
-                ("csr_matvec", "triton"),
-                ("edge_grad", "triton"),
-                ("csr_backward", "triton"),
-                ("prepare_pull", "triton"),
-            ),
-            build=_build_pull,
-        ),
-        device="cuda",
-        priority=10,
-        available=kernels_triton.is_available,
-    )
-    registry.register_route(
-        RouteSpec(
             key=RouteKey("propagate", "post_pre_csr", "adaptive-push", "torch"),
             kernel_bindings=(
                 ("spike_push", "torch"),
@@ -1258,29 +1279,6 @@ def _register_route_specs() -> None:
         ),
         device=("cpu", "cuda"),
         priority=0,
-    )
-    registry.register_route(
-        RouteSpec(
-            key=RouteKey("propagate", "post_pre_csr", "push", "triton"),
-            kernel_bindings=(
-                ("spike_push_dense", "triton"),
-                ("csr_matvec", "triton"),
-                ("edge_grad", "triton"),
-                ("csr_backward", "triton"),
-                ("prepare_push", "triton"),
-                ("prepare_task_values", "triton"),
-            ),
-            build=_build_source_push,
-            supports=lambda context: (
-                context is not None
-                and context.method == "auto"
-                and context.dtype in kernels_torch._FLOAT_DTYPES
-                and not context.value_batched
-            ),
-        ),
-        device="cuda",
-        priority=10,
-        available=kernels_triton_push.is_available,
     )
 
 

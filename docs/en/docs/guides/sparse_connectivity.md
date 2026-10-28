@@ -1671,12 +1671,11 @@ On a GPU, the kernels have a second implementation written in
 
 The backend is available when the `triton` package can be imported and CUDA is
 present. It then has a higher priority than `"cusparse"` and `"torch"`, so it is the default on
-CUDA and nothing has to be selected. The Triton kernels handle `float32` data
-only. For every other dtype they call the ATen kernel themselves, without a
-message; `conn.explain()` still reports `triton` in that case. When Triton is
-missing, native CUDA FP32/FP64 pull uses `"cusparse"`; `"torch"` remains the
-general fallback, the default on CPU, and the reference the Triton kernels
-are tested against.
+CUDA and nothing has to be selected. Sparse CUDA kernels support FP16,
+BF16, FP32 and FP64 operands, including mixed input/weight dtypes, with
+FP32 accumulation for low-precision outputs and FP64 accumulation for FP64.
+Unsupported layouts use the general Torch implementation. TileLang supplies
+another complete CUDA backend; explicit selection is described below.
 
 ```python
 print(runtime.registry.available("csr_matvec", "cuda"))  # best first
@@ -1703,6 +1702,37 @@ reference routing uses `"adaptive-push"`; an explicit Torch override can also
 select that reference route on CUDA. Automatic CUDA planning falls back to
 `"pull"` when no supported device push route exists. The differences are listed under
 [Performance hints](#performance-hints-and-explain).
+
+### TileLang backend (CUDA)
+
+`"tilelang"` implements the same sparse algorithms as `"triton"`: segmented
+CSR pull, sampled edge gradients, device spike-list fanout and direct/hash
+task queues. It uses TileLang's public JIT kernel calls and does not require
+Triton kernels for propagation or backward. Automatic selection continues to
+prefer Triton when available.
+
+Select sparse execution independently of neuron execution. For a standalone
+connection, use `runtime.use_backend("tilelang")`; combine it with
+`runtime.use_method("push")` to explicitly request spike-list propagation.
+For a recurrent network, pass these options as its `backend` argument:
+
+```python
+from btorch.models import KernelOptions
+
+options = KernelOptions(
+    neuron="tilelang",
+    connection="tilelang",
+    connection_method="push",  # use "pull" for deterministic sparse reductions
+)
+```
+
+A TileLang neuron currently emits a dense spike tensor; a TileLang packing
+kernel forms block-local spike lists before fanout. Direct list emission from
+the neuron remains available with the Triton neuron renderer. Thus an
+all-TileLang push step has one extra packing launch. This does not change the
+model equations or the selected sparse algorithm. Both backends support the
+same dtype promotion, autograd and CUDA Graph contracts; push accumulation
+remains nondeterministic.
 
 ## Migration from `SparseConn`
 

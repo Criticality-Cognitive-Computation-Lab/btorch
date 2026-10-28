@@ -231,7 +231,7 @@ def main(
     )
     parser.add_argument(
         "--sparse-backend",
-        choices=("auto", "torch", "triton", "cusparse"),
+        choices=("auto", "torch", "triton", "tilelang", "cusparse"),
         default=defaults.sparse_backend,
     )
     parser.add_argument(

@@ -11,8 +11,9 @@ from btorch.models.connection import SparseConnection
 from btorch.models.rnn import make_rnn
 from btorch.sparse import Hints
 from btorch.sparse.runtime import (
-    kernels_triton_tasks as task_kernels,
+    kernels_triton_tasks,
     registry,
+    task_layout as task_kernels,
     use_backend,
 )
 
@@ -21,6 +22,15 @@ from btorch.sparse.runtime import (
 def sparse_reference_backend():
     # These cases exercise task preparation, not the small-network dense route.
     with use_backend("torch"):
+        yield
+
+
+@pytest.fixture
+def triton_task_backend():
+    # Task preparation is the contract here. Explicit backend selection keeps
+    # these tiny physical fixtures off the auto dense-matmul route (<4000).
+    pytest.importorskip("triton")
+    with use_backend("triton"):
         yield
 
 
@@ -110,11 +120,11 @@ def test_sparse_run_scope_flattens_all_sample_dimensions():
 class _SparseCell(MemoryModule):
     """Stateless cell exposing a real sparse connection to the RNN scope."""
 
-    def __init__(self):
+    def __init__(self, device="cpu"):
         super().__init__()
         self.connection = SparseConnection.from_edges(
-            torch.tensor([0, 1, 2, 0]),
-            torch.tensor([1, 2, 0, 2]),
+            torch.tensor([0, 1, 2, 0], device=device),
+            torch.tensor([1, 2, 0, 2], device=device),
             3,
             3,
             hints=Hints(expected_density=0.0001),
@@ -231,7 +241,9 @@ def test_checkpoint_recompute_reuses_prepared_task_values(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_cuda_task_route_prepares_once_and_only_runs_per_timestep(monkeypatch):
+def test_cuda_task_route_prepares_once_and_only_runs_per_timestep(
+    monkeypatch, triton_task_backend
+):
     """A real PR70 trajectory pays conversion once and execution ``T``
     times."""
     if (
@@ -240,7 +252,7 @@ def test_cuda_task_route_prepares_once_and_only_runs_per_timestep(monkeypatch):
     ):
         pytest.skip("the Triton task route is unavailable")
 
-    cell = make_rnn(_SparseCell, chunk_size=2, unroll=1)().cuda()
+    cell = make_rnn(_SparseCell, chunk_size=2, unroll=1)(device="cuda")
     connection = cell.rnn_cell.connection
     calls = {"prepare": 0, "bind": 0, "pack": 0, "run": 0}
 
@@ -266,11 +278,19 @@ def test_cuda_task_route_prepares_once_and_only_runs_per_timestep(monkeypatch):
         "pack_values",
         counted("pack", task_kernels.pack_values),
     )
-    monkeypatch.setattr(
-        task_kernels,
-        "run",
-        counted("run", task_kernels.run),
-    )
+    prepare_launch = kernels_triton_tasks._Execution.prepare
+
+    def observe_task_stage(self, name, *args, **kwargs):
+        execute = prepare_launch(self, name, *args, **kwargs)
+
+        def submit(arguments):
+            if name == "pack_tasks":
+                calls["run"] += 1
+            return execute(arguments)
+
+        return submit
+
+    monkeypatch.setattr(kernels_triton_tasks._Execution, "prepare", observe_task_stage)
 
     pointers = tuple(
         getattr(connection.cache, name).data_ptr() for name in connection.cache._NAMES
@@ -291,9 +311,9 @@ def test_cuda_task_route_prepares_once_and_only_runs_per_timestep(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_cuda_task_route_supports_a_standalone_connection_call():
+def test_cuda_task_route_supports_a_standalone_connection_call(triton_task_backend):
     """A task-planned connection creates one temporary single-step scope."""
-    connection = _SparseCell().connection.cuda()
+    connection = _SparseCell(device="cuda").connection
     x = torch.ones(4, 3, device="cuda")
 
     output = connection(x)
@@ -371,9 +391,9 @@ def test_cuda_sparse_routes_preserve_typed_activity_and_gradients(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_compiled_standalone_task_plan_uses_prebound_pull_fallback():
+def test_compiled_standalone_task_plan_uses_prebound_pull_fallback(triton_task_backend):
     """Compilation never tries to prepare task state inside the graph."""
-    connection = _SparseCell().connection.cuda()
+    connection = _SparseCell(device="cuda").connection
     x = torch.ones(4, 3, device="cuda")
     expected = connection(x)
 
@@ -383,9 +403,11 @@ def test_compiled_standalone_task_plan_uses_prebound_pull_fallback():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_cuda_task_route_reprepares_after_kernel_cache_clear(monkeypatch):
+def test_cuda_task_route_reprepares_after_kernel_cache_clear(
+    monkeypatch, triton_task_backend
+):
     """Clearing process-local artefacts invalidates packed task bindings."""
-    cell = make_rnn(_SparseCell, unroll=1)().cuda()
+    cell = make_rnn(_SparseCell, unroll=1)(device="cuda")
     calls = 0
     prepare_values = cell.rnn_cell.connection._route.implementation.prepare_values
     assert prepare_values is not None
@@ -414,7 +436,9 @@ def test_cuda_task_route_reprepares_after_kernel_cache_clear(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_cuda_checkpoint_recompute_restores_evicted_task_binding(monkeypatch):
+def test_cuda_checkpoint_recompute_restores_evicted_task_binding(
+    monkeypatch, triton_task_backend
+):
     """Checkpoint recomputation restores its exact task binding after
     eviction."""
     if (
@@ -428,7 +452,7 @@ def test_cuda_checkpoint_recompute_restores_evicted_task_binding(monkeypatch):
         chunk_size=2,
         unroll=1,
         grad_checkpoint=True,
-    )().cuda()
+    )(device="cuda")
     calls = {"prepare": 0, "bind": 0, "pack": 0}
 
     def counted(name, function):

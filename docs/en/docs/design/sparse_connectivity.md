@@ -375,7 +375,7 @@ connection is built or its hints change.
 Native recurrent custom operators can request an invocation-local forward
 workspace through the bound route's optional `prepare_forward` capability.
 The route snapshot binds this capability alongside its forward and backward
-kernels. Triton pull reuses its output, hub-reduction and sample-layout buffers;
+kernels. CUDA pull reuses its output, hub-reduction and sample-layout buffers;
 spike-list push reuses block-local source lists, degree prefixes, counts and
 output storage. The prepared propagation exposes an optional producer
 destination to the template renderer. An eligible Triton neuron epilogue writes
@@ -390,7 +390,7 @@ register their optional execution factory through
 that implementation's revision; replacing a kernel cannot silently retain an
 older factory. Route snapshots bind execution and preparation together.
 
-When direct emission is unavailable, one Triton preparation kernel clears the
+When direct emission is unavailable, one preparation kernel in the selected backend clears the
 output and compacts sources while scanning their degrees. Both paths use the
 same block-local emitter and packed fanout; neither needs a global CUB scan or
 its per-step scratch allocation. Full source capacity prevents overflow even
@@ -454,7 +454,7 @@ frozen at capture time. Weights are read at replay time and may change.
 
 ## 9. Runtime backends
 
-| Kernel / route | Torch reference | Triton (CUDA) |
+| Kernel / route | Torch reference | Triton / TileLang (CUDA) |
 |---|---|---|
 | `csr_matvec` (pull and transposed input gradient) | native CSR product where supported; gather / `index_add` otherwise | row-block tiles, segmented hub rows, deterministic output ownership |
 | `edge_grad` (value gradient) | chunked gather-multiply | entry-block launch without a `[B, E]` temporary |
@@ -465,9 +465,16 @@ frozen at capture time. Weights are read at replay time and may change.
 The `torch` backend supplies the general reference. `cusparse` explicitly
 selects native CUDA CSR pull through PyTorch for FP32/FP64; its edge-value
 gradients reuse the Torch sampled product. Neither selector requests SpMSpV.
-Triton push routes use floating-point atomics and are not bitwise reproducible.
+Both CUDA push backends use floating-point atomics and are not bitwise reproducible.
 The kernels reuse the existing packed/source-major implementations rather than
 introducing another sparse product for the spike-list route.
+
+Both renderers share topology preparation, row/edge tiling and queue/workspace
+ownership. Prepared task execution also owns its reusable accumulation and
+output buffers. A prepared invocation fixes shape, strides, dtype and device;
+changing those facts requires preparation again. Replaceable source addresses
+are refreshed, including a same-object storage rebind. Static tensor storage
+must remain bound for that invocation, as for CUDA Graph capture.
 
 The planner binds a complete forward/backward route when static execution
 choices change. Explicit `method="pull"` or `method="push"` overrides activity

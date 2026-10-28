@@ -16,8 +16,8 @@ from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
-    from .kernels_triton_spikelist import SpikeList
     from .planner import PlanningContext
+    from .spike_list import SpikeList
 
 
 @dataclass(frozen=True)

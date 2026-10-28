@@ -668,8 +668,22 @@ class RecurrentNNAbstract(base.MemoryModule):
         # ------------------------------------------------------------------
         # Post-process: stack
         # ------------------------------------------------------------------
-        stacked_outputs = torch.stack(all_z_list, dim=0)
-        stacked_states = {k: torch.stack(v, dim=0) for k, v in all_states_lists.items()}
+        # Native chunks already own time-major trajectories. Unbinding them
+        # into per-step Tensor objects only to stack again adds O(T * records)
+        # wrappers and garbage-collection work to host submission.
+        if isinstance(z_chunk, Tensor):
+            stacked_outputs = (
+                all_z_list[0] if len(all_z_list) == 1 else torch.cat(all_z_list, dim=0)
+            )
+            stacked_states = {
+                name: values[0] if len(values) == 1 else torch.cat(values, dim=0)
+                for name, values in all_states_lists.items()
+            }
+        else:
+            stacked_outputs = torch.stack(all_z_list, dim=0)
+            stacked_states = {
+                k: torch.stack(v, dim=0) for k, v in all_states_lists.items()
+            }
 
         # Only compiled multi-chunk CPU offload needs serialization: its CPU
         # and CUDA compiled branches can enter the same AOTAutograd context on
@@ -1208,12 +1222,9 @@ class RecurrentNN(RecurrentNNAbstract):
             )
         from .kernels.recurrent import recurrent_sequence
 
-        output, states = recurrent_sequence(
+        return recurrent_sequence(
             self, *chunk_args, loop_args=loop_args, _chunk=True, **kwargs
         )
-        return list(output.unbind(0)), {
-            name: list(value.unbind(0)) for name, value in states.items()
-        }
 
     def single_step_forward(
         self, x: Tensor, x_syn: Tensor | None = None

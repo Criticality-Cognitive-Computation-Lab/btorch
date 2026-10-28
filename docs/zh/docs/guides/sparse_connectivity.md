@@ -47,3 +47,29 @@ CUDA `method="push"` 使用浮点原子累加；固定随机种子或 CUDA Graph
 求和的 FP32 权重对照均消除了该实验的全部 1000 步差异，支持舍入放大的解释，
 但不能证明所有路径没有 race，也不意味着应该偷偷改变模型权重或 dtype。
 完整实验条件及限制见英文指南。
+
+
+## TileLang 稀疏后端
+
+`tilelang` 与 `triton` 使用相同的分段 CSR pull、边梯度归约、块内 spike list
+与持久 fanout、direct/hash 任务队列算法。TileLang 路径通过公开 JIT 内核接口
+启动，前向与反向均不依赖 Triton 内核；自动选择仍优先使用可用的 Triton。
+
+```python
+from btorch.models import KernelOptions
+
+options = KernelOptions(
+    neuron="tilelang",
+    connection="tilelang",
+    connection_method="push",
+)
+```
+
+将 `options` 传给 `RecurrentNN` 的 `backend` 参数。独立连接可用
+`btorch.sparse.runtime.use_backend("tilelang")`，显式 push 则配合
+`use_method("push")`。后端选择与传播方法独立；FP16/BF16/FP32/FP64、混合 dtype、
+自动求导与 CUDA Graph 的契约不变。push 仍使用非确定性的浮点原子累加。
+
+目前 TileLang 神经元输出稠密脉冲，由 TileLang packing 内核生成块内列表，
+因此相比 Triton 神经元直接生成列表多一次 packing 启动。此差异不改变模型方程
+或稀疏算法；需要确定性的稀疏归约时选择 `connection_method="pull"`。

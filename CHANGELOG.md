@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add a complete TileLang sparse CUDA backend for pull, spike-list push,
+  direct/hash tasks and full connection VJPs. Sparse layouts and algorithm
+  preparation are shared with Triton; each backend keeps its own device
+  kernels and public launch API. `KernelOptions(connection="tilelang")`
+  enables recurrent execution entirely through TileLang.
+
+- Native recurrent execution prepares fused launch bindings and spike-list
+  executables once per chunk, retaining pointer owners and binding positional
+  state/record slots with stride-aware offsets. Current streams, profiler
+  hooks and boundary state views are preserved. Eager chunks retain time-major
+  recordings instead of unbinding and restacking every timestep.
+
 - Kernel model contracts now use registered `ModelTemplate` state/record
   metadata and shared forward/reverse fragments across primitive and fused
   renderers. Kernel parity uses the canonical `ModelParityCase` comparator and

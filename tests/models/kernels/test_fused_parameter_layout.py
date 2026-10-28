@@ -262,29 +262,67 @@ def test_recurrent_module_strided_parameters_match_torch_vjp(backend):
         "g_max",
         torch.tensor([[0.8], [1.2]], device="cuda"),
     )
+    # The first paired stage reads caller-owned PSC views; subsequent stages
+    # read the internal recording layout. Preparation must not assume that the
+    # initial storage describes every step of the recurrent working set.
+    for name in ("psc", "h"):
+        storage = torch.zeros(batch, neurons * 2, device="cuda")
+        setattr(model.synapse, name, storage[:, 1::2])
     reference = copy.deepcopy(model)
     reference.backend = "torch"
-    x = torch.randn(5, batch, neurons, device="cuda").requires_grad_()
+    # Three-neuron rows have alternating 16-byte alignment, and this external
+    # input also has a nonzero offset and nonunit stride. Reusing an executable
+    # compiled for the first pointer's alignment would be an invalid contract.
+    x = torch.randn(5, batch, neurons * 2, device="cuda")[..., 1::2].requires_grad_()
     x_reference = x.detach().clone().requires_grad_()
+    # Continue with a time-broadcast view. Its row address must remain fixed,
+    # while its input adjoint still sums all logical timesteps into the shared
+    # base. Together the windows exercise nonzero and zero temporal strides.
+    continuation_base = torch.randn(
+        1, batch, neurons * 2, device="cuda"
+    ).requires_grad_()
+    continuation_reference = continuation_base.detach().clone().requires_grad_()
+    continuation = continuation_base[..., 1::2].expand(3, -1, -1)
+    reference_continuation = continuation_reference[..., 1::2].expand(3, -1, -1)
 
     with environ.context(dt=0.5):
         output, records = model(x)
         expected, expected_records = reference(x_reference)
+        next_output, next_records = model(continuation)
+        next_expected, next_expected_records = reference(reference_continuation)
     torch.testing.assert_close(output, expected, atol=8e-5, rtol=8e-4)
+    torch.testing.assert_close(next_output, next_expected, atol=8e-5, rtol=8e-4)
     for name in records:
         torch.testing.assert_close(
             records[name], expected_records[name], atol=8e-5, rtol=8e-4
         )
+        torch.testing.assert_close(
+            next_records[name], next_expected_records[name], atol=8e-5, rtol=8e-4
+        )
     weights = torch.randn_like(output)
+    next_weights = torch.randn_like(next_output)
     loss = (output * weights).sum() + sum(
         value.square().sum() for value in records.values()
+    )
+    loss = (
+        loss
+        + (next_output * next_weights).sum()
+        + sum(value.square().sum() for value in next_records.values())
     )
     expected_loss = (expected * weights).sum() + sum(
         value.square().sum() for value in expected_records.values()
     )
+    expected_loss = (
+        expected_loss
+        + (next_expected * next_weights).sum()
+        + sum(value.square().sum() for value in next_expected_records.values())
+    )
     loss.backward()
     expected_loss.backward()
     torch.testing.assert_close(x.grad, x_reference.grad, atol=7e-4, rtol=7e-4)
+    torch.testing.assert_close(
+        continuation_base.grad, continuation_reference.grad, atol=7e-4, rtol=7e-4
+    )
     for name in ("tau", "v_reset"):
         torch.testing.assert_close(
             getattr(model.neuron, name).grad,

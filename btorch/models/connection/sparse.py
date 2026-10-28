@@ -15,10 +15,10 @@ from ...sparse.runtime import (
     RepresentationCache,
     kernels_torch,
     kernels_triton_push,
-    kernels_triton_tasks,
     ops,
     planner,
     registry,
+    task_layout,
 )
 from ...sparse.runtime.method import PropagationMethod, resolve_method, validate_method
 from .base import Connection
@@ -38,7 +38,7 @@ class SparseCheckpointBinding:
     max_density: float | None
     execution_weight: Tensor | None
     task_values: Tensor | None
-    task_state: kernels_triton_tasks.PreparedTaskState | None
+    task_state: task_layout.PreparedTaskState | None
 
 
 @dataclass(frozen=True)
@@ -834,7 +834,7 @@ class SparseConnection(Connection):
         """Capture the exact run binding used by checkpoint forward."""
         task_state = None
         if self._run_task_values is not None:
-            task_binding = kernels_triton_tasks.state_for_values(
+            task_binding = task_layout.state_for_values(
                 registry.kernels,
                 self._run_task_values,
                 self.cache.t_crow,
@@ -863,7 +863,7 @@ class SparseConnection(Connection):
             checkpoint_binding.task_state is not None
             and checkpoint_binding.task_values is not None
         ):
-            kernels_triton_tasks.restore_binding(
+            task_layout.restore_binding(
                 registry.kernels,
                 checkpoint_binding.task_state,
                 checkpoint_binding.task_values,

@@ -28,14 +28,16 @@ import torch
 from btorch.sparse.runtime import (
     kernels_torch,
     kernels_triton_push,
-    kernels_triton_tasks as task_kernels,
+    kernels_triton_tasks,
+    source_layout,
+    task_layout as task_kernels,
 )
 from btorch.sparse.runtime.backend import KernelCache
 from btorch.sparse.runtime.cache import RepresentationCache
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not task_kernels._available(),
+    not torch.cuda.is_available() or not kernels_triton_tasks._available(),
     reason="needs CUDA and Triton",
 )
 
@@ -122,7 +124,7 @@ def _run_task(graph: dict[str, Any], state, kernel_cache: KernelCache, spikes=No
     """Pack destination-CSR values and run the task backend."""
     spikes = graph["spikes"] if spikes is None else spikes
     packed = task_kernels.pack_values(state, graph["csr_values"])
-    return task_kernels.run(state, packed, spikes, N_DST, kernel_cache)
+    return kernels_triton_tasks.run(state, packed, spikes, N_DST, kernel_cache)
 
 
 def _aten_reference(graph: dict[str, Any], spikes: torch.Tensor) -> torch.Tensor:
@@ -240,14 +242,14 @@ def test_typed_task_hash_accumulation(graph, kernel_cache, value_dtype, input_dt
         kernel_cache, topology.t_crow, topology.t_col, topology.t_perm, 4, value_dtype
     )
     packed = task_kernels.pack_values(state, values)
-    actual = task_kernels.run(state, packed, x, N_DST, kernel_cache)
+    actual = kernels_triton_tasks.run(state, packed, x, N_DST, kernel_cache)
     if input_dtype == torch.float64:
         # Warm compilation and the promoted hash workspace first; capture
         # then replay changed strided activity without rebuilding either.
         torch.cuda.synchronize()
         capture = torch.cuda.CUDAGraph()
         with torch.cuda.graph(capture):
-            actual = task_kernels.run(state, packed, x, N_DST, kernel_cache)
+            actual = kernels_triton_tasks.run(state, packed, x, N_DST, kernel_cache)
         x[0, HUB_SOURCE] += 0.03125
         capture.replay()
     row = torch.repeat_interleave(
@@ -324,7 +326,7 @@ def test_bound_task_values_execute_without_conversion_in_the_timestep(
         raise AssertionError("layout conversion ran inside the timestep")
 
     monkeypatch.setattr(task_kernels, "prepare", fail_prepare)
-    monkeypatch.setattr(kernels_triton_push, "_layout", fail_layout)
+    monkeypatch.setattr(source_layout, "_layout", fail_layout)
     actual = kernels_triton_push.spike_push_dense(
         representation.t_crow,
         representation.t_col,
@@ -426,7 +428,7 @@ def test_independent_task_values_run_on_two_cuda_streams(graph, kernel_cache):
     first_stream = torch.cuda.Stream()
     second_stream = torch.cuda.Stream()
     with torch.cuda.stream(first_stream):
-        first_output = task_kernels.run(
+        first_output = kernels_triton_tasks.run(
             task_state,
             first_values,
             graph["spikes"],
@@ -435,7 +437,7 @@ def test_independent_task_values_run_on_two_cuda_streams(graph, kernel_cache):
             workspace=first_binding.workspace,
         )
     with torch.cuda.stream(second_stream):
-        second_output = task_kernels.run(
+        second_output = kernels_triton_tasks.run(
             task_state,
             second_values,
             graph["spikes"],

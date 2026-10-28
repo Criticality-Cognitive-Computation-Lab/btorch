@@ -24,7 +24,6 @@ from .engine import (
     _prepare,
     _prepare_parameters,
     _Source,
-    _storage_span,
     _tensor_storage,
 )
 from .fragments import get_fragments, scalar_layout
@@ -357,6 +356,16 @@ def generate_fused_source(
 
 
 @dataclass
+class _PreparedFusedLaunch:
+    """Own positional arguments, their slot metadata and storage lifetimes."""
+
+    launch: object
+    arguments: list
+    slots: dict
+    owners: list
+
+
+@dataclass
 class _FusedStep:
     """Invocation-local paired kernel bindings with caller-owned
     destinations."""
@@ -389,7 +398,8 @@ class _FusedStep:
             if declaration[0] in self.buffers
         )
         inputs = tuple(
-            _storage_span(self.buffers[name], size) for name, size in declared_inputs
+            self.runtime.argument(self.buffers[name], size)
+            for name, size in declared_inputs
         )
         for (name, _size), value in zip(declared_inputs, inputs):
             self.arguments[self.argument_indices[name]] = value
@@ -401,9 +411,8 @@ class _FusedStep:
             for name, shape in self.output_shapes.items()
         }
 
-    def launch_into(self, bindings):
-        """Launch into supplied storage, caching encountered storage
-        layouts."""
+    def _layout_variant(self, bindings):
+        """Select a typed storage ABI for this set of caller-owned views."""
         if self.source_factory is not None:
             buffers = {**self.buffers, **bindings}
             storage = _tensor_storage(buffers, self.strided_names)
@@ -428,17 +437,26 @@ class _FusedStep:
                         self.output_shapes,
                         self.enable_fp_fusion,
                         storage=storage,
+                        precise_division=self.precise_division,
                     )
                     self.variants[storage] = variant
-                variant.launch_into(bindings)
-                return
+                return variant
+        return self
+
+    def launch_into(self, bindings):
+        """Launch into supplied storage, caching encountered storage
+        layouts."""
+        variant = self._layout_variant(bindings)
+        if variant is not self:
+            variant.launch_into(bindings)
+            return
         declarations = tuple(
             declaration
             for declaration in self.declarations
             if declaration[0] in bindings
         )
         values = tuple(
-            _storage_span(bindings[name], size) for name, size in declarations
+            self.runtime.argument(bindings[name], size) for name, size in declarations
         )
         for (name, _size), value in zip(declarations, values):
             self.arguments[self.argument_indices[name]] = value
@@ -451,6 +469,51 @@ class _FusedStep:
                 debug=None,
                 num_warps=None,
             )
+
+    def prepare_launch(self, bindings):
+        """Bind a trajectory's invariant layouts before its repeated stages.
+
+        Only the supplied tensors' addresses may change after preparation.
+        The trajectory owns their shapes, strides and dtypes; standalone calls
+        and reverse steps with variable layouts retain ``launch_into``.
+        """
+        variant = self._layout_variant(bindings)
+        buffers = {**variant.buffers, **bindings}
+        declarations = variant.declarations
+        args = [
+            self.runtime.argument(buffers[name], size) for name, size in declarations
+        ]
+        updates = tuple(
+            (index, name, size)
+            for index, (name, size) in enumerate(declarations)
+            if name in bindings
+        )
+        device = buffers["neuron_input"].device
+        with _device_scope(device):
+            launch = self.runtime.prepare_launch(
+                variant.kernel,
+                args,
+                self.n,
+                changing=tuple(index for index, _name, _size in updates),
+                enable_fp_fusion=self.enable_fp_fusion,
+            )
+        if self.runtime.supports_pointer_offsets:
+            args, owners = launch.arguments, launch.owners
+            submit = launch.submit
+        else:
+            owners = args
+            submit = functools.partial(launch, args)
+
+        def run():
+            with _device_scope(device):
+                submit()
+
+        return _PreparedFusedLaunch(
+            run,
+            args,
+            {name: (index, size) for index, name, size in updates},
+            owners,
+        )
 
 
 def prepare_fused_step(

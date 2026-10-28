@@ -511,9 +511,10 @@ def test_changed_capture_version_of_any_submodule_recaptures():
 def test_recapture_covers_every_input_signature():
     """Each captured graph remembers the versions it was recorded for.
 
-    With ``chunk_size`` the loop replays one graph per chunk and a second graph
-    for the short remainder. After a version change both are stale, and each
-    must be captured again -- not only the first one the loop reaches.
+    Repeated full chunks share one graph. A short remainder runs eagerly
+    and must still observe the updated gain. Changing the version
+    invalidates the reusable graph without capturing a second, one-use
+    remainder graph.
     """
     eager = _dense_network(_HostGain(), unroll=2, chunk_size=4)
     graphed = _dense_network(_HostGain(), unroll=2, chunk_size=4, cudagraph=True)
@@ -521,12 +522,12 @@ def test_recapture_covers_every_input_signature():
     drive = _drive()  # T=10 -> chunks of 4, 4 and a remainder of 2
 
     assert torch.equal(_run(graphed, drive)[0], _run(eager, drive)[0])
-    assert (runner.n_captures, len(runner.entries)) == (2, 2)
+    assert (runner.n_captures, len(runner.entries)) == (1, 1)
 
     eager.neuron_inp_module.set_gain(2.0)
     graphed.neuron_inp_module.set_gain(2.0)
     assert torch.equal(_run(graphed, drive)[0], _run(eager, drive)[0])
-    assert (runner.n_captures, len(runner.entries)) == (4, 2)
+    assert (runner.n_captures, len(runner.entries)) == (2, 1)
 
 
 def test_reported_incompatibility_refuses_capture():

@@ -28,42 +28,20 @@ from canonical weights at trajectory preparation.
 from __future__ import annotations
 
 import importlib.util
-import weakref
-from dataclasses import dataclass
 
 import torch
 from torch import Tensor
 
-from . import kernels_torch, kernels_triton, kernels_triton_tasks
+from . import (
+    csr_execution,
+    kernels_torch,
+    kernels_triton,
+    kernels_triton_tasks,
+    source_layout,
+    task_layout,
+)
 from .backend import BackendRegistry, KernelCache, registry as _default_registry
 
-
-# Lanes (gathered edges) per block of the packed kernel and its warps.
-_BLOCK = 256
-_BLOCK_WARPS = 4
-# Upper bound on the persistent programs of the packed kernel (~6 per SM of an
-# RTX 5090); fewer are launched when the expected work is smaller.
-_MAX_PROGRAMS = 1024
-
-# Dense kernel: sources per program, lanes per out-edge block and its warps.
-_TILE = 64
-_TILE_BLOCK = 64
-_TILE_WARPS = 2
-# Sources with more out-edges than this are served by hub tasks of
-# ``_HUB_CHUNK`` edges each instead of by their tile.
-_HUB_DEGREE = 2048
-_HUB_CHUNK = 1024
-
-# Choice between the two kernels inside ``spike_push`` (see ``_prefer_dense``).
-_DENSE_MAX_SCAN = 1 << 21
-_DENSE_MIN_DENSITY = 0.02
-_DENSE_MAX_WORK = 1 << 20
-
-_INT32_MAX = 2**31 - 1
-# Layout holders kept per cache. A holder is dropped as soon as one of its
-# source tensors dies; the limit only bounds what long-lived tensors can pin
-# (the oldest holder goes first).
-_MAX_LAYOUTS = 1024
 
 # Runtime arguments of the kernels, in signature order. None of them is
 # specialised on its value or alignment. Compiled handles include constexprs
@@ -86,6 +64,9 @@ _PACKED_ARGS = [
     "n_iter",
     "b_iter",
     "n_programs",
+    "value_stride",
+    "x_batch_stride",
+    "x_source_stride",
 ]
 _PACKED_CONSTS = ("BLOCK", "PERMUTE", "SPIKE_BLOCK")
 _DENSE_ARGS = [
@@ -101,8 +82,10 @@ _DENSE_ARGS = [
     "n_tiles",
     "n_hub",
     "hub_degree",
+    "value_stride",
+    "x_batch_stride",
+    "x_source_stride",
 ]
-_DENSE_CONSTS = ("TILE", "BLOCK", "PERMUTE")
 
 
 def is_available() -> bool:
@@ -138,6 +121,9 @@ def _build_kernels():
         n_iter,  # binary-search steps over ``cum``: bit_length(A)
         b_iter,  # binary-search steps over ``ptr``: bit_length(B - 1)
         n_programs,
+        value_stride,
+        x_batch_stride,
+        x_source_stride,
         BLOCK: tl.constexpr,
         PERMUTE: tl.constexpr,
         SPIKE_BLOCK: tl.constexpr,
@@ -187,13 +173,17 @@ def _build_kernels():
                     s_lo = tl.where(s_open & (p <= owner), s_mid + 1, s_lo)
                 # 64-bit offsets: ``sample * n`` overflows int32 on large batches.
                 sample = s_lo.to(tl.int64)
-            amp = tl.load(x + sample * n_in + src, mask=live, other=0.0)
+            amp = tl.load(
+                x + sample * x_batch_stride + src * x_source_stride,
+                mask=live,
+                other=0.0,
+            )
             dst = tl.load(col + edge, mask=live, other=0)
             if PERMUTE:
                 slot = tl.load(perm + edge, mask=live, other=0)
-                w = tl.load(values + slot, mask=live, other=0.0)
+                w = tl.load(values + slot * value_stride, mask=live, other=0.0)
             else:
-                w = tl.load(values + edge, mask=live, other=0.0)
+                w = tl.load(values + edge * value_stride, mask=live, other=0.0)
             tl.atomic_add(
                 out + sample * n_out + dst, kernels_triton._multiply(w, amp), mask=live
             )
@@ -214,6 +204,9 @@ def _build_kernels():
         n_tiles,
         n_hub,
         hub_degree,
+        value_stride,
+        x_batch_stride,
+        x_source_stride,
         TILE: tl.constexpr,
         BLOCK: tl.constexpr,
         PERMUTE: tl.constexpr,
@@ -223,15 +216,17 @@ def _build_kernels():
         sample = (pid // per_sample).to(tl.int64)
         task = pid % per_sample
         lane = tl.arange(0, BLOCK)
-        x_row = x + sample * n_in
+        x_row = x + sample * x_batch_stride
         out_row = out + sample * n_out
         if task < n_tiles:
             first = task * TILE
             sources = first + tl.arange(0, TILE)
-            xs = tl.load(x_row + sources, mask=sources < n_in, other=0.0)
+            xs = tl.load(
+                x_row + sources * x_source_stride, mask=sources < n_in, other=0.0
+            )
             if tl.sum((xs != 0.0).to(tl.int32), axis=0) > 0:
                 for src in range(first, tl.minimum(first + TILE, n_in)):
-                    amp = tl.load(x_row + src)
+                    amp = tl.load(x_row + src * x_source_stride)
                     if amp != 0.0:
                         e0 = tl.load(crow + src)
                         e1 = tl.load(crow + src + 1)
@@ -242,9 +237,13 @@ def _build_kernels():
                                 dst = tl.load(col + edge, mask=m, other=0)
                                 if PERMUTE:
                                     slot = tl.load(perm + edge, mask=m, other=0)
-                                    w = tl.load(values + slot, mask=m, other=0.0)
+                                    w = tl.load(
+                                        values + slot * value_stride, mask=m, other=0.0
+                                    )
                                 else:
-                                    w = tl.load(values + edge, mask=m, other=0.0)
+                                    w = tl.load(
+                                        values + edge * value_stride, mask=m, other=0.0
+                                    )
                                 tl.atomic_add(
                                     out_row + dst,
                                     kernels_triton._multiply(w, amp),
@@ -256,7 +255,7 @@ def _build_kernels():
             e1 = tl.load(hub + h + 2)
             # Unused slots of the fixed-capacity task list are empty ranges.
             if e1 > e0:
-                amp = tl.load(x_row + tl.load(hub + h))
+                amp = tl.load(x_row + tl.load(hub + h) * x_source_stride)
                 if amp != 0.0:
                     for off in range(e0, e1, BLOCK):
                         edge = off + lane
@@ -264,9 +263,9 @@ def _build_kernels():
                         dst = tl.load(col + edge, mask=m, other=0)
                         if PERMUTE:
                             slot = tl.load(perm + edge, mask=m, other=0)
-                            w = tl.load(values + slot, mask=m, other=0.0)
+                            w = tl.load(values + slot * value_stride, mask=m, other=0.0)
                         else:
-                            w = tl.load(values + edge, mask=m, other=0.0)
+                            w = tl.load(values + edge * value_stride, mask=m, other=0.0)
                         tl.atomic_add(
                             out_row + dst, kernels_triton._multiply(w, amp), mask=m
                         )
@@ -281,325 +280,23 @@ def _kernels(cache: KernelCache):
 # ------------------------------------------------------------------ layouts
 
 
-@dataclass
-class _Layout:
-    """Kernel-side copies of one source-major CSR and how to validate them.
+class _Execution:
+    def __init__(self, cache):
+        self.cache = cache
 
-    Every tensor is allocated once and rewritten in place by :meth:`fill`,
-    and the launch arguments derived from the layout (``n_hub``,
-    ``hub_limit``) do not follow the current pattern, so a CUDA graph
-    captured around the dense kernel stays valid across rewiring:
-
-    - A layout that never saw a hub (a source with more than ``hub_degree``
-      out-edges) launches no hub tasks and passes ``hub_limit = int32 max``:
-      the tiles serve every source whatever its degree. A graph captured in
-      this state stays correct when a later rewiring creates a hub (the hub
-      is then served by one program until the graph is captured again).
-    - From the first hub on, and for the rest of the layout's life, the task
-      list has a fixed capacity derived from ``E`` alone: a hub of degree
-      ``d`` has ``ceil(d / hub_chunk) <= d // hub_chunk + 1`` tasks and at
-      most ``E // (hub_degree + 1)`` hubs exist, hence at most
-      ``E // hub_chunk + E // (hub_degree + 1)`` tasks. The grid always
-      covers the capacity; unused slots are empty edge ranges.
-    """
-
-    sources: tuple[weakref.ref, ...]
-    versions: tuple[int, ...]
-    hub_degree: int
-    hub_chunk: int
-    crow: Tensor  # int32 [N + 1]
-    col: Tensor  # int32 [E]
-    perm: Tensor  # int32 [E]
-    degree: Tensor  # int64 [N] (indexed by int64 ``active_idx``)
-    hub: Tensor  # int32 [3 * max(n_hub, 1)]: (source, first edge, end edge)
-    n_hub: int  # hub task slots in the launch grid (0 or the capacity)
-    hub_limit: int  # degree above which a tile leaves a source to hub tasks
-    mean_degree: float
-    epoch: int = 0  # stamp of the last allocation (see ``layout_epoch``)
-    n_fill: int = 0  # times the buffers were (re)derived
-    source_values: Tensor | None = None  # optional spike-list read layout
-    source_value_epoch: int = 0
-
-    def fill(self, t_crow: Tensor, t_col: Tensor, t_perm: Tensor) -> None:
-        """(Re)derive every buffer from the canonical tensors, in place.
-
-        Synchronises with the host (once per topology, never per call).
-        """
-        self.crow.copy_(t_crow)
-        self.col.copy_(t_col)
-        self.perm.copy_(t_perm)
-        torch.sub(t_crow[1:], t_crow[:-1], out=self.degree)
-        tasks = _hub_tasks(t_crow, self.degree, self.hub_degree, self.hub_chunk)
-        if tasks is not None and not self.n_hub:
-            # First hub: switch to the fixed-capacity task list for good.
-            n_edge = self.col.shape[0]
-            self.n_hub = n_edge // self.hub_chunk + n_edge // (self.hub_degree + 1)
-            self.hub = torch.empty(
-                3 * self.n_hub, dtype=torch.int32, device=self.col.device
-            )
-            self.hub_limit = self.hub_degree
-            self.epoch = kernels_triton._next_epoch()
-        if self.n_hub:
-            used = 0 if tasks is None else tasks.shape[0]
-            if used:
-                self.hub[:used].copy_(tasks)
-            self.hub[used:] = 0
-        self.n_fill += 1
-        self.versions = (
-            t_crow._version,
-            t_col._version,
-            t_perm._version,
-            t_crow.data_ptr(),
-            t_col.data_ptr(),
-            t_perm.data_ptr(),
+    def launch(self, name, grid, args, const_names, consts, warps):
+        kernel = _kernels(self.cache)[0 if name == "push_packed" else 1]
+        kernels_triton._launch(
+            self.cache,
+            name,
+            kernel,
+            args[0].device.index,
+            grid,
+            args,
+            const_names,
+            consts,
+            warps,
         )
-
-
-def _hub_tasks(
-    t_crow: Tensor, degree: Tensor, hub_degree: int, hub_chunk: int
-) -> Tensor | None:
-    """Split the out-edges of every hub into ``hub_chunk``-sized tasks.
-
-    Returns the flat ``int32 [3 * H]`` list of ``(source, first edge, end
-    edge)`` per task, or ``None`` without hubs. Built once per topology with
-    vectorised operations.
-    """
-    hubs = (degree > hub_degree).nonzero(as_tuple=True)[0]
-    if hubs.shape[0] == 0:
-        return None
-    n_chunks = (degree[hubs] + hub_chunk - 1) // hub_chunk
-    owner = torch.repeat_interleave(
-        torch.arange(hubs.shape[0], device=hubs.device), n_chunks
-    )
-    first_task = torch.cumsum(n_chunks, 0) - n_chunks
-    local = torch.arange(owner.shape[0], device=hubs.device) - first_task[owner]
-    source = hubs[owner]
-    lo = t_crow[source] + local * hub_chunk
-    hi = torch.minimum(lo + hub_chunk, t_crow[source + 1])
-    return torch.stack([source, lo, hi], dim=1).to(torch.int32).reshape(-1)
-
-
-def _layout(
-    cache: KernelCache, t_crow: Tensor, t_col: Tensor, t_perm: Tensor
-) -> _Layout | None:
-    """Return the memoised kernel layout of a source-major CSR.
-
-    The canonical buffers of a
-    :class:`~btorch.sparse.runtime.cache.RepresentationCache` are rewritten
-    *in place* on rewiring: same tensor object and address, new contents.
-    Identity or address alone therefore cannot key the derived copies. The
-    rule used here:
-
-    - A holder is looked up by the ``id`` of the three tensor objects (one
-      dictionary lookup; two views of one buffer are different objects and
-      never share a holder).
-    - A hit is valid only if the holder's weak references still resolve to
-      the very tensor objects passed in *and* their ``_version`` counters are
-      unchanged. Every in-place write (``copy_`` on rewiring) bumps
-      ``_version``, and a live weak reference proves the object was never
-      released, so its ``id`` cannot belong to a different tensor.
-    - On a stale hit the derived buffers are refreshed in place (mirroring
-      the cache contract: tensors captured by a compiled or CUDA graph stay
-      valid). The refresh synchronises with the host; :func:`prepare` does
-      it ahead of time.
-    - A holder is deleted when one of its source tensors dies, which
-      releases its device memory, and at most ``_MAX_LAYOUTS`` are kept, so
-      the cache cannot grow without bound.
-
-    Returns ``None`` when the layout cannot be tracked or represented:
-    inference tensors carry no version counter, and int32 indices require
-    ``E`` and ``N`` below ``2**31``.
-    """
-    n_edge, n_src = t_col.shape[0], t_crow.shape[0] - 1
-    device = t_col.device
-    if (
-        n_edge > _INT32_MAX
-        or n_src >= _INT32_MAX
-        or t_perm.shape[0] != n_edge
-        or t_crow.device != device
-        or t_perm.device != device
-    ):
-        return None
-    holders: dict = cache.get(("triton_push", "layouts"), dict)
-    key = (id(t_crow), id(t_col), id(t_perm))
-    holder: _Layout | None = holders.get(key)
-    try:
-        # The data pointers catch ``tensor.data = other``, which replaces the
-        # contents without touching the object or its version counter.
-        versions = (
-            t_crow._version,
-            t_col._version,
-            t_perm._version,
-            t_crow.data_ptr(),
-            t_col.data_ptr(),
-            t_perm.data_ptr(),
-        )
-    except RuntimeError:  # inference tensor: no version counter
-        return None
-    if holder is not None:
-        refs = holder.sources
-        if (
-            refs[0]() is t_crow
-            and refs[1]() is t_col
-            and refs[2]() is t_perm
-            and holder.hub_degree == _HUB_DEGREE
-            and holder.hub_chunk == _HUB_CHUNK
-            # ``resize_`` keeps the object but not the shape.
-            and holder.col.shape[0] == n_edge
-            and holder.crow.shape[0] == n_src + 1
-        ):
-            if holder.versions != versions:
-                holder.fill(t_crow, t_col, t_perm)
-            return holder
-        del holders[key]
-    while len(holders) >= _MAX_LAYOUTS:
-        try:
-            del holders[next(iter(holders))]
-        except (KeyError, StopIteration, RuntimeError):  # raced with ``_drop``
-            break
-
-    def _drop(ref, holders=holders, key=key):
-        # Only drop the holder this reference vouched for.
-        entry = holders.get(key)
-        if entry is not None and any(r is ref for r in entry.sources):
-            del holders[key]
-
-    holder = _Layout(
-        sources=tuple(weakref.ref(t, _drop) for t in (t_crow, t_col, t_perm)),
-        versions=(),
-        hub_degree=_HUB_DEGREE,
-        hub_chunk=_HUB_CHUNK,
-        crow=torch.empty(n_src + 1, dtype=torch.int32, device=device),
-        col=torch.empty(n_edge, dtype=torch.int32, device=device),
-        perm=torch.empty(n_edge, dtype=torch.int32, device=device),
-        degree=torch.empty(n_src, dtype=torch.long, device=device),
-        # A valid pointer is needed by the launch even without hub tasks.
-        hub=torch.zeros(3, dtype=torch.int32, device=device),
-        n_hub=0,
-        hub_limit=_INT32_MAX,
-        mean_degree=max(1.0, n_edge / max(n_src, 1)),
-        epoch=kernels_triton._next_epoch(),
-    )
-    holder.fill(t_crow, t_col, t_perm)
-    holders[key] = holder
-    return holder
-
-
-def _supported(values: Tensor, x: Tensor, t_crow: Tensor, t_col: Tensor) -> bool:
-    """Whether the Triton kernels can run on these operands.
-
-    Besides dtype and device, the sizes must match the pattern: the kernels
-    index ``values`` and the pointers without bounds checks.
-    """
-    device = x.device
-    return (
-        x.is_cuda
-        and x.ndim == 2
-        and values.ndim == 1
-        and x.dtype in kernels_torch._FLOAT_DTYPES
-        and values.dtype in kernels_torch._FLOAT_DTYPES
-        and values.device == device
-        and t_col.device == device
-        and t_col.shape[0] > 0
-        and values.shape[0] == t_col.shape[0]
-        and x.shape[1] == t_crow.shape[0] - 1
-        and x.shape[0] > 0
-        and x.shape[1] > 0
-        # Triton launches on the current device.
-        and device.index == torch.cuda.current_device()
-    )
-
-
-# ---------------------------------------------------------------- launchers
-
-
-def _prefer_dense(layout: _Layout, n_active: int, numel: int) -> bool:
-    """Whether ``spike_push`` should run the dense kernel on packed input.
-
-    Measured on an RTX 5090 (the two kernels are within ~20 % of each other
-    except for the fixed cost):
-
-    - The dense kernel has the lower fixed cost (no prefix sum, no search:
-      ~25 us against ~45 us per call) as long as scanning ``x`` is free, i.e.
-      up to ``_DENSE_MAX_SCAN`` elements.
-    - Its lanes are filled per source, so it is the faster one per edge only
-      when a typical out-edge list fills a block (mean out-degree at least
-      ``_TILE_BLOCK``); then it wins from ``_DENSE_MIN_DENSITY`` upwards
-      whatever the size. The packed kernel fills every lane regardless of
-      the degrees and wins on low-degree graphs once the delivered edges
-      (beyond ``_DENSE_MAX_WORK``) outweigh the fixed cost.
-    """
-    scan_is_free = numel <= _DENSE_MAX_SCAN
-    if layout.mean_degree >= _TILE_BLOCK:
-        return scan_is_free or n_active >= _DENSE_MIN_DENSITY * numel
-    return scan_is_free and n_active * layout.mean_degree <= _DENSE_MAX_WORK
-
-
-def _reference(
-    t_crow: Tensor,
-    t_col: Tensor,
-    t_perm: Tensor,
-    values: Tensor,
-    x: Tensor,
-    active_idx: Tensor,
-    ptr: Tensor,
-    n_out: int,
-    source_major_values: bool,
-) -> Tensor:
-    """ATen fallback for inputs the Triton kernels do not handle."""
-    if source_major_values:
-        # Values already follow the source-major order: identity permutation.
-        t_perm = torch.arange(t_col.shape[0], device=t_col.device)
-    return kernels_torch.spike_push(
-        t_crow, t_col, t_perm, values, x, active_idx, ptr, n_out
-    )
-
-
-def _launch_dense(
-    cache: KernelCache,
-    layout: _Layout,
-    values: Tensor,
-    x: Tensor,
-    n_out: int,
-    permute: bool,
-) -> Tensor:
-    n_batch, n_in = x.shape
-    output_dtype = torch.promote_types(values.dtype, x.dtype)
-    out = torch.zeros(
-        n_batch,
-        n_out,
-        dtype=kernels_torch._accumulation_dtype(output_dtype),
-        device=x.device,
-    )
-    n_tiles = (n_in + _TILE - 1) // _TILE
-    grid = n_batch * (n_tiles + layout.n_hub)
-    if grid > _INT32_MAX:
-        raise RuntimeError("spike_push_dense: batch too large for one launch.")
-    kernels_triton._launch(
-        cache,
-        "push_dense",
-        _kernels(cache)[1],
-        x.device.index,
-        (grid, 1),
-        (
-            layout.crow,
-            layout.col,
-            layout.perm,
-            values,
-            x,
-            layout.hub,
-            out,
-            n_in,
-            n_out,
-            n_tiles,
-            layout.n_hub,
-            layout.hub_limit,
-        ),
-        _DENSE_CONSTS,
-        (_TILE, _TILE_BLOCK, permute),
-        _TILE_WARPS,
-    )
-    return out.to(output_dtype)
 
 
 def spike_push_dense(
@@ -642,7 +339,7 @@ def spike_push_dense(
     """
     cache = _default_registry.kernels if cache is None else cache
     if task_values is not None and task_values.numel() != 0:
-        task_binding = kernels_triton_tasks.state_for_values(
+        task_binding = task_layout.state_for_values(
             cache,
             task_values,
             t_crow,
@@ -664,13 +361,13 @@ def spike_push_dense(
             "replan or prepare the connection before execution"
         )
     layout = (
-        _layout(cache, t_crow, t_col, t_perm)
-        if _supported(values, x, t_crow, t_col)
+        source_layout._layout(cache, t_crow, t_col, t_perm)
+        if source_layout._supported(values, x, t_crow, t_col)
         else None
     )
-    if layout is None or n_out > _INT32_MAX:
+    if layout is None or n_out > source_layout._INT32_MAX:
         active_idx, ptr = kernels_torch.pack_spikes(x)
-        return _reference(
+        return source_layout._reference(
             t_crow,
             t_col,
             t_perm,
@@ -681,142 +378,20 @@ def spike_push_dense(
             n_out,
             source_major_values,
         )
-    return _launch_dense(
+    return csr_execution._launch_dense(
+        _Execution(cache),
         cache,
         layout,
-        values.contiguous(),
-        x.contiguous(),
+        values,
+        x,
         n_out,
         not source_major_values,
     )
 
 
-def spike_push(
-    t_crow: Tensor,
-    t_col: Tensor,
-    t_perm: Tensor,
-    values: Tensor,
-    x: Tensor,
-    active_idx: Tensor,
-    ptr: Tensor,
-    n_out: int,
-    *,
-    source_major_values: bool = False,
-    cache: KernelCache | None = None,
-) -> Tensor:
-    """Source-driven propagation of the packed non-zero inputs (Triton).
-
-    Drop-in replacement of
-    :func:`btorch.sparse.runtime.kernels_torch.spike_push` for floating CUDA
-    tensors; other inputs are forwarded to it. The whole batch is served by
-    one launch. Accumulation uses float atomics, so the result matches the
-    reference up to accumulation rounding and is not bit-reproducible.
-
-    Args:
-        t_crow: ``[N + 1]`` pointers of the source-major (transposed) CSR.
-        t_col: ``[E]`` destination of each entry in source-major order.
-        t_perm: ``[E]`` position in ``values`` of each source-major entry.
-        values: ``[E]`` edge values in destination-major order.
-        x: ``[B, N]`` dense input (supplies the amplitudes).
-        active_idx: Packed source indices from ``pack_spikes``.
-        ptr: ``[B + 1]`` sample offsets from ``pack_spikes``.
-        n_out: Number of destinations ``M``.
-        source_major_values: ``values`` is already in source-major order
-            (``values_dst_major[t_perm]``), so ``t_perm`` is not consulted.
-            Edge values are then read sequentially instead of through a
-            random gather, which roughly halves the kernel time on large
-            graphs. Not part of the ATen contract; for callers that can keep
-            such a copy.
-        cache: Kernel cache holding the derived layouts (default: the global
-            registry's).
-
-    Returns:
-        ``[B, M]``.
-    """
+def spike_push(*args, cache=None, **kwargs):
     cache = _default_registry.kernels if cache is None else cache
-    layout = (
-        _layout(cache, t_crow, t_col, t_perm)
-        if _supported(values, x, t_crow, t_col)
-        else None
-    )
-    n_active = active_idx.shape[0]
-    if (
-        layout is None
-        or max(n_active, n_out) > _INT32_MAX
-        # The packed kernel reads both index lists as int64 on the device.
-        or active_idx.dtype != torch.long
-        or ptr.dtype != torch.long
-        or active_idx.device != x.device
-        or ptr.device != x.device
-        or ptr.shape[0] != x.shape[0] + 1
-    ):
-        return _reference(
-            t_crow,
-            t_col,
-            t_perm,
-            values,
-            x,
-            active_idx,
-            ptr,
-            n_out,
-            source_major_values,
-        )
-    n_batch, n_in = x.shape
-    if n_active == 0:
-        return torch.zeros(
-            n_batch,
-            n_out,
-            dtype=torch.promote_types(values.dtype, x.dtype),
-            device=x.device,
-        )
-    values, x = values.contiguous(), x.contiguous()
-    if _prefer_dense(layout, n_active, x.numel()):
-        return _launch_dense(cache, layout, values, x, n_out, not source_major_values)
-    output_dtype = torch.promote_types(values.dtype, x.dtype)
-    out = torch.zeros(
-        n_batch,
-        n_out,
-        dtype=kernels_torch._accumulation_dtype(output_dtype),
-        device=x.device,
-    )
-    # Inclusive prefix sum of the active out-degrees; its last element is the
-    # total work, which only the kernel reads (no host synchronisation).
-    active_idx, ptr = active_idx.contiguous(), ptr.contiguous()
-    cum = torch.cumsum(layout.degree[active_idx], 0)
-    # ``n_active`` is known on the host for free, so the number of persistent
-    # programs follows the *expected* work; the actual work is split evenly
-    # among them whatever the degrees of the active sources are.
-    expected_blocks = int(n_active * layout.mean_degree / _BLOCK) + 1
-    n_programs = min(_MAX_PROGRAMS, expected_blocks)
-    kernels_triton._launch(
-        cache,
-        "push_packed",
-        _kernels(cache)[0],
-        x.device.index,
-        (n_programs, 1),
-        (
-            layout.crow,
-            layout.col,
-            layout.perm,
-            values,
-            x,
-            active_idx,
-            cum,
-            ptr,
-            out,
-            n_active,
-            n_in,
-            n_out,
-            n_batch,
-            n_active.bit_length(),
-            (n_batch - 1).bit_length(),
-            n_programs,
-        ),
-        _PACKED_CONSTS,
-        (_BLOCK, not source_major_values, 0),
-        _BLOCK_WARPS,
-    )
-    return out.to(output_dtype)
+    return csr_execution.packed_push(_Execution(cache), *args, cache=cache, **kwargs)
 
 
 def prepare(
@@ -850,7 +425,7 @@ def prepare(
     """
     if not t_col.is_cuda or t_col.shape[0] == 0 or not is_available():
         return
-    _layout(
+    source_layout._layout(
         _default_registry.kernels if cache is None else cache, t_crow, t_col, t_perm
     )
 
@@ -876,7 +451,7 @@ def prepare_task_values(
         strategy cannot serve the operands.
     """
     cache = _default_registry.kernels if cache is None else cache
-    state = kernels_triton_tasks.prepare(
+    state = task_layout.prepare(
         cache,
         t_crow,
         t_col,
@@ -887,9 +462,7 @@ def prepare_task_values(
     )
     if state is None:
         return None, 0
-    packed = kernels_triton_tasks.bind_values(
-        cache, state, destination_major_values.detach()
-    )
+    packed = task_layout.bind_values(cache, state, destination_major_values.detach())
     return packed, state.layout_version
 
 
@@ -901,7 +474,7 @@ def invalidate_task_state(
     cache: KernelCache | None = None,
 ) -> None:
     """Release queued-task allocations derived from topology buffers."""
-    kernels_triton_tasks.invalidate_sources(
+    task_layout.invalidate_sources(
         _default_registry.kernels if cache is None else cache,
         t_crow,
         t_col,
@@ -935,15 +508,9 @@ def layout_epoch(
     Returns:
         The epoch.
     """
-    cache = _default_registry.kernels if cache is None else cache
-    holders: dict = cache.get(("triton_push", "layouts"), dict)
-    holder: _Layout | None = holders.get((id(t_crow), id(t_col), id(t_perm)))
-    if holder is None:
-        return 0
-    refs = holder.sources
-    if refs[0]() is t_crow and refs[1]() is t_col and refs[2]() is t_perm:
-        return holder.epoch
-    return 0
+    return source_layout.layout_epoch(
+        _default_registry.kernels if cache is None else cache, t_crow, t_col, t_perm
+    )
 
 
 def register(registry: BackendRegistry, priority: int = 10) -> None:
@@ -1010,6 +577,11 @@ def register(registry: BackendRegistry, priority: int = 10) -> None:
             route_key=route_key,
         )
 
+    def prepare_dense(*args, **kwargs):
+        return csr_execution.prepare_task_push(
+            kernels_triton_tasks._Execution(), registry.kernels, *args, **kwargs
+        )
+
     for kernel, fn in (
         ("spike_push", push),
         ("spike_push_dense", push_dense),
@@ -1022,4 +594,5 @@ def register(registry: BackendRegistry, priority: int = 10) -> None:
             device="cuda",
             priority=priority,
             available=is_available,
+            prepare_execution=prepare_dense if kernel == "spike_push_dense" else None,
         )

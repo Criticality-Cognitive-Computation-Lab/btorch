@@ -619,6 +619,29 @@ class RendererRuntime:
 
     name = ""
     supports_dynamic_steps = False
+    supports_pointer_offsets = False
+
+    def argument(self, value, span):
+        """Expose the pointer ABI without changing a tensor's storage."""
+        del span
+        return value
+
+    def bind_rows(self, value, span):
+        """Prepare a sequence's argument views for a tensor-based ABI."""
+        return tuple(self.argument(row, span) for row in value.unbind(0))
+
+    def prepare_launch(self, kernel, args, n, *, changing, enable_fp_fusion):
+        """Bind launch policy for an invocation with stable argument
+        layouts."""
+        del args, changing
+        return functools.partial(
+            self.launch,
+            kernel,
+            n=n,
+            enable_fp_fusion=enable_fp_fusion,
+            debug=None,
+            num_warps=None,
+        )
 
     def compile_context(self, toolchain_stamp, target):
         del toolchain_stamp, target
@@ -636,6 +659,22 @@ class RendererRuntime:
 class TritonRuntime(RendererRuntime):
     name = "triton"
     supports_dynamic_steps = True
+    supports_pointer_offsets = True
+
+    def prepare_launch(self, kernel, args, n, *, changing, enable_fp_fusion):
+        # Row views can change alignment even when shape/strides are constant.
+        # Specialize dtype/layout once, but never assume the first row's pointer
+        # alignment for changing arguments. Static parameters retain alignment.
+        from ....utils.triton import prepare_launch
+
+        return prepare_launch(
+            kernel,
+            args,
+            ((n + 127) // 128,),
+            (("BLOCK", 128),),
+            changing=changing,
+            enable_fp_fusion=enable_fp_fusion,
+        )
 
     def compile(self, source, enable_fp_fusion, precise_division, stamp, target):
         del enable_fp_fusion, stamp, target
@@ -667,6 +706,29 @@ class TritonRuntime(RendererRuntime):
 class CuPyRuntime(RendererRuntime):
     name = "cupy"
     supports_dynamic_steps = True
+    supports_pointer_offsets = True
+
+    def prepare_launch(self, kernel, args, n, *, changing, enable_fp_fusion):
+        del enable_fp_fusion
+        import cupy
+        import torch
+
+        from ....utils.kernel import PreparedLaunch
+
+        device = args[0].device.index
+        grid = ((n + 127) // 128,)
+        stream = cupy.cuda.Stream.from_external(torch.cuda.current_stream(device))
+
+        def launch(*pointers):
+            nonlocal stream
+            # Resolve the caller's stream at submission, including capture.
+            # The fused invocation already owns the device guard.
+            current = torch.cuda.current_stream(device)
+            if current.cuda_stream != stream.ptr:
+                stream = cupy.cuda.Stream.from_external(current)
+            kernel(grid, (128,), pointers, stream=stream)
+
+        return PreparedLaunch(launch, list(args), tuple(changing), ())
 
     def compile(self, source, enable_fp_fusion, precise_division, stamp, target):
         del stamp, target
@@ -703,6 +765,20 @@ class CuPyRuntime(RendererRuntime):
 
 class TileLangRuntime(RendererRuntime):
     name = "tilelang"
+
+    def argument(self, value, span):
+        # Unlike pointer-only runtimes, TileLang validates the flat buffer ABI.
+        from ....utils.kernel import storage_span
+
+        return storage_span(value, span)
+
+    def bind_rows(self, value, span):
+        # Build the ABI table with two Torch metadata operations, rather than
+        # select + as_strided for every argument at every timestep.
+        span = self.argument(value[0], span).numel()
+        return value.as_strided(
+            (value.shape[0], span), (value.stride(0), 1), value.storage_offset()
+        ).unbind(0)
 
     def compile_context(self, toolchain_stamp, target):
         return toolchain_stamp(), target()

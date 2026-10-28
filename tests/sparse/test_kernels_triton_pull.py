@@ -17,7 +17,12 @@ import numpy as np
 import pytest
 import torch
 
-from btorch.sparse.runtime import kernels_torch, kernels_triton
+from btorch.sparse.runtime import (
+    csr_execution,
+    csr_layout,
+    kernels_torch,
+    kernels_triton,
+)
 from btorch.sparse.runtime.backend import BackendRegistry, KernelCache
 
 
@@ -35,7 +40,7 @@ RTOL = 2e-5
 
 def patterns_of(cache: KernelCache) -> dict:
     """The cached patterns (derived layouts per ``(crow, col)`` pair)."""
-    return cache.get(kernels_triton._PATTERNS_KEY, dict)
+    return cache.get(csr_layout._PATTERNS_KEY, dict)
 
 
 @functools.cache
@@ -445,7 +450,7 @@ def test_layout_cache_is_bounded_and_evicts_dead_patterns(monkeypatch):
     gc.collect()
     assert len(patterns_of(cache)) == 0
 
-    monkeypatch.setattr(kernels_triton, "_MAX_PATTERNS", 4)
+    monkeypatch.setattr(csr_layout, "_MAX_PATTERNS", 4)
     alive = [col.clone() for _ in range(10)]
     for c in alive:
         assert_matches(kernels_triton._csr_matvec(cache, crow, c, values, x), expected)
@@ -626,34 +631,6 @@ def test_layout_cache_survives_address_reuse():
     # Not an assertion of the test, but the scenario it is about: on CUDA the
     # freed buffers are normally reused, giving fewer addresses than graphs.
     assert len(addresses) >= 1
-
-
-@pytest.mark.parametrize("variant", ("plain", "multi_hub"))
-def test_direct_launch_matches_public_launch(variant, monkeypatch):
-    # With a known Triton version the kernels are launched through a cached
-    # compiled handle, skipping Triton's per-call argument specialisation.
-    # Both launch paths must run the same binary: results are bitwise equal.
-    crow, col, m, n = make_csr(variant)
-    gen = torch.Generator(device=DEVICE).manual_seed(13)
-    values = torch.randn(col.shape[0], device=DEVICE, generator=gen)
-    x = torch.randn(5, n, device=DEVICE, generator=gen)
-    grad = torch.randn(5, m, device=DEVICE, generator=gen)
-
-    def run():
-        # Called twice: the first call may compile, the second one takes the
-        # steady-state path.
-        for _ in range(2):
-            out = (
-                kernels_triton.csr_matvec(crow, col, values, x),
-                kernels_triton.edge_grad(crow, col, grad, x, 0),
-            )
-        return out
-
-    direct = run()
-    monkeypatch.setattr(kernels_triton, "_DIRECT_LAUNCH", False)
-    public = run()
-    for a, b in zip(direct, public):
-        assert torch.equal(a, b)
 
 
 def test_inference_mode_buffers():
@@ -860,7 +837,8 @@ def test_prepared_sparse_reverse_accumulates_live_edge_vjp(
     destination = torch.zeros_like(values)
     expected = torch.zeros_like(values)
     cache = KernelCache()
-    execute = kernels_triton._prepare_backward(
+    execute = csr_execution._prepare_backward(
+        kernels_triton._Execution(cache),
         cache,
         crow,
         col,
@@ -896,7 +874,8 @@ def test_prepared_sparse_reverse_accumulates_live_edge_vjp(
     # list alone, not the union containing far-from-threshold firing rows.
     produce(2)
     full = kernels_triton.csr_matvec(t_crow, t_col, values, gradient)
-    only_input = kernels_triton._prepare_backward(
+    only_input = csr_execution._prepare_backward(
+        kernels_triton._Execution(cache),
         cache,
         crow,
         col,
@@ -993,7 +972,9 @@ def test_matvec_reuses_cache_across_operand_storage_dtypes(monkeypatch):
     ):
         values = original_values.to(value_dtype)
         x = original_x.to(input_dtype)[:, 1::2]
-        actual = kernels_triton._prepare_matvec(cache, crow, col, values, x)(x)
+        actual = csr_execution._prepare_matvec(
+            kernels_triton._Execution(cache), cache, crow, col, values, x
+        )(x)
         dtype = torch.promote_types(values.dtype, x.dtype)
         expected = reference(crow, col, values.double(), x.double()).to(dtype)
         atol = (

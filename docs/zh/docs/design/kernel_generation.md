@@ -45,6 +45,16 @@ Fragment 构造函数返回 `BackendFragments`。前向阶段使用 Python 表�
 `replay_state`；需要预计算系数的模型声明 `prepared_parameters` 与
 `prepare_parameters`。
 
+循环执行的准备阶段还绑定重复阶段的参数位置与存储布局。仅接收指针的运行时
+直接使用原张量存储；TileLang 使用其扁平缓冲区 ABI。序列中不同时间行的指针
+不能沿用首行的对齐特化。Triton 在准备时确定可执行内核，后续启动仍使用当前
+CUDA stream 并保留 profiler hooks。
+预绑定的指针参数保留其张量所有者。Triton 与 CuPy 内部时间步直接更新参数位置，并按
+实际时间步长计算字节偏移；仅在检查点及最终状态边界创建状态视图。所有模型
+的状态顺序均来自神经元与 PSC 模板元数据。
+TileLang 保留预先绑定的张量视图，并通过公开的内核调用接口启动；执行后端的
+参数与 stream 处理仍由 TileLang 负责。
+
 独立内核与融合内核为共享标量阶段设置各自的命名空间。后端渲染器提供张量访问、
 数学函数与源码外壳，不包含模型方程。编译扩展前，可通过
 `generate_cell_source` 或 `generate_fused_source` 查看生成源码。

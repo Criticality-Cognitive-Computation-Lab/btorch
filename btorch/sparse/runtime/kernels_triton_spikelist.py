@@ -8,14 +8,11 @@ activity cannot overflow and CUDA graphs need no host-side count read.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-import torch
 from torch import Tensor
 
-from . import kernels_torch, kernels_triton, kernels_triton_push
-from .activity import BLOCK_SIZE
+from . import kernels_triton_push, source_layout, spike_list
 from .backend import KernelCache
+from .spike_list import SPIKE_BLOCK
 
 
 try:
@@ -24,43 +21,6 @@ try:
 except ImportError:  # CPU installations do not need Triton.
     triton = None
     tl = None
-
-
-# Match the native cell launch width so one producer owns one queue block.
-SPIKE_BLOCK = BLOCK_SIZE
-
-
-@dataclass(frozen=True)
-class SpikeList:
-    """Invocation-owned block-local lists and degree prefixes for fanout.
-
-    Every producer writes its own count, including zero for a silent
-    block. Capacity covers all sources; neither a hint nor a global
-    atomic counter limits activity. Indices are flattened sample/source
-    coordinates.
-    """
-
-    indices: Tensor
-    cumulative: Tensor
-    counts: Tensor
-    degree: Tensor
-    output: Tensor
-    n_sources: int
-
-    @property
-    def producer_layout(self):
-        n_input = self.counts.numel() * SPIKE_BLOCK
-        n_output = self.output.numel()
-        return self.n_sources, n_output, n_input
-
-    def bindings(self):
-        return {
-            "spike_indices": self.indices,
-            "spike_cumulative": self.cumulative,
-            "spike_counts": self.counts,
-            "spike_degree": self.degree,
-            "spike_accumulation": self.output,
-        }
 
 
 if triton is not None:
@@ -108,11 +68,17 @@ if triton is not None:
         N_INPUT: tl.constexpr,
         N_OUTPUT: tl.constexpr,
         BLOCK: tl.constexpr,
+        X_BATCH: tl.constexpr,
+        X_SOURCE: tl.constexpr,
     ):
         index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         tl.store(output + index, 0.0, mask=index < N_OUTPUT)
         if tl.program_id(0) < tl.cdiv(N_INPUT, BLOCK):
-            amplitude = tl.load(x + index, mask=index < N_INPUT, other=0.0)
+            amplitude = tl.load(
+                x + (index // N) * X_BATCH + (index % N) * X_SOURCE,
+                mask=index < N_INPUT,
+                other=0.0,
+            )
             _emit_spike_list(
                 amplitude,
                 index,
@@ -126,63 +92,49 @@ if triton is not None:
             )
 
 
-def prepare_values(
-    t_crow, t_col, t_perm, values, batch_size, *, cache: KernelCache, route_key=None
-):
-    """Prepare source-major weights once per trajectory, outside its timestep
-    loop."""
-    if (
-        values.dtype not in kernels_torch._FLOAT_DTYPES
-        or values.ndim != 1
-        or not values.is_cuda
-    ):
-        return None, 0
-    layout = kernels_triton_push._layout(cache, t_crow, t_col, t_perm)
-    if (
-        layout is None
-        or batch_size > kernels_triton._MAX_GRID_Y
-        or batch_size * (t_crow.numel() - 1) > 2**31 - 1
-    ):
-        return None, 0
-    # Sparse backward still owns the canonical differentiable values. This is
-    # only a read layout; no second autograd path or independent weight exists.
-    if layout.source_values is None or layout.source_values.dtype != values.dtype:
-        # This read layout outlives the invocation that first requests it.
-        # Training may save it for backward after an inference-only run.
-        with torch.inference_mode(False):
-            layout.source_values = torch.empty_like(values)
-        layout.source_value_epoch = kernels_triton._next_epoch()
-    # Stable addresses let already-captured graphs observe optimizer updates.
-    # The shared layout cache owns lifetime and topology invalidation, just as
-    # for the packed fanout's index copies.
-    layout.source_values.copy_(values.detach().index_select(0, t_perm.long()))
-    return layout.source_values, layout.source_value_epoch
+def prepare_spike_list(*args, **kwargs):
+    return spike_list.prepare_spike_list(
+        *args, **kwargs, bind=_prepare_spike_list_launch
+    )
 
 
-@dataclass
-class _PreparedSpikeList:
-    spikes: SpikeList | None
-    values: Tensor
-    layout: object
-    task_values: Tensor | None
-    output: Tensor
-    input_workspace: Tensor | None
-    cache: KernelCache
-    programs: int = 1
+def _prepare_spike_list_launch(execution, x):
+    """Bind the existing packed fanout's arguments and executable once."""
+    from ...utils.triton import prepare_launch
 
-    def _source(self, input):
-        if self.input_workspace is not None:
-            self.input_workspace.copy_(input)
-            return self.input_workspace
-        return input
+    queue = execution.spikes
+    n_batch, n_in = x.shape
+    n_out = execution.output.shape[-1]
+    # Several consumers per queue retain parallelism for small populations and
+    # long fanouts; all consume the same packed kernel, without a global scan.
+    programs = execution.programs
+    execution.arguments = [
+        execution.layout.crow,
+        execution.layout.col,
+        execution.layout.perm,
+        execution.values if execution.task_values is None else execution.task_values,
+        x,
+        queue.indices,
+        queue.cumulative,
+        queue.counts,
+        queue.output,
+        SPIKE_BLOCK,
+        n_in,
+        n_out,
+        n_batch,
+        SPIKE_BLOCK.bit_length(),
+        0,
+        programs,
+        (
+            execution.values if execution.task_values is None else execution.task_values
+        ).stride(0),
+        x.stride(0),
+        x.stride(1),
+    ]
 
-    def __call__(self, input):
-        if self.spikes is None:
-            return self.output
-        input = self._source(input)
-        queue = self.spikes
+    def pack(input):
         _pack_spike_list_kernel[
-            (triton.cdiv(max(input.numel(), queue.output.numel()), SPIKE_BLOCK),)
+            (-(-max(input.numel(), queue.output.numel()) // SPIKE_BLOCK),)
         ](
             input,
             queue.degree,
@@ -194,123 +146,29 @@ class _PreparedSpikeList:
             input.numel(),
             queue.output.numel(),
             SPIKE_BLOCK,
-        )
-        return _launch_spike_list(self, input)
-
-    def from_spikes(self, input):
-        """Consume an emitted list; its producer already cleared the output."""
-        return (
-            self.output
-            if self.spikes is None
-            else _launch_spike_list(self, self._source(input))
+            x.stride(0),
+            x.stride(1),
         )
 
-
-def prepare_spike_list(
-    t_crow,
-    t_col,
-    t_perm,
-    values,
-    x,
-    n_out,
-    *,
-    task_values=None,
-    require_task=False,
-    cache: KernelCache,
-):
-    """Prepare block-local list storage for the shared packed SpMSpV kernel."""
-    n_batch, n_in = x.shape
-    output_dtype = torch.promote_types(values.dtype, x.dtype)
-    output = x.new_empty((n_batch, n_out), dtype=output_dtype)
-    accumulation = (
-        output
-        if output_dtype == kernels_torch._accumulation_dtype(output_dtype)
-        else torch.empty_like(
-            output, dtype=kernels_torch._accumulation_dtype(output_dtype)
-        )
-    )
-    if not x.numel() or not values.numel():
-        output.zero_()
-        return _PreparedSpikeList(None, values, None, None, output, None, cache)
-    layout = kernels_triton_push._layout(cache, t_crow, t_col, t_perm)
-    if layout is None or x.numel() > 2**31 - 1:
-        raise RuntimeError("Unsupported spike-list layout; replan the connection")
-    groups = triton.cdiv(x.numel(), SPIKE_BLOCK)
-    queue = SpikeList(
-        torch.empty(groups * SPIKE_BLOCK, device=x.device, dtype=torch.int32),
-        torch.empty(groups * SPIKE_BLOCK, device=x.device, dtype=torch.int64),
-        torch.empty(groups, device=x.device, dtype=torch.int32),
-        layout.degree,
-        accumulation,
-        n_in,
-    )
-    return _PreparedSpikeList(
-        queue,
-        values,
-        layout,
-        task_values,
-        output,
-        None
-        if x.is_contiguous()
-        else torch.empty_like(x, memory_format=torch.contiguous_format),
-        cache,
-        # Size from topology, not measured activity. Sparse blocks need enough
-        # consumers to hide dependent prefix/edge loads even when neighboring
-        # producer blocks are silent. Persistent consumers cover arbitrary
-        # degrees, including hubs; this is not a capacity bound.
-        min(
-            32,
-            max(
-                1,
-                triton.cdiv(
-                    values.numel() * SPIKE_BLOCK, n_in * kernels_triton_push._BLOCK
-                ),
-            ),
-        ),
-    )
-
-
-def _launch_spike_list(execution, x):
-    """Consume local prefixes with the existing persistent packed fanout."""
-    queue = execution.spikes
-    n_batch, n_in = x.shape
-    n_out = execution.output.shape[-1]
-    # Several consumers per queue retain parallelism for small populations and
-    # long fanouts; all consume the same packed kernel, without a global scan.
-    programs = execution.programs
-    kernels_triton._launch(
-        execution.cache,
-        "push_packed",
+    execution.pack = pack
+    execution.launch = prepare_launch(
         kernels_triton_push._kernels(execution.cache)[0],
-        x.device.index,
+        execution.arguments,
         (programs * queue.counts.numel(),),
-        (
-            execution.layout.crow,
-            execution.layout.col,
-            execution.layout.perm,
-            execution.values
-            if execution.task_values is None
-            else execution.task_values,
-            x,
-            queue.indices,
-            queue.cumulative,
-            queue.counts,
-            queue.output,
-            SPIKE_BLOCK,
-            n_in,
-            n_out,
-            n_batch,
-            SPIKE_BLOCK.bit_length(),
-            0,
-            programs,
+        tuple(
+            zip(
+                kernels_triton_push._PACKED_CONSTS,
+                (
+                    source_layout.EDGE_BLOCK,
+                    execution.task_values is None,
+                    SPIKE_BLOCK,
+                ),
+                strict=True,
+            )
         ),
-        kernels_triton_push._PACKED_CONSTS,
-        (kernels_triton_push._BLOCK, execution.task_values is None, SPIKE_BLOCK),
-        kernels_triton_push._BLOCK_WARPS,
+        changing=(4,),
+        num_warps=source_layout.BLOCK_WARPS,
     )
-    if queue.output is not execution.output:
-        execution.output.copy_(queue.output)
-    return execution.output
 
 
 def spike_push_list(
@@ -344,7 +202,7 @@ def register(registry):
     """Register spike-list preparation and fanout under the Triton backend."""
 
     def prepare(t_crow, t_col, t_perm, values, batch_size, *, route_key=None):
-        return prepare_values(
+        return spike_list.prepare_values(
             t_crow,
             t_col,
             t_perm,

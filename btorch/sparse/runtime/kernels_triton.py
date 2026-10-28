@@ -50,16 +50,10 @@ The module does not register itself; call :func:`register`.
 
 from __future__ import annotations
 
-import itertools
-import weakref
-from collections.abc import Callable
-from dataclasses import dataclass
-
 import torch
 from torch import Tensor
 
-from . import kernels_torch
-from .activity import GradientList
+from . import csr_execution, csr_layout
 from .backend import BackendRegistry, KernelCache, registry as _default_registry
 
 
@@ -69,65 +63,6 @@ try:  # optional dependency
 except ImportError:  # pragma: no cover - exercised only without triton
     triton = None
     tl = None
-
-
-_INT32_MAX = 2**31 - 1
-# CUDA limits the second grid dimension to 65535 blocks.
-_MAX_GRID_Y = 65535
-
-# Rows longer than this many entries are split into segments of this length
-# that are reduced by independent programs and combined afterwards (see
-# :class:`_RowLayout`). It bounds the work of one program, so the latency of a
-# launch does not grow with the longest row.
-_SEGMENT = 512
-# Bound the shape-only list grid; each program strides over further segments.
-_LIST_PARTITIONS = 8
-
-# ``csr_matvec`` tile ``(rows, entries, samples, warps)`` of one program: it
-# owns ``rows`` consecutive rows (or row segments) for ``samples`` consecutive
-# samples and walks them ``entries`` at a time. The tile is chosen from the
-# number of samples only, never from the data, so the reduction order (and
-# with it the result) is reproducible. Entries are ``(max samples, tile)``;
-# the last one also serves every larger sample count. Tuned on an RTX 5090.
-_MATVEC_TILES = (
-    (1, (4, 32, 1, 4)),
-    (4, (4, 32, 4, 4)),
-    (8, (4, 16, 8, 4)),
-    (31, (2, 16, 16, 4)),
-    (0, (2, 16, 32, 8)),
-)
-
-# ``edge_grad`` tile ``(entries, samples, warps)`` of one program, selected
-# like the ``csr_matvec`` tile.
-_EDGE_TILES = (
-    (1, (128, 1, 4)),
-    (8, (64, 8, 4)),
-    (0, (32, 16, 4)),
-)
-
-# Tile ``(split rows, partial sums)`` of one program of the launch that adds up
-# the partial sums of split rows.
-_COMBINE_TILE = (16, 16)
-
-# Regime rule of ``csr_matvec``: hand calls with at least this many samples
-# per member to the ATen kernel (cuSPARSE SpMM). ``None`` never hands over:
-# on an RTX 5090 the Triton kernel was at least as fast as cuSPARSE for every
-# measured size and batch (``benchmarks/sparse_conn/bench_kernels_pull.py``).
-_SPMM_MIN_SAMPLES: int | None = None
-
-# Patterns (derived layouts of one ``(crow, col)`` pair) kept per cache. A
-# pattern is dropped as soon as one of its index buffers dies; the limit only
-# bounds what long-lived buffers can pin (the oldest pattern goes first).
-_MAX_PATTERNS = 1024
-
-# Triton's public launch path re-derives the specialisation of every argument
-# on each call, which costs about as much as a small kernel. With the versions
-# listed here the compiled kernel handle is cached and launched directly; any
-# other version uses the public path.
-_DIRECT_LAUNCH_VERSIONS = ("3.6.",)
-_DIRECT_LAUNCH = triton is not None and triton.__version__.startswith(
-    _DIRECT_LAUNCH_VERSIONS
-)
 
 
 def is_available() -> bool:
@@ -537,102 +472,34 @@ if triton is not None:
         tl.store(destination, total, mask=mask)
 
 
-_MATVEC_CONSTS = (
-    "BR",
-    "BK",
-    "BS",
-    "HUB",
-    "PERM",
-    "MASK",
-    "WEIGHT_GRAD",
-    "LIST",
-    "SEGMENT",
-)
-_COMBINE_CONSTS = ("BH", "BK")
-_EDGE_CONSTS = ("BE", "BS", "ACCUMULATE")
-
-_HANDLES_KEY = ("triton", "compiled")
-_PATTERNS_KEY = ("triton", "patterns")
-
-
-def _no_launch_hooks() -> bool:
-    """Whether no Triton launch hook (profiler, tracer) is installed; the
-    direct launch would bypass them."""
-    runtime = triton.knobs.runtime
-    return not (
-        getattr(runtime.launch_enter_hook, "calls", True)
-        or getattr(runtime.launch_exit_hook, "calls", True)
-    )
-
-
-def _raw_stream(device_index: int) -> int:
-    """Handle of the current CUDA stream of ``device_index``."""
-    return torch.cuda.current_stream(device_index).cuda_stream
-
-
-# ``torch.cuda.current_stream()`` builds a ``Stream`` object on every call,
-# which costs about as much as the launch itself; the raw getter does not.
-_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", _raw_stream)
-
-
-def _launch(
-    cache: KernelCache,
-    name: str,
-    kernel,
-    device_index: int,
-    grid: tuple[int, ...],
-    args: tuple,
-    const_names: tuple[str, ...],
-    consts: tuple,
-    warps: int,
-) -> None:
-    """Launch ``kernel`` over ``grid`` on the current stream.
-
-    Every integer in ``args`` must fit ``int32``: the kernel binary depends
-    on the width of its scalar arguments. Cached handles include constexprs
-    and pointer dtypes; callers guarantee scalar widths by leaving larger
-    problems to the Torch kernels.
-
-    Args:
-        cache: Holds the compiled kernel handles.
-        name: Kernel name (cache key).
-        kernel: The ``triton.jit`` function.
-        device_index: CUDA device of the arguments (the current device).
-        grid: Programs, batch and optional row-segment axis.
-        args: Runtime arguments in signature order.
-        const_names: Names of the constexprs, in signature order.
-        consts: Their values.
-        warps: Warps per program.
-    """
-    if _DIRECT_LAUNCH and _no_launch_hooks():
-        handles = cache.get(_HANDLES_KEY, dict)
-        # A compiled module belongs to the CUDA context it was loaded in.
-        pointer_dtypes = tuple(arg.dtype for arg in args if isinstance(arg, Tensor))
-        key = (name, consts, warps, device_index, pointer_dtypes)
-        compiled = handles.get(key)
-        if compiled is not None:
-            compiled.run(
-                grid[0],
-                grid[1] if len(grid) > 1 else 1,
-                grid[2] if len(grid) > 2 else 1,
-                _raw_stream(device_index),
-                compiled.function,
-                compiled.packed_metadata,
-                None,
-                None,
-                None,
-                *args,
-                *consts,
-            )
-            return
-        compiled = kernel[grid](
-            *args, **dict(zip(const_names, consts, strict=True)), num_warps=warps
-        )
-        if hasattr(compiled, "result"):  # asynchronous compilation
-            compiled = compiled.result()
-        handles[key] = compiled
-        return
+def _launch(cache, name, kernel, device_index, grid, args, const_names, consts, warps):
+    """Submit a Triton stage through its public launch interface."""
+    del cache, name, device_index
     kernel[grid](*args, **dict(zip(const_names, consts, strict=True)), num_warps=warps)
+
+
+class _Execution:
+    def __init__(self, cache):
+        self.cache = cache
+
+    def launch(self, name, grid, args, const_names, consts, warps):
+        kernel = {
+            "csr_matvec": _csr_matvec_kernel,
+            "hub_combine": _hub_combine_kernel,
+            "edge_grad": _edge_grad_kernel,
+            "listed_output": _listed_matvec_output_kernel,
+        }[name]
+        _launch(
+            self.cache,
+            name,
+            kernel,
+            args[0].device.index,
+            grid,
+            args,
+            const_names,
+            consts,
+            warps,
+        )
 
 
 # ------------------------------------------------------------ derived layouts
@@ -640,651 +507,7 @@ def _launch(
 
 # Stamps of :func:`layout_epoch`: process-wide, so they stay monotonic when
 # patterns are evicted and rebuilt or a kernel cache is cleared.
-_EPOCH = itertools.count(1)
-
-
-def _next_epoch() -> int:
-    """A stamp larger than every stamp handed out before."""
-    return next(_EPOCH)
-
-
-def _int32_copy(index: Tensor) -> Tensor:
-    """A contiguous ``int32`` copy of ``index`` that never aliases it (it is
-    rewritten in place when ``index`` changes)."""
-    return torch.empty(index.shape, dtype=torch.int32, device=index.device).copy_(index)
-
-
-def _row_index(crow: Tensor) -> Tensor:
-    """Row of every entry, ``[E]`` ``int32`` (expanded row pointers)."""
-    counts = crow[1:] - crow[:-1]
-    rows = torch.arange(counts.shape[0], dtype=torch.int32, device=crow.device)
-    return torch.repeat_interleave(rows, counts)
-
-
-class _RowLayout:
-    """Row pointers as the ``csr_matvec`` kernel reads them.
-
-    Two formulations exist; which one a layout uses never depends on the
-    *current* contents of ``crow`` in a way a captured graph could notice:
-
-    - *Plain* (a layout that never saw a row longer than ``_SEGMENT``): the
-      kernel reads the ``int32`` copy of ``crow`` and one program reduces
-      whole rows. This is correct for rows of any length, so a graph
-      captured in this formulation stays correct when a later rewiring
-      creates a long row; only the latency bound of the split is lost until
-      the graph is captured again.
-    - *Segmented* (from the first long row on, for the rest of the layout's
-      life): every row longer than ``_SEGMENT`` is cut into segments of
-      ``_SEGMENT`` entries whose partial sums a second launch adds up.
-      Segments are consecutive in entry order, so they are described by a
-      refined pointer array plus the destination of each segment's sum.
-
-    The segmented tables have a fixed *capacity* derived from ``M`` and ``E``
-    alone. A row of ``c`` entries has ``max(1, ceil(c / S)) <= 1 + c // S``
-    segments, hence at most ``M + E // S`` segments in total; at most
-    ``E // (S + 1)`` rows are split, into at most ``E // S + E // (S + 1)``
-    partial sums. Launch grids and scalar arguments use the capacities, never
-    the actual counts; unused slots are marked (target / row ``-1``, empty
-    entry range) and their programs store nothing. Refilling the tables for
-    another pattern of the same size therefore changes neither an address
-    nor a launch argument.
-
-    Attributes:
-        crow32: ``[M + 1]`` ``int32`` copy of ``crow`` (always maintained).
-        segmented: Whether the segmented formulation is in use.
-        ptr: Segment pointers: ``crow32`` if plain, else ``[n_seg + 1]``.
-        target: ``[n_seg]`` destination of each segment: the row for an
-            unsplit row, ``M + j`` for partial sum ``j`` of a split row,
-            ``-1`` for an unused slot; ``None`` if plain.
-        owner: Original row of each segment, for output-adjoint support masks.
-        hub_row: ``[n_hub]`` the split rows (``-1``: unused slot).
-        hub_ptr: ``[n_hub + 1]`` partial sums owned by each split row.
-        n_seg: Segments the kernel is launched over (``M`` if plain, else
-            the capacity).
-        n_tmp: Width of the partial-sum buffer (capacity; 0 if plain).
-        n_hub: Split-row slots the combine kernel is launched over
-            (capacity; 0 if plain).
-        n_split: Rows actually split by the current pattern (informative).
-        row_segment_start: Per-row offsets into compact listed-row partials.
-    """
-
-    __slots__ = (
-        "crow32",
-        "hub_ptr",
-        "hub_row",
-        "n_hub",
-        "n_seg",
-        "n_split",
-        "n_tmp",
-        "ptr",
-        "segmented",
-        "target",
-        "owner",
-        "row_segment_start",
-    )
-
-    def __init__(self, crow: Tensor, n_edge: int) -> None:
-        self.crow32 = torch.empty(crow.shape, dtype=torch.int32, device=crow.device)
-        self.ptr = self.crow32
-        self.target = self.owner = self.hub_row = self.hub_ptr = None
-        self.segmented = False
-        self.n_seg = crow.shape[0] - 1
-        self.n_tmp = self.n_hub = self.n_split = 0
-        self.row_segment_start = torch.arange(
-            crow.numel(), dtype=torch.int32, device=crow.device
-        )
-        self.fill(crow, n_edge)
-
-    def fill(self, crow: Tensor, n_edge: int) -> bool:
-        """(Re)derive the tables from ``crow``, in place.
-
-        Synchronises with the host (once per topology, never per call).
-
-        Returns:
-            Whether derived tensors were allocated.
-        """
-        self.crow32.copy_(crow)
-        n_rows = crow.shape[0] - 1
-        counts = crow[1:] - crow[:-1]
-        long = counts > _SEGMENT
-        allocated = False
-        if not self.segmented:
-            if n_rows == 0 or not bool(long.any()):
-                return allocated
-            device = crow.device
-            n_seg = n_rows + n_edge // _SEGMENT
-            n_hub = min(n_rows, n_edge // (_SEGMENT + 1))
-            self.ptr = torch.empty(n_seg + 1, dtype=torch.int32, device=device)
-            self.target = torch.empty(n_seg, dtype=torch.int32, device=device)
-            self.owner = torch.empty(n_seg, dtype=torch.int32, device=device)
-            self.hub_row = torch.empty(n_hub, dtype=torch.int32, device=device)
-            self.hub_ptr = torch.empty(n_hub + 1, dtype=torch.int32, device=device)
-            self.n_seg, self.n_hub = n_seg, n_hub
-            self.n_tmp = n_edge // _SEGMENT + n_hub
-            self.segmented = allocated = True
-        # Segments per row; empty rows keep one (it writes their zero).
-        n_seg = ((counts + (_SEGMENT - 1)) // _SEGMENT).clamp_(min=1)
-        first = torch.cumsum(n_seg, 0) - n_seg
-        self.row_segment_start[:-1].copy_(first)
-        self.row_segment_start[-1:].copy_(first[-1:] + n_seg[-1:])
-        seg_row = torch.repeat_interleave(
-            torch.arange(n_rows, device=crow.device), n_seg
-        )
-        used = seg_row.shape[0]
-        within = torch.arange(used, device=crow.device) - first[seg_row]
-        seg_long = long[seg_row]
-        partial = torch.cumsum(seg_long, 0) - 1
-        self.ptr[:used].copy_(crow[:-1][seg_row] + within * _SEGMENT)
-        self.ptr[used:] = n_edge  # unused slots own no entries
-        self.target[:used].copy_(torch.where(seg_long, n_rows + partial, seg_row))
-        self.target[used:] = -1
-        self.owner[:used].copy_(seg_row)
-        self.owner[used:] = -1
-        hub_row = long.nonzero().squeeze(1)
-        n_split = self.n_split = hub_row.shape[0]
-        self.hub_row[:n_split].copy_(hub_row)
-        self.hub_row[n_split:] = -1
-        self.hub_ptr.zero_()
-        self.hub_ptr[1 : n_split + 1].copy_(torch.cumsum(n_seg[long], 0))
-        return allocated
-
-
-class _Pattern:
-    """Everything the kernels derive from one ``(crow, col)`` pair.
-
-    The derived tensors are allocated once and rewritten in place when the
-    index buffers change (:meth:`refresh`), so their addresses are stable
-    for as long as the pattern lives.
-
-    Attributes:
-        crow_ref, col_ref: Weak references to the index buffers the pattern
-            was built from.
-        versions: Their ``_version`` counters and addresses at build time.
-        supported: Whether the Triton kernels can read the pattern (both
-            buffers on one CUDA device, index space within ``int32``).
-        device: Device of the buffers.
-        n_out, n_edge: ``M`` and ``E``.
-        col32: ``[E]`` ``int32`` copy of ``col``.
-        rows: :class:`_RowLayout` of ``crow`` (built on first use).
-        row32: ``[E]`` ``int32`` row of every entry (built on first use).
-        perm32: ``int32`` copy of the last value permutation used with the
-            pattern, with the buffer and version it was built from.
-        epoch: Stamp of the last allocation of a derived tensor.
-        n_fill: Times the derived tensors were (re)derived from the buffers.
-    """
-
-    __slots__ = (
-        "col32",
-        "col_ref",
-        "crow_ref",
-        "device",
-        "epoch",
-        "n_edge",
-        "n_fill",
-        "n_out",
-        "perm32",
-        "perm_ref",
-        "perm_version",
-        "row32",
-        "rows",
-        "supported",
-        "versions",
-    )
-
-    def __init__(self, crow: Tensor, col: Tensor) -> None:
-        self.crow_ref = self.col_ref = self.perm_ref = None
-        self.versions = None
-        self.perm_version = None
-        self.device = crow.device
-        self.n_out = crow.shape[0] - 1
-        self.n_edge = col.shape[0]
-        self.rows = self.row32 = self.perm32 = self.col32 = None
-        self.epoch = 0
-        self.n_fill = 1
-        self.supported = (
-            crow.is_cuda
-            and col.device == crow.device
-            # 32-bit entry and row offsets.
-            and max(self.n_edge, self.n_out + 1) < _INT32_MAX
-        )
-        if self.supported:
-            self.col32 = _int32_copy(col)
-            self.epoch = _next_epoch()
-
-    def refresh(self, crow: Tensor, col: Tensor) -> None:
-        """Rewrite every derived tensor built so far from the (same-sized)
-        buffers, in place."""
-        self.col32.copy_(col)
-        if self.rows is not None and self.rows.fill(crow, self.n_edge):
-            self.epoch = _next_epoch()
-        if self.row32 is not None:
-            self.row32.copy_(_row_index(crow))
-        self.n_fill += 1
-
-    def row_layout(self, crow: Tensor) -> _RowLayout:
-        """The :class:`_RowLayout` of the pattern (built on first use)."""
-        layout = self.rows
-        if layout is None:
-            layout = self.rows = _RowLayout(crow, self.n_edge)
-            self.epoch = _next_epoch()
-        return layout
-
-    def row_index(self, crow: Tensor) -> Tensor:
-        """``[E]`` ``int32`` row of every entry (built on first use)."""
-        row32 = self.row32
-        if row32 is None:
-            row32 = self.row32 = _row_index(crow).contiguous()
-            self.epoch = _next_epoch()
-        return row32
-
-    def permutation(self, perm: Tensor) -> Tensor | None:
-        """``int32`` copy of ``perm`` (``None`` if it cannot be used).
-
-        The copy of the last permutation tensor is kept and rewritten in
-        place when that tensor changes.
-        """
-        if perm.device != self.device or perm.shape != (self.n_edge,):
-            return None
-        try:
-            version = (perm._version, perm.data_ptr())
-        except RuntimeError:  # inference tensor: no version counter
-            return _int32_copy(perm)
-        ref = self.perm_ref
-        if ref is not None and ref() is perm:
-            if self.perm_version != version:
-                self.perm32.copy_(perm)
-                self.perm_version = version
-            return self.perm32
-        self.perm32 = _int32_copy(perm)
-        self.perm_ref = weakref.ref(perm)
-        self.perm_version = version
-        self.epoch = _next_epoch()
-        return self.perm32
-
-
-def _check_pointers(crow: Tensor, col: Tensor) -> None:
-    """Checked once per pattern contents: the kernels trust the pointers."""
-    if crow.shape[0] and int(crow[-1]) != col.shape[0]:
-        raise ValueError(
-            f"crow ends at {int(crow[-1])} but col has {col.shape[0]} entries."
-        )
-
-
-def _pattern(cache: KernelCache, crow: Tensor, col: Tensor) -> _Pattern:
-    """Return the :class:`_Pattern` of ``(crow, col)``, cached in ``cache`` for
-    as long as it is valid.
-
-    The index buffers of a connection are rewritten *in place* when it is
-    rewired (same tensor objects, new contents) and replaced by new tensors
-    when the number of edges changes. Neither the object identity nor the
-    address alone identifies the contents, and two views of one buffer
-    (``base[:n]`` and ``base[::2]``) share address, shape and version. The
-    cache therefore uses:
-
-    - the key ``(id(crow), id(col))``: one pattern per pair of tensor
-      *objects*, found with a single dictionary lookup. Different views are
-      different objects, so they can never be confused;
-    - weak references to both tensors, compared by identity on every hit: an
-      ``id`` is only reused after its object died, and then the reference no
-      longer resolves to the tensor passed in;
-    - the autograd version counters ``_version``: every in-place write
-      (``copy_``, index assignment, ...) bumps them, also under ``no_grad``.
-      The derived tensors of the pattern are then rewritten *in place*
-      (:meth:`_Pattern.refresh`): rewiring does not grow the cache, and
-      tensors referenced by a captured CUDA graph keep their addresses.
-
-    Refreshing synchronises with the host. :func:`prepare` does it ahead of
-    time; a call on prepared, unchanged buffers only compares versions.
-
-    The entry is deleted when either tensor dies (releasing the derived
-    copies), and at most ``_MAX_PATTERNS`` entries are kept.
-
-    Tensors without a version counter (inference tensors) are not cached.
-    Writes that bypass the version counter (through DLPack or
-    ``__cuda_array_interface__`` aliases) are not detected.
-    """
-    patterns: dict = cache.get(_PATTERNS_KEY, dict)
-    key = (id(crow), id(col))
-    hit: _Pattern | None = patterns.get(key)
-    try:
-        # The data pointers catch ``tensor.data = other``, which replaces the
-        # contents without touching the object or its version counter.
-        versions = (crow._version, col._version, crow.data_ptr(), col.data_ptr())
-    except RuntimeError:  # inference tensor: no version counter
-        return _Pattern(crow, col)
-    if hit is not None and hit.crow_ref() is crow and hit.col_ref() is col:
-        if hit.versions == versions:
-            return hit
-        if (
-            # ``resize_`` keeps the object but not the shape.
-            hit.n_out == crow.shape[0] - 1
-            and hit.n_edge == col.shape[0]
-            and hit.device == crow.device == col.device
-        ):
-            _check_pointers(crow, col)
-            hit.refresh(crow, col)
-            hit.versions = versions
-            return hit
-    _check_pointers(crow, col)
-    pattern = _Pattern(crow, col)
-    if not pattern.supported:
-        return pattern  # cheap to rebuild, nothing worth keeping
-
-    def _drop(ref, patterns=patterns, key=key):
-        # Only drop the entry this reference vouched for.
-        entry = patterns.get(key)
-        if entry is not None and (entry.crow_ref is ref or entry.col_ref is ref):
-            del patterns[key]
-
-    pattern.crow_ref = weakref.ref(crow, _drop)
-    pattern.col_ref = weakref.ref(col, _drop)
-    pattern.versions = versions
-    patterns.pop(key, None)  # re-insert as the newest entry
-    while len(patterns) >= _MAX_PATTERNS:
-        try:
-            del patterns[next(iter(patterns))]
-        except (KeyError, StopIteration, RuntimeError):  # raced with ``_drop``
-            break
-    patterns[key] = pattern
-    return pattern
-
-
-def _tile(table: tuple, n_sample: int) -> tuple:
-    """Tile of the first table entry that covers ``n_sample`` samples."""
-    for limit, tile in table:
-        if n_sample <= limit:
-            return tile
-    return table[-1][1]
-
-
-def _numel(shape) -> int:
-    n = 1
-    for s in shape:
-        n *= s
-    return n
-
-
-def _prepare_sample_minor(t: Tensor, n_sample: int):
-    """Prepare reusable sample-minor storage without changing operand dtype."""
-    if n_sample <= 1 and t.is_contiguous():
-        return lambda input: input
-    minor = t.reshape(-1, n_sample, t.shape[-1]).transpose(1, 2) if n_sample > 1 else t
-    workspace = torch.empty_like(minor, memory_format=torch.contiguous_format)
-
-    def forward(input):
-        minor = (
-            input.reshape(-1, n_sample, input.shape[-1]).transpose(1, 2)
-            if n_sample > 1
-            else input
-        )
-        workspace.copy_(minor)
-        return workspace
-
-    return forward
-
-
-def _on_current_device(pattern: _Pattern, a: Tensor, b: Tensor) -> bool:
-    """Whether the pattern and both operands live on the current CUDA
-    device."""
-    device = pattern.device
-    return (
-        a.device == device
-        and b.device == device
-        and device.index == torch.cuda.current_device()
-    )
-
-
 # ---------------------------------------------------------------- csr_matvec
-
-
-@dataclass(frozen=True)
-class _WeightGradient:
-    source: Tensor
-    destination: Tensor
-
-
-@dataclass(frozen=True)
-class _PreparedMatvec:
-    """Bind a product and whether it also accumulates its value VJP."""
-
-    forward: Callable
-    accumulates_values: bool = False
-
-    def __call__(self, input, mask=None, activity=None):
-        return self.forward(input, mask, activity)
-
-
-def _prepare_matvec(
-    cache: KernelCache,
-    crow: Tensor,
-    col: Tensor,
-    values: Tensor,
-    x: Tensor,
-    perm: Tensor | None = None,
-    x_minor: Tensor | None = None,
-    input_mask: Tensor | GradientList | None = None,
-    weight_gradient: _WeightGradient | None = None,
-) -> _PreparedMatvec:
-    """Prepare reusable destinations for ``csr_matvec`` or its gather variant.
-
-    ``x_minor`` is the sample-minor layout of ``x`` if the caller already has
-    it (the backward shares one transposed gradient between its kernels).
-    """
-    n_vb = values.ndim - 1
-    pattern = None
-    # ``x`` needs the value-batch dimensions and the neuron axis; the
-    # reference kernel raises the error for anything shorter.
-    if triton is not None and x.is_cuda and x.ndim > n_vb:
-        pattern = _pattern(cache, crow, col)
-    if pattern is not None and pattern.supported:
-        n_out, n_edge = pattern.n_out, pattern.n_edge
-        n_in = x.shape[-1]
-        if n_vb:
-            v_batch, x_batch = values.shape[:-1], x.shape[:n_vb]
-            sample = x.shape[n_vb:-1]
-            if v_batch == x_batch:
-                batch = v_batch
-                v_member = x_member = n_member = _numel(batch)
-            else:
-                batch = torch.broadcast_shapes(v_batch, x_batch)
-                v_member, x_member = _numel(v_batch), _numel(x_batch)
-                n_member = _numel(batch)
-        else:
-            batch = ()
-            sample = x.shape[:-1]
-            v_member = x_member = n_member = 1
-        n_sample = _numel(sample)
-        rows, entries, samples, warps = _tile(_MATVEC_TILES, n_sample)
-        if (
-            isinstance(input_mask, GradientList)
-            and n_vb == 0
-            and (weight_gradient is None or n_sample == 1)
-        ):
-            rows, entries, samples, warps = _tile(_MATVEC_TILES, 1)
-        perm32 = None if perm is None else pattern.permutation(perm)
-        supported = (
-            _on_current_device(pattern, values, x)
-            and values.dtype in kernels_torch._FLOAT_DTYPES
-            and x.dtype in kernels_torch._FLOAT_DTYPES
-            # Entry values are read at ``k`` (or ``perm[k]``) without a bound.
-            and (values.shape[-1] == n_edge if perm is None else perm32 is not None)
-            and values.shape[-1] < _INT32_MAX
-            # 32-bit sample-minor input offsets (the lanes past the last
-            # sample of a block are masked but still computed).
-            and n_in * max(n_sample, 1) + samples < _INT32_MAX
-            # A side that is constant across members is passed once (stride
-            # 0); partial broadcasts ([G, 1] against [1, H]) are left to ATen.
-            and (v_member == n_member or v_member == 1)
-            and (x_member == n_member or x_member == 1)
-            and (_SPMM_MIN_SAMPLES is None or n_sample < _SPMM_MIN_SAMPLES)
-        )
-    else:
-        supported = False
-    if not supported:
-        if perm is not None:
-            values = values.index_select(-1, perm)
-        return _PreparedMatvec(
-            lambda input, mask, activity: kernels_torch.csr_matvec(
-                crow, col, values, input
-            )
-        )
-
-    out_shape = (*batch, *sample, n_out)
-    output_dtype = torch.promote_types(values.dtype, x.dtype)
-    if n_out == 0 or n_member * n_sample == 0 or n_edge == 0:
-        empty = torch.zeros(out_shape, dtype=output_dtype, device=x.device)
-        return _PreparedMatvec(lambda input, mask, activity: empty)
-
-    layout = pattern.rows
-    if layout is None:
-        layout = pattern.row_layout(crow)
-    gradient_list = input_mask if isinstance(input_mask, GradientList) else None
-    if gradient_list is not None:
-        input_mask = gradient_list.mask
-    listed = (
-        gradient_list is not None
-        and n_vb == 0
-        and (weight_gradient is None or n_sample == 1)
-    )
-    hub = layout.segmented and not listed
-    n_sample_block = 1 if listed else -(-n_sample // samples)
-    if n_member * (n_sample if hub else n_sample_block) > _MAX_GRID_Y:
-        if perm is not None:
-            values = values.index_select(-1, perm)
-        return _PreparedMatvec(
-            lambda input, mask, activity: kernels_torch.csr_matvec(
-                crow, col, values, input
-            )
-        )
-
-    device_index = pattern.device.index
-    values = values.contiguous()
-    prepare_input = _prepare_sample_minor(x, n_sample) if x_minor is None else None
-    out = torch.empty(out_shape, dtype=output_dtype, device=x.device)
-    accumulate_values = (
-        weight_gradient is not None
-        and perm32 is not None
-        and n_vb == 0
-        and n_sample_block == 1
-        and (not listed or n_sample == 1)
-        and weight_gradient.destination.is_contiguous()
-        and weight_gradient.source.dtype in kernels_torch._FLOAT_DTYPES
-    )
-    prepare_activity = (
-        _prepare_sample_minor(weight_gradient.source, n_sample)
-        if accumulate_values
-        else None
-    )
-    tmp = out
-    if hub:
-        tmp = torch.empty(
-            (n_member * n_sample, layout.n_tmp),
-            dtype=kernels_torch._accumulation_dtype(output_dtype),
-            device=x.device,
-        )
-    if listed:
-        # Sparse row traversal writes only listed rows. The final consumer
-        # materializes inactive zeros, so previous-timestep work cannot leak.
-        tmp = torch.empty(
-            (n_sample, layout.n_seg),
-            dtype=kernels_torch._accumulation_dtype(out.dtype),
-            device=out.device,
-        )
-
-    def forward(input, mask, activity):
-        queue = mask if isinstance(mask, GradientList) else None
-        mask = queue.mask if queue is not None else mask
-        indices, counts = queue.work(accumulate_values) if listed else (out, out)
-        source = x_minor if x_minor is not None else prepare_input(input)
-        activity_minor = (
-            source if prepare_activity is None else prepare_activity(activity)
-        )
-        n_seg = gradient_list.capacity if listed else layout.n_seg
-        _launch(
-            cache,
-            "csr_matvec",
-            _csr_matvec_kernel,
-            device_index,
-            (
-                -(-n_seg // rows),
-                n_member * n_sample_block,
-                min(_LIST_PARTITIONS, max(1, -(-n_edge // _SEGMENT))) if listed else 1,
-            ),
-            (
-                layout.crow32 if listed else layout.ptr,
-                layout.target if hub else layout.ptr,
-                pattern.col32,
-                pattern.col32 if perm32 is None else perm32,
-                values,
-                source,
-                tmp if listed else out,
-                tmp,
-                n_seg,
-                n_out,
-                n_sample,
-                n_sample_block,
-                layout.n_seg if listed else layout.n_tmp,
-                0 if v_member == 1 else values.shape[-1],
-                0 if x_member == 1 else n_sample * n_in,
-                source if input_mask is None else mask,
-                layout.row_segment_start
-                if listed
-                else layout.ptr
-                if layout.owner is None
-                else layout.owner,
-                activity_minor,
-                out if not accumulate_values else weight_gradient.destination,
-                indices,
-                counts,
-            ),
-            _MATVEC_CONSTS,
-            (
-                rows,
-                entries,
-                samples,
-                hub,
-                perm32 is not None,
-                input_mask is not None,
-                accumulate_values,
-                listed,
-                _SEGMENT,
-            ),
-            warps,
-        )
-        if listed:
-            _listed_matvec_output_kernel[(triton.cdiv(out.numel(), _COMBINE_TILE[0]),)](
-                tmp,
-                mask,
-                out,
-                layout.row_segment_start,
-                out.numel(),
-                n_out,
-                layout.n_seg,
-                *_COMBINE_TILE,
-            )
-        if hub:
-            _launch(
-                cache,
-                "hub_combine",
-                _hub_combine_kernel,
-                device_index,
-                (-(-layout.n_hub // _COMBINE_TILE[0]), n_member * n_sample),
-                (
-                    layout.hub_row,
-                    layout.hub_ptr,
-                    tmp,
-                    out,
-                    layout.n_hub,
-                    n_out,
-                    layout.n_tmp,
-                ),
-                _COMBINE_CONSTS,
-                _COMBINE_TILE,
-                1,
-            )
-        return out
-
-    return _PreparedMatvec(forward, accumulate_values)
 
 
 def _csr_matvec(
@@ -1297,7 +520,9 @@ def _csr_matvec(
     x_minor: Tensor | None = None,
 ) -> Tensor:
     """Execute a product through the shared prepared destination launcher."""
-    forward = _prepare_matvec(cache, crow, col, values, x, perm, x_minor)
+    forward = csr_execution._prepare_matvec(
+        _Execution(cache), cache, crow, col, values, x, perm, x_minor
+    )
     return forward(x)
 
 
@@ -1353,107 +578,6 @@ def csr_matvec_gather(
 # ----------------------------------------------------------------- edge_grad
 
 
-def _prepare_edge_grad(
-    cache: KernelCache,
-    crow: Tensor,
-    col: Tensor,
-    grad: Tensor,
-    x: Tensor,
-    n_vb: int,
-    grad_minor: Tensor | None = None,
-    destination: Tensor | None = None,
-) -> Callable[[Tensor, Tensor], Tensor]:
-    """``edge_grad``; ``grad_minor`` is the sample-minor layout of ``grad`` if
-    the caller already has it."""
-    supported = False
-    # Both operands need the value-batch dimensions and the neuron axis.
-    if triton is not None and grad.is_cuda and grad.ndim > n_vb and x.ndim > n_vb:
-        pattern = _pattern(cache, crow, col)
-        if pattern.supported:
-            n_out, n_edge = pattern.n_out, pattern.n_edge
-            n_in = x.shape[-1]
-            batch = grad.shape[:n_vb]
-            n_member = _numel(batch)
-            x_member = _numel(x.shape[:n_vb])
-            n_sample = _numel(grad.shape[n_vb:-1])
-            entries, samples, warps = _tile(_EDGE_TILES, n_sample)
-            supported = (
-                _on_current_device(pattern, grad, x)
-                and grad.dtype in kernels_torch._FLOAT_DTYPES
-                and x.dtype in kernels_torch._FLOAT_DTYPES
-                and grad.shape[-1] == n_out
-                # 32-bit sample-minor offsets (the lanes past the last
-                # sample of a block are masked but still computed).
-                and max(n_out, n_in) * (n_sample + samples) < _INT32_MAX
-                and (x_member == n_member or x_member == 1)
-                and _numel(x.shape[n_vb:-1]) == n_sample
-                and n_member <= _MAX_GRID_Y
-                and (
-                    destination is None
-                    or (
-                        destination.shape == (*batch, n_edge)
-                        and destination.is_contiguous()
-                    )
-                )
-            )
-    if not supported:
-
-        def reference(gradient, input):
-            result = kernels_torch.edge_grad(crow, col, gradient, input, n_vb)
-            if destination is None:
-                return result
-            destination.add_(
-                result.sum_to_size(destination.shape).to(destination.dtype)
-            )
-            return None
-
-        return reference
-
-    out_shape = (*batch, n_edge)
-    if n_edge == 0 or n_member == 0 or n_sample == 0:
-        out = torch.zeros(out_shape, dtype=grad.dtype, device=grad.device)
-        return lambda gradient, input: out if destination is None else None
-
-    row32 = pattern.row32
-    if row32 is None:
-        row32 = pattern.row_index(crow)
-    prepare_grad = _prepare_sample_minor(grad, n_sample) if grad_minor is None else None
-    prepare_input = _prepare_sample_minor(x, n_sample)
-    out = (
-        torch.empty(out_shape, dtype=grad.dtype, device=grad.device)
-        if destination is None
-        else destination
-    )
-
-    def forward(gradient, input):
-        gradient = grad_minor if grad_minor is not None else prepare_grad(gradient)
-        input = prepare_input(input)
-        _launch(
-            cache,
-            "edge_grad",
-            _edge_grad_kernel,
-            pattern.device.index,
-            (-(-n_edge // entries), n_member),
-            (
-                row32,
-                pattern.col32,
-                gradient,
-                input,
-                out,
-                n_edge,
-                n_sample,
-                n_sample * n_out,
-                0 if x_member == 1 else n_sample * n_in,
-            ),
-            _EDGE_CONSTS,
-            (entries, samples, destination is not None),
-            warps,
-        )
-        return out if destination is None else None
-
-    return forward
-
-
 def _edge_grad(
     cache: KernelCache,
     crow: Tensor,
@@ -1465,7 +589,9 @@ def _edge_grad(
 ) -> Tensor:
     """``edge_grad``; ``grad_minor`` is the sample-minor layout of ``grad`` if
     the caller already has it."""
-    return _prepare_edge_grad(cache, crow, col, grad, x, n_vb, grad_minor)(grad, x)
+    return csr_execution._prepare_edge_grad(
+        _Execution(cache), cache, crow, col, grad, x, n_vb, grad_minor
+    )(grad, x)
 
 
 def edge_grad(crow: Tensor, col: Tensor, grad: Tensor, x: Tensor, n_vb: int) -> Tensor:
@@ -1493,77 +619,6 @@ def edge_grad(crow: Tensor, col: Tensor, grad: Tensor, x: Tensor, n_vb: int) -> 
 # ------------------------------------------------------------------ backward
 
 
-def _prepare_backward(
-    cache: KernelCache,
-    crow: Tensor,
-    col: Tensor,
-    t_crow: Tensor,
-    t_col: Tensor,
-    t_perm: Tensor,
-    values: Tensor,
-    x: Tensor,
-    grad: Tensor,
-    need_values: bool,
-    need_x: bool,
-    input_mask: Tensor | None = None,
-    grad_values: Tensor | None = None,
-):
-    n_vb = values.ndim - 1
-    grad_minor = None
-    prepare_grad = None
-    if (
-        need_values
-        and need_x
-        and grad.is_cuda
-        and grad.dtype in kernels_torch._FLOAT_DTYPES
-        and grad.ndim > n_vb + 1
-        and grad.numel() > 0
-    ):
-        # Both kernels read the output gradient sample-minor: transpose once.
-        n_sample = _numel(grad.shape[n_vb:-1])
-        if n_sample > 1:
-            prepare_grad = _prepare_sample_minor(grad, n_sample)
-            grad_minor = prepare_grad(grad)
-    input_backward = (
-        _prepare_matvec(
-            cache,
-            t_crow,
-            t_col,
-            values,
-            grad,
-            t_perm,
-            grad_minor,
-            input_mask,
-            _WeightGradient(x, grad_values)
-            if need_values and grad_values is not None
-            else None,
-        )
-        if need_x
-        else None
-    )
-    fused_values = input_backward is not None and input_backward.accumulates_values
-    values_backward = (
-        _prepare_edge_grad(cache, crow, col, grad, x, n_vb, grad_minor, grad_values)
-        if need_values and not fused_values
-        else None
-    )
-
-    def backward(input, gradient, mask=None):
-        if prepare_grad is not None:
-            prepare_grad(gradient)
-        value_gradient = (
-            values_backward(gradient, input) if values_backward is not None else None
-        )
-        grad_x = (
-            (input_backward(gradient, mask, input))
-            if input_backward is not None
-            else None
-        )
-        return value_gradient, grad_x
-
-    return backward
-
-
 def _backward(
     cache: KernelCache,
     crow: Tensor,
@@ -1577,8 +632,19 @@ def _backward(
     need_values: bool,
     need_x: bool,
 ) -> tuple[Tensor | None, Tensor | None]:
-    return _prepare_backward(
-        cache, crow, col, t_crow, t_col, t_perm, values, x, grad, need_values, need_x
+    return csr_execution._prepare_backward(
+        _Execution(cache),
+        cache,
+        crow,
+        col,
+        t_crow,
+        t_col,
+        t_perm,
+        values,
+        x,
+        grad,
+        need_values,
+        need_x,
     )(x, grad)
 
 
@@ -1638,55 +704,6 @@ def csr_backward(
 # ------------------------------------------------------- prepare and epoch
 
 
-def _cached_pattern(cache: KernelCache, crow: Tensor, col: Tensor) -> _Pattern | None:
-    """The cached pattern of ``(crow, col)`` if there is one (not validated
-    against the buffer versions, nothing is built)."""
-    hit = cache.get(_PATTERNS_KEY, dict).get((id(crow), id(col)))
-    if hit is not None and hit.crow_ref() is crow and hit.col_ref() is col:
-        return hit
-    return None
-
-
-def _prepare(
-    cache: KernelCache,
-    crow: Tensor,
-    col: Tensor,
-    t_crow: Tensor,
-    t_col: Tensor,
-    t_perm: Tensor,
-) -> None:
-    if triton is None or not (crow.is_cuda and t_crow.is_cuda):
-        return
-    # Forward (``csr_matvec``) and value gradient (``edge_grad``).
-    pattern = _pattern(cache, crow, col)
-    if pattern.supported and pattern.versions is not None:
-        pattern.row_layout(crow)
-        pattern.row_index(crow)
-    # Transposed product of the backward (``csr_matvec_gather``).
-    pattern = _pattern(cache, t_crow, t_col)
-    if pattern.supported and pattern.versions is not None:
-        pattern.row_layout(t_crow)
-        pattern.permutation(t_perm)
-
-
-def _layout_epoch(
-    cache: KernelCache,
-    crow: Tensor,
-    col: Tensor,
-    t_crow: Tensor,
-    t_col: Tensor,
-    t_perm: Tensor,
-) -> int:
-    epoch = 0
-    for pattern in (
-        _cached_pattern(cache, crow, col),
-        _cached_pattern(cache, t_crow, t_col),
-    ):
-        if pattern is not None:
-            epoch = max(epoch, pattern.epoch)
-    return epoch
-
-
 def prepare(
     crow: Tensor, col: Tensor, t_crow: Tensor, t_col: Tensor, t_perm: Tensor
 ) -> None:
@@ -1716,7 +733,7 @@ def prepare(
     Raises:
         ValueError: If a pointer array does not match its index array.
     """
-    _prepare(_default_registry.kernels, crow, col, t_crow, t_col, t_perm)
+    csr_layout._prepare(_default_registry.kernels, crow, col, t_crow, t_col, t_perm)
 
 
 def layout_epoch(
@@ -1738,7 +755,9 @@ def layout_epoch(
     Returns:
         The epoch.
     """
-    return _layout_epoch(_default_registry.kernels, crow, col, t_crow, t_col, t_perm)
+    return csr_layout._layout_epoch(
+        _default_registry.kernels, crow, col, t_crow, t_col, t_perm
+    )
 
 
 # -------------------------------------------------------------- registration
@@ -1771,7 +790,9 @@ def register(registry: BackendRegistry, priority: int = 10) -> None:
         return _csr_matvec(cache, crow, col, values, x)
 
     def _prepare_forward(crow, col, values, x):
-        return _prepare_matvec(cache, crow, col, values, x)
+        return csr_execution._prepare_matvec(
+            _Execution(cache), cache, crow, col, values, x
+        )
 
     def _grad(crow: Tensor, col: Tensor, grad: Tensor, x: Tensor, n_vb: int) -> Tensor:
         return _edge_grad(cache, crow, col, grad, x, n_vb)
@@ -1808,7 +829,8 @@ def register(registry: BackendRegistry, priority: int = 10) -> None:
         input_mask=None,
         grad_values=None,
     ):
-        return _prepare_backward(
+        return csr_execution._prepare_backward(
+            _Execution(cache),
             cache,
             crow,
             col,
@@ -1828,11 +850,11 @@ def register(registry: BackendRegistry, priority: int = 10) -> None:
         # Imported here: the push module imports this one.
         from . import kernels_triton_push as push
 
-        _prepare(cache, crow, col, t_crow, t_col, t_perm)
+        csr_layout._prepare(cache, crow, col, t_crow, t_col, t_perm)
         push.prepare(crow, col, t_crow, t_col, t_perm, cache=cache)
 
     def _prepare_pull(crow, col, t_crow, t_col, t_perm) -> None:
-        _prepare(cache, crow, col, t_crow, t_col, t_perm)
+        csr_layout._prepare(cache, crow, col, t_crow, t_col, t_perm)
 
     def _prepare_push(crow, col, t_crow, t_col, t_perm) -> None:
         from . import kernels_triton_push as push
@@ -1843,7 +865,7 @@ def register(registry: BackendRegistry, priority: int = 10) -> None:
         from . import kernels_triton_push as push
 
         return max(
-            _layout_epoch(cache, crow, col, t_crow, t_col, t_perm),
+            csr_layout._layout_epoch(cache, crow, col, t_crow, t_col, t_perm),
             push.layout_epoch(crow, col, t_crow, t_col, t_perm, cache=cache),
         )
 

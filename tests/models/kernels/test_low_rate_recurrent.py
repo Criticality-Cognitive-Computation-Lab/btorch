@@ -11,7 +11,7 @@ from btorch.models.rnn import RecurrentNN
 from btorch.models.surrogate import Sigmoid, Truncated
 from btorch.models.synapse import ExponentialPSC
 from btorch.sparse import Hints
-from btorch.sparse.runtime import kernels_triton_spikelist
+from btorch.sparse.runtime import kernels_triton_spikelist, spike_list
 from tests.models.kernels.helpers import require_cuda_backend
 
 
@@ -64,13 +64,13 @@ def test_low_rate_recurrent_states_continuation_and_input_vjp(
             model.gradient = BPTT(sparse=True)
             model.neuron.surrogate_function = Truncated(Sigmoid(alpha=2.0), 0.4)
     executions = []
-    original = kernels_triton_spikelist._launch_spike_list
+    original = spike_list._PreparedSpikeList._consume
 
     def observed(*args, **kwargs):
         executions.append(True)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(kernels_triton_spikelist, "_launch_spike_list", observed)
+    monkeypatch.setattr(spike_list._PreparedSpikeList, "_consume", observed)
     # Train through the actual Inductor boundary; the inference variant keeps
     # a lightweight Dynamo route check alongside the CUDA-graph tests below.
     run = (
@@ -179,13 +179,13 @@ def test_compiled_recurrent_method_changes_and_runtime_precedence(monkeypatch):
     model = _network(KernelOptions(neuron="triton", connection_method="push"), None)
     run = torch.compile(model, backend="eager", fullgraph=True)
     launches = []
-    original = kernels_triton_spikelist._launch_spike_list
+    original = spike_list._PreparedSpikeList._consume
 
     def observed(*args, **kwargs):
         launches.append(True)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(kernels_triton_spikelist, "_launch_spike_list", observed)
+    monkeypatch.setattr(spike_list._PreparedSpikeList, "_consume", observed)
     x = torch.full((3, 2, 4), 1.1, device="cuda")
     with torch.no_grad(), environ.context(dt=0.25):
         run(x)
@@ -403,3 +403,71 @@ def test_cupy_push_inference_then_training_matches_torch():
         # training no longer raises when it saves the cached execution layout.
         for actual, expected in zip(gradients, expected_gradients):
             torch.testing.assert_close(actual, expected, atol=3e-5, rtol=3e-4)
+
+
+def test_tilelang_neuron_and_connection_training_and_graph_replay(monkeypatch):
+    """Use TileLang for both components without hidden Triton propagation."""
+    from btorch.sparse.runtime import kernels_triton, kernels_triton_tasks
+
+    require_cuda_backend("tilelang")
+    native = _network(
+        KernelOptions(
+            neuron="tilelang", connection="tilelang", connection_method="push"
+        ),
+        None,
+    )
+    reference = _network(KernelOptions(neuron="torch", connection="torch"), None)
+    for model in (native, reference):
+        model.neuron.v.requires_grad_()
+        model.synapse.psc.requires_grad_()
+    # Checkpoint/offload operate on btorch's actual recurrent state, including
+    # trainable connections, rather than a second hand-written time loop.
+    native.chunk_size = native.unroll = 5
+    native.grad_checkpoint = native.cpu_offload = True
+    x = torch.linspace(0.4, 1.2, 13 * 2 * 4, device="cuda").reshape(13, 2, 4)
+    x.requires_grad_()
+    xr = x.detach().clone().requires_grad_()
+    roots = (x, native.neuron.v, native.synapse.psc, *native.parameters())
+    ref_roots = (xr, reference.neuron.v, reference.synapse.psc, *reference.parameters())
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("All-TileLang network attempted a Triton launch")
+
+    monkeypatch.setattr(kernels_triton, "_launch", forbidden)
+    monkeypatch.setattr(kernels_triton_tasks._Execution, "launch", forbidden)
+    monkeypatch.setattr(kernels_triton_spikelist, "prepare_spike_list", forbidden)
+    with environ.context(dt=0.25):
+        output, records = native(x)
+        expected, ref_records = reference(xr)
+        torch.testing.assert_close(output.to("cuda"), expected)
+        for name in records:
+            torch.testing.assert_close(
+                records[name].to("cuda"), ref_records[name], atol=2e-6, rtol=2e-5
+            )
+        actual = torch.autograd.grad(
+            output.square().sum() + sum(v.square().sum() for v in records.values()),
+            roots,
+        )
+        oracle = torch.autograd.grad(
+            expected.square().sum()
+            + sum(v.square().sum() for v in ref_records.values()),
+            ref_roots,
+        )
+        for a, b in zip(actual, oracle):
+            torch.testing.assert_close(a, b, atol=3e-5, rtol=3e-4)
+        # Reuse the same public model for inference with graph replay. The
+        # shorter final split remains eager, while full chunks replay.
+        native.grad_checkpoint = native.cpu_offload = False
+        native.cudagraph = True
+        from btorch.models.functional import reset_net_state
+
+        reset_net_state(native)
+        reset_net_state(reference)
+        with torch.no_grad():
+            result, states = native(x)
+            golden, golden_states = reference(xr)
+            torch.testing.assert_close(result, golden)
+            for name in states:
+                torch.testing.assert_close(
+                    states[name], golden_states[name], atol=2e-6, rtol=2e-5
+                )

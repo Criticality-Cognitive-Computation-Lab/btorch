@@ -55,6 +55,19 @@ reconstruct state during backward declare `checkpoint_state`,
 `checkpoint_interval` and `replay_state`; models that precompute coefficients
 declare `prepared_parameters` and `prepare_parameters`.
 
+Recurrent preparation also binds the repeated stage's argument slots and
+storage layout. Pointer-only runtimes use the original tensor storage;
+TileLang exposes its flat buffer ABI. Changing sequence rows must not inherit
+the first row's alignment specialization. Prepared Triton launches resolve the
+executable once and continue to use the current stream and profiler hooks.
+Prepared pointer arguments retain their owning tensors. Triton and CuPy interior stages
+update positional slots with byte offsets computed from the actual time stride;
+state views are materialized at checkpoint and final-state boundaries. The
+neuron/PSC template metadata supplies the state ordering for every model.
+TileLang retains prepared tensor views and launches through its public kernel
+call interface; execution-backend argument and stream handling remain TileLang's
+responsibility.
+
 Primitive and fused generation apply separate namespaces to the shared scalar
 stages. Backend renderers provide tensor access, math intrinsics and source
 wrappers; they do not define model equations. Inspect generated code with

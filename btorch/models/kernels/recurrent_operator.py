@@ -1,7 +1,8 @@
 """Register whole recurrent trajectories with explicit cell reverse passes."""
 
 import json
-from dataclasses import replace
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 
 import torch
 from torch import Tensor
@@ -283,6 +284,9 @@ def _source(spikes, ring, n_delay):
 def _prepare_source(spikes, x_syn_seq, ring, spec, ring_history):
     """Prepare invocation-owned synaptic input and delay destinations."""
     neuron_dims = len(spec["neuron_shape"])
+    if neuron_dims == 1 and not spec["delay"] and not x_syn_seq.numel():
+        # A one-axis neuron population already has the connection's layout.
+        return lambda spikes, ring, time_index: (spikes, ring)
     source_dtype = (
         torch.promote_types(spikes.dtype, x_syn_seq.dtype)
         if x_syn_seq.numel()
@@ -327,6 +331,176 @@ def _prepare_source(spikes, x_syn_seq, ring, spec, ring_history):
         return source, next_ring
 
     return forward
+
+
+@dataclass
+class _PreparedRecurrentStep:
+    """Own a trajectory's stage bindings and boundary state materialization."""
+
+    launch: Callable
+    state_views: Callable
+    owners: tuple[Tensor, ...]
+
+
+def _prepare_recurrent_step(
+    step,
+    worksets,
+    x_seq,
+    output_seq,
+    histories,
+    templates,
+    drive,
+    *,
+    charged_histories=(),
+    gradient_activity=None,
+    uniform_seq=None,
+):
+    """Prepare state/record slots without materializing every temporal view.
+
+    A stage at t writes PSC(t) and neuron(t+1). Inputs use the preceding
+    stage's destinations. Only logical boundaries need Tensor state
+    views; Triton interior launches use stride-aware byte offsets into
+    owned storage. Other runtimes consume Tensor views through the same
+    slot schedule.
+    """
+    owners = []
+    slots = []
+    slot_storage = {}
+
+    def sequence(name, value, offset=0, *, keepdim=False):
+        owners.append(value)
+        slot_storage[name] = (value, offset)
+        base, stride = value.data_ptr(), value.stride(0) * value.element_size()
+
+        def pointer(time):
+            return base + (time + offset) * stride
+
+        def tensor(time):
+            index = time + offset
+            return value[index : index + 1] if keepdim else value[index]
+
+        return pointer, tensor
+
+    def workspace(name):
+        values = tuple(buffers[name] for buffers in worksets)
+        owners.extend(values)
+        slot_storage[name] = (values, 0)
+        pointers = tuple(value.data_ptr() for value in values)
+        return lambda time: pointers[time % 2], lambda time: values[time % 2]
+
+    def previous(getter):
+        return lambda time: getter(time - 1)
+
+    state_views = []
+    offset = 0
+    for prefix, template, record_offset in (
+        ("neuron_", templates[0], 1),
+        ("psc_", templates[1], 0),
+    ):
+        readers = []
+        for index, name in enumerate(template.state_names):
+            final = prefix + name + "_final"
+            record = histories.get(offset + index)
+            pointers, tensors = (
+                workspace(final)
+                if record is None
+                else sequence(final, record, record_offset)
+            )
+            slots.append((final, pointers, tensors))
+            initial = prefix + name + "_init"
+            slots.append((initial, previous(pointers), previous(tensors)))
+            storage, position = slot_storage[final]
+            slot_storage[initial] = (storage, position - 1)
+            readers.append(tensors)
+        state_views.append(tuple(readers))
+        offset += len(template.state_names)
+
+    charged_views = []
+    for name, record in charged_histories:
+        final = "neuron_" + name + "_seq"
+        pointers, tensors = (
+            workspace(final)
+            if record is None
+            else sequence(final, record, 1, keepdim=True)
+        )
+        slots.append((final, pointers, tensors))
+        charged_views.append(tensors)
+    for name, value in (
+        ("neuron_input", x_seq),
+        ("spike", output_seq),
+        ("gradient_activity", gradient_activity),
+        ("neuron_uniform", uniform_seq),
+    ):
+        if value is not None:
+            pointers, tensors = sequence(name, value, 1)
+            slots.append((name, pointers, tensors))
+
+    bindings = {name: tensors(1) for name, _pointers, tensors in slots}
+    bindings["drive"] = drive
+    prepared = step.prepare_launch(bindings)
+    arguments = prepared.arguments
+    updates = tuple(
+        (
+            *prepared.slots[name],
+            pointers if step.runtime.supports_pointer_offsets else tensors,
+        )
+        for name, pointers, tensors in slots
+    )
+    drive_slot, drive_span = prepared.slots["drive"]
+    if step.runtime.supports_pointer_offsets:
+
+        def run(time, drive):
+            for index, _span, getter in updates:
+                arguments[index] = getter(time)
+            prepared.owners[drive_slot] = drive
+            arguments[drive_slot] = drive.data_ptr()
+            prepared.launch()
+
+    else:
+        argument = step.runtime.argument
+        tables = {}
+
+        def view_getter(name, span):
+            storage, offset = slot_storage[name]
+            key = (id(storage), span)
+            rows = tables.get(key)
+            sequence_storage = isinstance(storage, Tensor)
+            if rows is None:
+                rows = (
+                    step.runtime.bind_rows(storage, span)
+                    if sequence_storage
+                    else tuple(argument(value, span) for value in storage)
+                )
+                tables[key] = rows
+            if sequence_storage:
+                return lambda time: rows[time + offset]
+            return lambda time: rows[(time + offset) % len(rows)]
+
+        updates = tuple(
+            (prepared.slots[name][0], view_getter(name, prepared.slots[name][1]))
+            for name, _pointers, _tensors in slots
+        )
+        last_drive = drive
+        drive_argument = argument(drive, drive_span)
+
+        def run(time, drive):
+            nonlocal last_drive, drive_argument
+            for index, getter in updates:
+                arguments[index] = getter(time)
+            if drive is not last_drive:
+                last_drive, drive_argument = drive, argument(drive, drive_span)
+            arguments[drive_slot] = drive_argument
+            prepared.launch()
+
+    def materialize(time):
+        neuron, psc = state_views
+        return (
+            tuple(getter(time) for getter in neuron),
+            tuple(getter(time) for getter in psc),
+            tuple(getter(time)[0] for getter in charged_views),
+        )
+
+    return _PreparedRecurrentStep(run, materialize, tuple(owners))
 
 
 def _current(psc, spec):
@@ -565,6 +739,7 @@ def _trajectory(
         else []
     )
     prepared_step = None
+    step_launch = None
     step_outputs = None
     prepared_connection = None
     spike_list = None
@@ -642,6 +817,7 @@ def _trajectory(
         if use_fused
         else None
     )
+    drive_shape = synapse_states[0].shape
     for time_index in range(x_seq.shape[0]):
         if not use_fused:
             spikes, neuron_states, neuron_charged = _cell_forward(
@@ -678,8 +854,7 @@ def _trajectory(
             if prepared_connection is not None
             else _connection(source, connection_parameters, topology, spec)
         )
-        drive_shape = synapse_states[0].shape
-        if not spec.get("merge_receptors", 0):
+        if not spec.get("merge_receptors", 0) and drive.shape != drive_shape:
             drive = drive.reshape(drive_shape)
         current_spikes, current_neuron_states = spikes, neuron_states
         current_neuron_charged = neuron_charged
@@ -718,52 +893,81 @@ def _trajectory(
                     prepared_step.allocate_outputs(),
                     prepared_step.allocate_outputs(),
                 )
-            outputs = dict(step_outputs[time_index % 2])
-            outputs["spike"] = output_seq[time_index + 1]
-            bindings = {
-                "neuron_input": x_seq[time_index + 1],
-                "drive": drive,
-            }
-            if gradient_activity is not None:
-                bindings["gradient_activity"] = gradient_activity[time_index + 1]
-            for prefix, template, values, offset, record_time in (
-                ("neuron_", neuron_template, neuron_states, 0, time_index + 1),
-                (
-                    "psc_",
-                    synapse_template,
-                    synapse_states,
-                    len(neuron_states),
-                    time_index,
-                ),
-            ):
-                for index, (name, value) in enumerate(
-                    zip(template.state_names, values)
+            if time_index == 0:
+                outputs = step_outputs[time_index % 2]
+                outputs["spike"] = output_seq[time_index + 1]
+                bindings = {
+                    "neuron_input": x_seq[time_index + 1],
+                    "drive": drive,
+                }
+                if gradient_activity is not None:
+                    bindings["gradient_activity"] = gradient_activity[time_index + 1]
+                for prefix, template, values, offset, record_time in (
+                    ("neuron_", neuron_template, neuron_states, 0, time_index + 1),
+                    (
+                        "psc_",
+                        synapse_template,
+                        synapse_states,
+                        len(neuron_states),
+                        time_index,
+                    ),
                 ):
-                    bindings[prefix + name + "_init"] = value
-                    record = histories.get(offset + index)
+                    for index, (name, value) in enumerate(
+                        zip(template.state_names, values)
+                    ):
+                        bindings[prefix + name + "_init"] = value
+                        record = histories.get(offset + index)
+                        if record is not None:
+                            outputs[prefix + name + "_final"] = record[record_time]
+                for index, name in enumerate(charged_names):
+                    record = histories.get(len(initial_states) + index)
                     if record is not None:
-                        outputs[prefix + name + "_final"] = record[record_time]
-            for index, name in enumerate(charged_names):
-                record = histories.get(len(initial_states) + index)
-                if record is not None:
-                    outputs["neuron_" + name + "_seq"] = record[
-                        time_index + 1
-                    ].unsqueeze(0)
-            if uniform_seq is not None:
-                bindings["neuron_uniform"] = uniform_seq[time_index + 1]
-            prepared_step.launch_into({**outputs, **bindings})
-            spikes = outputs["spike"]
-            neuron_states = [
-                outputs["neuron_" + name + "_final"]
-                for name in neuron_template.state_names
-            ]
-            synapse_states = [
-                outputs["psc_" + name + "_final"]
-                for name in synapse_template.state_names
-            ]
-            neuron_charged = tuple(
-                outputs["neuron_" + name + "_seq"][0] for name in charged_names
-            )
+                        outputs["neuron_" + name + "_seq"] = record[
+                            time_index + 1
+                        ].unsqueeze(0)
+                if uniform_seq is not None:
+                    bindings["neuron_uniform"] = uniform_seq[time_index + 1]
+                outputs.update(bindings)
+                prepared_step.launch_into(outputs)
+                spikes = outputs["spike"]
+                neuron_states = [
+                    outputs["neuron_" + name + "_final"]
+                    for name in neuron_template.state_names
+                ]
+                synapse_states = [
+                    outputs["psc_" + name + "_final"]
+                    for name in synapse_template.state_names
+                ]
+                neuron_charged = tuple(
+                    outputs["neuron_" + name + "_seq"][0] for name in charged_names
+                )
+            else:
+                if step_launch is None:
+                    step_launch = _prepare_recurrent_step(
+                        prepared_step,
+                        step_outputs,
+                        x_seq,
+                        output_seq,
+                        histories,
+                        (neuron_template, synapse_template),
+                        drive,
+                        charged_histories=tuple(
+                            (name, histories.get(len(initial_states) + index))
+                            for index, name in enumerate(charged_names)
+                        ),
+                        gradient_activity=gradient_activity,
+                        uniform_seq=uniform_seq,
+                    )
+                step_launch.launch(time_index, drive)
+                spikes = output_seq[time_index + 1]
+                if time_index + 2 == x_seq.shape[0] or (
+                    checkpoint_interval and (time_index + 1) % checkpoint_interval == 0
+                ):
+                    # Interior states stay in owned destinations. Only a
+                    # checkpoint or the trailing primitive stage needs views.
+                    neuron_states, synapse_states, neuron_charged = (
+                        step_launch.state_views(time_index)
+                    )
         else:
             if spec.get("merge_receptors", 0):
                 drive = drive.reshape(
@@ -781,11 +985,6 @@ def _trajectory(
                 precise_exp=precise_exp,
                 prepared_parameters=synapse_prepared_parameters,
             )
-        states = [
-            *current_neuron_states,
-            *synapse_states,
-            *([ring] if spec["delay"] else []),
-        ]
         if (
             checkpoint_interval
             and (time_index + 1) % checkpoint_interval == 0
@@ -799,15 +998,12 @@ def _trajectory(
                 target[checkpoint_index].copy_(value)
         if not use_fused or time_index == 0:
             output_seq[time_index].copy_(current_spikes)
+        history_values = None
         for name in history_names:
             if name < 0:
                 continue
             if name == activity_index:
                 continue
-            history_values = (*states, *current_neuron_charged)
-            value = history_values[int(name)]
-            if name not in histories:
-                histories[name] = value.new_empty((x_seq.shape[0], *value.shape))
             # Native interior stages already wrote these records. Only
             # the leading neuron and trailing PSC need copies.
             ns, ss = len(neuron_states), len(synapse_states)
@@ -817,8 +1013,19 @@ def _trajectory(
                 or (name >= len(initial_states) and time_index > 0)
                 or (spec["delay"] and name == len(initial_states) - 1)
             )
-            if not direct:
-                histories[name][time_index].copy_(value)
+            if direct:
+                continue
+            if history_values is None:
+                history_values = (
+                    *current_neuron_states,
+                    *synapse_states,
+                    *([ring] if spec["delay"] else []),
+                    *current_neuron_charged,
+                )
+            value = history_values[int(name)]
+            if name not in histories:
+                histories[name] = value.new_empty((x_seq.shape[0], *value.shape))
+            histories[name][time_index].copy_(value)
     # Custom operators must not alias their input or another output. Final
     # states are already independent tensor allocations for nonempty runs;
     # histories own one preallocated sequence allocation throughout forward.

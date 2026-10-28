@@ -8,7 +8,7 @@ from .registry import _NATIVE_GPU_BACKENDS
 
 
 NeuronBackend = str
-ConnectionBackend = Literal["auto", "triton", "cusparse", "torch"]
+ConnectionBackend = Literal["auto", "triton", "tilelang", "cusparse", "torch"]
 
 
 @dataclass(frozen=True)
@@ -18,7 +18,8 @@ class KernelOptions:
     Args:
         neuron: Implementation of neuron and PSC dynamics.
         connection: Sparse implementation: ``cusparse`` selects native CUDA CSR
-            products, ``triton`` selects generated kernels, ``torch`` selects
+            products, ``triton`` and ``tilelang`` select their sparse CUDA kernels,
+            ``torch`` selects
             the general PyTorch reference, and ``auto`` preserves routing.
         connection_method: Explicit sparse execution method. ``auto`` inherits
             connection settings and hints; ``push`` requests spike-list SpMSpV,
@@ -69,7 +70,7 @@ class KernelOptions:
 
         if self.neuron not in cell_backend_names():
             raise ValueError(f"Unknown neuron backend: {self.neuron!r}")
-        if self.connection not in ("auto", "triton", "cusparse", "torch"):
+        if self.connection not in ("auto", "triton", "tilelang", "cusparse", "torch"):
             raise ValueError(f"Unknown connection backend: {self.connection!r}")
         validate_method(self.connection_method)
         if not isinstance(self.merge_synapse, bool):

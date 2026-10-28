@@ -55,9 +55,11 @@ Surrogate functions use ordinary PyTorch autograd and `torch.compile`, without
 TorchScript. Native cells support Sigmoid, ATan, ATanApprox, Erf, SuperSpike,
 Triangle, and PoissonRandomSpike surrogate templates.
 
-Use `KernelOptions(neuron="triton", connection="auto")` to select cell dynamics
+Use `KernelOptions(neuron="triton", connection="auto")` to select neuron/PSC dynamics
 independently of sparse propagation. Torch is the default; Triton is available
 with `pip install 'btorch[gpu]'`, and TileLang/CuPy are optional separate installs.
+Use `KernelOptions(neuron="tilelang", connection="tilelang")` to run both neuron
+and sparse connection kernels through TileLang.
 Training versus simulation follows autograd inputs, including upstream encoders.
 
 External packages can register cell callbacks and validate their outputs, states
