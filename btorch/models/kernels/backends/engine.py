@@ -38,35 +38,51 @@ class _ParameterLayout:
 
 @dataclass(frozen=True)
 class _TensorStorage:
-    shape: tuple[int, ...]
+    shape: tuple[int | None, ...]
     stride: tuple[int, ...]
     dtype: str
     span: int
     physical_index: bool = False
+    dynamic_first: bool = False
 
 
-def _tensor_storage(buffers, physical_names=()):
+def _tensor_storage(buffers, physical_names=(), dynamic_names=()):
     """Describe views requiring typed pointers or noncanonical addressing."""
-    return tuple(
-        (
-            name,
-            _TensorStorage(
-                tuple(value.shape),
-                tuple(value.stride()),
-                str(value.dtype).removeprefix("torch."),
+    entries = []
+    for name, value in sorted(buffers.items()):
+        dynamic_first = name in dynamic_names and value.ndim > 0
+        if value.dtype == torch.float32 and value.is_contiguous() and not dynamic_first:
+            continue
+        shape = tuple(value.shape)
+        if dynamic_first:
+            # The time extent is invocation data.  The trailing dimensions and
+            # strides still describe the caller's storage layout.
+            shape = (None, *shape[1:])
+            span = 0
+        else:
+            span = (
                 0
                 if not value.numel()
                 else 1
                 + sum(
                     (size - 1) * stride
                     for size, stride in zip(value.shape, value.stride())
+                )
+            )
+        entries.append(
+            (
+                name,
+                _TensorStorage(
+                    shape,
+                    tuple(value.stride()),
+                    str(value.dtype).removeprefix("torch."),
+                    span,
+                    name in physical_names,
+                    dynamic_first,
                 ),
-                name in physical_names,
-            ),
+            )
         )
-        for name, value in sorted(buffers.items())
-        if value.dtype != torch.float32 or not value.is_contiguous()
-    )
+    return tuple(entries)
 
 
 @dataclass(frozen=True)
@@ -165,11 +181,23 @@ def _parameter_index(scalar, layout, modes, renderer):
 
 
 class _Source:
-    def __init__(self, backend, n, n_step, modes, precise_exp=False, storage=()):
+    def __init__(
+        self,
+        backend,
+        n,
+        n_step,
+        modes,
+        precise_exp=False,
+        storage=(),
+        dynamic_steps=False,
+    ):
         self.backend, self.n, self.n_step, self.modes = backend, n, n_step, modes
+        self.dynamic_steps = dynamic_steps
         self.precise_exp = precise_exp
         self.storage = dict(storage)
-        self.renderer = get_renderer(backend, n, n_step, self.storage, precise_exp)
+        self.renderer = get_renderer(
+            backend, n, n_step, self.storage, precise_exp, dynamic_steps
+        )
         self.pointers = []
         self.lines = []
         self.has_spike_list = False
@@ -177,7 +205,8 @@ class _Source:
 
     def pointer(self, name, size):
         if name in self.storage:
-            size = self.storage[name].span
+            if size is not None:
+                size = self.storage[name].span
         if (name, size) not in self.pointers:
             self.pointers.append((name, size))
 
@@ -233,7 +262,10 @@ class _Source:
             raise ValueError(
                 "Gradient activity requires declared compact spike support"
             )
-        self.pointer("gradient_activity", self.n * self.n_step)
+        self.pointer(
+            "gradient_activity",
+            None if self.dynamic_steps else self.n * self.n_step,
+        )
         layout = self.storage.get("gradient_activity")
         emission = self.renderer.emit_gradient_activity(
             scalar, width, prefix, time, self.n, self.n_step, layout
@@ -298,18 +330,28 @@ def _generate_source(
         raise NotImplementedError(
             "Checkpoint replay must be declared by the model definition"
         )
+    dynamic_steps = get_runtime(backend).supports_dynamic_steps
     checkpoint_count = (
         max((n_step - 1) // checkpoint_interval, 0) if checkpoint_state else 0
     )
-    source = _Source(backend, n, n_step, modes, precise_exp, storage)
+    source = _Source(
+        backend,
+        n,
+        n_step,
+        modes,
+        precise_exp,
+        storage,
+        dynamic_steps,
+    )
     checkpoint_block = f"(time {source.renderer.division} {checkpoint_interval or 1})"
     source.pointer("dt", 1)
     source.load("dt", "dt", "0")
     source.lines.extend(source.renderer.validate_dt(template.required_dt))
+    step_count = "n_steps" if dynamic_steps else str(n_step)
     size = lambda name: n * modes if template.extra_dims(name) else n
-    source.pointer("x_seq", n * n_step)
+    source.pointer("x_seq", None if dynamic_steps else n * n_step)
     if spec.surrogate == "poisson" and spec.poisson.spiking and not backward:
-        source.pointer("uniform_seq", n * n_step)
+        source.pointer("uniform_seq", None if dynamic_steps else n * n_step)
     for name in template.state_names:
         source.pointer(name + "_init", size(name))
     if parameter_layouts is not None and len(parameter_layouts) != len(
@@ -334,20 +376,22 @@ def _generate_source(
     _load_prepared_parameters(source, template, prepared_parameter_layouts)
     if not backward:
         forward_fragments = fragments.forward
-        source.pointer("output_seq", n * n_step)
+        source.pointer("output_seq", None if dynamic_steps else n * n_step)
         for name in template.state_names:
             source.pointer(name + "_final", size(name))
         for name in history_names:
-            source.pointer(name + "_seq", size(name) * n_step)
-        if checkpoint_state is not None and checkpoint_count:
+            source.pointer(
+                name + "_seq", None if dynamic_steps else size(name) * n_step
+            )
+        if checkpoint_state is not None and (dynamic_steps or checkpoint_count):
             source.pointer(
                 checkpoint_state + "_checkpoint",
-                size(checkpoint_state) * checkpoint_count,
+                None if dynamic_steps else size(checkpoint_state) * checkpoint_count,
             )
         for name in states:
             base, _ = _mode_name(name, modes)
             source.load(name + "_prev", base + "_init", source.index(name))
-        source.lines.append(f"for time in range({n_step}):")
+        source.lines.append(f"for time in range({step_count}):")
         start = len(source.lines)
         source.load("x", "x_seq", source.index("x", "time"))
         if spec.surrogate == "poisson" and spec.poisson.spiking:
@@ -369,10 +413,11 @@ def _generate_source(
             for scalar in scalars:
                 value = scalar + "_next" if name in template.state_names else scalar
                 source.store(name + "_seq", source.index(scalar, "time"), value)
-        if checkpoint_state is not None and checkpoint_count:
+        if checkpoint_state is not None and (dynamic_steps or checkpoint_count):
             checkpoint_start = len(source.lines)
             source.lines.append(
-                f"if (time + 1) % {checkpoint_interval} == 0 and time + 1 < {n_step}:"
+                f"if (time + 1) % {checkpoint_interval} == 0 and "
+                f"time + 1 < {step_count}:"
             )
             scalars = (
                 tuple(f"{checkpoint_state}_{i}" for i in range(modes))
@@ -405,19 +450,21 @@ def _generate_source(
         )
         targets = _normalize_gradient_targets(template, gradient_targets)
         if presence.output:
-            source.pointer("grad_output_seq", n * n_step)
+            source.pointer("grad_output_seq", None if dynamic_steps else n * n_step)
         if targets.input:
-            source.pointer("grad_x_seq", n * n_step)
+            source.pointer("grad_x_seq", None if dynamic_steps else n * n_step)
         if residual.save_output:
-            source.pointer("output_seq", n * n_step)
-        if checkpoint_state is not None and checkpoint_count:
+            source.pointer("output_seq", None if dynamic_steps else n * n_step)
+        if checkpoint_state is not None and (dynamic_steps or checkpoint_count):
             source.pointer(
                 checkpoint_state + "_checkpoint",
-                size(checkpoint_state) * checkpoint_count,
+                None if dynamic_steps else size(checkpoint_state) * checkpoint_count,
             )
         for name, final_present in zip(template.state_names, presence.final_states):
             if name != checkpoint_state:
-                source.pointer(name + "_seq", size(name) * n_step)
+                source.pointer(
+                    name + "_seq", None if dynamic_steps else size(name) * n_step
+                )
             if final_present:
                 source.pointer("grad_" + name + "_final", size(name))
             if targets.states[template.state_names.index(name)]:
@@ -425,7 +472,10 @@ def _generate_source(
         history_presence = dict(zip(history_names, presence.histories))
         for name, history_present in zip(history_names, presence.histories):
             if history_present:
-                source.pointer("grad_" + name + "_seq", size(name) * n_step)
+                source.pointer(
+                    "grad_" + name + "_seq",
+                    None if dynamic_steps else size(name) * n_step,
+                )
         needed_params = set(
             template.parameter_names if parameter_mask is None else parameter_mask
         )
@@ -450,7 +500,7 @@ def _generate_source(
         for name in states:
             base, _ = _mode_name(name, modes)
             source.load("initial_" + name, base + "_init", source.index(name))
-        source.lines.append(f"for time in range({n_step - 1}, -1, -1):")
+        source.lines.append(f"for time in range({step_count} - 1, -1, -1):")
         start = len(source.lines)
         source.load("x", "x_seq", source.index("x", "time"))
         if presence.output:
@@ -463,9 +513,24 @@ def _generate_source(
             base, _ = _mode_name(name, modes)
             index = source.index(name)
             if base == checkpoint_state:
-                if not checkpoint_count:
-                    source.load(name + "_prev", base + "_init", index)
-                else:
+                source.lines.append(f"{name}_prev = initial_{name}")
+                if dynamic_steps:
+                    checkpoint_start = len(source.lines)
+                    source.lines.append(f"if time >= {checkpoint_interval}:")
+                    checkpoint_index = source.index(
+                        name, f"maximum({checkpoint_block} - 1, 0)"
+                    )
+                    source.load(
+                        name + "_checkpoint_value",
+                        base + "_checkpoint",
+                        checkpoint_index,
+                    )
+                    source.lines.append(f"{name}_prev = {name}_checkpoint_value")
+                    source.lines[checkpoint_start + 1 :] = [
+                        "    " + line for line in source.lines[checkpoint_start + 1 :]
+                    ]
+                    source.lines.append("END_IF")
+                elif checkpoint_count:
                     checkpoint_index = source.index(
                         name, f"maximum({checkpoint_block} - 1, 0)"
                     )
@@ -489,7 +554,7 @@ def _generate_source(
                 source.load(
                     replay_output,
                     "output_seq",
-                    source.index("output", f"minimum({replay_time}, {n_step - 1})"),
+                    source.index("output", f"minimum({replay_time}, {step_count} - 1)"),
                 )
                 mode = _mode_name(name, modes)[1]
                 condition = f"{replay_time} < time"
@@ -629,11 +694,13 @@ def generate_source(
         gradient_targets = None
     residual_template = residual_template or ResidualTemplate(template.state_names)
     semantic_spec = replace(spec, dt=1.0)
+    supports_dynamic_steps = get_runtime(backend).supports_dynamic_steps
+    cache_steps = n_step if not supports_dynamic_steps or spike_list else 0
     return _generate_source(
         backend,
         semantic_spec,
         n,
-        n_step,
+        cache_steps,
         history_names,
         modes,
         backward,
@@ -768,11 +835,12 @@ def _compile(
 
 
 def _launch_kernel(
-    backend,
+    runtime,
     kernel,
     args,
     n,
     *,
+    steps=None,
     enable_fp_fusion=True,
     debug=None,
     num_warps=None,
@@ -782,10 +850,11 @@ def _launch_kernel(
     if not n:
         return
     with _device_scope(args[0].device):
-        get_runtime(backend).launch(
+        runtime.launch(
             kernel,
             args,
             n,
+            steps=steps,
             enable_fp_fusion=enable_fp_fusion,
             debug=debug,
             num_warps=num_warps,
@@ -815,6 +884,8 @@ def _launch(
 ):
     if not n:
         return
+    runtime = get_runtime(backend)
+    dynamic_steps = runtime.supports_dynamic_steps
     strided_names = set(get_template(spec).parameter_names)
     if prepared_parameter_layouts is not None:
         strided_names.update(name for name, _ in prepared_parameter_layouts)
@@ -833,7 +904,22 @@ def _launch(
         gradient_targets=gradient_targets,
         residual_template=residual_template,
         precise_exp=precise_exp,
-        storage=_tensor_storage(buffers, strided_names),
+        storage=_tensor_storage(
+            buffers,
+            strided_names,
+            ()
+            if not dynamic_steps
+            else {
+                name
+                for name in buffers
+                if name == "x_seq"
+                or name == "uniform_seq"
+                or name == "output_seq"
+                or name == "gradient_activity"
+                or name.endswith("_seq")
+                or name.endswith("_checkpoint")
+            },
+        ),
         spike_list=spike_list,
         gradient_activity=gradient_activity,
     )
@@ -854,10 +940,11 @@ def _launch(
                     num_warps = warps
                     break
     _launch_kernel(
-        backend,
+        runtime,
         kernel,
         args,
         n,
+        steps=n_step if dynamic_steps else None,
         enable_fp_fusion=enable_fp_fusion,
         debug=True,
         num_warps=num_warps,
@@ -887,6 +974,15 @@ def _kernel_arguments(buffers, declarations, strided_names):
 
 def _storage_span(value, span):
     """Expose reachable storage without changing logical parameter offsets."""
+    if span is None:
+        span = (
+            0
+            if not value.numel()
+            else 1
+            + sum(
+                (size - 1) * stride for size, stride in zip(value.shape, value.stride())
+            )
+        )
     return value.as_strided((span,), (1,), value.storage_offset())
 
 
@@ -1099,7 +1195,7 @@ def forward(
         tuple(buffers[name + "_final"] for name in template.state_names),
         tuple(buffers[name + "_seq"] for name in history_names)
         + (
-            (buffers[residual.checkpoint_state + "_checkpoint"],)
+            (buffers[residual.checkpoint_state + "_checkpoint"][:checkpoint_count],)
             if residual.checkpoint_state is not None
             else ()
         ),

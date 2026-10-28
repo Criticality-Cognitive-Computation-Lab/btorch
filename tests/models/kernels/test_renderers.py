@@ -4,6 +4,7 @@ import ast
 
 import pytest
 
+from btorch.models.kernels.backends.engine import _TensorStorage
 from btorch.models.kernels.backends.renderers import (
     get_renderer,
     local_statement,
@@ -57,11 +58,7 @@ def test_renderer_keeps_shared_math_and_emits_backend_syntax(backend):
 def test_renderer_storage_index_preserves_strided_views():
     """The renderer owns integer division syntax while preserving view
     strides."""
-    layout = type(
-        "Layout",
-        (),
-        {"shape": (2, 3), "stride": (4, 1), "physical_index": False},
-    )()
+    layout = _TensorStorage((2, 3), (4, 1), "float32", 7)
     triton = get_renderer("triton", 6, 1, {}, False)
     cupy = get_renderer("cupy", 6, 1, {}, False)
     assert "//" in triton.storage_index(layout, "index")

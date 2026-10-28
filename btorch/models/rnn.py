@@ -3,7 +3,7 @@ from collections.abc import Callable, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import partial
-from typing import Any, overload
+from typing import Any, Literal, overload
 
 import torch
 import torch.nn as nn
@@ -45,23 +45,28 @@ def _serialize_offload_backward(grad: Tensor) -> Tensor:
     return grad
 
 
-def _split_loop_args(args: Sequence, loop_args: Sequence[int], size: int):
-    """Yield positional-arg tuples, splitting only ``loop_args`` along time.
+def _split_loop_args(
+    args: Sequence,
+    loop_args: Sequence[int],
+    size: int,
+    mode: Literal["split", "chunk"] = "split",
+):
+    """Yield time views using the selected Torch partition operation.
 
-    ``torch.split`` returns zero-copy views; every other arg passes through
-    unchanged at its position.
+    Only loop inputs are split; every other argument passes through
+    unchanged.
     """
-    split = {i: torch.split(args[i], size, dim=0) for i in loop_args}
+    splitter = partial(torch.split, split_size_or_sections=size, dim=0)
+    if mode == "chunk":
+        steps = args[loop_args[0]].shape[0]
+        splitter = partial(
+            torch.chunk, chunks=max(1, (steps + size - 1) // size), dim=0
+        )
+    split = {i: splitter(args[i]) for i in loop_args}
     for block_id in range(len(split[loop_args[0]])):
         yield tuple(
             split[i][block_id] if i in loop_args else args[i] for i in range(len(args))
         )
-
-
-def _cat_chunks(chunks: list[Tensor]) -> Tensor:
-    """Join per-chunk results along time, without a copy in the single-chunk
-    case."""
-    return chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
 
 
 def _append_chunk(z_list: list, states_lists: dict[str, list], z, states: dict) -> None:
@@ -86,9 +91,90 @@ def _chunk_to_cpu(z, states: dict):
     """
 
     def to_cpu(x):
-        return x.cpu() if isinstance(x, Tensor) else [t.cpu() for t in x]
+        if isinstance(x, Tensor):
+            return x.cpu()
+        # One transfer per chunk/record, preserving the existing list-of-steps
+        # contract and its autograd edges without a copy launch per timestep.
+        return list(torch.stack(x, dim=0).cpu().unbind(0))
 
     return to_cpu(z), {k: to_cpu(v) for k, v in states.items()}
+
+
+def _tensor_storage_key(tensor: Tensor) -> tuple[str, int | None, int]:
+    """Return a stable key for storage sharing, including views."""
+    device = tensor.device
+    return device.type, device.index, tensor.untyped_storage().data_ptr()
+
+
+def _iter_tensors(value: Any):
+    """Yield tensors nested in recurrent argument containers."""
+    if isinstance(value, Tensor):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_tensors(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_tensors(item)
+
+
+@contextmanager
+def _offload_saved_tensors(
+    enabled: bool,
+    persistent: Sequence[Tensor] = (),
+    providers: Sequence[Callable[[], Sequence[Tensor]]] = (),
+):
+    """Move autograd intermediates to CPU while an offloaded run is built.
+
+    ``_chunk_to_cpu`` moves the public chunk outputs, but it does not affect
+    tensors saved by individual autograd nodes inside the chunk.  Keeping those
+    tensors on the accelerator defeats the memory purpose of ``cpu_offload``
+    when checkpointing is disabled.  Caller-owned inputs and module parameters
+    remain resident; only newly allocated intermediates are packed with their
+    original device and restored when backward consumes them. This avoids
+    copying a large sparse topology or trainable weight for every chunk.
+
+    The context is active only while autograd records a training forward.  In
+    particular, inference and ``torch.no_grad`` retain the existing fast path.
+    The hook is equivalent to ``save_on_cpu`` for private tensors while keeping
+    persistent storage resident.
+    """
+    if not enabled or not torch.is_grad_enabled():
+        yield
+        return
+    resident = {_tensor_storage_key(tensor) for tensor in persistent}
+
+    def pack(tensor: Tensor):
+        key = _tensor_storage_key(tensor)
+        if key not in resident:
+            # Sparse execution bindings are prepared after this outer context
+            # opens and may be rebuilt for each chunk. Refresh those small
+            # ownership protocols lazily so large topology/weight storage is
+            # never copied into every chunk's private autograd saves.
+            for provider in providers:
+                resident.update(
+                    _tensor_storage_key(value)
+                    for value in provider()
+                    if isinstance(value, Tensor)
+                )
+        try:
+            version = tensor._version
+        except RuntimeError:
+            version = None
+        if tensor.device.type == "cpu" or key in resident:
+            # Hooks bypass SavedVariable's normal version check. Keep a detached
+            # resident view and restore that check explicitly on unpack.
+            return "resident", tensor.device, tensor.detach(), version
+        return "cpu", tensor.device, tensor.detach().cpu(), None
+
+    def unpack(value):
+        kind, device, tensor, version = value
+        if version is not None and tensor._version != version:
+            raise RuntimeError("a saved recurrent tensor was modified in-place")
+        return tensor if kind == "resident" else tensor.to(device)
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+        yield
 
 
 def _sparse_run_arguments(loop_tensor: Tensor) -> tuple[int, torch.dtype]:
@@ -205,9 +291,10 @@ class RecurrentNNAbstract(base.MemoryModule):
     * Inference: ``cudagraph=True`` captures the loop's device work and replays
       it (see ``cudagraph.py``). It is the fastest option and composes with
       ``torch.compile`` and ``cpu_offload``, but is inference-only. Warm-up,
-      capture and replay use fixed-length ``torch.split`` chunks controlled by
-      ``chunk_size`` (default 200). Equal-length chunks share a capture;
-      a short final chunk gets its own capture.
+      capture and replay use pieces of at most ``chunk_size`` steps (default
+      200). ``chunk_mode="split"`` uses torch.split; ``"chunk"`` uses
+      torch.chunk with ceil(T / chunk_size) sections. A shorter final piece
+      runs eagerly rather than creating a graph used only once per sequence.
       ``None`` explicitly opts out of outer chunking.
     * Training: wrap the module in ``torch.compile(model, mode="reduce-overhead")``
       instead. Its CUDAGraph Trees capture forward and backward separately, so it
@@ -230,6 +317,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         step_mode: StepMode = "m",
         unroll: int | bool = 8,
         chunk_size: int | None = 200,
+        chunk_mode: Literal["split", "chunk"] = "split",
         cpu_offload: bool = False,
         grad_checkpoint: bool = False,
         save_grad_history: bool = False,
@@ -242,6 +330,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         self.update_state_names = update_state_names
         self.unroll = unroll
         self.chunk_size = chunk_size
+        self.chunk_mode = chunk_mode
         self.cpu_offload = cpu_offload
         self.grad_checkpoint = grad_checkpoint
         self.save_grad_history = save_grad_history
@@ -249,6 +338,14 @@ class RecurrentNNAbstract(base.MemoryModule):
         self._grad_history = {}
         self.cudagraph = cudagraph
         self._cudagraph_runner = CudaGraphRunner(warmup=cudagraph_warmup)
+
+    @property
+    def capture_version(self) -> tuple:
+        """Track scheduling and recording choices bound into a capture."""
+        return (
+            self.unroll,
+            None if self.update_state_names is None else tuple(self.update_state_names),
+        )
 
     def clear_cudagraph(self) -> None:
         """Release cached CUDA graphs without resetting model memories.
@@ -453,6 +550,8 @@ class RecurrentNNAbstract(base.MemoryModule):
             _, scoped_loop_args = self._detect_loop_args(*args)
         else:
             scoped_loop_args = loop_args
+        if args[scoped_loop_args[0]].shape[0] == 0:
+            raise ValueError("RecurrentNN requires at least one timestep")
         with _sparse_run_scope(
             self,
             args[scoped_loop_args[0]],
@@ -483,15 +582,16 @@ class RecurrentNNAbstract(base.MemoryModule):
             large_chunk_size = unroll_size if self.grad_checkpoint else T
         if large_chunk_size < 1:
             raise ValueError("chunk_size must be positive or None")
+        if self.chunk_mode not in ("split", "chunk"):
+            raise ValueError("chunk_mode must be 'split' or 'chunk'")
 
         return T, loop_args, unroll_size, large_chunk_size
 
     def _iter_large_chunks(
         self, args: Sequence, loop_args: Sequence[int], chunk_size: int
     ):
-        """Yield fixed-length time views, with a possibly shorter final
-        chunk."""
-        yield from _split_loop_args(args, loop_args, chunk_size)
+        """Yield time views, each at most chunk_size steps long."""
+        yield from _split_loop_args(args, loop_args, chunk_size, self.chunk_mode)
 
     # NOTE: `disable(recursive=False)` here is load-bearing, not cosmetic. It keeps
     # the O(T) python loop eager so only the unroll block is traced+compiled, which
@@ -521,28 +621,49 @@ class RecurrentNNAbstract(base.MemoryModule):
         # ------------------------------------------------------------------
         # Outer Loop: Large Chunks (Checkpointing & CPU Offloading)
         # ------------------------------------------------------------------
-        for chunk_args in self._iter_large_chunks(args, loop_args, large_chunk_size):
-            process = (
-                self._checkpointed_large_chunk
-                if use_checkpoint
-                else self._run_chunk_steps
-            )
-            history_kwargs = (
-                {"timestep_offset": timestep_offset} if self.save_grad_history else {}
-            )
-            z_chunk, states_chunk = process(
-                *chunk_args,
-                loop_args=loop_args,
-                unroll_size=unroll_size,
-                **history_kwargs,
-                **kwargs,
-            )
+        if self.cpu_offload and torch.is_grad_enabled():
+            persistent_providers = []
+            persistent_tensors = [
+                tensor for value in (*args, kwargs) for tensor in _iter_tensors(value)
+            ]
+            persistent_tensors.extend(self.parameters())
+            persistent_tensors.extend(self.buffers())
+            for submodule in self.modules():
+                provider = getattr(submodule, "_recurrent_persistent_tensors", None)
+                if callable(provider):
+                    persistent_providers.append(provider)
+        else:
+            persistent_tensors = ()
+            persistent_providers = ()
+        with _offload_saved_tensors(
+            self.cpu_offload, persistent_tensors, persistent_providers
+        ):
+            for chunk_args in self._iter_large_chunks(
+                args, loop_args, large_chunk_size
+            ):
+                process = (
+                    self._checkpointed_large_chunk
+                    if use_checkpoint
+                    else self._run_chunk_steps
+                )
+                history_kwargs = (
+                    {"timestep_offset": timestep_offset}
+                    if self.save_grad_history
+                    else {}
+                )
+                z_chunk, states_chunk = process(
+                    *chunk_args,
+                    loop_args=loop_args,
+                    unroll_size=unroll_size,
+                    **history_kwargs,
+                    **kwargs,
+                )
 
-            timestep_offset += chunk_args[loop_args[0]].shape[0]
+                timestep_offset += chunk_args[loop_args[0]].shape[0]
 
-            if self.cpu_offload:
-                z_chunk, states_chunk = _chunk_to_cpu(z_chunk, states_chunk)
-            _append_chunk(all_z_list, all_states_lists, z_chunk, states_chunk)
+                if self.cpu_offload:
+                    z_chunk, states_chunk = _chunk_to_cpu(z_chunk, states_chunk)
+                _append_chunk(all_z_list, all_states_lists, z_chunk, states_chunk)
 
         # ------------------------------------------------------------------
         # Post-process: stack
@@ -589,19 +710,27 @@ class RecurrentNNAbstract(base.MemoryModule):
 
         The capture boundary sits at the large chunk rather than the whole loop.
         The default ``chunk_size=200`` bounds warm-up and capture. With
-        explicit ``chunk_size=None`` one chunk spans T. When chunked,
-        each chunk replays and every host-side step -- the ``cpu_offload`` moves,
-        the accumulation, the final concat -- stays out here in eager python,
-        where a replay cannot swallow it.
+        explicit ``chunk_size=None`` one chunk spans T. When chunked, each
+        replay copies directly into one preallocated full-sequence output and
+        state destination; CPU offload uses the same ownership model with CPU
+        destinations. No graph-pool tensor escapes to the caller.
 
-        Chunks of equal length share one capture; a short final remainder keys to
-        its own.
+        Equal-length pieces share a capture. A shorter final piece runs eagerly
+        through the same recording path instead of creating a one-use graph.
         """
         T, loop_args, unroll_size, large_chunk_size = self._chunk_plan(
             *args, loop_args=loop_args
         )
-        z_chunks = []
-        state_chunks = {}
+        # A single chunk can use the runner's owned clone directly.  For a
+        # multi-chunk call, allocate the complete trajectory after the first
+        # replay has revealed the output shapes, then copy each replay into its
+        # final time slice.  This keeps graph-pool tensors from escaping and
+        # avoids both per-chunk clones and a final concatenation.
+        n_chunks = (T + large_chunk_size - 1) // large_chunk_size
+        full_z = None
+        full_states = None
+        time_offset = 0
+        replay_length = None
         from .kernels.operators import poisson_uniforms
         from .kernels.options import normalize_backend
         from .surrogate import PoissonRandomSpike, Truncated
@@ -615,17 +744,19 @@ class RecurrentNNAbstract(base.MemoryModule):
             and normalize_backend(self.backend).neuron != "torch"
         )
         for chunk_args in self._iter_large_chunks(args, loop_args, large_chunk_size):
+            length = chunk_args[loop_args[0]].shape[0]
+            if replay_length is None:
+                replay_length = length
             uniform = (
                 poisson_uniforms(chunk_args[loop_args[0]]) if poisson_spiking else None
             )
             capture_args = (*chunk_args, uniform) if poisson_spiking else chunk_args
 
-            def fn(*inner_args):
+            def fn(*inner_args, **step_kwargs):
                 if poisson_spiking:
                     inner_args, inner_uniform = inner_args[:-1], inner_args[-1]
                 else:
                     inner_uniform = None
-                step_kwargs = dict(kwargs)
                 if poisson_spiking:
                     step_kwargs["uniform_seq"] = inner_uniform
                 return self._stacked_chunk_forward(
@@ -635,23 +766,50 @@ class RecurrentNNAbstract(base.MemoryModule):
                     **step_kwargs,
                 )
 
-            # Offloading copies out of the pool itself, so skip the runner's clone.
-            z, states = self._cudagraph_runner(
-                self,
-                fn,
-                capture_args,
-                clone_outputs=not self.cpu_offload,
-                incompatible=self._cudagraph_incompatibilities(),
-            )
+            # Multi-chunk calls copy out of the graph pool into one stable
+            # destination.  A single chunk retains the runner's existing
+            # clone/CPU-offload ownership behavior.
+            if length < replay_length:
+                z, states = fn(*capture_args, **kwargs)
+            else:
+                z, states = self._cudagraph_runner(
+                    self,
+                    fn,
+                    capture_args,
+                    kwargs,
+                    clone_outputs=n_chunks == 1 and not self.cpu_offload,
+                    incompatible=self._cudagraph_incompatibilities(),
+                )
 
-            if self.cpu_offload:
-                z, states = _chunk_to_cpu(z, states)
-            _append_chunk(z_chunks, state_chunks, z, states)
+            if n_chunks == 1:
+                if self.cpu_offload:
+                    z, states = _chunk_to_cpu(z, states)
+                return z, states
 
-        return (
-            _cat_chunks(z_chunks),
-            {k: _cat_chunks(v) for k, v in state_chunks.items()},
-        )
+            chunk_length = z.shape[0]
+            destination_device = torch.device("cpu") if self.cpu_offload else z.device
+            if full_z is None:
+                full_z = torch.empty(
+                    (T, *z.shape[1:]),
+                    dtype=z.dtype,
+                    device=destination_device,
+                )
+                full_states = {
+                    name: torch.empty(
+                        (T, *value.shape[1:]),
+                        dtype=value.dtype,
+                        device=destination_device,
+                    )
+                    for name, value in states.items()
+                }
+
+            full_z[time_offset : time_offset + chunk_length].copy_(z)
+            for name, value in states.items():
+                full_states[name][time_offset : time_offset + chunk_length].copy_(value)
+            time_offset += chunk_length
+
+        assert full_z is not None and full_states is not None
+        return full_z, full_states
 
     def _cudagraph_incompatibilities(self) -> dict[str, str]:
         """Enabled options the CUDA-graph path cannot honour, with the reason.
@@ -768,6 +926,14 @@ class RecurrentNN(RecurrentNNAbstract):
         synapse: Recurrent connection and postsynaptic dynamics.
         syn_inp_module: Optional transformation of external synaptic input.
         neuron_inp_module: Optional transformation of external neuron input.
+        chunk_size: Maximum timesteps per outer chunk; None disables outer
+            chunking unless checkpointing selects unroll-sized pieces.
+        chunk_mode: "split" uses fixed-length torch.split pieces; "chunk" uses
+            torch.chunk with ceil(T / chunk_size) sections.
+        cpu_offload: Store returned histories and private saved tensors on CPU;
+            model parameters, buffers and caller inputs remain on their devices.
+        grad_checkpoint: Recompute chunks during backward instead of retaining
+            their private forward activations.
         backend: Kernel selection, independent of gradient mathematics.
         gradient: Recurrent gradient algorithm. ``BPTT(sparse=True)`` exploits
             compact surrogate support where dependency analysis permits it;
@@ -785,6 +951,7 @@ class RecurrentNN(RecurrentNNAbstract):
         update_state_names: Sequence[str] | None = None,
         unroll: int | bool = 8,
         chunk_size: int | None = 200,
+        chunk_mode: Literal["split", "chunk"] = "split",
         cpu_offload: bool = False,
         grad_checkpoint: bool = False,
         allow_buffer: bool = False,
@@ -796,6 +963,7 @@ class RecurrentNN(RecurrentNNAbstract):
             update_state_names=update_state_names,
             unroll=unroll,
             chunk_size=chunk_size,
+            chunk_mode=chunk_mode,
             cpu_offload=cpu_offload,
             grad_checkpoint=grad_checkpoint,
             **kwargs,
@@ -869,8 +1037,8 @@ class RecurrentNN(RecurrentNNAbstract):
             self.backend, *(() if neuron_model is None else (neuron_model,))
         )
         execution = (
+            super().capture_version,
             self.gradient,
-            None if self.update_state_names is None else tuple(self.update_state_names),
             self.allow_buffer,
             options.neuron,
             options.connection,
@@ -1181,11 +1349,12 @@ class ApicalRecurrentNN(RecurrentNN):
         update_state_names: Dotted state names to expose in the returned
             state dictionary.
         unroll: Inner unroll block size.
-        chunk_size: Fixed outer chunk length (default 200), using torch.split.
-            A short final chunk uses its own CUDA Graph capture.
+        chunk_size: Maximum outer chunk length (default 200).
             Applies to checkpointing, offloading and CUDA Graph warm-up/replay.
             None uses the full sequence, or an unroll block with checkpointing.
-        cpu_offload: Move chunk outputs to CPU during forward.
+        chunk_mode: "split" uses torch.split with chunk_size timesteps per piece;
+            "chunk" uses torch.chunk with ceil(T / chunk_size) sections.
+        cpu_offload: Move output traces and private backward residuals to CPU.
         grad_checkpoint: Use ``torch.utils.checkpoint`` on large chunks.
         allow_buffer: Allow collecting hidden states from non-MemoryModule
             buffers.
@@ -1203,6 +1372,7 @@ class ApicalRecurrentNN(RecurrentNN):
         update_state_names: Sequence[str] | None = None,
         unroll: int | bool = 8,
         chunk_size: int | None = 200,
+        chunk_mode: Literal["split", "chunk"] = "split",
         cpu_offload: bool = False,
         grad_checkpoint: bool = False,
         allow_buffer: bool = False,
@@ -1216,6 +1386,7 @@ class ApicalRecurrentNN(RecurrentNN):
             update_state_names=update_state_names,
             unroll=unroll,
             chunk_size=chunk_size,
+            chunk_mode=chunk_mode,
             cpu_offload=cpu_offload,
             grad_checkpoint=grad_checkpoint,
             allow_buffer=allow_buffer,

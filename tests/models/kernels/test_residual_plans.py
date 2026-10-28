@@ -57,9 +57,11 @@ def test_glif_checkpoint_source_replaces_only_private_adaptation_history():
     # The public voltage record remains a full trajectory. Adaptation is a
     # private block-boundary residual and the existing spike output drives the
     # ordinary stable recurrence during reverse replay.
-    assert names["v_seq"] == x.numel()
+    # Triton receives the sequence length as a scalar launch argument; the
+    # temporal extent is therefore intentionally absent from the source ABI.
+    assert names["v_seq"] is None
     assert "Iasc_seq" not in names
-    assert names["Iasc_checkpoint"] == ((x.shape[0] - 1) // 16) * states[1].numel()
+    assert names["Iasc_checkpoint"] is None
     assert "Iasc_checkpoint_ptr" in source
 
 
@@ -91,7 +93,7 @@ def test_requested_adaptation_history_reuses_full_record_instead_of_checkpoint()
         residual_template=plan,
     )
     names = dict(pointers)
-    assert names["Iasc_seq"] == x.shape[0] * states[1].numel()
+    assert names["Iasc_seq"] is None
     assert "Iasc_checkpoint" not in names
 
 

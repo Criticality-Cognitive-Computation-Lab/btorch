@@ -59,3 +59,9 @@ Primitive and fused generation apply separate namespaces to the shared scalar
 stages. Backend renderers provide tensor access, math intrinsics and source
 wrappers; they do not define model equations. Inspect generated code with
 `generate_cell_source` or `generate_fused_source` before compiling an extension.
+
+Triton and CuPy sequence kernels accept the timestep count at invocation, so
+changing only the sequence length reuses their generated source and compiled
+kernel. Trailing shapes, strides, dtypes and model options still specialize the
+kernel. The current TileLang wrapper uses static loop and buffer extents and
+therefore specializes on sequence length. CUDA Graphs remain shape-specific.

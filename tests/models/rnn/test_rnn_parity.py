@@ -65,11 +65,18 @@ def test_rnn_native_parity(T, unroll):
     ), "Bias grad mismatch"
 
 
-def test_rnn_unaligned_chunks_preserve_state_and_gradients():
+@pytest.mark.parametrize("chunk_mode", ["split", "chunk"])
+def test_rnn_unaligned_chunks_preserve_state_and_gradients(chunk_mode):
     """Unaligned chunks preserve records, state and full input/weight VJPs."""
     torch.manual_seed(42)
     reference = make_rnn(SimpleRNNCell, unroll=4, chunk_size=None)(3, 4)
-    actual = make_rnn(SimpleRNNCell, unroll=4, chunk_size=6, grad_checkpoint=True)(3, 4)
+    actual = make_rnn(
+        SimpleRNNCell,
+        unroll=4,
+        chunk_size=6,
+        chunk_mode=chunk_mode,
+        grad_checkpoint=True,
+    )(3, 4)
     actual.load_state_dict(reference.state_dict())
     x = torch.randn(10, 2, 3, requires_grad=True)
     y = x.detach().clone().requires_grad_(True)

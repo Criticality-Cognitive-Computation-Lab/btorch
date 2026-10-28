@@ -809,6 +809,27 @@ class SparseConnection(Connection):
         object.__setattr__(self, "_run_task_values", None)
         self._run_active = False
 
+    def _recurrent_persistent_tensors(self) -> tuple[Tensor, ...]:
+        """Return prepared sparse tensors that backward should keep resident.
+
+        Recurrent autograd saves the route's derived arrays in a flat topology
+        list. The canonical CSR buffers are registered on ``cache`` and are
+        found by the generic module buffer walk; run-local packed values and a
+        permuted execution weight are transient attributes, so expose them
+        through this small storage-ownership protocol instead of teaching the
+        recurrent loop about sparse connection internals.
+        """
+        return tuple(
+            value
+            for value in (
+                self._run_weight,
+                self._run_task_values,
+                self._prepared_weight,
+                self._prepared_task_values,
+            )
+            if isinstance(value, Tensor)
+        )
+
     def _capture_checkpoint_binding(self) -> SparseCheckpointBinding:
         """Capture the exact run binding used by checkpoint forward."""
         task_state = None

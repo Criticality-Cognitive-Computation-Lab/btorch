@@ -344,8 +344,10 @@ def profile_launches(
     cpu_events = sum(
         event.device_type == torch.profiler.DeviceType.CPU for event in events
     )
-    cuda_events = sum(
-        event.device_type == torch.profiler.DeviceType.CUDA for event in events
-    )
-    device_time_ms = sum(event.device_time_total for event in events) / 1000.0
-    return LaunchProfile(cpu_events, cuda_events, device_time_ms)
+    cuda_events = [
+        event for event in events if event.device_type == torch.profiler.DeviceType.CUDA
+    ]
+    # CPU parents include their children's device durations. Sum device events
+    # only so nested CPU scopes cannot count the same GPU work more than once.
+    device_time_ms = sum(event.device_time_total for event in cuda_events) / 1000.0
+    return LaunchProfile(cpu_events, len(cuda_events), device_time_ms)

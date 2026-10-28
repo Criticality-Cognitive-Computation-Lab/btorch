@@ -26,6 +26,7 @@ _MATH_NAMES = {
     "minimum",
     "where",
 }
+_FLOAT_DTYPES = {"float16", "bfloat16", "float64"}
 
 
 @dataclass(frozen=True)
@@ -149,22 +150,30 @@ class SourceRenderer:
     calls: dict[str, str] = {}
     floor_division = False
 
-    def __init__(self, n, n_step, storage, precise_exp=False):
+    def __init__(self, n, n_step, storage, precise_exp=False, dynamic_steps=False):
         self.n = n
         self.n_step = n_step
         self.storage = storage
         self.precise_exp = precise_exp
+        self.dynamic_steps = dynamic_steps
 
     def storage_index(self, layout, index):
         if layout is None or layout.physical_index:
             return index
         terms = []
         trailing = 1
-        for size, stride in reversed(tuple(zip(layout.shape, layout.stride))):
-            if size > 1 and stride:
+        axes = tuple(enumerate(zip(layout.shape, layout.stride)))
+        for axis, (size, stride) in reversed(axes):
+            if layout.dynamic_first and axis == 0:
+                coordinate = f"(({index}) {self.division} {trailing})"
+            elif size is not None and size > 1 and stride:
                 coordinate = f"(({index}) {self.division} {trailing}) % {size}"
+            else:
+                coordinate = None
+            if coordinate is not None and stride:
                 terms.append(f"({coordinate}) * {stride}")
-            trailing *= size
+            if size is not None:
+                trailing *= size
         return " + ".join(reversed(terms)) or "0"
 
     @property
@@ -173,7 +182,7 @@ class SourceRenderer:
 
     def load(self, pointer, index, layout, *, lane_index):
         expression = f"{pointer}_ptr[{index}]"
-        if layout is not None and layout.dtype != "float32":
+        if layout is not None and layout.dtype in _FLOAT_DTYPES:
             expression = self.cast_load(expression, layout.dtype)
         return expression
 
@@ -247,7 +256,7 @@ class TritonRenderer(SourceRenderer):
             if "index" in index
             else f"tl.load({pointer}_ptr + {index})"
         )
-        if layout is not None and layout.dtype != "float32":
+        if layout is not None and layout.dtype in _FLOAT_DTYPES:
             expression = self.cast_load(expression, layout.dtype)
         if lane_index and "index" not in index:
             expression = f"tl.broadcast_to({expression}, (BLOCK,))"
@@ -316,6 +325,18 @@ class TritonRenderer(SourceRenderer):
             line = raw.strip()
             if line in ("END", "END_IF", "END_REPLAY"):
                 continue
+            if self.dynamic_steps and line.startswith("for time in range("):
+                reverse = "-1, -1" in line
+                if reverse:
+                    rendered.append(
+                        indentation + "for reverse_time in tl.range(0, n_steps):"
+                    )
+                    rendered.append(
+                        indentation + "    time = n_steps - 1 - reverse_time"
+                    )
+                else:
+                    rendered.append(indentation + "for time in tl.range(0, n_steps):")
+                continue
             if line.rstrip().endswith(" = 0.0"):
                 statement = _parse_statement(line)
                 if isinstance(statement, ast.Assign):
@@ -327,6 +348,8 @@ class TritonRenderer(SourceRenderer):
                 line = self._math(line)
             rendered.append(indentation + line)
         args = ", ".join(name + "_ptr" for name, _ in pointers)
+        if self.dynamic_steps:
+            args += ", n_steps"
         imports = (
             "import triton\nimport triton.language as tl\n"
             "from triton.language.extra import libdevice\n"
@@ -343,7 +366,11 @@ class TritonRenderer(SourceRenderer):
             )
         return (
             imports
-            + "@triton.jit\n"
+            + (
+                "@triton.jit(do_not_specialize=['n_steps'])\n"
+                if self.dynamic_steps
+                else "@triton.jit\n"
+            )
             + f"def cell_kernel({args}, BLOCK: tl.constexpr):\n"
             + "    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n"
             + f"    mask = index < {self.n}\n"
@@ -405,11 +432,18 @@ class CuPyRenderer(SourceRenderer):
             line = raw.strip()
             if line.startswith("for time in"):
                 reverse = "-1, -1" in line
-                line = (
-                    f"for (int time = {self.n_step - 1}; time >= 0; --time) {{"
-                    if reverse
-                    else f"for (int time = 0; time < {self.n_step}; ++time) {{"
-                )
+                if self.dynamic_steps:
+                    line = (
+                        "for (int time = n_steps - 1; time >= 0; --time) {"
+                        if reverse
+                        else "for (int time = 0; time < n_steps; ++time) {"
+                    )
+                else:
+                    line = (
+                        f"for (int time = {self.n_step - 1}; time >= 0; --time) {{"
+                        if reverse
+                        else f"for (int time = 0; time < {self.n_step}; ++time) {{"
+                    )
             elif line.startswith("for replay_offset in range("):
                 end = line.removeprefix("for replay_offset in range(").removesuffix(
                     "):"
@@ -440,7 +474,7 @@ class CuPyRenderer(SourceRenderer):
                     name = statement.targets[0].id
                     if name not in declared:
                         declared.add(name)
-                        line = "float " + line
+                        line = ("int " if name == "n_steps" else "float ") + line
                 line = re.sub(
                     r"(?<![\w.])(\d+\.\d+(?:e[-+]?\d+)?)(?![\w.])",
                     r"\1f",
@@ -466,6 +500,8 @@ class CuPyRenderer(SourceRenderer):
             else "float* " + name + "_ptr"
             for name, _ in pointers
         )
+        if self.dynamic_steps:
+            args += ", int n_steps"
         return (
             "#include <cuda_fp16.h>\n#include <cuda_bf16.h>\n"
             "__device__ __forceinline__ float where(bool condition, float x, float y) "
@@ -582,6 +618,7 @@ class RendererRuntime:
     """Compilation and launch operations for one source backend."""
 
     name = ""
+    supports_dynamic_steps = False
 
     def compile_context(self, toolchain_stamp, target):
         del toolchain_stamp, target
@@ -590,12 +627,15 @@ class RendererRuntime:
     def compile(self, source, enable_fp_fusion, precise_division, stamp, target):
         raise NotImplementedError
 
-    def launch(self, kernel, args, n, *, enable_fp_fusion, debug, num_warps):
+    def launch(
+        self, kernel, args, n, *, steps=None, enable_fp_fusion, debug, num_warps
+    ):
         raise NotImplementedError
 
 
 class TritonRuntime(RendererRuntime):
     name = "triton"
+    supports_dynamic_steps = True
 
     def compile(self, source, enable_fp_fusion, precise_division, stamp, target):
         del enable_fp_fusion, stamp, target
@@ -610,19 +650,23 @@ class TritonRuntime(RendererRuntime):
             linecache.cache.pop(filename, None)
             raise
 
-    def launch(self, kernel, args, n, *, enable_fp_fusion, debug, num_warps):
+    def launch(
+        self, kernel, args, n, *, steps=None, enable_fp_fusion, debug, num_warps
+    ):
         options = {}
         if debug is not None:
             options["debug"] = debug
         if num_warps is not None:
             options["num_warps"] = num_warps
+        call_args = (*args, steps) if steps is not None else args
         kernel[((n + 127) // 128,)](
-            *args, BLOCK=128, enable_fp_fusion=enable_fp_fusion, **options
+            *call_args, BLOCK=128, enable_fp_fusion=enable_fp_fusion, **options
         )
 
 
 class CuPyRuntime(RendererRuntime):
     name = "cupy"
+    supports_dynamic_steps = True
 
     def compile(self, source, enable_fp_fusion, precise_division, stamp, target):
         del stamp, target
@@ -637,7 +681,9 @@ class CuPyRuntime(RendererRuntime):
         kernel.compile()
         return kernel
 
-    def launch(self, kernel, args, n, *, enable_fp_fusion, debug, num_warps):
+    def launch(
+        self, kernel, args, n, *, steps=None, enable_fp_fusion, debug, num_warps
+    ):
         del enable_fp_fusion, debug, num_warps
         import cupy
         import numpy
@@ -649,7 +695,10 @@ class CuPyRuntime(RendererRuntime):
             )
             with stream:
                 pointers = tuple(numpy.uintp(arg.data_ptr()) for arg in args)
-                kernel(((n + 127) // 128,), (128,), pointers)
+                call_args = (
+                    (*pointers, numpy.int32(steps)) if steps is not None else pointers
+                )
+                kernel(((n + 127) // 128,), (128,), call_args)
 
 
 class TileLangRuntime(RendererRuntime):
@@ -684,8 +733,10 @@ class TileLangRuntime(RendererRuntime):
             linecache.cache.pop(filename, None)
             raise
 
-    def launch(self, kernel, args, n, *, enable_fp_fusion, debug, num_warps):
-        del n, enable_fp_fusion, debug, num_warps
+    def launch(
+        self, kernel, args, n, *, steps=None, enable_fp_fusion, debug, num_warps
+    ):
+        del n, enable_fp_fusion, debug, num_warps, steps
         kernel(*args)
 
 
@@ -705,7 +756,7 @@ def get_runtime(name):
     return runtime()
 
 
-def get_renderer(name, n, n_step, storage, precise_exp=False):
+def get_renderer(name, n, n_step, storage, precise_exp=False, dynamic_steps=False):
     """Construct the syntax renderer for one registered source backend."""
     renderer = {
         "triton": TritonRenderer,
@@ -714,4 +765,4 @@ def get_renderer(name, n, n_step, storage, precise_exp=False):
     }.get(name)
     if renderer is None:
         raise ValueError(f"Unknown source renderer {name!r}")
-    return renderer(n, n_step, storage, precise_exp)
+    return renderer(n, n_step, storage, precise_exp, dynamic_steps)

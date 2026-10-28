@@ -191,7 +191,7 @@ def neuron_sequence(module, x_seq: Tensor) -> Tensor:
             setattr(
                 module,
                 attributes[name],
-                value[-1],
+                value[-1].clone(),
             )
     return result[0]
 

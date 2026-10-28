@@ -19,18 +19,20 @@ No extra parameters are needed. The script constructs the exact edge count using
 btorch's `FixedIndegree` sampler, calibrates sustained heterogeneous current,
 and runs 5000 steps at 1 ms. It prints matched **push eager**, **pull CUDA Graph**,
 and **push CUDA Graph** timings, with the same recordings enabled in every case.
-The first timed call includes first-chunk JIT and graph setup. Network
-construction, calibration, CPU validation/transfers, and writing the recording
+The first timed call includes first-chunk JIT and graph setup. Firing-rate
+calibration is excluded from simulation totals. Network construction,
+calibration, CPU validation/transfers, and writing the recording
 archive are measured separately; disk caches remain enabled. Public replay input,
 state, and output-ownership copies are part of the replay timing. The benchmark
 uses one fixed configuration and policy order with shared calibration, so its
 numbers describe this synthetic circuit rather than an isolated process-cold
 claim or a guarantee for every GPU.
 
-CUDA Graph warm-up and capture use chunks of 200 timesteps by default. Full
-chunks reuse one graph; a shorter final chunk uses a second graph. For example,
-413 steps replay the 200-step graph twice and the 13-step graph once.
-Use `--chunk-size` to change this length. In the Python API, `chunk_size=None`
+`--chunk-size 200` bounds CUDA Graph warm-up and capture. The default
+`--chunk-mode split` uses `torch.split`: 413 steps become 200, 200 and 13.
+`--chunk-mode chunk` uses `torch.chunk` with `ceil(T / chunk_size)` sections:
+the same input becomes 138, 138 and 137. Repeated pieces reuse one graph;
+a shorter final piece runs eagerly. In the Python API, `chunk_size=None`
 disables outer chunking.
 
 The default archive is `fig/rsnn_izhikevich/recordings.pt` (about 6.7 GiB for

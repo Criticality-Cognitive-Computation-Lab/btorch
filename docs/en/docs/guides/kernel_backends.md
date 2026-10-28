@@ -150,6 +150,24 @@ CPU offload and compiled training keep the same public state interface;
 `torch.compile(mode="reduce-overhead")` can capture training, while the explicit
 `cudagraph=True` option remains for inference.
 
+For longer training sequences, combine checkpointing with CPU offload:
+
+```python
+network = RecurrentNN(
+    neuron, synapse, chunk_size=200, chunk_mode="split",
+    grad_checkpoint=True, cpu_offload=True,
+    update_state_names=("neuron.v",),
+)
+```
+
+Checkpointing recomputes private activations during backward. CPU offload moves
+saved private tensors and returned histories to host memory while parameters
+and caller inputs remain on their original devices. Returned histories remain
+differentiable. With offload enabled, full traces use CPU memory proportional
+to sequence length; GPU recording buffers stay bounded by chunk size. Model
+weights and caller-owned GPU inputs remain resident. Select only the records
+you need, or use `update_state_names=()` to omit state traces.
+
 Surrogate primitives and derivatives are plain Torch functions, compatible
 with the existing autograd and `torch.compile` paths. The former `btorch.jit`
 shim and `BTORCH_JIT` environment option have been removed; there is no

@@ -17,15 +17,17 @@ python -m examples.rsnn_izhikevich
 
 无需额外设置。脚本复用 btorch 的 `FixedIndegree` 采样器生成精确边数，校准持续异质
 输入，运行 5000 步、每步 1 ms，并输出相同记录策略下 push eager、pull CUDA Graph、
-push CUDA Graph 的计时。首个计时调用包含首块 JIT 和 Graph 设置；构图、校准、CPU
+push CUDA Graph 的计时。首个计时调用包含首块 JIT 和 Graph 设置；目标发放率的
+校准不计入模拟总耗时。构图、校准、CPU
 校验/传输以及写入记录文件单独计时，保留磁盘缓存。公共 replay 的输入、状态和返回
 结果所有权复制计入 replay 时间。基准固定网络、共享校准和策略顺序，因此只描述该
 合成电路，不构成进程冷启动的单独结论，也不保证其他硬件达到相同结果。
 
-CUDA Graph 默认按 200 个时间步预热和捕获。完整 chunk 复用同一个 Graph，
-较短的尾部使用第二个 Graph。例如 413 步会重放 200 步 Graph 两次，
-再重放一次 13 步 Graph。通过 `--chunk-size` 修改长度；在 Python API 中，
-`chunk_size=None` 关闭外层分块。
+`--chunk-size 200` 限制 CUDA Graph 的预热和捕获长度。默认
+`--chunk-mode split` 使用 `torch.split`，413 步分为 200、200、13；
+`--chunk-mode chunk` 使用 `torch.chunk`，分块数为 `ceil(T / chunk_size)`，
+同一输入分为 138、138、137 步。重复的块复用 Graph，较短的最后一块直接
+eager 执行。在 Python API 中，`chunk_size=None` 关闭外层分块。
 
 默认保存 `fig/rsnn_izhikevich/recordings.pt`（本配置约 6.7 GiB），旁边的 JSON
 保存配置、实测率和计时。六个张量形状均为 `[time, batch, neuron]`：

@@ -80,3 +80,19 @@ merge 是 heterogeneous RSNN 的选项，独立 neuron/PSC 调用会拒绝该选
 `ConductancePSC` 的独立调用可使用原生后端。连接 COBA 网络时使用
 `ConductanceRecurrentNN`；该类只接受 `ConductancePSC` 类型，且网络中所有
 模块必须使用纯 `backend="torch"`。目前不支持原生后端的循环 COBA 执行。
+
+较长训练序列可结合 checkpoint 与 CPU offload：
+
+```python
+network = RecurrentNN(
+    neuron, synapse, chunk_size=200, chunk_mode="split",
+    grad_checkpoint=True, cpu_offload=True,
+    update_state_names=("neuron.v",),
+)
+```
+
+Checkpoint 在反向时重算私有激活；CPU offload 将保存的私有张量和返回的历史
+移至主机内存，参数和调用方输入保留在原设备。返回的历史仍可参与梯度计算。
+开启 offload 后，完整轨迹占用的 CPU 内存随序列长度增长，GPU 记录缓冲区
+则由 chunk 大小限制。模型权重和调用方的 GPU 输入仍驻留在 GPU。
+只选择需要的记录，或通过 `update_state_names=()` 省略状态轨迹。

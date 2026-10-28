@@ -617,7 +617,13 @@ def _execute(
     histories = dict(zip(history_indices, result[1 + len(states) :]))
     for offset, (name, index) in enumerate(zip(charged_names, charged_indices)):
         attribute = dict(get_template(neuron_spec).record_attributes)[name]
-        value = histories[index][-1] if index in histories else histories[-offset - 1]
+        # Live memory must own one timestep, not a view retaining the complete
+        # requested trajectory. Clone preserves its continuation cotangent.
+        value = (
+            histories[index][-1].clone()
+            if index in histories
+            else histories[-offset - 1]
+        )
         setattr(module.neuron, attribute, value)
     records = {}
     for name, index in zip(requested, indices):

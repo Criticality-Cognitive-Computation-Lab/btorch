@@ -48,3 +48,7 @@ Fragment 构造函数返回 `BackendFragments`。前向阶段使用 Python 表�
 独立内核与融合内核为共享标量阶段设置各自的命名空间。后端渲染器提供张量访问、
 数学函数与源码外壳，不包含模型方程。编译扩展前，可通过
 `generate_cell_source` 或 `generate_fused_source` 查看生成源码。
+
+Triton 和 CuPy 序列内核在调用时接收时间步数，只改变序列长度可复用生成源码
+及编译内核。其余形状、步长、dtype 和模型选项仍用于特化。当前 TileLang 包装
+使用静态循环与缓冲区长度，因此仍按序列长度特化。CUDA Graph 仍按形状捕获。

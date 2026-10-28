@@ -15,11 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit named physical/VJP cases, including local extensions, instead of a
   routine model/backend/dtype Cartesian matrix.
 - CUDA Graph inference warms/captures bounded `RecurrentNN` chunks and reuses
-  full chunks across `torch.split` segments. `chunk_size=200` is the default.
-  A shorter final segment has its own shape-specific capture, so a call uses at
-  most two graph shapes: the full chunk and its remainder. Warm-up never runs
-  the complete long sequence. Examples expose `--chunk-size`; there is no
-  chunk-mode argument.
+  repeated pieces. `chunk_size=200` is the default maximum timestep count;
+  `chunk_mode="split"` uses `torch.split`, while `"chunk"` uses `torch.chunk`
+  with `ceil(T / chunk_size)` sections. A shorter final piece runs eagerly.
+  Examples expose both options and report firing-rate calibration separately
+  from simulation timing.
 - `btorch.analysis.compute_input_scale` calibrates external drive using the
   actual recurrent model while restoring its memories and recording policy.
 - The Izhikevich example defaults to 60k neurons, 33,072,348 edges, ~5 Hz and
@@ -434,6 +434,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Recurrent CPU offload includes private backward residuals as well as public
+  traces, while keeping model-owned weights/topology resident. Graph inference
+  copies chunks directly into full-sequence recording destinations. Charged
+  final memories no longer retain a full history through a last-row view.
+- CUDA Graph replay copies updated keyword tensor inputs, invalidates changed
+  unroll schedules, and preserves RNG state across warm-up and capture.
 - CUDA Graph replay observes in-place parameter updates under autocast by
   capturing weight conversion instead of retaining warm-up's autocast cache.
   Replacing recurrent parameters/buffers or changing scalar `dt` invalidates

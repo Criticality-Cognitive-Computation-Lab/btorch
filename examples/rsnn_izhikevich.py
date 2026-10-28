@@ -86,6 +86,7 @@ def build_model(options: ExampleOptions) -> RecurrentNN:
         update_state_names=records,
         cudagraph=options.cudagraph,
         chunk_size=options.chunk_size,
+        chunk_mode=options.chunk_mode,
     ).to(options.device)
 
 

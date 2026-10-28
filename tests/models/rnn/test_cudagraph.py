@@ -105,9 +105,8 @@ def test_cudagraph_composes_with_compile():
 def test_cudagraph_with_cpu_offload(seq_len):
     """Offload composes with capture: device work replays, the D2H moves stay eager.
 
-    ``seq_len=72`` with ``chunk_size=16`` leaves a short final chunk that keys to
-    its own capture against an already-dirty pool -- the case that catches a
-    capture reading uninitialised pool memory, so it is worth parametrizing.
+    ``seq_len=72`` leaves an eight-step eager piece after graph replay. Both
+    paths must write the same CPU trajectory without exposing graph storage.
     """
     eager, graphed = _pair(chunk_size=16, cpu_offload=True)
     x = torch.randn(seq_len, B, INPUT_DIM, device="cuda")
@@ -120,6 +119,122 @@ def test_cudagraph_with_cpu_offload(seq_len):
     assert torch.equal(out, ref)
     for name, value in states.items():
         assert torch.equal(value, ref_states[name]), name
+    assert graphed._cudagraph_runner.n_captures == 1
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "chunk_mode,full_length,tail_length", [("split", 16, 3), ("chunk", 12, 11)]
+)
+def test_cudagraph_multichunk_owns_one_full_trajectory(
+    monkeypatch, chunk_mode, full_length, tail_length
+):
+    """Keep each full trajectory independent from later graph replays.
+
+    The graph pool is overwritten by every replay. Keeping the first
+    result unchanged after a second call verifies that the returned
+    trajectory owns its storage. Comparing both calls with eager
+    execution also checks that the full destination is populated at the
+    correct time offsets.
+    """
+    eager, graphed = _pair(chunk_size=16, chunk_mode=chunk_mode)
+    x1 = torch.randn(35, B, INPUT_DIM, device="cuda")
+    x2 = torch.randn(35, B, INPUT_DIM, device="cuda")
+    seen = []
+    original = graphed._stacked_chunk_forward
+
+    def observed(x, **kwargs):
+        seen.append(x.shape[0])
+        return original(x, **kwargs)
+
+    monkeypatch.setattr(graphed, "_stacked_chunk_forward", observed)
+
+    first_ref, first_ref_states = _run(eager, x1)
+    first, first_states = _run(graphed, x1)
+    assert torch.equal(first, first_ref)
+    for name, value in first_states.items():
+        assert torch.equal(value, first_ref_states[name]), name
+    assert seen == [full_length] * 4 + [tail_length]
+    assert graphed._cudagraph_runner.n_captures == 1
+
+    first_copy = first.clone()
+    first_state_copies = {name: value.clone() for name, value in first_states.items()}
+    second_ref, second_ref_states = _run(eager, x2)
+    second, second_states = _run(graphed, x2)
+
+    assert torch.equal(first, first_copy)
+    for name, value in first_states.items():
+        assert torch.equal(value, first_state_copies[name]), name
+    assert torch.equal(second, second_ref)
+    for name, value in second_states.items():
+        assert torch.equal(value, second_ref_states[name]), name
+    assert seen == [full_length] * 4 + [tail_length, tail_length]
+    assert graphed._cudagraph_runner.n_captures == 1
+
+
+@torch.no_grad()
+def test_cudagraph_keyword_drive_and_changed_schedule_match_eager():
+    """Replay must read fresh keyword tensors and invalidate static choices.
+
+    Drive tensors have identical signatures across calls, so checking a
+    second trajectory detects stale captured values rather than just
+    exercising a new graph. A changed unroll or scalar gain must then
+    capture the new program.
+    """
+
+    class DrivenCell(SimpleRNNCell):
+        def forward(self, x, *, drive, gain=1.0):
+            return super().forward(x + gain * drive)
+
+    models = []
+    for graph in (False, True):
+        torch.manual_seed(42)
+        constructor = make_rnn(DrivenCell, cudagraph=graph, unroll=8)
+        models.append(constructor(INPUT_DIM, H).cuda())
+    eager, graphed = models
+    x = torch.randn(T, B, INPUT_DIM, device="cuda")
+    for unroll, gain, captures in ((8, 1.0, 1), (8, 1.0, 1), (4, 1.0, 2), (4, 0.5, 3)):
+        drive = torch.randn(B, INPUT_DIM, device="cuda")
+        for model in models:
+            model.unroll = unroll
+            reset_net_state(model, batch_size=B)
+        expected, expected_states = eager(x, drive=drive, gain=gain)
+        actual, actual_states = graphed(x, drive=drive, gain=gain)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for name, value in expected_states.items():
+            torch.testing.assert_close(actual_states[name], value, rtol=0, atol=0)
+        assert graphed._cudagraph_runner.n_captures == captures
+
+
+@torch.no_grad()
+def test_cudagraph_preparation_preserves_stochastic_timestep_rng():
+    """Warmup must not consume random draws belonging to the real sequence.
+
+    Compare both trajectories and the generator after two calls: matching only
+    the first output would miss replay repeatedly using the same RNG offset.
+    """
+
+    class StochasticCell(SimpleRNNCell):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.dropout = torch.nn.Dropout(0.3)
+
+        def forward(self, x):
+            return super().forward(self.dropout(x))
+
+    trajectories = []
+    generator_states = []
+    x = torch.ones(T, B, INPUT_DIM, device="cuda")
+    for graph in (False, True):
+        torch.manual_seed(132)
+        constructor = make_rnn(StochasticCell, cudagraph=graph, unroll=8)
+        model = constructor(INPUT_DIM, H).cuda()
+        reset_net_state(model, batch_size=B)
+        trajectories.append([model(x)[0] for _ in range(2)])
+        generator_states.append(torch.cuda.get_rng_state())
+    for actual, expected in zip(trajectories[1], trajectories[0]):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.equal(*generator_states)
 
 
 # --- edge cases ---------------------------------------------------------------

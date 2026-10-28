@@ -182,6 +182,7 @@ class _Entry:
     __slots__ = (
         "graph",
         "static_args",
+        "static_kwargs",
         "static_state_in",
         "state_out",
         "outputs",
@@ -192,6 +193,7 @@ class _Entry:
         self,
         graph: torch.cuda.CUDAGraph,
         static_args: tuple,
+        static_kwargs: dict,
         static_state_in: dict[str, torch.Tensor],
         state_out: dict[str, Any],
         outputs: Any,
@@ -199,6 +201,7 @@ class _Entry:
     ) -> None:
         self.graph = graph
         self.static_args = static_args
+        self.static_kwargs = static_kwargs
         self.static_state_in = static_state_in
         self.state_out = state_out
         self.outputs = outputs
@@ -340,6 +343,10 @@ class CudaGraphRunner:
         }
         amp_enabled = torch.is_autocast_enabled("cuda")
         amp_dtype = torch.get_autocast_dtype("cuda")
+        static_kwargs = {
+            name: value.detach().clone() if torch.is_tensor(value) else value
+            for name, value in kwargs.items()
+        }
 
         def invoke(*inputs):
             # A cached autocast weight from warm-up would become an immutable
@@ -348,7 +355,7 @@ class CudaGraphRunner:
             with torch.autocast(
                 "cuda", enabled=amp_enabled, dtype=amp_dtype, cache_enabled=False
             ):
-                return fn(*inputs, **kwargs)
+                return fn(*inputs, **static_kwargs)
 
         static_args = tuple(
             value.detach().clone() if torch.is_tensor(value) else value
@@ -406,6 +413,7 @@ class CudaGraphRunner:
         return _Entry(
             graph,
             static_args,
+            static_kwargs,
             static_state_in,
             state_out,
             outputs,
@@ -432,7 +440,7 @@ class CudaGraphRunner:
         nothing about the module's own options.
         """
         kwargs = kwargs or {}
-        self._check_supported(module, args, incompatible)
+        self._check_supported(module, (*args, *kwargs.values()), incompatible)
         self._check_submodules(module)
 
         key = self._key(args, kwargs)
@@ -445,7 +453,19 @@ class CudaGraphRunner:
             # the module state, which may still live in the stale graph's pool.
             entry = None
         if entry is None:
-            entry = self._capture(module, fn, args, kwargs)
+            # Warm-up and recording are preparation, not logical timesteps.
+            # Restore their RNG consumption; graph replay advances CUDA's
+            # registered generators for the actual call.
+            devices = sorted(
+                {torch.cuda.current_device()}
+                | {
+                    value.device.index
+                    for value in (*args, *kwargs.values())
+                    if torch.is_tensor(value)
+                }
+            )
+            with torch.random.fork_rng(devices=devices):
+                entry = self._capture(module, fn, args, kwargs)
             self.entries[key] = entry
             # Graphs of other signatures that are stale as well can never be
             # replayed again; drop them now to release their memory pools.
@@ -456,6 +476,9 @@ class CudaGraphRunner:
         for static, incoming in zip(entry.static_args, args):
             if torch.is_tensor(static):
                 static.copy_(incoming)
+        for name, static in entry.static_kwargs.items():
+            if torch.is_tensor(static):
+                static.copy_(kwargs[name])
 
         # The caller may have reset or advanced the state since capture, and the
         # cells rebind rather than mutate, so feed the state in by value.

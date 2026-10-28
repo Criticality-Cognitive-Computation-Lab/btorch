@@ -39,3 +39,7 @@ the two public network factories are explicit named cases, not a hidden matrix.
 | Delays and heterogeneous receptors | `test_sparse_heter_delay_preserves_initial_ring_adjoint`, `test_native_cudagraph_delayed_sparse_continuation` |
 | AMP and capture precision changes | `test_autocast_checkpoint_training_matches_module`, `test_autocast_cudagraph_reselects_precision_and_replays_changed_input` |
 | Checkpoint and CPU offload state adjoints | `test_checkpoint_chunks_keep_full_bptt_and_state_records`, `test_native_checkpointed_recurrence_matches_module_vjp` |
+| Runtime sequence lengths and time-strided storage | `test_runtime_steps.py` source/cache anchors and GPU numerical cases |
+| Charged-state storage ownership and continuation VJP | `test_history_storage.py` standalone and recurrent oracles |
+| CPU saved-tensor offload and version checks | `tests/models/rnn/test_history_memory.py` |
+| Graph trajectory ownership, keyword drives and stochastic RNG | `tests/models/rnn/test_cudagraph.py` |

@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import torch
 
@@ -34,6 +35,7 @@ class ExampleOptions:
     method: str = "auto"
     cudagraph: bool = False
     chunk_size: int | None = 200
+    chunk_mode: Literal["split", "chunk"] = "split"
 
 
 @dataclass(frozen=True)
@@ -212,6 +214,9 @@ def main(
         help="RecurrentNN chunk size; also bounds graph warm-up/capture",
     )
     parser.add_argument(
+        "--chunk-mode", choices=("split", "chunk"), default=defaults.chunk_mode
+    )
+    parser.add_argument(
         "--target-rate-hz",
         type=float,
         default=execution.target_rate_hz,
@@ -299,6 +304,7 @@ def main(
             parser.error("Imported circuit does not match this example")
         network.cudagraph = args.cudagraph
         network.chunk_size = args.chunk_size
+        network.chunk_mode = args.chunk_mode
     else:
         network, dt = build_model(options), args.dt
     if args.device.split(":")[0] == "cuda":
@@ -344,12 +350,6 @@ def main(
                     flush=True,
                 )
                 timings = compare_inference(network, inputs)
-                for label in ("push eager", "pull CUDA Graph", "push CUDA Graph"):
-                    print(
-                        f"{label} total (calibration/JIT + first sequence): "
-                        f"{calibration_ms + timings[f'{label} first call']:.3f} ms",
-                        flush=True,
-                    )
             initialize(network, args.device)
             with torch.inference_mode():
                 spikes, records = run(inputs)
@@ -393,6 +393,7 @@ def main(
                                 seed=args.seed,
                                 cudagraph=network.cudagraph,
                                 chunk_size=network.chunk_size,
+                                chunk_mode=network.chunk_mode,
                                 neuron_backend=args.neuron_backend,
                                 sparse_backend=args.sparse_backend,
                                 method=args.method,

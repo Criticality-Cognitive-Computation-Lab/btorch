@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from btorch.models.kernels.backends.engine import backward, forward, generate_source
+from btorch.models.kernels.backends.renderers import get_runtime
 from btorch.models.kernels.contracts import NeuronSpec
 from btorch.models.kernels.templates import get_template
 from btorch.models.kernels.torch_backend import forward_step
@@ -68,11 +69,14 @@ def test_inference_source_contains_only_requested_trajectory_storage(backend, mo
         sizes = dict(pointers)
         longer_sizes = dict(longer)
         growing = {name for name in names if sizes[name] != longer_sizes[name]}
-        assert growing == {
-            "x_seq",
-            "output_seq",
-            *(name + "_seq" for name in requested),
-        }
+        expected_growing = set()
+        if not get_runtime(backend).supports_dynamic_steps:
+            expected_growing = {
+                "x_seq",
+                "output_seq",
+                *(name + "_seq" for name in requested),
+            }
+        assert growing == expected_growing
 
 
 def _example(spec, dtype=torch.float32):
