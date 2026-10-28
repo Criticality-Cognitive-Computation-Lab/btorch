@@ -19,6 +19,7 @@ from .base import (
     OperatorConnection,
     StructuredConnection,
 )
+from .plasticity import PairSTDP
 from .projection import Projection
 from .rewire import HardDeepR, HardDeepROptions
 from .rule import (
@@ -59,6 +60,7 @@ __all__ = [
     "OneToOne",
     "OperatorConnection",
     "PairwiseBernoulli",
+    "PairSTDP",
     "Projection",
     "SparseConnection",
     "SparseLinear",

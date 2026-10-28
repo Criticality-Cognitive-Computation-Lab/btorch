@@ -45,6 +45,7 @@ class RepresentationCache(nn.Module):
         self.topology_version = -1
         self.identity_perm = True
         self.shape = (0, 0)
+        self.max_source_degree = 0
 
     @torch.no_grad()
     def build(self, row: Tensor, col: Tensor, shape: tuple[int, int], version: int):
@@ -77,6 +78,9 @@ class RepresentationCache(nn.Module):
             "t_col": row_s[t_perm],
             "t_perm": t_perm,
         }
+        self.max_source_degree = (
+            int((new["t_crow"][1:] - new["t_crow"][:-1]).max().item()) if n_in else 0
+        )
         for name, value in new.items():
             current = getattr(self, name)
             if current.shape == value.shape and current.device == value.device:

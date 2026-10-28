@@ -24,8 +24,9 @@ def compute_input_scale(
     """Find a drive scale giving the requested finite-trial population rate.
 
     Evaluate the actual network from the same initialized memories on every
-    trial. Restore the caller's memories, recording policy and CUDA Graph flag
-    afterwards. Parameters and input storage are unchanged. Calibration runs
+    trial. Restore the caller's memories, online-plastic weights, recording
+    policy and CUDA Graph flag afterwards. Parameters and input storage are
+    unchanged. Calibration runs
     eagerly without state histories; perform it before compilation or capture.
 
     This bracketed search assumes activity generally increases with input
@@ -48,6 +49,7 @@ def compute_input_scale(
         RuntimeError: If no tested scale reaches the requested tolerance.
     """
     from btorch.models import environ, functional
+    from btorch.models.cudagraph import _capture_mutable_tensors
 
     if (
         inputs.ndim < 3
@@ -60,10 +62,14 @@ def compute_input_scale(
             "Nonempty time-major input and positive finite search settings required"
         )
     original = functional.named_hidden_states(network)
+    mutable = _capture_mutable_tensors(network)
+    mutable_values = {name: value.clone() for name, value in mutable.items()}
     recording, graph = network.update_state_names, network.cudagraph
     network.update_state_names, network.cudagraph = (), False
 
     def measure(scale):
+        for name, value in mutable.items():
+            value.copy_(mutable_values[name])
         functional.set_hidden_states(
             network,
             {
@@ -104,5 +110,7 @@ def compute_input_scale(
                 )
             return best_scale, best_rate
     finally:
+        for name, value in mutable.items():
+            value.copy_(mutable_values[name])
         functional.set_hidden_states(network, original)
         network.update_state_names, network.cudagraph = recording, graph

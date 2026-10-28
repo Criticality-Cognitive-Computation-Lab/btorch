@@ -23,7 +23,7 @@ from ...sparse.runtime import (
 from ...sparse.runtime.method import PropagationMethod, resolve_method, validate_method
 from .base import Connection
 from .synapse import Synapse
-from .weight import Weight
+from .weight import EdgeWeight, Weight
 
 
 Orientation = Literal["pre_post", "post_pre"]
@@ -163,11 +163,6 @@ class SparseConnection(Connection):
             _scipy_origin or not isinstance(matrix, (Sparse, Tensor))
         ):
             value_dtype = torch.get_default_dtype()
-        if synapse.plasticity is not None:
-            raise NotImplementedError(
-                "Synapse.plasticity is reserved for online plasticity rules "
-                "and not implemented yet."
-            )
         A = as_sparse(matrix, device=device)
         if getattr(A, "_reordered", False) and synapse.has_edge_arrays():
             raise ValueError(
@@ -245,6 +240,21 @@ class SparseConnection(Connection):
         self.weight: Weight = synapse.make_weight()
         self.weight.bind(values, edge_map, adjacency)
         self.weight.to(device=row.device)
+        self.plasticity = synapse.plasticity
+        if self.plasticity is not None:
+            from .plasticity import PairSTDP
+
+            if not isinstance(self.plasticity, PairSTDP):
+                raise TypeError("Synapse.plasticity must be PairSTDP or None")
+            if type(self.weight) is not EdgeWeight or self.weight.dale:
+                raise NotImplementedError(
+                    "STDP requires unconstrained per-edge EdgeWeight"
+                )
+            if self.weight().ndim != 1 or self._member_shape:
+                raise NotImplementedError(
+                    "STDP does not support batched connection weights"
+                )
+            self.plasticity.bind(edge_map, self.weight())
         self.orientation: Orientation = "post_pre"
         self.bias = None
         self.register_buffer(
@@ -589,6 +599,59 @@ class SparseConnection(Connection):
         """``[n_edge]`` target neuron of every edge slot."""
         return self.indices[0]
 
+    def update_plasticity(
+        self, arrivals: Tensor, post_spikes: Tensor, *, dt: float | Tensor
+    ) -> None:
+        """Apply online learning after propagating this step with old weights.
+
+        Args:
+            arrivals: One sample of actual delay-expanded arrivals, with last
+                dimension ``n_pre * n_delay``. Index ``i * n_delay + d`` is
+                the spike from source i arriving through delay bin d now.
+                The PSC or caller owns the delay buffer; this method never
+                advances it a second time.
+            post_spikes: Postsynaptic spikes, last dimension ``n_post``.
+                Receptors share postsynaptic activity, not necessarily traces.
+            dt: Positive simulation timestep in the STDP time units.
+        """
+        if self.plasticity is None:
+            return
+        if torch.is_grad_enabled():
+            raise RuntimeError(
+                "Online STDP requires no_grad or inference_mode; BPTT is unsupported"
+            )
+        if (
+            arrivals.ndim == 0
+            or post_spikes.ndim == 0
+            or arrivals.shape[-1] != self.in_features
+            or post_spikes.shape[-1] != self.n_post
+        ):
+            raise ValueError(
+                "STDP arrivals/post spikes have incompatible population dimensions"
+            )
+        if arrivals.numel() != self.in_features or post_spikes.numel() != self.n_post:
+            raise NotImplementedError(
+                "STDP shared-weight minibatch reduction is undefined; use one sample"
+            )
+        if (
+            arrivals.device != self.indices.device
+            or post_spikes.device != self.indices.device
+        ):
+            raise ValueError(
+                "STDP spikes and canonical weights must be on the same device"
+            )
+        delay = 0 if self.delay is None else self.delay
+        arrival = arrivals.reshape(-1)[self.pre * self.n_delay + delay]
+        post = post_spikes.reshape(-1)[self.post]
+        self.plasticity.single_step_forward(self.weight.value, arrival, post, dt)
+        # Derived permutations/task packs are snapshots, not canonical weight
+        # owners. Refresh a live CSR view and discard any static packed values.
+        if self._run_weight is not None and self._run_weight is not self.weight.value:
+            self._run_weight.copy_(self.weight.value.index_select(-1, self.cache.perm))
+        self._prepared_task_values = None
+        self._prepared_task_signature = None
+        self._run_task_values = None
+
     def find_edges(self, pre: Tensor | int, post: Tensor | int) -> Tensor:
         """Edge slots connecting the given neurons.
 
@@ -767,6 +830,10 @@ class SparseConnection(Connection):
                 else:
                     weight = ordered
             object.__setattr__(self, "_run_weight", weight)
+            if self.plasticity is not None:
+                # Online weights remain live. Static task-value packs would
+                # become stale after the first plasticity update.
+                return
             if self._max_density is None or self._value_batch_dim or self._member_shape:
                 return
             # Packing depends on edge storage, not the outer sequence dtype.
@@ -1081,6 +1148,15 @@ class SparseConnection(Connection):
             )
         return None
 
+    def capture_mutable_tensors(self) -> dict[str, Tensor]:
+        """Expose online weights for capture warmup restoration.
+
+        Trace memories already participate through MemoryModule. The
+        canonical weight keeps its address and ownership during capture
+        and replay.
+        """
+        return {} if self.plasticity is None else {"weight": self.weight.value}
+
     @torch.no_grad()
     def set_edges_(
         self,
@@ -1108,6 +1184,10 @@ class SparseConnection(Connection):
             receptor: Optional ``[K]`` new receptor ids.
             delay: Optional ``[K]`` new delays.
         """
+        if self.plasticity is not None:
+            raise NotImplementedError(
+                "Reset/rebind STDP traces explicitly before structural rewiring"
+            )
         slots, pre, post = (torch.as_tensor(t) for t in (slots, pre, post))
         receptor = None if receptor is None else torch.as_tensor(receptor)
         delay = None if delay is None else torch.as_tensor(delay)

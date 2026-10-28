@@ -48,6 +48,9 @@ may define either or both of:
 * ``capture_incompatibility()`` -- returns ``None``, or a human-readable reason
   why the submodule cannot be captured in its current configuration (e.g. its
   forward synchronises with the host). Capture is refused with that reason.
+* ``capture_mutable_tensors()`` -- returns a mapping of persistent tensors that
+  the captured operation mutates in place. The runner snapshots these before
+  warm-up and capture, then leaves their addresses live for replay.
 
 What must stay *outside* the captured region: replay re-runs the captured device
 kernels and nothing else, so any host-side work (a ``.cpu()`` move, a python-level
@@ -112,6 +115,34 @@ def _capture_participants(
         if callable(getattr(sub, "capture_incompatibility", None)):
             checked.append((name or type(sub).__name__, sub))
     return versioned, checked
+
+
+def _capture_mutable_tensors(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Collect tensors mutated by a captured inference trajectory.
+
+    Stateful memories are already covered by :func:`named_hidden_states`.
+    This narrow protocol covers persistent parameters such as online-plastic
+    connection weights that a custom operator mutates in place.
+    """
+    tensors: dict[str, torch.Tensor] = {}
+    for name, submodule in module.named_modules():
+        getter = getattr(submodule, "capture_mutable_tensors", None)
+        if not callable(getter):
+            continue
+        values = getter()
+        if values is None:
+            continue
+        for key, value in values.items():
+            if not torch.is_tensor(value):
+                raise TypeError(
+                    f"capture_mutable_tensors() returned non-tensor {key!r} "
+                    f"from {type(submodule).__name__}"
+                )
+            full_name = f"{name}.{key}" if name else key
+            if full_name in tensors:
+                raise RuntimeError(f"duplicate captured mutable tensor {full_name!r}")
+            tensors[full_name] = value
+    return tensors
 
 
 def capture_versions(module: torch.nn.Module) -> tuple:
@@ -400,6 +431,14 @@ class CudaGraphRunner:
             name: value.detach().clone() if torch.is_tensor(value) else value
             for name, value in kwargs.items()
         }
+        mutable = _capture_mutable_tensors(module)
+        mutable_snapshot = {
+            name: value.detach().clone() for name, value in mutable.items()
+        }
+
+        def restore_mutable() -> None:
+            for name, value in mutable.items():
+                value.copy_(mutable_snapshot[name])
 
         def invoke(*inputs):
             # A cached autocast weight from warm-up would become an immutable
@@ -422,7 +461,16 @@ class CudaGraphRunner:
             # task layout, workspace or compiled kernel is first created while
             # the graph is being recorded.
             for _ in range(max(1, self.warmup)):
-                set_hidden_states(module, snapshot)
+                set_hidden_states(
+                    module,
+                    {
+                        name: value.detach().clone()
+                        if torch.is_tensor(value)
+                        else value
+                        for name, value in snapshot.items()
+                    },
+                )
+                restore_mutable()
                 invoke(*static_args)
         torch.cuda.current_stream().wait_stream(stream)
         torch.cuda.synchronize()
@@ -432,6 +480,7 @@ class CudaGraphRunner:
             k: v.detach().clone() for k, v in snapshot.items() if torch.is_tensor(v)
         }
         set_hidden_states(module, {**snapshot, **static_state_in})
+        restore_mutable()
 
         # Completed runners and entries form reference cycles. Reclaiming one
         # during an active capture resets its stream and invalidates the capture
@@ -497,6 +546,7 @@ class CudaGraphRunner:
         # follows starts from that rather than from the pool garbage capture left
         # bound -- and so __call__ needs no special case for the capturing call.
         set_hidden_states(module, snapshot)
+        restore_mutable()
         self.n_captures += 1
         # Stamp with the versions read *after* capture: a submodule may settle
         # its own derived state lazily during warm-up (and bump its version

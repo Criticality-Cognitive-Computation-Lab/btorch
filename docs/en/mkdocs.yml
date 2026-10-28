@@ -91,6 +91,7 @@ nav:
   - guides/kernel_backends.md
   - guides/oot_kernels.md
   - guides/sparse_connectivity.md
+  - guides/plasticity.md
 - Design notes:
   - design/kernel_generation.md
   - design/sparse_connectivity.md

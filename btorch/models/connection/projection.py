@@ -106,6 +106,7 @@ class Projection(nn.Module):
             and fixed_scalar
             and synapse.delay is None
             and synapse.receptor is None
+            and synapse.plasticity is None
             and synapse.n_delay in (None, 1)
             and synapse.n_receptor in (None, 1)
             and not synapse.dale

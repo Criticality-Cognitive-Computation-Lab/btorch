@@ -9,6 +9,7 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from .plasticity import PairSTDP
 from .weight import ConstantWeight, EdgeWeight, Weight
 
 
@@ -16,10 +17,10 @@ from .weight import ConstantWeight, EdgeWeight, Weight
 class Synapse:
     """Synaptic properties of the edges of a connection.
 
-    Weight, receptor, delay and plasticity are orthogonal: any combination is
-    valid, and none of them prescribes how the connection is stored or
-    executed. Per-edge arrays are aligned with the edges as supplied to the
-    connection (the stored entries of the matrix, or the rule's edge list).
+    Weight, receptor, delay and plasticity describe independent properties;
+    the connection validates which combinations it supports. They do not
+    prescribe storage or execution. Per-edge arrays are aligned with the edges
+    as supplied to the connection (matrix entries or the rule's edge list).
 
     Args:
         weight: ``None`` (use the matrix values, trainable), a number (the
@@ -39,8 +40,9 @@ class Synapse:
         n_receptor: Number of receptor channels (default: largest id + 1).
         dale: Enforce Dale's law on the weights. For a :class:`Weight`
             module this switches its own ``dale`` flag on.
-        plasticity: Reserved for online plasticity rules; anything but
-            ``None`` raises ``NotImplementedError`` for now.
+        plasticity: Optional arrival-based :class:`PairSTDP` rule. The
+            connection owns its persistent traces; propagation and online
+            learning remain separate operations.
 
     Examples:
         >>> Synapse(weight=1.0)                                # doctest: +SKIP
@@ -54,7 +56,7 @@ class Synapse:
     n_delay: int | None = None
     n_receptor: int | None = None
     dale: bool = False
-    plasticity: Any = None
+    plasticity: PairSTDP | None = None
 
     def has_edge_arrays(self) -> bool:
         """Whether any attribute is given per edge (and so depends on the order
@@ -67,7 +69,9 @@ class Synapse:
                 return False
             return torch.as_tensor(value).ndim > 0
 
-        return any(per_edge(v) for v in (self.weight, self.delay, self.receptor))
+        return self.plasticity is not None or any(
+            per_edge(v) for v in (self.weight, self.delay, self.receptor)
+        )
 
     def make_weight(self) -> Weight:
         """Build the weight module described by :attr:`weight`.

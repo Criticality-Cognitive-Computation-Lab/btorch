@@ -60,3 +60,62 @@ def test_rate_calibration_restores_trial_state_and_gradients():
             )
         for gradient, reference in zip(forward_vjp(), expected, strict=True):
             torch.testing.assert_close(gradient, reference, rtol=0, atol=0)
+
+
+def test_rate_calibration_restores_online_learning_between_trials():
+    """Calibrating a plastic circuit must not consume its learning state."""
+    from btorch.models.connection import EdgeWeight, PairSTDP, SparseConnection, Synapse
+
+    connection = SparseConnection.from_edges(
+        torch.arange(4),
+        torch.arange(4),
+        4,
+        4,
+        Synapse(
+            weight=EdgeWeight(torch.full((4,), 0.002), trainable=False),
+            plasticity=PairSTDP(a_plus=0.0002, a_minus=0.0001, w_max=0.02),
+        ),
+    )
+    network = RecurrentNN(
+        LIF(4, tau=5.0, c_m=1.0, v_threshold=1.0),
+        ExponentialPSC(4, 3.0, connection),
+        update_state_names=(),
+    )
+    functional.init_net_state(network, batch_size=1, device="cpu", dtype=torch.float32)
+    connection.plasticity.pre_trace.fill_(0.2)
+    connection.plasticity.post_trace.fill_(0.05)
+    initial = functional.named_hidden_states(network, clone=True)
+    weights = connection.weight.value.detach().clone()
+    inputs = torch.linspace(0.2, 0.8, 4).expand(250, 1, 4)
+
+    # Repeat calibration from the same state. Online weights must be restored
+    # between search trials as well as after the complete search; otherwise
+    # the second search may choose a different input scale.
+    first = compute_input_scale(
+        network, inputs, target_hz=20.0, dt_ms=1.0, tolerance_hz=1.0
+    )
+    second = compute_input_scale(
+        network, inputs, target_hz=20.0, dt_ms=1.0, tolerance_hz=1.0
+    )
+    assert first == second
+    torch.testing.assert_close(connection.weight.value, weights, atol=0, rtol=0)
+    torch.testing.assert_close(functional.named_hidden_states(network), initial)
+    # This finite window has 1 Hz population-rate resolution, so this target
+    # cannot be reached. Failed search trials must also leave learning intact.
+    with pytest.raises(RuntimeError, match="Cannot calibrate"):
+        compute_input_scale(
+            network,
+            inputs,
+            target_hz=20.123,
+            dt_ms=1.0,
+            tolerance_hz=0.0001,
+            max_trials=2,
+        )
+    torch.testing.assert_close(connection.weight.value, weights, atol=0, rtol=0)
+    torch.testing.assert_close(functional.named_hidden_states(network), initial)
+
+    # Prove the restored weights were actually subject to learning, rather
+    # than testing a circuit whose plasticity happened to remain inactive.
+    with torch.no_grad(), environ.context(dt=1.0):
+        network(inputs * first[0])
+    assert not torch.equal(connection.weight.value, weights)

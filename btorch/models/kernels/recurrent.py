@@ -1,8 +1,6 @@
 """Prepare stateful recurrent modules for a whole tensor sequence operator."""
 
 import json
-from contextlib import nullcontext
-from functools import lru_cache
 
 import torch
 from torch import nn
@@ -56,17 +54,7 @@ def _reject_stochastic_input_composition(module):
 
 @torch.compiler.assume_constant_result
 def _encode_recurrent_spec(spec):
-    return _encoded_recurrent_items(
-        tuple(
-            (name, tuple(value) if isinstance(value, list) else value)
-            for name, value in sorted(spec.items())
-        )
-    )
-
-
-@lru_cache(maxsize=256)
-def _encoded_recurrent_items(items):
-    return json.dumps(dict(items), sort_keys=True)
+    return json.dumps(spec, sort_keys=True)
 
 
 @torch.compiler.assume_constant_result
@@ -76,7 +64,7 @@ def _compiled_sparse_route(connection, options, method):
         return connection._compiled_method_route(method)
 
 
-def _prepare_connection(connection, options=None):
+def _prepare_connection(connection, options=None, *, online=False):
     if isinstance(connection, nn.Identity):
         return {"connection": "identity"}, (), ()
     if isinstance(connection, nn.Linear):
@@ -132,16 +120,39 @@ def _prepare_connection(connection, options=None):
             )
         )
         topology = (cache.crow, cache.col, cache.t_crow, cache.t_col, cache.t_perm)
-        if connection._run_task_values is not None and explicit_route is None:
+        if (
+            connection._run_task_values is not None
+            and explicit_route is None
+            and not online
+        ):
             topology += (connection._run_task_values,)
+        if online:
+            # Online STDP owns canonical edge identity.  Keep the edge index
+            # arrays beside the execution topology, but never pass packed task
+            # values: they are snapshots and would become stale after step 0.
+            topology += (
+                connection.indices[1],
+                connection.indices[0],
+                connection.delay
+                if connection.delay is not None
+                else connection.indices[1].new_empty(0),
+                cache.perm,
+            )
+        connection_spec = {
+            "connection": "sparse",
+            "online_permuted": bool(
+                online and (connection._always_permute or not cache.identity_perm)
+            ),
+            "method": method,
+            "route": route,
+            "max_density": explicit_route[1]
+            if explicit_route is not None
+            else (None if use_fallback else connection._max_density),
+        }
+        if options is not None and options.recurrent == "helion":
+            connection_spec["max_degree"] = cache.max_source_degree
         return (
-            {
-                "connection": "sparse",
-                "route": route,
-                "max_density": explicit_route[1]
-                if explicit_route is not None
-                else (None if use_fallback else connection._max_density),
-            },
+            connection_spec,
             (
                 values,
                 *(() if connection.bias is None else (connection.bias,)),
@@ -243,27 +254,6 @@ def recurrent_sequence(
 
     if kwargs or loop_args not in (None, (0,), (0, 1)):
         raise ValueError("Cell recurrent sequences accept time-major x and x_syn only")
-    if (
-        not _chunk
-        and module.cudagraph is True
-        and torch.is_grad_enabled()
-        and not torch.compiler.is_compiling()
-    ):
-        from .recurrent_graph import RecurrentGraphs
-
-        steps = x_seq.shape[0]
-        if module.chunk_size is not None and steps > module.chunk_size:
-            sections = (steps + module.chunk_size - 1) // module.chunk_size
-            steps = (
-                module.chunk_size
-                if module.chunk_mode == "split"
-                else (steps + sections - 1) // sections
-            )
-        graphs = getattr(module, "_training_graphs", None)
-        if graphs is None or graphs.steps != steps:
-            module._training_graphs = RecurrentGraphs(
-                steps, module._cudagraph_runner.warmup
-            )
     chunked = module.chunk_size is not None and x_seq.shape[0] > module.chunk_size
     if not _chunk and (chunked or module.grad_checkpoint or module.cpu_offload):
         # Bind sparse execution before checkpoint snapshots are taken. Preparing
@@ -294,6 +284,10 @@ def recurrent_sequence(
         cell, cell.psc.unsqueeze(0)
     )
     options = resolve_model_options(backend, neuron_spec.model, synapse_spec.model)
+    if options.recurrent == "helion" and options.merge_synapse:
+        raise NotImplementedError(
+            "HELION recurrent execution does not support merge_synapse"
+        )
     if options.merge_synapse:
         synapse_states, synapse_parameters = _merge_receptors(
             module, synapse_states, synapse_parameters
@@ -328,10 +322,22 @@ def recurrent_sequence(
     charged_names = [name for name, _ in charged_bindings]
     charged_attributes = [f"neuron.{attribute}" for _, attribute in charged_bindings]
     all_record_names = [*state_names, *charged_attributes]
+    online_connection = (
+        cell.linear if isinstance(cell.linear, SparseConnection) else None
+    )
+    if online_connection is not None and online_connection.plasticity is not None:
+        online_names = (
+            "synapse.linear.plasticity.pre_trace",
+            "synapse.linear.plasticity.post_trace",
+            "synapse.linear.weight.value",
+        )
+    else:
+        online_names = ()
+    available_record_names = [*all_record_names, *online_names]
     requested = (
         list(module.update_state_names)
         if module.update_state_names is not None
-        else all_record_names
+        else [*all_record_names, *online_names[:2]]
     )
     # Sum receptor PSC records from the exact same per-receptor history used by
     # backward; retain the individual dynamics for get_psc and continuation.
@@ -339,7 +345,7 @@ def recurrent_sequence(
     if options.merge_synapse and module.update_state_names is None:
         requested = ["neuron." + name for name in neuron_names] + ["synapse.psc"]
     indices = [
-        aliases[name] if name in aliases else all_record_names.index(name)
+        aliases[name] if name in aliases else available_record_names.index(name)
         for name in requested
     ]
     if x_syn is not None and (
@@ -347,6 +353,9 @@ def recurrent_sequence(
     ):
         raise ValueError("x_syn must have the same time-first shape and device as x")
     x_syn_seq = x_seq.new_empty(0) if x_syn is None else x_syn
+    stdp_bindings = getattr(module, "_stdp_bindings", ())
+    online_binding = stdp_bindings[0] if len(stdp_bindings) == 1 else None
+    online = online_binding is not None
     connection_tensors = tuple(
         (f"connection parameter {name}", value)
         for name, value in cell.linear.named_parameters()
@@ -385,7 +394,7 @@ def recurrent_sequence(
     )
     if torch.compiler.is_compiling():
         connection_spec, connection_parameters, topology = _prepare_connection(
-            cell.linear, options
+            cell.linear, options, online=online
         )
         return _execute(
             module,
@@ -408,10 +417,11 @@ def recurrent_sequence(
             options,
             cell,
             uniform_seq,
+            online_binding,
         )
     with connection_scope(options), _sparse_run_scope(module, x_seq):
         connection_spec, connection_parameters, topology = _prepare_connection(
-            cell.linear
+            cell.linear, options, online=online
         )
         return _execute(
             module,
@@ -434,6 +444,7 @@ def recurrent_sequence(
             options,
             cell,
             uniform_seq,
+            online_binding,
         )
 
 
@@ -458,9 +469,14 @@ def _execute(
     options,
     cell,
     uniform_seq=None,
+    online_binding=None,
 ):
     from .operators import poisson_uniforms
-    from .recurrent_operator import inference, training
+    from .recurrent_operator import (
+        inference,
+        online_inference,
+        training,
+    )
 
     _validate_compile_policy(
         options.neuron,
@@ -498,6 +514,30 @@ def _execute(
             else value
             for value in connection_parameters
         ]
+    online_weight = None
+    online_traces = ()
+    online_parameters = ()
+    if online_binding is not None:
+        connection, _ = online_binding
+        online_weight = connection.weight()
+        online_traces = (
+            connection.plasticity.pre_trace,
+            connection.plasticity.post_trace,
+        )
+        online_parameters = tuple(
+            getattr(connection.plasticity, name)
+            for name in (
+                "a_plus",
+                "a_minus",
+                "tau_plus",
+                "tau_minus",
+                "w_min",
+                "w_max",
+            )
+        )
+        # The canonical weight is a mutable custom-op argument. The first
+        # execution parameter remains the live ordered CSR view when needed.
+        connection_parameters = connection_parameters[1:]
     parameters = [*neuron_parameters, *synapse_parameters, *connection_parameters]
     needs_backward = torch.is_grad_enabled() and any(
         t.requires_grad for t in (x_seq, x_syn_seq, *states, *parameters)
@@ -521,6 +561,10 @@ def _execute(
         else 0
     )
     if needs_backward:
+        if options.recurrent == "helion":
+            raise NotImplementedError(
+                "HELION recurrent execution currently supports inference only"
+            )
         residual_indices = () if checkpoint_interval else range(len(states))
         history_indices = list(dict.fromkeys((*residual_indices, *indices)))
         # The general reverse path retains physical trajectories; the selected
@@ -587,9 +631,38 @@ def _execute(
         "enable_fp_fusion": options.enable_fp_fusion,
         "precise_division": (not options.fast_math),
         "precise_exp": (not options.fast_math),
+        "recurrent": options.recurrent,
         "gradient_activity": activity_index if gradient_activity else None,
         "gradient_list": gradient_list,
     }
+    if online_binding is not None:
+        recurrent_spec["online_stdp"] = True
+    if options.recurrent == "helion":
+        if options.neuron not in ("triton", "tilelang"):
+            raise NotImplementedError(
+                "HELION recurrent execution requires the Triton or TileLang "
+                "neuron backend"
+            )
+        if n_delay:
+            raise NotImplementedError(
+                "HELION recurrent execution currently supports no-delay networks only"
+            )
+        if x_syn_seq.numel():
+            raise NotImplementedError(
+                "HELION recurrent execution currently does not support x_syn"
+            )
+        if connection_spec["connection"] != "sparse":
+            raise NotImplementedError(
+                "HELION recurrent execution requires a static sparse CSR connection"
+            )
+        if connection_spec.get("method") != "push":
+            raise NotImplementedError(
+                "HELION recurrent execution requires connection_method='push'"
+            )
+        if online_binding is not None:
+            raise NotImplementedError(
+                "HELION recurrent execution currently does not support online STDP"
+            )
     if (
         needs_backward
         and x_seq.dtype != torch.float32
@@ -603,7 +676,15 @@ def _execute(
         # schedule only. The encoded layout is part of operator specialization.
         recurrent_spec["paired_checkpoint_interval"] = checkpoint_interval
     encoded = _encode_recurrent_spec(recurrent_spec)
-    operator = training if needs_backward else inference
+    if online_binding is not None and needs_backward:
+        raise RuntimeError("Online STDP cannot be combined with autograd")
+    operator = (
+        online_inference
+        if online_binding is not None
+        else training
+        if needs_backward
+        else inference
+    )
     poisson = neuron_spec.poisson
     if poisson is not None and options.neuron not in _NATIVE_GPU_BACKENDS:
         raise NotImplementedError(
@@ -635,44 +716,79 @@ def _execute(
         options.neuron,
         torch.as_tensor(neuron_spec.dt, dtype=torch.float32, device=x_seq.device),
     )
-    graphs = getattr(module, "_training_graphs", None)
-    capture = (
-        needs_backward
-        and module.cudagraph is True
-        and graphs is not None
-        and x_seq.is_cuda
-        and options.neuron in _NATIVE_GPU_BACKENDS
-        and x_seq.shape[0] == graphs.steps
-        and not torch.compiler.is_compiling()
-        and not torch.cuda.is_current_stream_capturing()
-    )
-    if capture:
-        from ..cudagraph import capture_versions
-        from .registry import cell_backend_revision
-        from .templates import model_template_revision
-
-        version = (
-            capture_versions(module),
-            cell_backend_revision(options.neuron),
-            model_template_revision(neuron_spec.model),
-            model_template_revision(synapse_spec.model),
+    if online_binding is not None:
+        arguments = (
+            x_seq,
+            x_syn_seq,
+            states,
+            parameters,
+            list(topology),
+            online_weight,
+            *online_traces,
+            list(online_parameters),
+            encoded,
+            history_indices,
+            options.neuron,
+            torch.as_tensor(
+                neuron_spec.dt,
+                dtype=torch.float64
+                if online_weight.dtype == torch.float64
+                else torch.float32,
+                device=x_seq.device,
+            ),
         )
-        if graphs.version != version:
-            graphs.stages.clear()
-            graphs.version = version
-    with graphs.activate() if capture else nullcontext():
-        result = operator(
-            *arguments,
-            *((uniform_seq,) if poisson is not None and poisson.spiking else ()),
-        )
+    uniform_args = (uniform_seq,) if poisson is not None and poisson.spiking else ()
+    if online_binding is not None:
+        history_sources = [
+            *states,
+            *(
+                getattr(
+                    module.neuron,
+                    "v_pre_spike" if name == "v_charged" else "u_pre_spike",
+                )
+                for name in charged_names
+            ),
+            *online_traces,
+            online_weight,
+        ]
+        result = [
+            torch.empty_like(x_seq),
+            *(torch.empty_like(value) for value in states),
+            *(
+                history_sources[index].new_empty(
+                    (x_seq.shape[0], *history_sources[index].shape)
+                )
+                if index >= 0
+                else torch.empty_like(history_sources[len(states) - index - 1])
+                for index in history_indices
+            ),
+        ]
+        # Mutable operators with Tensor[] returns cannot be automatically
+        # functionalized by Torch. Preallocated destinations keep the mutation
+        # explicit and let compile preserve its normal functionalization path.
+        operator(*arguments[:9], result, *arguments[9:], *uniform_args)
+    else:
+        result = operator(*arguments, *uniform_args)
     ns = len(neuron_names)
     for name, value in zip(neuron_names, result[1 : 1 + ns]):
-        setattr(module.neuron, name, value)
+        if online_binding is not None:
+            # Online state survives compiler CUDA Graph tree iterations. Keep
+            # its original storage rather than retaining a graph-pool output.
+            getattr(module.neuron, name).copy_(value)
+        else:
+            setattr(module.neuron, name, value)
     for name, value in zip(synapse_names, result[1 + ns : 1 + ns + len(synapse_names)]):
-        setattr(cell, name, value)
+        if online_binding is not None:
+            getattr(cell, name).copy_(value)
+        else:
+            setattr(cell, name, value)
     if n_delay:
         delay = module.synapse.delayed_spike
-        delay.history = result[len(states)].movedim(0, -len(delay.n_neuron) - 1)
+        history = result[len(states)].movedim(0, -len(delay.n_neuron) - 1)
+        if online_binding is not None:
+            delay.history.copy_(history)
+        else:
+            delay.history = history
     histories = dict(zip(history_indices, result[1 + len(states) :]))
     for offset, (name, index) in enumerate(zip(charged_names, charged_indices)):
         attribute = dict(get_template(neuron_spec).record_attributes)[name]
@@ -683,7 +799,10 @@ def _execute(
             if index in histories
             else histories[-offset - 1]
         )
-        setattr(module.neuron, attribute, value)
+        if online_binding is not None:
+            getattr(module.neuron, attribute).copy_(value)
+        else:
+            setattr(module.neuron, attribute, value)
     records = {}
     for name, index in zip(requested, indices):
         value = histories[index]
@@ -700,7 +819,11 @@ def _execute(
     if options.merge_synapse:
         module.synapse.psc = cell.psc
     elif cell is not module.synapse:
-        module.synapse.psc = cell.psc.reshape(
+        psc = cell.psc.reshape(
             *cell.psc.shape[:-1], *module.neuron.n_neuron, module.synapse.n_receptor
         ).sum(-1)
+        if online_binding is not None:
+            module.synapse.psc.copy_(psc)
+        else:
+            module.synapse.psc = psc
     return result[0], records

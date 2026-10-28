@@ -9,6 +9,7 @@ from .registry import _NATIVE_GPU_BACKENDS
 
 NeuronBackend = str
 ConnectionBackend = Literal["auto", "triton", "tilelang", "cusparse", "torch"]
+RecurrentStrategy = Literal["standard", "helion"]
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,8 @@ class KernelOptions:
             differences reached 0.676 mV at step 1000 and about 95 mV
             transiently at differing resets; one repeat had 12 differing
             spike bins out of 60 million. These are observations, not bounds.
+        recurrent: Recurrent schedule. ``helion`` selects the experimental
+            cooperative fused inference path; unsupported configurations raise.
         merge_synapse: Combine compatible linear receptor states explicitly.
             Independent trainable parameters cannot be merged by value.
         enable_fp_fusion: Permit the GPU compiler to contract compatible
@@ -53,6 +56,7 @@ class KernelOptions:
 
     neuron: NeuronBackend = "torch"
     connection: ConnectionBackend = "auto"
+    recurrent: RecurrentStrategy = "standard"
     connection_method: PropagationMethod = "auto"
     merge_synapse: bool = False
     enable_fp_fusion: bool = True
@@ -65,6 +69,8 @@ class KernelOptions:
             raise ValueError(f"Unknown neuron backend: {self.neuron!r}")
         if self.connection not in ("auto", "triton", "tilelang", "cusparse", "torch"):
             raise ValueError(f"Unknown connection backend: {self.connection!r}")
+        if self.recurrent not in ("standard", "helion"):
+            raise ValueError(f"Unknown recurrent backend: {self.recurrent!r}")
         validate_method(self.connection_method)
         if not isinstance(self.merge_synapse, bool):
             raise TypeError("merge_synapse must be a bool")

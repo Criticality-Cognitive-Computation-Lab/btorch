@@ -21,6 +21,7 @@ nav:
   - guides/kernel_backends.md
   - guides/oot_kernels.md
   - guides/sparse_connectivity.md
+  - guides/plasticity.md
 - 设计说明:
   - design/kernel_generation.md
 - faq.md
