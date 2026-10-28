@@ -11,9 +11,15 @@ from .registry import (
 from .templates import (
     BackendFragments,
     ModelTemplate,
+    _load_definitions,
     get_template,
     register_model_template,
 )
+
+
+# Discover scalar model definitions before Dynamo can trace a first execution.
+# Definitions import stateful model classes only inside their golden factories.
+_load_definitions()
 
 
 __all__ = [
@@ -50,13 +56,7 @@ __all__ = [
 def __getattr__(name):
     # Keep stateful-model imports lazy: models import KernelOptions while
     # their classes are still being initialized.
-    native_names = {
-        "KernelBinding",
-        "ModelParityCase",
-        "ModelParityOptions",
-        "check_model_parity",
-        "load_kernel_package",
-    }
+    native_names = {"KernelBinding", "load_kernel_package"}
     response_names = {
         "ModelSnapshot",
         "ResponseTrace",
@@ -67,11 +67,17 @@ def __getattr__(name):
         "plot_response",
         "describe_response",
     }
-    if name in native_names | response_names:
+    testing_names = {"ModelParityCase", "ModelParityOptions", "check_model_parity"}
+    if name in native_names | testing_names | response_names:
         from importlib import import_module
 
         module = import_module(
-            ".native" if name in native_names else ".response", package=__name__
+            ".testing"
+            if name in testing_names
+            else ".native"
+            if name in native_names
+            else ".response",
+            package=__name__,
         )
         value = getattr(module, name)
         globals()[name] = value

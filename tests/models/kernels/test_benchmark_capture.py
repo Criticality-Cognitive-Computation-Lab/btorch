@@ -1,16 +1,15 @@
 """Regression tests for foreign CUDA kernels in benchmark graph capture."""
 
-import functools
 import importlib.util
-import sys
-from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
+from btorch.models.kernels.benchmark import CaptureCase, capture_measure, tensor_bytes
 
-pytestmark = pytest.mark.skipif(
+
+_CUDA_CAPTURE_REQUIRED = pytest.mark.skipif(
     not torch.cuda.is_available() or importlib.util.find_spec("cupy") is None,
     reason="CUDA Graph and CuPy are required",
 )
@@ -31,26 +30,6 @@ extern "C" __global__ void recurrence(
   }
 }
 """
-
-
-@functools.lru_cache(maxsize=1)
-def _benchmark_module():
-    """Load the script-local helper without making benchmarks a package."""
-    root = Path(__file__).resolve().parents[3]
-    benchmark_dir = root / "benchmarks" / "models"
-    path = benchmark_dir / "bench_002hip.py"
-    declaration = importlib.util.spec_from_file_location(
-        "_btorch_test_bench_002hip", path
-    )
-    if declaration is None or declaration.loader is None:
-        raise ImportError(path)
-    module = importlib.util.module_from_spec(declaration)
-    sys.path.insert(0, str(benchmark_dir))
-    try:
-        declaration.loader.exec_module(module)
-    finally:
-        sys.path.remove(str(benchmark_dir))
-    return module
 
 
 def _reference(input):
@@ -82,8 +61,7 @@ def _launch(cupy, kernel, input, output, *, bind_torch_stream):
 
 
 def _build(cupy, kernel, *, bind_torch_stream):
-    """Build the persistent input/output pair expected by
-    ``_measure_graph``."""
+    """Build the persistent input/output pair expected by graph capture."""
     capture_x = torch.linspace(0.2, 1.8, 257, device="cuda")
     captured_output = torch.empty_like(capture_x)
 
@@ -100,7 +78,7 @@ def _build(cupy, kernel, *, bind_torch_stream):
     # Populate the persistent output before capture, matching the benchmark's
     # contract and reproducing the stale-but-initially-correct failure mode.
     operation()
-    return operation, [captured_output], capture_x
+    return CaptureCase(operation=operation, inputs=(capture_x,))
 
 
 def _assert_eager_kernel(cupy, kernel, *, bind_torch_stream):
@@ -119,11 +97,11 @@ def _assert_eager_kernel(cupy, kernel, *, bind_torch_stream):
     torch.testing.assert_close(output, _reference(input), atol=1e-6, rtol=1e-6)
 
 
+@_CUDA_CAPTURE_REQUIRED
 def test_benchmark_rejects_uncaptured_cupy_kernel_after_input_change():
     """Accept a bound RawKernel graph and reject the same kernel when
     unbound."""
     cupy = pytest.importorskip("cupy")
-    benchmark = _benchmark_module()
     kernel = cupy.RawKernel(_SOURCE, "recurrence", options=("--fmad=false",))
     kernel.compile()
 
@@ -132,20 +110,26 @@ def test_benchmark_rejects_uncaptured_cupy_kernel_after_input_change():
     _assert_eager_kernel(cupy, kernel, bind_torch_stream=True)
     _assert_eager_kernel(cupy, kernel, bind_torch_stream=False)
 
-    result = benchmark._measure_graph(
-        torch,
+    result = capture_measure(
         lambda: _build(cupy, kernel, bind_torch_stream=True),
         warmup=2,
         repeats=3,
+        validate=lambda actual, expected: torch.testing.assert_close(
+            actual, expected, atol=0, rtol=0
+        ),
+        mutate=lambda inputs: inputs[0].add_(0.25),
     )
-    assert "changed output required" in result["replay_validation"]
+    assert "changed-input replay passed" in result.validation
 
     try:
-        benchmark._measure_graph(
-            torch,
+        capture_measure(
             lambda: _build(cupy, kernel, bind_torch_stream=False),
             warmup=2,
             repeats=3,
+            validate=lambda actual, expected: torch.testing.assert_close(
+                actual, expected, atol=0, rtol=0
+            ),
+            mutate=lambda inputs: inputs[0].add_(0.25),
         )
     except AssertionError as exc:
         # A stale output is expected to fail either the bit-exact comparison or
@@ -171,3 +155,14 @@ def test_benchmark_rejects_uncaptured_cupy_kernel_after_input_change():
         )
     else:
         pytest.fail("An unbound CuPy kernel was accepted as a captured replay")
+
+
+def test_tensor_bytes_counts_alias_views_once():
+    """Count one allocation when a result exposes both a tensor and its
+    view."""
+    base = torch.empty(16, dtype=torch.float32)
+    clone = torch.empty(4, dtype=torch.float32)
+    result = {"full": base, "view": base[::2], "clone": clone}
+
+    expected = base.untyped_storage().nbytes() + clone.untyped_storage().nbytes()
+    assert tensor_bytes(result) == expected

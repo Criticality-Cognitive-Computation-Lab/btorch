@@ -116,6 +116,8 @@ class GLIF3(BaseNode):
         https://doi.org/10.1126/sciadv.abq7592
     """
 
+    kernel_model = "glif3"
+
     # make mypy typing and autocompletion easier
     Iasc: torch.Tensor
     refractory: torch.Tensor | None

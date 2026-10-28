@@ -34,8 +34,9 @@ def environment_dt(x_seq: Tensor, model: str) -> Tensor:
     dt = float(environ.get("dt"))
     if not math.isfinite(dt) or dt <= 0:
         raise ValueError("dt must be finite and positive")
-    if model == "alpha_billeh" and dt != 1:
-        raise ValueError("AlphaPSCBilleh requires dt == 1")
+    required_dt = get_template(NeuronSpec(model)).required_dt
+    if required_dt is not None and dt != required_dt:
+        raise ValueError(f"{model} requires dt == {required_dt:g}")
     return torch.full((), dt, device=x_seq.device, dtype=torch.float32)
 
 
@@ -198,16 +199,18 @@ def _uses_integrated_dt_validation(callback, backend, x_seq):
 def _validate_parameter_shapes(parameters, spec, states, target_shape, *, label=""):
     """Validate model-aware parameter broadcasting without tensor reads."""
     template = get_template(spec)
-    modes = (
-        states[template.state_names.index("Iasc")].shape[-1]
-        if spec.model == "glif3"
-        else 0
+    component_shapes = tuple(
+        tuple(value.shape[-ndim:])
+        for (name, ndim) in template.state_extra_dims
+        for value in (states[template.state_names.index(name)],)
+        if ndim
     )
+    components = component_shapes[0] if component_shapes else ()
     prefix = f"{label} " if label else ""
     for name, value in zip(template.parameter_names, parameters):
         target = (
-            (*target_shape, modes)
-            if spec.model == "glif3" and name in ("k", "asc_amps")
+            (*target_shape, *components[-template.extra_dims(name) :])
+            if template.extra_dims(name)
             else target_shape
         )
         try:
@@ -257,8 +260,11 @@ def _forward(
         torch._assert_async(
             torch.isfinite(dt) & (dt > 0), "dt must be finite and positive"
         )
-        if spec.model == "alpha_billeh":
-            torch._assert_async(dt == 1, "AlphaPSCBilleh requires dt == 1")
+        required_dt = get_template(spec).required_dt
+        if required_dt is not None:
+            torch._assert_async(
+                dt == required_dt, f"{spec.model} requires dt == {required_dt:g}"
+            )
     arguments = (
         x_seq,
         tuple(states),
@@ -563,18 +569,13 @@ def _setup_context(ctx, inputs, output):
     ctx.model_revision = model_template_revision(decode_spec(encoded).model)
     # Histories are also returned to callers. save_for_backward retains the
     # exact same storage; it does not clone or duplicate requested records.
-    ctx.primary_psc = decode_spec(encoded).model in (
-        "alpha",
-        "alpha_billeh",
-        "exponential",
-        "dual_exponential",
-    )
+    ctx.output_state = get_template(decode_spec(encoded)).output_state
     ctx.save_for_backward(
         x_seq,
         *states,
         *parameters,
         *([output[0]] if residual.save_output else []),
-        *([output[0]] if ctx.primary_psc else []),
+        *([output[0]] if ctx.output_state else []),
         *output[1 + len(states) :],
         dt,
     )
@@ -595,7 +596,7 @@ def _backward(ctx, grad_results):
     residual_output = saved[offset] if ctx.save_residual_output else None
     offset += int(ctx.save_residual_output)
     saved_outputs = list(saved[offset:-1])
-    psc_history = saved_outputs.pop(0) if ctx.primary_psc else None
+    psc_history = saved_outputs.pop(0) if ctx.output_state else None
     histories = saved_outputs[: ctx.n_histories]
     residuals = saved_outputs[ctx.n_histories :]
     grad_output = grad_results[0]
@@ -604,10 +605,12 @@ def _backward(ctx, grad_results):
         grad_results[1 + ctx.n_states : 1 + ctx.n_states + ctx.n_histories]
     )
     history_names = ctx.history_names
-    if ctx.primary_psc:
+    if ctx.output_state:
         histories.append(psc_history)
         grad_history.append(None)
-        history_names = history_names + ("|" if history_names else "") + "psc"
+        history_names = (
+            history_names + ("|" if history_names else "") + ctx.output_state
+        )
     needs_x, needs_states, needs_parameters = ctx.needs_input_grad[:3]
     needs = [needs_x, *needs_states, *needs_parameters]
     results = _reverse(
@@ -790,11 +793,7 @@ def run_multi_step(
             f"Model template {spec.model!r} does not provide a backward_step; "
             "use inference mode or register a backend with a backward implementation"
         )
-    if (
-        needs_backward
-        and backend not in ("torch", "triton", "tilelang", "cupy")
-        and _backend(backend, spec, x_seq.device).backward is None
-    ):
+    if needs_backward and _backend(backend, spec, x_seq.device).backward is None:
         raise NotImplementedError(
             f"Cell backend {backend!r} does not provide a backward implementation"
         )
@@ -818,14 +817,9 @@ def run_multi_step(
         if residual is not None
         else history.requested
     )
-    primary_psc = spec.model in (
-        "alpha",
-        "alpha_billeh",
-        "exponential",
-        "dual_exponential",
-    )
-    if primary_psc:
-        names = tuple(name for name in names if name != "psc")
+    output_state = template.output_state
+    if output_state is not None:
+        names = tuple(name for name in names if name != output_state)
     operator = _training if needs_backward else _inference
     arguments = (
         x_seq,
@@ -847,8 +841,8 @@ def run_multi_step(
     )
     n_states = len(states)
     record_map = dict(zip(names, result[1 + n_states :]))
-    if primary_psc:
-        record_map["psc"] = result[0]
+    if output_state is not None:
+        record_map[output_state] = result[0]
     return (
         result[0].to(x_seq.dtype),
         *result[1 : 1 + n_states],

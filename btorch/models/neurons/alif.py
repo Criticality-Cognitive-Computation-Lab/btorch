@@ -72,6 +72,8 @@ class ALIF(BaseNode):
         dg_k: Per-spike adaptation increment.
     """
 
+    kernel_model = "alif"
+
     g_k: torch.Tensor
     refractory: torch.Tensor | None
 
@@ -312,6 +314,8 @@ class ELIF(ALIF):
         delta_T: Slope factor for exponential term.
         v_T: Soft threshold potential.
     """
+
+    kernel_model = "elif"
 
     delta_T: torch.Tensor | torch.nn.Parameter
     v_T: torch.Tensor | torch.nn.Parameter

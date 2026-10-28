@@ -1,6 +1,8 @@
 """Qualify native floating-point policies against the actual Module
 recurrence."""
 
+import ast
+
 import pytest
 import torch
 
@@ -180,9 +182,23 @@ def test_precise_exp_changes_source_policy_without_changing_default(backend, bac
         assert "libdevice.exp(" in precise
         assert "tl.exp(" not in precise
     elif backend == "tilelang":
+        # Inspect the extern ABI structurally: quote style is not a numerical
+        # policy. The precise path must select CUDA expf rather than T.exp.
+        def expf_calls(source):
+            return [
+                node
+                for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "call_pure_extern"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "expf"
+            ]
+
         assert "T.exp(" in default
-        assert 'T.call_pure_extern("float32", "expf", ' not in default
-        assert 'T.call_pure_extern("float32", "expf", ' in precise
+        assert not expf_calls(default)
+        assert expf_calls(precise)
         assert "T.exp(" not in precise
     else:
         # CuPy's historical lowering is already the standard accurate expf.

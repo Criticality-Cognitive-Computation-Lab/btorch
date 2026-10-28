@@ -784,12 +784,34 @@ def test_autocast_checkpoint_training_matches_module(backend, dtype, execution):
         torch.testing.assert_close(
             root.grad / scale, reference_root.grad / scale, atol=atol, rtol=rtol
         )
+    parameter_values = tuple(
+        parameter.detach().clone() for parameter in model.parameters()
+    )
+    reference_parameter_values = tuple(
+        parameter.detach().clone() for parameter in reference.parameters()
+    )
     scaler.step(optimizer)
     scaler.update()
     reference_scaler.step(reference_optimizer)
     reference_scaler.update()
-    for parameter, wanted in zip(model.parameters(), reference.parameters()):
-        torch.testing.assert_close(parameter, wanted, atol=atol * 0.01, rtol=rtol)
+    # Compare effective SGD updates in gradient units. Direct parameter
+    # comparison is unstable when BF16 cancellation leaves a near-zero value.
+    learning_rate = optimizer.param_groups[0]["lr"]
+    for (
+        parameter,
+        wanted,
+        initial,
+        reference_initial,
+    ) in zip(
+        model.parameters(),
+        reference.parameters(),
+        parameter_values,
+        reference_parameter_values,
+        strict=True,
+    ):
+        update = (initial - parameter) / learning_rate
+        reference_update = (reference_initial - wanted) / learning_rate
+        torch.testing.assert_close(update, reference_update, atol=atol, rtol=rtol)
 
 
 @torch.no_grad()

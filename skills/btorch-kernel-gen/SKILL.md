@@ -17,6 +17,29 @@ Performance acceptance is separate from correctness. For cost that varies with n
 
 Start from [GLIF3/RecurrentNN](assets/templates/glif3_rsnn.py), [MemoryModule](assets/templates/stateful_module.py) or [native operators](assets/templates/native_operator.py). Preserve primitive neuron/PSC multi_step_forward as continuous sequence kernel/op boundaries. Reuse RecurrentNN for network scheduling when sufficient; do not replace primitive multi-step execution with make_rnn. Reusable execution/state/plotting belongs in btorch. NESTML informs explicit state/event and scientific checks.
 
+Treat each `ModelTemplate` as the source of truth for state, parameter, record,
+forward and reverse fragments. Reuse those fragments through the primitive and
+fused paths and render them with the backend-specific renderer; do not add a
+model-specific branch to central dispatch for a new neuron or PSC. A module
+adapter declares its template binding explicitly, and a local extension test
+must exercise the Python golden, generated source and at least one runtime
+backend.
+
 Distinguish inference (stateful, no backward-only tape), training forward and backward. Torch owns autograd/registration. Custom models, mega kernels, sparse layouts, quantization and different backward algorithms remain valid; compare declared semantic oracles. Report first divergence with trace/figure evidence, and do not count missing checks as passes.
 
 OOT directories are unrestricted. Upstream follows target btorch files/tests, fig_path/save_fig and pre-commit formatting, then reruns relevant tests. Verify OOT/in-tree behavior in fresh processes. Default requested delivery is a GitHub Draft PR or GitLab Draft MR, without automatic merge.
+
+For kernel parity, import `ModelParityCase`, `ModelParityOptions` and
+`check_model_parity` from `btorch.models.kernels.testing`; native binding and
+loading helpers remain in `btorch.models.kernels.native`. Prefer a small set of
+named cases, each with an independent physical or gradient oracle. Preserve
+distinct checks for noncontiguous inputs, state continuation, records,
+trainability and compiler/capture behavior. Do not expand routine validation
+into a Cartesian model/backend/dtype/options matrix or repeat the same oracle
+under every combination. Run the full collection only after shared dispatch,
+registration, autograd or source-generation changes.
+
+Coverage audits must enumerate every built-in template and fragment metadata
+declaration, plus each local extension registration, and map them to named
+source, output/state and VJP checks. An unlisted declaration is a coverage gap,
+not an implicit pass.

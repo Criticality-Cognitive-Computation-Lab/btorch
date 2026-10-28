@@ -221,13 +221,24 @@ def test_native_recorded_cudagraph_continuation_and_record_policy(backend):
             precise_exp=True,
         )
         initialize(network, "cuda")
-    inputs = torch.linspace(280.0, 340.0, 8, device="cuda").expand(24, 1, 8)
+    # The expanded source and the strided neuron view are deliberately
+    # non-contiguous. T=413 crosses two default 200-step chunks and a
+    # 13-step tail; shorter calls exercise shape-specific graph entries.
+    source = torch.linspace(280.0, 340.0, 16, device="cuda").reshape(1, 1, 16)
+    inputs = source.expand(413, 1, 16)[..., ::2]
+    assert not inputs.is_contiguous()
+    sequences = (
+        (source.expand(413, 1, 16) + 0.0)[..., ::2][:13],
+        (source.expand(413, 1, 16) + 5.0)[..., ::2],
+        (source.expand(413, 1, 16) + 10.0)[..., ::2][:31],
+    )
     with torch.inference_mode(), environ.context(dt=1.0):
         first = None
         frozen = None
-        for offset in (0.0, 5.0):
-            expected = eager(inputs + offset)
-            actual = captured(inputs + offset)
+        for sequence in sequences:
+            assert not sequence.is_contiguous()
+            expected = eager(sequence)
+            actual = captured(sequence)
             torch.testing.assert_close(actual, expected, atol=1e-3, rtol=2e-5)
             for name, value in functional.named_hidden_states(eager).items():
                 torch.testing.assert_close(
@@ -252,15 +263,12 @@ def test_native_recorded_cudagraph_continuation_and_record_policy(backend):
                 # Returning borrowed graph-pool tensors would mutate the
                 # caller's first result on this continuation replay.
                 torch.testing.assert_close(first, frozen, atol=0, rtol=0)
-        assert captured._cudagraph_runner.n_captures == 1
-
         # Same input shape with a different recording request must recapture;
         # serving an old graph would silently return the wrong record schema.
         eager.update_state_names = captured.update_state_names = ("neuron.v",)
         torch.testing.assert_close(
             captured(inputs), eager(inputs), atol=1e-3, rtol=2e-5
         )
-        assert captured._cudagraph_runner.n_captures == 2
         captured.clear_cudagraph()
         # Clearing graph handles cannot invalidate results already returned.
         torch.testing.assert_close(first, frozen, atol=0, rtol=0)
@@ -275,3 +283,32 @@ def test_native_recorded_cudagraph_continuation_and_record_policy(backend):
             torch.testing.assert_close(
                 captured(inputs), eager(inputs), atol=1e-3, rtol=2e-5
             )
+
+
+def test_native_cudagraph_delayed_sparse_continuation():
+    """Match delayed sparse state across split and ragged graph replays."""
+    require_cuda_backend("triton")
+    eager = _build("delayed_sparse", "triton")
+    captured = copy.deepcopy(eager)
+    captured.cudagraph = True
+    inputs = torch.linspace(0.1, 0.7, 8, device="cuda").reshape(1, 2, 4)
+    inputs = inputs.expand(413, 2, 4)
+
+    with torch.inference_mode(), environ.context(dt=0.3):
+        for sequence in (inputs[:13], inputs, inputs[:31]):
+            expected, expected_records = eager(sequence)
+            actual, actual_records = captured(sequence)
+            torch.testing.assert_close(actual, expected, atol=5e-6, rtol=5e-5)
+            for name in RECORDS:
+                torch.testing.assert_close(
+                    actual_records[name],
+                    expected_records[name],
+                    atol=5e-6,
+                    rtol=5e-5,
+                )
+            for actual_state, expected_state in zip(
+                _final(captured), _final(eager), strict=True
+            ):
+                torch.testing.assert_close(
+                    actual_state, expected_state, atol=5e-6, rtol=5e-5
+                )

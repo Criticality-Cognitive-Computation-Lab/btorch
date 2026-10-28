@@ -4,12 +4,7 @@ equations."""
 import torch
 from torch import Tensor
 
-from .. import environ, surrogate
-from ..neurons.alif import ALIF, ELIF
-from ..neurons.glif import GLIF3
-from ..neurons.izhikevich import Izhikevich
-from ..neurons.lif import IF, LIF
-from ..synapse import AlphaPSC, AlphaPSCBilleh, DualExponentialPSC, ExponentialPSC
+from .. import environ
 from .contracts import NeuronSpec
 from .templates import get_template
 
@@ -42,92 +37,30 @@ def python_module_sequence(
         ValueError: When the model has no built-in Python Module.
     """
     template = get_template(spec)
-    n_neuron = x_seq.shape[-1]
-    kwargs = dict(n_neuron=n_neuron, backend="torch", step_mode="s")
-    neurons = {
-        "if": IF,
-        "lif": LIF,
-        "alif": ALIF,
-        "elif": ELIF,
-        "glif3": GLIF3,
-        "izhikevich": Izhikevich,
-    }
-    if spec.model in neurons:
-        functions = dict(
-            sigmoid=surrogate.Sigmoid,
-            atan=surrogate.ATan,
-            atan_approx=surrogate.ATanApprox,
-            erf=surrogate.Erf,
-            superspike=surrogate.SuperSpike,
-            triangle=surrogate.Triangle,
-            poisson=surrogate.PoissonRandomSpike,
-        )
-        function_kwargs = (
-            {
-                "spiking": spec.poisson.spiking,
-                "tau": spec.poisson.tau,
-                "rho": spec.poisson.rho,
-                "leak": spec.poisson.leak,
-                "k": spec.poisson.k,
-                "damping_factor": spec.damping,
-            }
-            if spec.poisson is not None
-            else {"alpha": spec.alpha, "damping_factor": spec.damping}
-        )
-        spike_function = functions[spec.surrogate](**function_kwargs)
-        if spec.surrogate_width is not None:
-            spike_function = surrogate.Truncated(spike_function, spec.surrogate_width)
-        kwargs.update(
-            surrogate_function=spike_function,
-            hard_reset=spec.hard_reset,
-            detach_reset=spec.detach_reset,
-            device="cpu",
-            dtype=torch.float32,
-        )
-        kwargs["pre_spike" if spec.model == "izhikevich" else "pre_spike_v"] = True
-        if spec.refractory:
-            kwargs["tau_ref"] = 1.0
-        if spec.model == "glif3":
-            n_modes = states[1].shape[-1]
-            kwargs.update(k=[0.2] * n_modes, asc_amps=[0.0] * n_modes)
-        # Constructor defaults are irrelevant after binding. Keep them on CPU
-        # to avoid synchronous host-to-device copies during CUDA graph capture.
-        with torch.device("cpu"):
-            module = neurons[spec.model](**kwargs)
-    else:
-        kwargs["linear"] = torch.nn.Identity()
-        if spec.model == "dual_exponential":
-            with torch.device("cpu"):
-                module = DualExponentialPSC(tau_rise=2.0, tau_decay=4.0, **kwargs)
-        else:
-            classes = dict(
-                exponential=ExponentialPSC, alpha=AlphaPSC, alpha_billeh=AlphaPSCBilleh
-            )
-            if spec.model not in classes:
-                raise ValueError("External model parity requires ParityCase.golden")
-            with torch.device("cpu"), environ.context(dt=spec.dt):
-                module = classes[spec.model](tau_syn=4.0, **kwargs)
+    if template.module_factory is None:
+        raise ValueError("External model parity requires an explicit golden callable")
+    with torch.device("cpu"), environ.context(dt=spec.dt):
+        module = template.module_factory(spec, states, x_seq.shape[-1])
+    parameter_attributes = dict(template.parameter_attributes)
+    record_attributes = dict(template.record_attributes)
     for name, value in zip(template.parameter_names, parameters):
         # Registering a new Parameter would detach the supplied leaf tensor.
         # Bind the original tensor as a buffer so autograd sees this exact input.
-        name = "_v_rest" if spec.model == "glif3" and name == "v_rest" else name
+        name = parameter_attributes.get(name, name)
         module._parameters.pop(name, None)
         module._buffers.pop(name, None)
         if name in module.__dict__:
             delattr(module, name)
-        module.register_buffer(name, value.float(), persistent=False)
+        module.register_buffer(name, value, persistent=False)
     for name, value in zip(template.state_names, states):
-        setattr(module, name, value.float())
+        setattr(module, name, value)
     outputs = []
     histories = {name: [] for name in requested}
     with environ.context(dt=spec.dt):
         for x in x_seq:
-            outputs.append(module.single_step_forward(x.float()))
+            outputs.append(module.single_step_forward(x))
             for name in requested:
-                attribute = {
-                    "v_charged": "v_pre_spike",
-                    "u_charged": "u_pre_spike",
-                }.get(name, name)
+                attribute = record_attributes.get(name, name)
                 histories[name].append(getattr(module, attribute))
     output = (
         torch.stack(outputs).to(x_seq.dtype)
@@ -139,12 +72,12 @@ def python_module_sequence(
         torch.stack(histories[name])
         if histories[name]
         else states[
-            template.state_names.index(name.removesuffix("_charged"))
+            template.state_names.index(template.history_state_name(name))
         ].new_empty(
             (
                 0,
                 *states[
-                    template.state_names.index(name.removesuffix("_charged"))
+                    template.state_names.index(template.history_state_name(name))
                 ].shape,
             )
         )

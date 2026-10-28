@@ -863,9 +863,8 @@ class RecurrentNN(RecurrentNNAbstract):
         """Track execution choices and tensors wired into captured kernels."""
         from .kernels.options import resolve_model_options
         from .kernels.registry import cell_backend_revision
-        from .neurons.alif import ALIF, ELIF
 
-        neuron_model = {ALIF: "alif", ELIF: "elif"}.get(type(self.neuron))
+        neuron_model = type(self.neuron).__dict__.get("kernel_model")
         options = resolve_model_options(
             self.backend, *(() if neuron_model is None else (neuron_model,))
         )

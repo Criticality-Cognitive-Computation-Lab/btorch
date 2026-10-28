@@ -77,7 +77,7 @@ Parameters and initial states must be explicit participating tensor inputs. Your
 ## Check model and gradient parity
 
 ```python
-from btorch.models.kernels.native import (
+from btorch.models.kernels.testing import (
     ModelParityCase, ModelParityOptions, check_model_parity,
 )
 

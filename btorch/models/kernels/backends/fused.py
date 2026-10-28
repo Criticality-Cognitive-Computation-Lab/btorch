@@ -7,15 +7,15 @@ cell launches.
 """
 
 import functools
-import re
 from dataclasses import dataclass, field, replace
 
 import torch
 
-from ..templates import get_template, model_template_revision
+from ..program import namespace_statements, substitute_expression
+from ..templates import RecordCotangent, get_template, model_template_revision
 from .engine import (
     _compile,
-    _launch_kernel,
+    _device_scope,
     _layout,
     _load_prepared_parameters,
     _mode_name,
@@ -28,6 +28,7 @@ from .engine import (
     _tensor_storage,
 )
 from .fragments import get_fragments, scalar_layout
+from .renderers import get_runtime
 
 
 def _prepare_psc_parameters(parameters, template, physical_target, logical_target):
@@ -49,20 +50,6 @@ def _prepare_psc_parameters(parameters, template, physical_target, logical_targe
         buffers[name] = converted
         layouts.append(layout)
     return buffers, tuple(layouts)
-
-
-def _prefix(statements, prefix):
-    """Rename declared scalar registers without interpreting their
-    expressions."""
-    functions = {"exp", "expm1", "fma", "where", "maximum", "abs"}
-    return tuple(
-        re.sub(
-            r"\b[A-Za-z_]\w*\b",
-            lambda match: match[0] if match[0] in functions else prefix + match[0],
-            statement,
-        )
-        for statement in statements
-    )
 
 
 def _build_fused_source(
@@ -133,10 +120,8 @@ def _build_fused_source(
                 layout.span if layout is not None else n * _state_receptors,
             )
             parameter_index = (
-                re.sub(
-                    r"\bindex\b",
-                    f"({index})",
-                    _parameter_index(name, layout, 0, backend),
+                substitute_expression(
+                    _parameter_index(name, layout, 0, source.renderer), {"index": index}
                 )
                 if layout is not None
                 else index
@@ -169,7 +154,7 @@ def _build_fused_source(
             index=index,
         )
         source.statements(
-            _prefix(
+            namespace_statements(
                 get_fragments(psc_spec, prepared_values=psc_prepared_scalars).forward,
                 prefix,
             )
@@ -204,7 +189,7 @@ def _build_fused_source(
         base, _ = _mode_name(name, modes)
         layout = neuron_layouts[base] if neuron_layouts is not None else None
         index = (
-            _parameter_index(name, layout, modes, backend)
+            _parameter_index(name, layout, modes, source.renderer)
             if layout is not None
             else source.index(name)
         )
@@ -225,7 +210,7 @@ def _build_fused_source(
             "index",
         )
     source.statements(
-        _prefix(
+        namespace_statements(
             get_fragments(
                 neuron_spec,
                 modes,
@@ -252,12 +237,16 @@ def _build_fused_source(
                 "neuron_" + name + "_next",
             )
     for name in neuron_histories:
-        source.pointer("neuron_" + name + "_seq", n * modes if name == "Iasc" else n)
+        source.pointer(
+            "neuron_" + name + "_seq", n * modes if neuron.extra_dims(name) else n
+        )
         scalars = (
-            tuple(f"Iasc_{i}" for i in range(modes)) if name == "Iasc" else (name,)
+            tuple(f"{name}_{i}" for i in range(modes))
+            if neuron.extra_dims(name)
+            else (name,)
         )
         for scalar in scalars:
-            value = scalar if name.endswith("_charged") else scalar + "_next"
+            value = scalar + "_next" if name in neuron.state_names else scalar
             source.store(
                 "neuron_" + name + "_seq", source.index(scalar), "neuron_" + value
             )
@@ -386,8 +375,10 @@ class _FusedStep:
     variants: dict = field(default_factory=dict, init=False)
     argument_indices: dict[str, int] = field(init=False)
     arguments: list = field(init=False)
+    runtime: object = field(init=False, repr=False)
 
     def __post_init__(self):
+        self.runtime = get_runtime(self.backend)
         self.argument_indices = {
             name: index for index, (name, _size) in enumerate(self.declarations)
         }
@@ -451,13 +442,15 @@ class _FusedStep:
         )
         for (name, _size), value in zip(declarations, values):
             self.arguments[self.argument_indices[name]] = value
-        _launch_kernel(
-            self.backend,
-            self.kernel,
-            tuple(self.arguments),
-            self.n,
-            enable_fp_fusion=self.enable_fp_fusion,
-        )
+        with _device_scope(self.buffers["neuron_input"].device):
+            self.runtime.launch(
+                self.kernel,
+                self.arguments,
+                self.n,
+                enable_fp_fusion=self.enable_fp_fusion,
+                debug=None,
+                num_warps=None,
+            )
 
 
 def prepare_fused_step(
@@ -678,20 +671,27 @@ def fused_step_forward(
     )
 
 
-def _reverse_statements(spec, prefix, names, modes=0, *, prepared_values=()):
+def _reverse_statements(
+    spec, prefix, names, modes=0, *, prepared_values=(), record_presence=None
+):
     statements = []
     for statement in get_fragments(
         spec,
         modes,
         prepared_values=prepared_values,
     ).backward:
+        if isinstance(statement, RecordCotangent):
+            if record_presence and record_presence.get(statement.name, False):
+                name = statement.name
+                statements.append(f"grad_s_{name} = grad_s_{name} + grad_r_{name}")
+            continue
         lhs = statement.split(" = ", 1)[0]
         if lhs.startswith("grad_p_"):
             base, _ = _mode_name(lhs[len("grad_p_") :], modes)
             if base not in names:
                 continue
         statements.append(statement)
-    return _prefix(statements, prefix)
+    return namespace_statements(tuple(statements), prefix)
 
 
 @functools.lru_cache(maxsize=256)
@@ -809,7 +809,7 @@ def _cached_fused_backward_source(
             f"neuron_grad_s_{name} = neuron_grad_s_{name} + neuron_grad_r_{name}"
         )
     for name in neuron.history_names:
-        if not name.endswith("_charged"):
+        if name in neuron.state_names:
             continue
         cotangent(
             "neuron_grad_r_" + name,
@@ -850,7 +850,7 @@ def _cached_fused_backward_source(
                 source.index(name),
                 "neuron_grad_p_" + name,
             )
-    record_vjp_after = dict(get_fragments(psc_spec).record_vjp_after)
+    deferred_records = get_fragments(psc_spec).deferred_records
     for receptor in range(_state_receptors):
         prefix = f"psc_{receptor}_"
         index = f"index * {_state_receptors} + {receptor}"
@@ -870,7 +870,7 @@ def _cached_fused_backward_source(
                 psc_size(name),
                 psc_record_presence.get(name, False),
             )
-            if name not in record_vjp_after:
+            if name not in deferred_records:
                 source.lines.append(
                     f"{prefix}grad_s_{name} = "
                     f"{prefix}grad_s_{name} + {prefix}grad_r_{name}"
@@ -880,6 +880,7 @@ def _cached_fused_backward_source(
                 psc_spec,
                 prefix,
                 psc_parameter_names,
+                record_presence=psc_record_presence,
                 prepared_values=tuple(
                     item.scalar_name
                     for item in psc.prepared_parameters
@@ -887,23 +888,6 @@ def _cached_fused_backward_source(
                 ),
             )
         )
-        for name, anchor in record_vjp_after.items():
-            if not psc_record_presence.get(name, False):
-                continue
-            # Association constraints belong to the mathematical fragments;
-            # pairing only inserts the declared record cotangent at that stage.
-            output_update = _prefix((anchor,), prefix)[0]
-            try:
-                output_index = psc_reverse.index(output_update)
-            except ValueError as error:
-                raise RuntimeError(
-                    f"Missing record VJP stage for {psc.name}.{name}: {anchor}"
-                ) from error
-            psc_reverse.insert(
-                output_index + 1,
-                f"{prefix}grad_s_{name} = "
-                f"{prefix}grad_s_{name} + {prefix}grad_r_{name}",
-            )
         source.statements(psc_reverse)
         for name in psc.state_names:
             source.store("psc_grad_" + name + "_init", index, prefix + "grad_s_" + name)
@@ -1229,7 +1213,7 @@ def prepare_fused_backward(
                 layout = parameter_layouts[name]
                 output_shapes[prefix + "grad_" + name] = layout.target_shape
     for name in neuron.history_names:
-        if not name.endswith("_charged"):
+        if name in neuron.state_names:
             continue
         cotangent("neuron_record_grad_" + name, neuron_record_grads.get(name))
     output_gradient("grad_neuron_input", neuron_input)

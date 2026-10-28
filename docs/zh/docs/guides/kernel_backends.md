@@ -61,7 +61,7 @@ backward 使用对应 forward 的 dt。CUDA graph replay 保留捕获值，除�
 
 显式 kernel 选项使用有状态 PSC 序列递推。原有 `backend="torch"` 的 PSC 多步
 卷积从静息状态计算，由 `kernel_len` 截断 impulse response，不写回状态；需要
-有状态 Torch reference 时使用 `backend=KernelOptions(cell="torch")`。
+有状态 Torch reference 时使用 `backend=KernelOptions(neuron="torch")`。
 
 `merge_synapse=False` 保留独立 receptor 状态，可查询 EPSC/IPSC。显式 merge 仅
 适用于兼容的线性 dynamics，以及兼容的冻结参数或真正共享的参数对象。独立可训练
@@ -76,3 +76,7 @@ merge 是 heterogeneous RSNN 的选项，独立 neuron/PSC 调用会拒绝该选
 
 参见 [外部 kernel 指南](oot_kernels.md)、
 [训练教程](../tutorials/kernel_training.md) 和 [sparse 指南](sparse_connectivity.md)。
+
+`ConductancePSC` 的独立调用可使用原生后端。连接 COBA 网络时使用
+`ConductanceRecurrentNN`；该类只接受 `ConductancePSC` 类型，且网络中所有
+模块必须使用纯 `backend="torch"`。目前不支持原生后端的循环 COBA 执行。

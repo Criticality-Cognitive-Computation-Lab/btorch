@@ -385,6 +385,8 @@ class ExponentialPSC(BasePSC):
         backend: Compute backend. Default: "torch".
     """
 
+    kernel_model = "exponential"
+
     tau_syn: torch.Tensor | torch.nn.Parameter
 
     def __init__(
@@ -473,12 +475,26 @@ class ConductancePSC(ExponentialPSC):
         """COBA output ``g (E - v)`` given post-synaptic ``v``; else ``g`` (CUBA)."""
         return self.psc if v is None else self.psc * (self.E - v)
 
+    def _kernel_sequence(self, z_seq: Tensor, v_seq: Tensor | None = None) -> Tensor:
+        """Execute the native exponential state kernel and apply COBA
+        voltage."""
+        from .kernels.adapters import _psc_sequence
+
+        conductance = _psc_sequence(
+            self,
+            z_seq,
+            layout=("exponential", ("psc",), ("tau_syn",)),
+        )
+        if v_seq is None:
+            return conductance
+        padding = conductance.ndim - v_seq.ndim
+        voltage = v_seq.reshape(v_seq.shape[0], *((1,) * padding), *v_seq.shape[1:])
+        return conductance * (self.E - voltage)
+
     def single_step_forward(self, z: Tensor, v: Tensor | None = None):
         if self.backend != "torch":
-            from .kernels.adapters import conductance_sequence
-
             voltage = None if v is None else v.unsqueeze(0)
-            return conductance_sequence(self, z.unsqueeze(0), voltage)[0]
+            return self._kernel_sequence(z.unsqueeze(0), voltage)[0]
         self.conductance_charge()
         self.adaptation_charge(z)
         return self.current_charge(v)
@@ -522,9 +538,7 @@ class ConductancePSC(ExponentialPSC):
         """
         if v_seq is None:
             if self.backend != "torch":
-                from .kernels.adapters import conductance_sequence
-
-                return conductance_sequence(self, z_seq)
+                return self._kernel_sequence(z_seq)
             return super().multi_step_forward(z_seq, kernel_len=kernel_len)
         if v_seq.ndim == 0:
             raise ValueError("v_seq must have a leading time dimension")
@@ -557,9 +571,7 @@ class ConductancePSC(ExponentialPSC):
             ).expand(0, *output_shape)
             return self.psc * (self.E - voltage)
         if self.backend != "torch":
-            from .kernels.adapters import conductance_sequence
-
-            return conductance_sequence(self, z_seq, v_seq)
+            return self._kernel_sequence(z_seq, v_seq)
 
         static_voltage = v_seq.shape[0] == 1
         return torch.stack(
@@ -588,6 +600,7 @@ class _Adaptive2VarPSC(BasePSC):
 
 
 class AlphaPSCBilleh(_Adaptive2VarPSC):
+    kernel_model = "alpha_billeh"
     tau_syn: torch.Tensor | torch.nn.Parameter
     syn_decay: torch.Tensor
 
@@ -657,6 +670,7 @@ class AlphaPSCBilleh(_Adaptive2VarPSC):
 
 
 class AlphaPSC(_Adaptive2VarPSC):
+    kernel_model = "alpha"
     tau_syn: torch.Tensor | torch.nn.Parameter
     g_max: torch.Tensor | torch.nn.Parameter
 
@@ -713,6 +727,7 @@ class AlphaPSC(_Adaptive2VarPSC):
 
 
 class DualExponentialPSC(BasePSC):
+    kernel_model = "dual_exponential"
     tau_rise: torch.Tensor | torch.nn.Parameter
     tau_decay: torch.Tensor | torch.nn.Parameter
     a: torch.Tensor
@@ -1153,11 +1168,32 @@ class HeterSynapsePSC(BasePSC):
     ) -> torch.Tensor:
         return psc_flat.reshape(*leading, *self.n_neuron, self.n_receptor).sum(-1)
 
+    def _kernel_sequence(self, z_seq: Tensor) -> Tensor:
+        """Execute the delayed/receptor composition around the base PSC."""
+        from contextlib import nullcontext
+
+        from .kernels.adapters import connection_scope, delay_sequence, psc_sequence
+        from .kernels.options import normalize_backend
+        from .rnn import _sparse_run_scope
+
+        options = normalize_backend(self.backend)
+        with (
+            connection_scope(options),
+            _sparse_run_scope(self, z_seq) if z_seq.shape[0] else nullcontext(),
+        ):
+            source, leading, has_receptor_axis = self._flatten_input(z_seq)
+            if self.delayed_spike is not None:
+                self._validate_delayed_input(has_receptor_axis, z_seq.shape)
+                source = delay_sequence(self, source)
+            output = psc_sequence(self.base_psc, source)
+            result = self._reshape_sum_receptor(output, leading)
+            if z_seq.shape[0]:
+                self.psc = result[-1]
+            return result
+
     def single_step_forward(self, z: torch.Tensor) -> torch.Tensor:
         if self.backend != "torch":
-            from .kernels.adapters import psc_sequence
-
-            return psc_sequence(self, z.unsqueeze(0))[0]
+            return self._kernel_sequence(z.unsqueeze(0))[0]
         z_flat, leading, has_receptor_axis = self._flatten_input(z)
 
         if self.delayed_spike is not None:

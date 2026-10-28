@@ -1,66 +1,16 @@
-"""Validate external cell kernels against the existing btorch Python
-Modules."""
+"""Compare explicit kernel workloads with independent model executions."""
 
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 import torch
 from torch import Tensor
+from torch.utils._pytree import keystr, tree_flatten, tree_flatten_with_path
 
 from .contracts import HistoryPlan, NeuronSpec
 from .golden import python_module_sequence
 from .operators import run_multi_step
 from .templates import get_template
-
-
-@dataclass(frozen=True)
-class ParityCase:
-    """Describe an independent numerical trajectory for kernel validation.
-
-    Args:
-        x_seq: Time-first drive tensor.
-        states: Initial states in the declared model order.
-        parameters: Floating parameters in the declared model order.
-        spec: Model and scalar integration choices.
-        history: Records included in the loss as well as output comparison.
-        name: Human-readable scenario name.
-        golden: Independent Python sequence callable for external models. Built-in
-            models always default to the original btorch Torch Modules.
-    """
-
-    x_seq: Tensor
-    states: tuple[Tensor, ...]
-    parameters: tuple[Tensor, ...]
-    spec: NeuronSpec
-    history: HistoryPlan = HistoryPlan()
-    name: str = "trajectory"
-    golden: Callable | None = None
-
-
-@dataclass(frozen=True)
-class ParityOptions:
-    """Configure numerical tolerances and additional execution checks.
-
-    Args:
-        atol: Absolute tolerance; None selects a dtype-dependent default.
-        rtol: Relative tolerance; None selects a dtype-dependent default.
-        check_gradients: Check every floating input, initial state and parameter.
-        check_edge_cases: Also check empty, single-step and noncontiguous drives,
-            plus losses on every record declared by the model template.
-        check_continuation: Also check chunk continuation and two outstanding
-            forwards followed by one combined backward.
-        compile: Also test static fullgraph compilation and its gradients.
-        capture: Also test warmed-up CUDA inference replay and, when
-            check_gradients is enabled, captured forward/backward replay.
-    """
-
-    atol: float | None = None
-    rtol: float | None = None
-    check_gradients: bool = True
-    check_edge_cases: bool = True
-    check_continuation: bool = True
-    compile: bool = False
-    capture: bool = False
 
 
 @dataclass(frozen=True)
@@ -149,7 +99,10 @@ def _compare(name, actual, expected, atol, rtol, *, spikes=False) -> TensorParit
     actual, expected = actual.detach().cpu(), expected.detach().cpu()
     if not actual.numel():
         return TensorParity(name, True, 0.0, 0.0)
-    difference = (actual.double() - expected.double()).abs()
+    difference = (
+        actual.to(torch.complex128 if actual.is_complex() else torch.float64)
+        - expected.to(torch.complex128 if expected.is_complex() else torch.float64)
+    ).abs()
     close = (
         actual == expected
         if spikes or not (actual.is_floating_point() or actual.is_complex())
@@ -157,560 +110,515 @@ def _compare(name, actual, expected, atol, rtol, *, spikes=False) -> TensorParit
     )
     mismatch = torch.nonzero(~close, as_tuple=False)
     first = tuple(mismatch[0].tolist()) if mismatch.numel() else None
-    relative = difference / expected.double().abs().clamp_min(max(atol, 1e-12))
+    relative = difference / expected.abs().to(torch.float64).clamp_min(max(atol, 1e-12))
     return TensorParity(
         name,
         first is None,
         difference.max().item(),
         relative.max().item(),
         first,
-        first[0] if spikes and first is not None else None,
+        first[0] if spikes and first is not None and first else None,
     )
 
 
-def _inputs(case, gradients):
-    values = (case.x_seq, *case.states, *case.parameters)
-    mask = (gradients,) * len(values) if isinstance(gradients, bool) else gradients
-    result = []
-    for value, needed in zip(values, mask):
-        # clone() can compact sliced views. Preserve the actual input strides so
-        # indexing defects in an external kernel are observable.
-        copied = torch.empty_strided(
-            value.shape, value.stride(), dtype=value.dtype, device=value.device
-        )
-        copied.copy_(value.detach())
-        result.append(copied.requires_grad_(needed))
-    return tuple(result)
-
-
 def _loss_weights(outputs):
-    # Local seeded, nonperiodic VJP probes expose indexing defects without
-    # consuming the caller's RNG. A probe is numerical evidence, not a proof
-    # of the complete Jacobian.
+    """Create identical local cotangents without consuming the caller's RNG."""
     weights = []
     for index, value in enumerate(outputs):
         generator = torch.Generator(device=value.device).manual_seed(1729 + index)
+        dtype = (
+            value.dtype
+            if value.is_floating_point() or value.is_complex()
+            else torch.float32
+        )
         weights.append(
             torch.randn(
-                value.shape,
-                device=value.device,
-                dtype=torch.float32,
-                generator=generator,
+                value.shape, device=value.device, dtype=dtype, generator=generator
             )
         )
     return tuple(weights)
 
 
-def _loss(outputs, weights=None):
-    if weights is None:
-        weights = _loss_weights(outputs)
-    terms = [
-        (value.float() * weight).sum() / (index + 1)
-        for index, (value, weight) in enumerate(zip(outputs, weights))
+@dataclass(frozen=True)
+class ModelParityCase:
+    """Describe a whole model or operator comparison.
+
+    Callables must start from the supplied independent initial tensors on each
+    invocation; factories or closures can reconstruct stateful Modules. No
+    model equations or numerical-gradient semantics are inferred by this tool.
+
+    Args:
+        name: Scenario identifier.
+        golden: Confirmed Python model execution.
+        candidate: Native execution or binding with the same tensor contract.
+        inputs: Inputs, initial states and parameters, including frozen tensors.
+        input_names: Optional semantic names for input/state/parameter VJPs.
+        exact_outputs: Pytree paths compared exactly, such as spike records.
+        immutable_inputs: Reject a candidate mutating the supplied pure tensor
+            ABI inputs; stateful model wrappers may leave this disabled.
+        gradient_oracle: Optional callable ``(inputs, outputs, cotangents)``
+            returning one gradient per input for alternative gradient semantics.
+    """
+
+    name: str
+    golden: Callable
+    candidate: Callable
+    inputs: tuple[Tensor, ...]
+    gradient_oracle: Callable | None = None
+    input_names: tuple[str, ...] = ()
+    exact_outputs: tuple[str, ...] = ()
+    immutable_inputs: bool = False
+
+
+@dataclass(frozen=True)
+class ModelParityOptions:
+    """Configure whole-operator numerical comparison.
+
+    Args:
+        atol: Absolute tolerance.
+        rtol: Relative tolerance.
+        check_gradients: Compare VJPs of inputs marked requires_grad.
+        gradient_atol: Optional VJP tolerance; None uses atol.
+        gradient_rtol: Optional VJP tolerance; None uses rtol.
+        modes: Verification autograd contexts, not a Module execution switch.
+            Inference-only kernels can select inference and no_grad. A training
+            context with frozen inputs does not prove training-kernel execution.
+    """
+
+    atol: float = 1e-5
+    rtol: float = 1e-5
+    check_gradients: bool = True
+    gradient_atol: float | None = None
+    gradient_rtol: float | None = None
+    modes: tuple[str, ...] = ("training", "inference")
+
+
+def _storage_bytes(value):
+    storage = value.untyped_storage()
+    raw = torch.empty(0, device=value.device, dtype=torch.uint8)
+    return raw.set_(storage, 0, (storage.nbytes(),), (1,))
+
+
+def _clone_inputs(inputs):
+    """Isolate materialized strided inputs while retaining their storage
+    graph."""
+    storages, identities, copied = {}, {}, []
+    with torch.no_grad():
+        for value in inputs:
+            if value.layout != torch.strided or value.device.type == "meta":
+                raise ValueError("Parity inputs must be materialized strided tensors")
+            if id(value) not in identities:
+                storage = value.untyped_storage()
+                key = (value.device, storage._cdata)
+                if key not in storages:
+                    # Clone bytes once, so mixed-dtype aliases retain storage too.
+                    storages[key] = _storage_bytes(value).clone().untyped_storage()
+                clone = torch.empty(0, device=value.device, dtype=value.dtype)
+                clone.set_(
+                    storages[key], value.storage_offset(), value.shape, value.stride()
+                )
+                clone = clone.detach().requires_grad_(value.requires_grad)
+                identities[id(value)] = clone
+            copied.append(identities[id(value)])
+    return tuple(copied)
+
+
+def _copy_inputs(destinations, sources):
+    """Restore aliased or expanded input views through their backing stores."""
+    copied = set()
+    with torch.no_grad():
+        for dst, src in zip(destinations, sources, strict=True):
+            key = (dst.device, dst.untyped_storage()._cdata)
+            if key not in copied:
+                _storage_bytes(dst).copy_(_storage_bytes(src))
+                copied.add(key)
+
+
+def _outputs(result):
+    values, structure = tree_flatten(result)
+    if any(not isinstance(value, Tensor) for value in values):
+        raise TypeError("Parity outputs must be a tensor pytree")
+    return values, structure
+
+
+def _vjp(inputs, outputs, cotangents):
+    active = list(dict.fromkeys(value for value in inputs if value.requires_grad))
+    selected = [
+        (value, grad) for value, grad in zip(outputs, cotangents) if value.requires_grad
     ]
-    return sum(terms)
-
-
-def _gradients(outputs, inputs, weights=None):
-    if not inputs:
-        return ()
-    loss = _loss(outputs, weights)
-    # An empty trajectory or unused parameter has the zero mathematical
-    # derivative even when the eager reference constructs no autograd graph.
-    if not loss.requires_grad:
+    if not active or not selected:
         return (None,) * len(inputs)
-    return torch.autograd.grad(loss, inputs, allow_unused=True)
+    gradients = torch.autograd.grad(
+        [value for value, _ in selected],
+        active,
+        [grad for _, grad in selected],
+        allow_unused=True,
+    )
+    lookup = {id(value): grad for value, grad in zip(active, gradients)}
+    return tuple(lookup.get(id(value)) for value in inputs)
+
+
+def check_model_parity(
+    cases: list[ModelParityCase], *, options: ModelParityOptions = ModelParityOptions()
+) -> ParityReport:
+    """Compare inference, training outputs and declared input gradients.
+
+    Output pytree leaves include final states and user records, so their VJPs
+    also participate in backward checks. A local seeded nonperiodic cotangent
+    samples one VJP, not the complete Jacobian. Supply separate cases for edge
+    cases, continuation and alternative workloads; no time layout is assumed.
+
+    Args:
+        cases: Independent executions using the actual Python model as golden.
+        options: Numerical tolerances and gradient-check selection.
+
+    Returns:
+        Existing btorch parity report, including explicit unavailable checks.
+    """
+    if not options.modes or any(
+        mode not in ("inference", "no_grad", "training") for mode in options.modes
+    ):
+        raise ValueError("modes must select inference, no_grad or training contexts")
+    report = ParityReport("native")
+    for case in cases:
+        if case.input_names and len(case.input_names) != len(case.inputs):
+            raise ValueError("input_names must name every input tensor")
+        for mode in options.modes:
+            label = f"{case.name}/{mode}"
+            context = {
+                "inference": torch.inference_mode,
+                "no_grad": torch.no_grad,
+                "training": torch.enable_grad,
+            }[mode]
+            try:
+                with context():
+                    expected_inputs = _clone_inputs(case.inputs)
+                    actual_inputs = _clone_inputs(case.inputs)
+                    expected_result = case.golden(*expected_inputs)
+                    expected, expected_tree = _outputs(expected_result)
+                    named_leaves, _ = tree_flatten_with_path(expected_result)
+                    output_names = tuple(keystr(path) for path, _ in named_leaves)
+                    if set(case.exact_outputs).difference(output_names):
+                        raise ValueError(
+                            "exact_outputs must name existing output tensor paths"
+                        )
+                    snapshots = (
+                        tuple(v.detach().clone() for v in actual_inputs)
+                        if case.immutable_inputs
+                        else ()
+                    )
+                    actual, actual_tree = _outputs(case.candidate(*actual_inputs))
+                    for index, before in enumerate(snapshots):
+                        if not torch.equal(actual_inputs[index].detach(), before):
+                            name = (
+                                case.input_names[index]
+                                if case.input_names
+                                else str(index)
+                            )
+                            raise RuntimeError(f"callback mutated input {name!r}")
+                    if expected_tree != actual_tree:
+                        raise ValueError("Candidate output pytree differs from golden")
+                    for index, (value, reference) in enumerate(zip(actual, expected)):
+                        report.comparisons.append(
+                            _compare(
+                                f"{label}/output/{output_names[index]}",
+                                value,
+                                reference,
+                                options.atol,
+                                options.rtol,
+                                spikes=output_names[index] in case.exact_outputs,
+                            )
+                        )
+                    if mode == "training" and not any(
+                        value.requires_grad for value in case.inputs
+                    ):
+                        report.skipped.append(
+                            f"{label}: frozen inputs may select inference; "
+                            "not evidence of training-kernel execution"
+                        )
+                    if mode != "training" or not options.check_gradients:
+                        continue
+                    if not any(value.requires_grad for value in case.inputs):
+                        report.skipped.append(
+                            f"{label}/backward: no inputs request gradients"
+                        )
+                        continue
+                    cotangents = tuple(
+                        weight.to(value.dtype)
+                        for value, weight in zip(expected, _loss_weights(expected))
+                    )
+                    expected_gradients = (
+                        case.gradient_oracle(expected_inputs, expected, cotangents)
+                        if case.gradient_oracle is not None
+                        else _vjp(expected_inputs, expected, cotangents)
+                    )
+                    actual_gradients = _vjp(actual_inputs, actual, cotangents)
+                    if len(expected_gradients) != len(case.inputs):
+                        raise ValueError(
+                            "Gradient oracle must return one gradient per input"
+                        )
+                    for index, (value, reference) in enumerate(
+                        zip(actual_gradients, expected_gradients)
+                    ):
+                        if not case.inputs[index].requires_grad:
+                            continue
+                        input_name = (
+                            case.input_names[index] if case.input_names else str(index)
+                        )
+                        name = f"{label}/backward/input/{input_name}"
+                        # Torch materializes unused gradients as None, while a
+                        # valid native backward may return explicit zeros. The
+                        # numerical contract compares their mathematical VJP.
+                        detail = (
+                            f"candidate grad={value is not None}; "
+                            f"oracle grad={reference is not None}"
+                        )
+                        value = (
+                            torch.zeros_like(actual_inputs[index])
+                            if value is None
+                            else value
+                        )
+                        reference = (
+                            torch.zeros_like(expected_inputs[index])
+                            if reference is None
+                            else reference
+                        )
+                        comparison = _compare(
+                            name,
+                            value,
+                            reference,
+                            options.atol
+                            if options.gradient_atol is None
+                            else options.gradient_atol,
+                            options.rtol
+                            if options.gradient_rtol is None
+                            else options.gradient_rtol,
+                        )
+                        report.comparisons.append(
+                            replace(comparison, detail=f"{detail}; {comparison.detail}")
+                        )
+            except Exception as error:
+                report.errors.append(f"{label}: {type(error).__name__}: {error}")
+    return report
+
+
+@dataclass(frozen=True)
+class ParityCase:
+    """Declare one cell workload; stimuli and edge cases remain explicit.
+
+    Args:
+        x_seq: Time-first drive, preserving dtype and storage layout.
+        states: Initial physical states in template order.
+        parameters: Floating parameters in template order.
+        spec: Declared model math.
+        history: Records participating in output and full-VJP comparison.
+        name: Physical scenario name.
+        golden: Independent execution; defaults to original Torch Modules.
+    """
+
+    x_seq: Tensor
+    states: tuple[Tensor, ...]
+    parameters: tuple[Tensor, ...]
+    spec: NeuronSpec
+    history: HistoryPlan = HistoryPlan()
+    name: str = "trajectory"
+    golden: Callable | None = None
+
+
+@dataclass(frozen=True)
+class ParityOptions:
+    """Select cell execution checks without expanding workload combinations.
+
+    Args:
+        atol: Absolute tolerance, or dtype-dependent default.
+        rtol: Relative tolerance, or dtype-dependent default.
+        check_gradients: Compare all drive, state and parameter VJPs.
+        modes: Explicit inference/no_grad/training contexts.
+        compile: Also compare one compiled training execution.
+        capture: Also compare captured inference and full-VJP replay on CUDA.
+    """
+
+    atol: float | None = None
+    rtol: float | None = None
+    check_gradients: bool = True
+    modes: tuple[str, ...] = ("training", "inference")
+    compile: bool = False
+    capture: bool = False
 
 
 def check_backend_parity(
     backend: str, cases: list[ParityCase], *, options: ParityOptions = ParityOptions()
 ) -> ParityReport:
-    """Compare external execution and gradients with the original btorch Python
-    Modules.
+    """Adapt explicitly selected cell cases to the shared execution comparator.
 
-    The reference uses ordinary autograd over the original Module recurrence,
-    independently of the candidate's handwritten backward. Every floating input
-    is tested with gradients enabled, including otherwise frozen initial state.
-    Inference is checked independently under no_grad and inference_mode.
-
-    Args:
-        backend: Registered implementation to validate.
-        cases: Representative user trajectories, parameter shapes and options.
-        options: Tolerances and optional fullgraph/capture checks.
-
-    Returns:
-        Structured numerical report. Call ``assert_close`` to reject failures;
-        inspect ``skipped`` separately for unavailable optional capabilities.
+    Empty/single-step drives, record selection, trainability and
+    continuation are caller-owned cases. This function never
+    manufactures a case matrix.
     """
     report = ParityReport(backend)
-    original_cases = cases
-    if options.check_edge_cases:
-        cases = []
-        for case in original_cases:
-            cases.append(case)
-            record_names = get_template(case.spec).history_names
-            if case.history.requested != record_names:
-                cases.append(
-                    replace(
-                        case,
-                        history=HistoryPlan(requested=record_names),
-                        name=f"{case.name}/all_records",
-                    )
-                )
-            cases.append(replace(case, x_seq=case.x_seq[:0], name=f"{case.name}/empty"))
-            if case.x_seq.shape[0]:
-                cases.append(
-                    replace(case, x_seq=case.x_seq[:1], name=f"{case.name}/singleton")
-                )
-            if case.x_seq.numel():
-                storage = case.x_seq.new_empty((*case.x_seq.shape, 2))
-                view = storage[..., 0]
-                view.copy_(case.x_seq)
-                cases.append(
-                    replace(case, x_seq=view, name=f"{case.name}/noncontiguous")
-                )
     for case in cases:
-        if case.x_seq.is_cuda and not torch.cuda.is_available():
-            report.skipped.append(f"{case.name}: CUDA unavailable")
-            continue
         template = get_template(case.spec)
-        names = ("output_seq", *template.state_names, *case.history.requested)
-        atol = (
-            options.atol
-            if options.atol is not None
-            else (3e-5 if case.x_seq.dtype == torch.float32 else 5e-3)
+        n_states = len(case.states)
+        input_names = ("x_seq", *template.state_names, *template.parameter_names)
+        output_names = (
+            "output_seq",
+            *("final/" + n for n in template.state_names),
+            *("record/" + n for n in case.history.requested),
         )
-        rtol = (
-            options.rtol
-            if options.rtol is not None
-            else (3e-5 if case.x_seq.dtype == torch.float32 else 5e-3)
+        # Preserve storage aliases and strides before enabling the declared full VJP.
+        values = _clone_inputs((case.x_seq, *case.states, *case.parameters))
+        for value in values:
+            value.requires_grad_(
+                options.check_gradients
+                and (value.is_floating_point() or value.is_complex())
+            )
+
+        def golden(*inputs):
+            output, final, records = (case.golden or python_module_sequence)(
+                inputs[0],
+                inputs[1 : 1 + n_states],
+                inputs[1 + n_states :],
+                case.spec,
+                case.history.requested,
+            )
+            return dict(zip(output_names, (output, *final, *records), strict=True))
+
+        def candidate(*inputs):
+            result = run_multi_step(
+                inputs[0],
+                inputs[1 : 1 + n_states],
+                inputs[1 + n_states :],
+                case.spec,
+                case.history,
+                backend=backend,
+            )
+            return dict(zip(output_names, result, strict=True))
+
+        exact = ("['output_seq']",) if "v" in template.state_names else ()
+        model_case = ModelParityCase(
+            case.name,
+            golden,
+            candidate,
+            values,
+            input_names=input_names,
+            exact_outputs=exact,
+            immutable_inputs=True,
         )
-        modes = [
-            "all_grad",
-            "input_grad",
-            "state_grad",
-            "parameter_grad",
-            "frozen",
-            "readout",
-            "no_grad",
-            "inference",
-        ]
+        tolerance = {torch.float64: 1e-7, torch.float32: 3e-5}.get(
+            case.x_seq.dtype, 5e-3
+        )
+        model_options = ModelParityOptions(
+            atol=tolerance if options.atol is None else options.atol,
+            rtol=tolerance if options.rtol is None else options.rtol,
+            check_gradients=options.check_gradients,
+            modes=options.modes,
+        )
+        result = check_model_parity([model_case], options=model_options)
+        report.comparisons.extend(result.comparisons)
+        report.errors.extend(result.errors)
+        report.skipped.extend(result.skipped)
         if options.compile:
-            modes.append("compile")
-        for mode in modes:
-            gradients = options.check_gradients and (
-                mode
-                in ("all_grad", "input_grad", "state_grad", "parameter_grad", "compile")
+            compiled = replace(
+                model_case,
+                name=case.name + "/compile",
+                candidate=torch.compile(candidate, fullgraph=True),
             )
-            context = (
-                torch.inference_mode()
-                if mode == "inference"
-                else (
-                    torch.enable_grad()
-                    if gradients or mode in ("frozen", "readout")
-                    else torch.no_grad()
-                )
+            result = check_model_parity(
+                [compiled], options=replace(model_options, modes=("training",))
             )
-            try:
-                with torch.inference_mode(False), context:
-                    mask = (
-                        gradients and mode in ("all_grad", "input_grad", "compile"),
-                        *(
-                            (
-                                gradients
-                                and mode in ("all_grad", "state_grad", "compile"),
-                            )
-                            * len(case.states)
-                        ),
-                        *(
-                            (
-                                gradients
-                                and mode in ("all_grad", "parameter_grad", "compile"),
-                            )
-                            * len(case.parameters)
-                        ),
-                    )
-                    reference_inputs = _inputs(case, mask)
-                    candidate_inputs = _inputs(case, mask)
-                    n_states = len(case.states)
-
-                    def execute(inputs, reference=False):
-                        x = inputs[0]
-                        states = inputs[1 : 1 + n_states]
-                        parameters = inputs[1 + n_states :]
-                        if reference:
-                            output, final, histories = (
-                                case.golden or python_module_sequence
-                            )(x, states, parameters, case.spec, case.history.requested)
-                            return (output.to(x.dtype), *final, *histories)
-                        return run_multi_step(
-                            x,
-                            states,
-                            parameters,
-                            case.spec,
-                            case.history,
-                            backend=backend,
-                        )
-
-                    expected = execute(reference_inputs, reference=True)
-                    runner = (
-                        torch.compile(execute, fullgraph=True)
-                        if mode == "compile"
-                        else execute
-                    )
-                    candidate_snapshot = tuple(
-                        value.detach().clone() for value in candidate_inputs
-                    )
-                    actual = runner(candidate_inputs)
-                    input_names = (
-                        "x_seq",
-                        *template.state_names,
-                        *template.parameter_names,
-                    )
-                    for input_name, value, before in zip(
-                        input_names, candidate_inputs, candidate_snapshot
-                    ):
-                        if not torch.equal(value.detach(), before):
-                            report.errors.append(
-                                f"{case.name}/{mode}: callback mutated "
-                                f"input {input_name!r}"
-                            )
-                    for name, a, e in zip(names, actual, expected):
-                        report.comparisons.append(
-                            _compare(
-                                f"{case.name}/{mode}/{name}",
-                                a,
-                                e,
-                                atol,
-                                rtol,
-                                spikes=name == "output_seq"
-                                and "v" in template.state_names,
-                            )
-                        )
-                    if len(actual) != len(expected):
-                        report.errors.append(
-                            f"{case.name}/{mode}: output count mismatch"
-                        )
-                    if mode == "readout":
-                        # Frozen dynamics should use inference even in grad mode,
-                        # while a downstream trainable readout still gets gradients.
-                        expected_weight = expected[0].new_tensor(
-                            0.7, requires_grad=True
-                        )
-                        actual_weight = actual[0].new_tensor(0.7, requires_grad=True)
-                        expected_readout_grad = torch.autograd.grad(
-                            (expected[0] * expected_weight).square().sum(),
-                            expected_weight,
-                        )[0]
-                        actual_readout_grad = torch.autograd.grad(
-                            (actual[0] * actual_weight).square().sum(), actual_weight
-                        )[0]
-                        report.comparisons.append(
-                            _compare(
-                                f"{case.name}/{mode}/grad_readout",
-                                actual_readout_grad,
-                                expected_readout_grad,
-                                atol,
-                                rtol,
-                            )
-                        )
-                    if gradients:
-                        reference_active = tuple(
-                            value
-                            for value, needed in zip(reference_inputs, mask)
-                            if needed
-                        )
-                        candidate_active = tuple(
-                            value
-                            for value, needed in zip(candidate_inputs, mask)
-                            if needed
-                        )
-                        expected_grad = _gradients(expected, reference_active)
-                        actual_grad = _gradients(actual, candidate_active)
-                        grad_names = (
-                            "x_seq",
-                            *template.state_names,
-                            *template.parameter_names,
-                        )
-                        active_names = tuple(
-                            name for name, needed in zip(grad_names, mask) if needed
-                        )
-                        for name, a, e, source in zip(
-                            active_names, actual_grad, expected_grad, reference_active
-                        ):
-                            a = torch.zeros_like(source) if a is None else a
-                            e = torch.zeros_like(source) if e is None else e
-                            report.comparisons.append(
-                                _compare(
-                                    f"{case.name}/{mode}/grad_{name}", a, e, atol, rtol
-                                )
-                            )
-            except Exception as error:
-                report.errors.append(
-                    f"{case.name}/{mode}: {type(error).__name__}: {error}"
-                )
+            report.comparisons.extend(result.comparisons)
+            report.errors.extend(result.errors)
         if options.capture:
             if not case.x_seq.is_cuda:
                 report.skipped.append(f"{case.name}/capture: CUDA inputs required")
-                continue
-            try:
-                with torch.no_grad():
-                    inputs = _inputs(case, False)
-                    states = inputs[1 : 1 + len(case.states)]
-                    parameters = inputs[1 + len(case.states) :]
-
-                    def replay_target():
-                        return run_multi_step(
-                            inputs[0],
-                            states,
-                            parameters,
-                            case.spec,
-                            case.history,
-                            backend=backend,
-                        )
-
-                    stream = torch.cuda.Stream()
-                    stream.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(stream):
-                        for _ in range(3):
-                            replay_target()
-                    torch.cuda.current_stream().wait_stream(stream)
-                    expected_output, expected_final, expected_histories = (
-                        case.golden or python_module_sequence
-                    )(
-                        inputs[0],
-                        states,
-                        parameters,
-                        case.spec,
-                        case.history.requested,
-                    )
-                    expected = (
-                        expected_output.to(inputs[0].dtype),
-                        *expected_final,
-                        *expected_histories,
-                    )
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
-                        actual = replay_target()
-                    graph.replay()
-                    torch.cuda.synchronize()
-                    for name, a, e in zip(names, actual, expected):
-                        report.comparisons.append(
-                            _compare(
-                                f"{case.name}/capture/{name}",
-                                a,
-                                e,
-                                atol,
-                                rtol,
-                                spikes=name == "output_seq"
-                                and "v" in template.state_names,
-                            )
-                        )
-            except Exception as error:
-                report.errors.append(
-                    f"{case.name}/capture: {type(error).__name__}: {error}"
-                )
-            if options.check_gradients:
-                try:
-                    with torch.inference_mode(False), torch.enable_grad():
-                        inputs = _inputs(case, True)
-                        reference_inputs = _inputs(case, True)
-                        n_states = len(case.states)
-                        reference_output, reference_final, reference_history = (
-                            case.golden or python_module_sequence
-                        )(
-                            reference_inputs[0],
-                            reference_inputs[1 : 1 + n_states],
-                            reference_inputs[1 + n_states :],
-                            case.spec,
-                            case.history.requested,
-                        )
-                        expected = (
-                            reference_output.to(reference_inputs[0].dtype),
-                            *reference_final,
-                            *reference_history,
-                        )
-                        # CUDA generators cannot be constructed during capture.
-                        # Reuse identical deterministic cotangents for the golden
-                        # VJP and every warmup/captured candidate invocation.
-                        weights = _loss_weights(expected)
-                        expected_grad = _gradients(expected, reference_inputs, weights)
-
-                        def training_target():
-                            outputs = run_multi_step(
-                                inputs[0],
-                                inputs[1 : 1 + n_states],
-                                inputs[1 + n_states :],
-                                case.spec,
-                                case.history,
-                                backend=backend,
-                            )
-                            return outputs, _gradients(outputs, inputs, weights)
-
-                        stream = torch.cuda.Stream()
-                        stream.wait_stream(torch.cuda.current_stream())
-                        with torch.cuda.stream(stream):
-                            for _ in range(3):
-                                training_target()
-                        torch.cuda.current_stream().wait_stream(stream)
-                        graph = torch.cuda.CUDAGraph()
-                        with torch.cuda.graph(graph):
-                            actual, actual_grad = training_target()
-                        # A second replay catches accidental accumulation into
-                        # persistent gradient buffers, not just capture success.
-                        graph.replay()
-                        graph.replay()
-                        torch.cuda.synchronize()
-                        grad_names = (
-                            "x_seq",
-                            *template.state_names,
-                            *template.parameter_names,
-                        )
-                        for name, a, e in zip(names, actual, expected):
-                            report.comparisons.append(
-                                _compare(
-                                    f"{case.name}/capture_training/{name}",
-                                    a,
-                                    e,
-                                    atol,
-                                    rtol,
-                                    spikes=name == "output_seq"
-                                    and "v" in template.state_names,
-                                )
-                            )
-                        for name, a, e, source in zip(
-                            grad_names, actual_grad, expected_grad, reference_inputs
-                        ):
-                            report.comparisons.append(
-                                _compare(
-                                    f"{case.name}/capture_training/grad_{name}",
-                                    torch.zeros_like(source) if a is None else a,
-                                    torch.zeros_like(source) if e is None else e,
-                                    atol,
-                                    rtol,
-                                )
-                            )
-                except Exception as error:
-                    report.errors.append(
-                        f"{case.name}/capture_training: {type(error).__name__}: {error}"
-                    )
-    if options.check_continuation:
-        for case in original_cases:
-            _check_composed_calls(backend, case, options, report)
+            else:
+                _check_capture(model_case, model_options, report)
     return report
 
 
-def _check_composed_calls(backend, case, options, report):
-    """Check state continuation and backward ownership across multiple
-    calls."""
-    template = get_template(case.spec)
-    names = ("output_seq", *template.state_names, *case.history.requested)
-    grad_names = ("x_seq", *template.state_names, *template.parameter_names)
-    atol = (
-        options.atol
-        if options.atol is not None
-        else (3e-5 if case.x_seq.dtype == torch.float32 else 5e-3)
-    )
-    rtol = (
-        options.rtol
-        if options.rtol is not None
-        else (3e-5 if case.x_seq.dtype == torch.float32 else 5e-3)
-    )
-    n_states = len(case.states)
-    for scenario in ("continuation", "two_forwards"):
+def _check_capture(case, options, report):
+    """Replay owned inference and VJP buffers without re-running a case
+    matrix."""
+    for training in (False, True) if options.check_gradients else (False,):
+        mode = "capture_training" if training else "capture"
         try:
-            with (
-                torch.inference_mode(False),
-                torch.set_grad_enabled(options.check_gradients),
-            ):
-                expected_inputs = _inputs(case, options.check_gradients)
-                actual_inputs = _inputs(case, options.check_gradients)
+            with torch.inference_mode(False), torch.set_grad_enabled(training):
+                inputs = _clone_inputs(case.inputs)
+                if not training:
+                    inputs = tuple(value.detach() for value in inputs)
+                # Build cotangents before capture; local generator construction is
+                # host work. The canonical comparator still owns the golden/VJP.
+                sample, _ = _outputs(case.candidate(*inputs))
+                cotangents = _loss_weights(sample)
+                # Release the probe graph before warming on the capture stream;
+                # otherwise its leaf accumulators remain bound to this stream.
+                del sample
 
-                def execute(inputs, reference):
-                    x, states, parameters = (
-                        inputs[0],
-                        inputs[1 : 1 + n_states],
-                        inputs[1 + n_states :],
-                    )
+                def operation():
+                    result = case.candidate(*inputs)
+                    flat, _ = _outputs(result)
+                    gradients = _vjp(inputs, flat, cotangents) if training else ()
+                    return result, gradients
 
-                    def run(drive, initial):
-                        if reference:
-                            output, final, records = (
-                                case.golden or python_module_sequence
-                            )(
-                                drive,
-                                initial,
-                                parameters,
-                                case.spec,
-                                case.history.requested,
-                            )
-                            return (output, *final, *records)
-                        return run_multi_step(
-                            drive,
-                            initial,
-                            parameters,
-                            case.spec,
-                            case.history,
-                            backend=backend,
-                        )
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    operation()
+                torch.cuda.current_stream().wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured, gradients = operation()
 
-                    if scenario == "two_forwards":
-                        # Both graphs stay live. The second call uses a distinct
-                        # trajectory to expose reused mutable backward buffers.
-                        return (*run(x, states), *run(x.flip(0), states))
-                    if reference:
-                        return run(x, states)
-                    split = x.shape[0] // 2
-                    first = run(x[:split], states)
-                    second = run(x[split:], first[1 : 1 + n_states])
-                    return (
-                        torch.cat((first[0], second[0])),
-                        *second[1 : 1 + n_states],
-                        *(
-                            torch.cat((left, right))
-                            for left, right in zip(
-                                first[1 + n_states :], second[1 + n_states :]
-                            )
+                def replay(*new_inputs):
+                    _copy_inputs(inputs, new_inputs)
+                    graph.replay()
+                    graph.replay()  # Detect persistent gradient accumulation.
+                    return captured
+
+                # The captured forward has no eager graph in inference, and the
+                # VJP is an explicit captured output in training. Compare both as
+                # named tensor outputs through the same primitive.
+                def with_vjp(fn, *new_inputs):
+                    result = fn(*new_inputs)
+                    flat, _ = _outputs(result)
+                    grads = _vjp(new_inputs, flat, cotangents) if training else ()
+                    return {
+                        "forward": result,
+                        "vjp": tuple(
+                            torch.zeros_like(v) if g is None else g
+                            for v, g in zip(new_inputs, grads)
                         ),
-                    )
+                    }
 
-                expected = execute(expected_inputs, True)
-                actual = execute(actual_inputs, False)
-                output_names = (
-                    names
-                    if scenario == "continuation"
-                    else tuple(
-                        f"call{call}/{name}" for call in (1, 2) for name in names
-                    )
+                def captured_result(*new_inputs):
+                    result = replay(*new_inputs)
+                    return {
+                        "forward": result,
+                        "vjp": tuple(
+                            torch.zeros_like(v) if g is None else g
+                            for v, g in zip(inputs, gradients)
+                        ),
+                    }
+
+                check = ModelParityCase(
+                    case.name + "/" + mode,
+                    lambda *args: with_vjp(case.golden, *args),
+                    captured_result,
+                    case.inputs,
+                    input_names=case.input_names,
+                    exact_outputs=tuple(
+                        "['forward']" + name for name in case.exact_outputs
+                    ),
                 )
-                for name, a, e in zip(output_names, actual, expected):
-                    report.comparisons.append(
-                        _compare(
-                            f"{case.name}/{scenario}/{name}",
-                            a,
-                            e,
-                            atol,
-                            rtol,
-                            spikes=name.endswith("output_seq")
-                            and "v" in template.state_names,
-                        )
-                    )
-                if options.check_gradients:
-                    expected_grads = _gradients(expected, expected_inputs)
-                    actual_grads = _gradients(actual, actual_inputs)
-                    for name, a, e, source in zip(
-                        grad_names, actual_grads, expected_grads, expected_inputs
-                    ):
-                        report.comparisons.append(
-                            _compare(
-                                f"{case.name}/{scenario}/grad_{name}",
-                                torch.zeros_like(source) if a is None else a,
-                                torch.zeros_like(source) if e is None else e,
-                                atol,
-                                rtol,
-                            )
-                        )
+                result = check_model_parity(
+                    [check],
+                    options=replace(
+                        options,
+                        check_gradients=False,
+                        modes=("training",) if training else ("inference",),
+                    ),
+                )
+                report.comparisons.extend(result.comparisons)
+                report.errors.extend(result.errors)
         except Exception as error:
-            report.errors.append(
-                f"{case.name}/{scenario}: {type(error).__name__}: {error}"
-            )
+            report.errors.append(f"{case.name}/{mode}: {type(error).__name__}: {error}")

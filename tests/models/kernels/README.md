@@ -1,11 +1,14 @@
 # Kernel test structure
 
-Use `helpers.py` for backend names (`GPU_BACKENDS`), optional
-CUDA availability checks, the common cell input layouts, `NewEmptyShapes`, and
-whole-sequence output/VJP comparison against the actual Module. Numerical
-options for that oracle are grouped in `SequenceParityOptions`; callers with
-parameter views can supply their backing-storage roots. Helpers coordinate
-existing Torch and btorch code rather than implement another simulator.
+See the [coverage map](COVERAGE.md) for model oracles and numerical failure mechanisms.
+
+Use `helpers.py` for backend names (`GPU_BACKENDS`), optional CUDA availability
+checks, `NewEmptyShapes`, and whole-sequence output/VJP comparison against the
+actual Module. `assert_module_sequence` delegates to the canonical
+`btorch.models.kernels.testing` comparator; its `SequenceParityOptions` keeps
+separate forward and VJP tolerances, and callers with parameter views can supply
+their backing-storage roots. Helpers coordinate existing Torch and btorch code
+rather than implement another simulator.
 
 The `reference_backend` fixture registers the real Torch sequence callbacks
 once, on demand. Use it when a CPU test needs to enter the same recurrent

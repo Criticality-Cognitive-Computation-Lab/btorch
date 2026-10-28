@@ -92,6 +92,7 @@ nav:
   - guides/oot_kernels.md
   - guides/sparse_connectivity.md
 - Design notes:
+  - design/kernel_generation.md
   - design/sparse_connectivity.md
   - design/sparse_einsum_notes.md
 - FAQ: faq.md

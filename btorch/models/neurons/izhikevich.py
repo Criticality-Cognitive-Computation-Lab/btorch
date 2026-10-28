@@ -58,6 +58,8 @@ class Izhikevich(BaseNode):
         Izhikevich, IEEE Trans. Neural Networks, 2003.
     """
 
+    kernel_model = "izhikevich"
+
     HIPPOCAMPOME_TO_ARGS = {
         "k": "k",
         "a": "a",

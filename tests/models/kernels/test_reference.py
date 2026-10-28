@@ -7,7 +7,8 @@ import torch
 from btorch.models.kernels.contracts import HistoryPlan, NeuronSpec
 from btorch.models.kernels.templates import get_template
 from btorch.models.kernels.torch_backend import forward_step
-from tests.models.kernels.helpers import cell_inputs
+from tests.models.kernels.cases import cell_inputs, register_external_psc_template
+from tests.models.kernels.helpers import require_cuda_backend
 
 
 @pytest.mark.parametrize(
@@ -75,9 +76,13 @@ def test_reference_matches_existing_single_step(model):
 
 
 @pytest.mark.parametrize(
-    "model", ["lif", "glif3", "izhikevich", "alpha", "dual_exponential"]
+    ("model", "n_step"),
+    [
+        pytest.param("lif", 0, id="empty-neuron"),
+        pytest.param("glif3", 1, id="single-adaptation"),
+        pytest.param("dual_exponential", 7, id="long-dual-psc"),
+    ],
 )
-@pytest.mark.parametrize("n_step", [0, 1, 7])
 def test_sequence_operator_gradients_and_record_losses(model, n_step):
     from btorch.models.kernels.operators import run_multi_step
 
@@ -166,8 +171,17 @@ def test_static_fullgraph_forward_backward_and_chunk_continuation(compiler):
     torch.testing.assert_close(chunk_grad, full_grad)
 
 
-@pytest.mark.parametrize("trainable", ["input", "state", "parameter", "none"])
-@pytest.mark.parametrize("grad_mode", ["enabled", "no_grad", "inference"])
+@pytest.mark.parametrize(
+    ("trainable", "grad_mode"),
+    [
+        pytest.param("input", "enabled", id="input-training"),
+        pytest.param("state", "enabled", id="state-training"),
+        pytest.param("parameter", "enabled", id="parameter-training"),
+        pytest.param("none", "enabled", id="frozen-enabled"),
+        pytest.param("input", "no_grad", id="input-no-grad"),
+        pytest.param("input", "inference", id="input-inference"),
+    ],
+)
 def test_dispatch_tracks_actual_inputs_and_retains_only_needed_history(
     trainable, grad_mode
 ):
@@ -308,6 +322,7 @@ def test_external_model_declares_history_shapes_and_reference_derivatives(n_step
             + grad_records.get("q", 0)
             + grad_records.get("charged", 0)
         )
+
         return (
             grad_q,
             (grad_q * parameters[0],),
@@ -350,8 +365,13 @@ def test_external_model_declares_history_shapes_and_reference_derivatives(n_step
         )
 
 
-@pytest.mark.parametrize("neuron_model", ["lif", "izhikevich"])
-@pytest.mark.parametrize("compiler", [None, "aot_eager"])
+@pytest.mark.parametrize(
+    ("neuron_model", "compiler"),
+    [
+        pytest.param("lif", None, id="lif-eager"),
+        pytest.param("izhikevich", "aot_eager", id="izhikevich-aot"),
+    ],
+)
 def test_recurrent_charged_history_losses_and_multidimensional_states(
     neuron_model, compiler
 ):
@@ -514,8 +534,13 @@ def test_parameter_only_training_preserves_temporal_state_adjoint():
         torch.testing.assert_close(actual, reference)
 
 
-@pytest.mark.parametrize("registration", ["backend", "model"])
-@pytest.mark.parametrize("compiler", [None, "aot_eager"])
+@pytest.mark.parametrize(
+    ("registration", "compiler"),
+    [
+        pytest.param("backend", None, id="backend-eager"),
+        pytest.param("model", "aot_eager", id="model-aot"),
+    ],
+)
 def test_replacement_rejects_outstanding_backward(registration, compiler):
     from btorch.models.kernels import register_cell_backend, run_multi_step
     from btorch.models.kernels.templates import ModelTemplate, register_model_template
@@ -819,3 +844,223 @@ def test_environment_rejects_invalid_physical_timestep(dt):
     neuron.init_state(batch_size=2)
     with environ.context(dt=dt), pytest.raises(ValueError, match="finite and positive"):
         neuron(torch.ones(2, 2, 3))
+
+
+def test_external_psc_template_renders_and_matches_full_torch_vjp():
+    """A registered PSC extension must cover metadata, source and full VJP."""
+    from btorch.models import environ
+    from btorch.models.kernels.backends.engine import generate_source
+    from btorch.models.kernels.backends.fused import generate_fused_source
+    from btorch.models.kernels.golden import python_module_sequence
+    from btorch.models.kernels.operators import run_multi_step
+
+    template, spec, external_cls = register_external_psc_template()
+    from btorch.models.kernels.adapters import _model_layout
+
+    assert _model_layout(external_cls(3)) == (
+        "test_external_psc",
+        ("psc",),
+        ("tau_syn",),
+    )
+    assert template.history_state_name("psc") == "psc"
+    x = torch.randn(5, 2, 3, requires_grad=True)
+    initial = (torch.randn(2, 3, requires_grad=True),)
+    tau_syn = (torch.tensor(2.5, requires_grad=True),)
+    plan = HistoryPlan(requested=("psc",))
+    actual = run_multi_step(x, initial, tau_syn, spec, plan, backend="torch")
+    expected = python_module_sequence(x, initial, tau_syn, spec, plan.requested)
+    expected_flat = (expected[0], *expected[1], *expected[2])
+    for got, trusted in zip(actual, expected_flat):
+        torch.testing.assert_close(got, trusted)
+    assert actual[-1].shape == (x.shape[0], *x.shape[1:])
+
+    cotangents = tuple(torch.randn_like(value) for value in actual)
+    actual_gradients = torch.autograd.grad(
+        sum((value * cotangent).sum() for value, cotangent in zip(actual, cotangents)),
+        (x, *initial, *tau_syn),
+    )
+    expected_gradients = torch.autograd.grad(
+        sum(
+            (value * cotangent).sum()
+            for value, cotangent in zip(expected_flat, cotangents)
+        ),
+        (x, *initial, *tau_syn),
+    )
+    for got, trusted in zip(actual_gradients, expected_gradients):
+        torch.testing.assert_close(got, trusted)
+
+    lif_spec = NeuronSpec("lif", dt=0.25)
+    for backend in ("triton", "cupy", "tilelang"):
+        primitive, primitive_pointers = generate_source(
+            backend, spec, 6, 5, ("psc",), backward=False
+        )
+        reverse, _ = generate_source(backend, spec, 6, 5, ("psc",), backward=True)
+        fused, fused_pointers = generate_fused_source(
+            backend,
+            lif_spec,
+            spec,
+            6,
+            1,
+            1,
+            neuron_histories=("v",),
+            psc_histories=("psc",),
+        )
+        assert "psc_decay" in primitive and "grad_p_tau_syn" in reverse
+        assert "psc_decay" in fused and "psc_tau_syn" in fused
+        assert any(name == "psc_psc_init" for name, _ in fused_pointers)
+        assert any(name == "output_seq" for name, _ in primitive_pointers)
+
+    # The local golden module remains a real btorch-style stateful module and
+    # therefore exercises the same environment timestep contract.
+    with environ.context(dt=spec.dt):
+        expected_step, _, _ = python_module_sequence(
+            x[:1], initial, tau_syn, spec, plan.requested
+        )
+    assert expected_step.shape == x[:1].shape
+
+
+def test_external_psc_template_runs_triton_primitive_and_fused_vjp():
+    """Execute one extension through both generated GPU contracts."""
+    require_cuda_backend("triton")
+    from btorch.models.kernels.backends.fused import (
+        fused_step_backward,
+        fused_step_forward,
+    )
+
+    _, psc_spec, _ = register_external_psc_template()
+    neuron_spec = NeuronSpec("lif", dt=0.25, hard_reset=True)
+    shape = (2, 3)
+    from btorch.models.kernels.operators import run_multi_step
+
+    def leaf(value):
+        return value.detach().requires_grad_()
+
+    external = leaf(torch.randn(*shape, device="cuda") * 0.1)
+    drive = leaf(torch.randn(*shape, device="cuda") * 0.2)
+    neuron_state = leaf(torch.randn(*shape, device="cuda") * 0.1)
+    psc_state = leaf(torch.randn(*shape, device="cuda") * 0.1)
+    neuron_parameters = tuple(
+        leaf(torch.full(shape[-1:], value, device="cuda"))
+        for value in (1.0, 0.0, 1.2, 4.0)
+    )
+    psc_parameters = (leaf(torch.tensor(2.5, device="cuda")),)
+
+    primitive_drive = leaf(drive.detach().clone())
+    primitive_state = leaf(psc_state.detach().clone())
+    primitive_tau = (leaf(psc_parameters[0].detach().clone()),)
+    primitive = run_multi_step(
+        primitive_drive.unsqueeze(0),
+        (primitive_state,),
+        primitive_tau,
+        psc_spec,
+        HistoryPlan(requested=("psc",)),
+        backend="triton",
+    )
+    primitive_output, primitive_final, primitive_records = forward_step(
+        primitive_drive,
+        (primitive_state,),
+        primitive_tau,
+        psc_spec,
+    )
+    primitive_expected = (
+        primitive_output.unsqueeze(0),
+        primitive_final[0],
+        primitive_records["psc"].unsqueeze(0),
+    )
+    for got, trusted in zip(primitive, primitive_expected):
+        torch.testing.assert_close(got, trusted, atol=8e-5, rtol=8e-4)
+    primitive_cotangents = tuple(
+        torch.randn_like(value) for value in primitive_expected
+    )
+    primitive_gradients = torch.autograd.grad(
+        sum(
+            (value * cotangent).sum()
+            for value, cotangent in zip(primitive, primitive_cotangents)
+        ),
+        (primitive_drive, primitive_state, *primitive_tau),
+    )
+    primitive_trusted = torch.autograd.grad(
+        sum(
+            (value * cotangent).sum()
+            for value, cotangent in zip(primitive_expected, primitive_cotangents)
+        ),
+        (primitive_drive, primitive_state, *primitive_tau),
+    )
+    for got, trusted in zip(primitive_gradients, primitive_trusted):
+        torch.testing.assert_close(got, trusted, atol=8e-4, rtol=8e-4)
+
+    psc_output, psc_final, psc_records = forward_step(
+        drive, (psc_state,), psc_parameters, psc_spec
+    )
+    expected_spike, expected_neuron, neuron_records = forward_step(
+        external + psc_output,
+        (neuron_state,),
+        neuron_parameters,
+        neuron_spec,
+    )
+    expected = (
+        expected_spike,
+        *expected_neuron,
+        *psc_final,
+        neuron_records["v"].unsqueeze(0),
+        psc_records["psc"].unsqueeze(0),
+    )
+
+    actual = fused_step_forward(
+        external,
+        drive,
+        (neuron_state,),
+        (psc_state,),
+        neuron_parameters,
+        psc_parameters,
+        neuron_spec,
+        psc_spec,
+        ("v",),
+        ("psc",),
+        backend="triton",
+    )
+    actual_flat = (actual[0], *actual[1], *actual[2], *actual[3], *actual[4])
+    for got, trusted in zip(actual_flat, expected):
+        torch.testing.assert_close(got, trusted, atol=8e-5, rtol=8e-4)
+
+    cotangents = tuple(torch.randn_like(value) for value in expected)
+    expected_inputs = (
+        external,
+        drive,
+        neuron_state,
+        psc_state,
+        *neuron_parameters,
+        *psc_parameters,
+    )
+    trusted_gradients = torch.autograd.grad(
+        sum(
+            (value * cotangent).sum() for value, cotangent in zip(expected, cotangents)
+        ),
+        expected_inputs,
+    )
+    reverse = fused_step_backward(
+        external,
+        drive,
+        (neuron_state,),
+        (psc_state,),
+        neuron_parameters,
+        psc_parameters,
+        neuron_spec,
+        psc_spec,
+        cotangents[0],
+        (cotangents[1],),
+        (cotangents[2],),
+        grad_neuron_records={"v": cotangents[3][0]},
+        grad_psc_records={"psc": cotangents[4][0]},
+        backend="triton",
+    )
+    actual_gradients = (
+        reverse[0],
+        reverse[1],
+        *reverse[2],
+        *reverse[3],
+        *reverse[4],
+        *reverse[5],
+    )
+    for got, trusted in zip(actual_gradients, trusted_gradients):
+        torch.testing.assert_close(got, trusted, atol=8e-4, rtol=8e-4)

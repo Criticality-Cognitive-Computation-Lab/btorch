@@ -45,6 +45,8 @@ Forward 返回 FP32 输出、状态、记录；序列 wrapper 将公共输出转
 新模型使用 `register_model_template`，必须提供具名声明、状态扩展维度、记录
 形状来源及可信的单步 forward/backward reference。注册后端名称本身不会定义
 新的模型方程。
+若要为同一模型生成多种后端的内核，见
+[生成内核的模型契约](../design/kernel_generation.md)。
 
 ## 生成与验证
 
@@ -56,11 +58,15 @@ callback 实现，再独立调整调度。
 公共验证工具不依赖 pytest：
 
 ```python
-from btorch.models.kernels.testing import ParityCase, check_backend_parity
+from btorch.models.kernels.testing import (
+    ParityCase, ParityOptions, check_backend_parity,
+)
 
-report = check_backend_parity("lab_cell", [
-    ParityCase(x_seq, states, parameters, spec, history),
-])
+report = check_backend_parity(
+    "lab_cell",
+    [ParityCase(x_seq, states, parameters, spec, history)],
+    options=ParityOptions(modes=("training", "inference")),
+)
 report.assert_close()
 ```
 
@@ -72,18 +78,12 @@ report.assert_close()
 surrogate/reset 选项。报告指出失败张量、坐标及首次 spike 分歧的时间步。
 Spike 必须严格一致；连续张量使用可配置的容差。
 
-每个 case 默认还检查：
-
-- 空序列、单步序列，以及数值相同的非连续输入。
-- 所有已声明的状态与 charged-state 记录，即使提供的 case 没有请求它们。
-- 仅输入、仅状态、仅参数求梯度；全部冻结；下游 readout 可训练；
-  `no_grad` 和 `inference_mode`。
-- 两段调用保持状态梯度连续，以及两次 forward 后一次联合 backward。
-
-定位单个问题时，可设置
-`ParityOptions(check_edge_cases=False, check_continuation=False)`。工具保留你提供
-的 dtype 和参数数值；需要自行为声称支持的每种精度、形状、广播、长序列和模型
-选项添加 case。
+Comparator 不会自动生成边界场景矩阵。请为 kernel 声称支持的行为添加明确命名
+的 case：空序列和单步序列、非连续输入、声明的 state 或 charged record、输入/状态/
+参数梯度、冻结输入、`no_grad` 与 `inference_mode`、可微分的 chunk continuation，
+以及多个未完成的 forward。每个 case 都应对应它要发现的物理或编译行为。工具保留
+你提供的 dtype 和参数数值；需要自行为声称支持的每种精度、形状、广播、长序列和
+模型选项添加 case。
 
 `ParityOptions(compile=True, capture=True)` 额外检查 fullgraph 与 warmup 后的
 CUDA replay。开启梯度检查时，capture 还会将重放的前向、反向以及输入、状态和参数

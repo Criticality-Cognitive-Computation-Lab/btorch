@@ -75,6 +75,8 @@ class LIF(BaseNode):
         - Output: (*batch, n_neuron) spike tensor (0 or 1)
     """
 
+    kernel_model = "lif"
+
     refractory: torch.Tensor | None
     c_m: torch.Tensor | torch.nn.Parameter
     tau: torch.Tensor | torch.nn.Parameter
@@ -228,6 +230,8 @@ class IF(LIF):
         device: Device for tensors. Default: None.
         dtype: Data type for tensors. Default: None.
     """
+
+    kernel_model = "if"
 
     def dV(
         self,

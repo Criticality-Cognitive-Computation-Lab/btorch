@@ -285,14 +285,15 @@ def recurrent_sequence(
         ),
         *(["synapse.delayed_spike.history"] if n_delay else []),
     ]
-    charged_names = []
-    charged_attributes = []
-    if module.neuron.pre_spike_v:
-        charged_names.append("v_charged")
-        charged_attributes.append("neuron.v_pre_spike")
-        if "u_pre_spike" in module.neuron._memories_rv:
-            charged_names.append("u_charged")
-            charged_attributes.append("neuron.u_pre_spike")
+    from .templates import get_template
+
+    charged_bindings = tuple(
+        (name, attribute)
+        for name, attribute in get_template(neuron_spec).record_attributes
+        if attribute in module.neuron._memories_rv
+    )
+    charged_names = [name for name, _ in charged_bindings]
+    charged_attributes = [f"neuron.{attribute}" for _, attribute in charged_bindings]
     all_record_names = [*state_names, *charged_attributes]
     requested = (
         list(module.update_state_names)
@@ -522,6 +523,17 @@ def _execute(
     if gradient_activity:
         activity_index = len(states) + len(charged_names)
         history_indices.append(activity_index)
+    # A Python branch specializes the algorithm choice with a shape guard.
+    # bool(SymBool) can remain symbolic in a JSON metadata dictionary under
+    # Dynamo's automatic dynamic shapes and cannot cross the custom-op ABI.
+    gradient_list = False
+    if gradient_activity and options.neuron == "triton":
+        if x_seq.numel() // max(1, x_seq.shape[0]) < 2**31:
+            if (
+                not connection_parameters[0].requires_grad
+                or x_seq[0].numel() == topology[2].numel() - 1
+            ):
+                gradient_list = True
     recurrent_spec = {
         **connection_spec,
         "neuron": encode_spec(neuron_spec),
@@ -543,18 +555,7 @@ def _execute(
         "precise_division": options.precise_division,
         "precise_exp": options.precise_exp,
         "gradient_activity": activity_index if gradient_activity else None,
-        "gradient_list": bool(
-            gradient_activity
-            and options.neuron == "triton"
-            and x_seq.numel() // max(1, x_seq.shape[0]) < 2**31
-            # Batched trainable weights reuse one edge traversal across
-            # samples. Keep that fused path rather than introducing a separate
-            # edge-gradient pass or racing per-sample parameter updates.
-            and (
-                not connection_parameters[0].requires_grad
-                or x_seq[0].numel() == topology[2].numel() - 1
-            )
-        ),
+        "gradient_list": gradient_list,
     }
     if (
         needs_backward
@@ -615,7 +616,7 @@ def _execute(
         delay.history = result[len(states)].movedim(0, -len(delay.n_neuron) - 1)
     histories = dict(zip(history_indices, result[1 + len(states) :]))
     for offset, (name, index) in enumerate(zip(charged_names, charged_indices)):
-        attribute = "v_pre_spike" if name == "v_charged" else "u_pre_spike"
+        attribute = dict(get_template(neuron_spec).record_attributes)[name]
         value = histories[index][-1] if index in histories else histories[-offset - 1]
         setattr(module.neuron, attribute, value)
     records = {}

@@ -77,7 +77,7 @@ result = bindings["affine"](x, gain)
 ## 验证 parity
 
 ```python
-from btorch.models.kernels.native import (
+from btorch.models.kernels.testing import (
     ModelParityCase, ModelParityOptions, check_model_parity,
 )
 

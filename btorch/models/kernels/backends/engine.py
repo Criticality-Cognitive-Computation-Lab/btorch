@@ -6,15 +6,9 @@ reduce across broadcast batch axes afterwards; no time-by-edge
 intermediate is created.
 """
 
-import ast
 import functools
-import gc
 import hashlib
-import linecache
-import re
 import subprocess
-import uuid
-import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -22,8 +16,16 @@ from pathlib import Path
 import torch
 
 from ..contracts import surrogate_support
-from ..templates import _MODELS, ResidualTemplate, get_template, model_template_revision
-from .fragments import _exp_euler_forward, get_fragments, scalar_layout
+from ..program import substitute_expression
+from ..templates import (
+    RecordCotangent,
+    ResidualTemplate,
+    get_template,
+    has_generated_model,
+    model_template_revision,
+)
+from .fragments import get_fragments, scalar_layout
+from .renderers import get_renderer, get_runtime
 
 
 @dataclass(frozen=True)
@@ -118,17 +120,19 @@ def _normalize_gradient_targets(template, targets):
 
 def supports(spec, device):
     """Restrict built-in GPU kernels to their explicitly declared models."""
-    return device.type == "cuda" and spec.model in _MODELS
+    return device.type == "cuda" and has_generated_model(spec.model)
 
 
 def _mode_name(name, modes):
-    for base in ("Iasc", "k", "asc_amps"):
-        if modes and name.startswith(base + "_") and name[len(base) + 1 :].isdigit():
-            return base, int(name[len(base) + 1 :])
-    return name, None
+    base, separator, component = name.rpartition("_")
+    return (
+        (base, int(component))
+        if modes and separator and component.isdigit()
+        else (name, None)
+    )
 
 
-def _parameter_index(scalar, layout, modes, backend):
+def _parameter_index(scalar, layout, modes, renderer):
     """Render a storage offset for one broadcast parameter element."""
     _, mode = _mode_name(scalar, modes)
     logical_shape = layout.target_shape
@@ -152,7 +156,7 @@ def _parameter_index(scalar, layout, modes, backend):
             trailing = 1
             for size in target_shape[lane_axis + 1 :]:
                 trailing *= size
-            division = "/" if backend == "cupy" else "//"
+            division = renderer.division
             coordinate = "index" if trailing == 1 else f"index {division} {trailing}"
             if target_shape[lane_axis] != 1:
                 coordinate = f"({coordinate}) % {target_shape[lane_axis]}"
@@ -165,6 +169,7 @@ class _Source:
         self.backend, self.n, self.n_step, self.modes = backend, n, n_step, modes
         self.precise_exp = precise_exp
         self.storage = dict(storage)
+        self.renderer = get_renderer(backend, n, n_step, self.storage, precise_exp)
         self.pointers = []
         self.lines = []
         self.has_spike_list = False
@@ -185,60 +190,19 @@ class _Source:
         return index
 
     def storage_index(self, pointer, index):
-        layout = self.storage.get(pointer)
-        if layout is None or layout.physical_index:
-            return index
-        terms = []
-        trailing = 1
-        division = "/" if self.backend == "cupy" else "//"
-        for size, stride in reversed(tuple(zip(layout.shape, layout.stride))):
-            if size > 1 and stride:
-                coordinate = f"(({index}) {division} {trailing}) % {size}"
-                terms.append(f"({coordinate}) * {stride}")
-            trailing *= size
-        return " + ".join(reversed(terms)) or "0"
+        return self.renderer.storage_index(self.storage.get(pointer), index)
 
     def load(self, local, pointer, index):
         lane_index = "index" in index
         index = self.storage_index(pointer, index)
-        if self.backend == "cupy":
-            # Clamp addresses with integer intrinsics; fminf would turn an
-            # index into a float and lose precision for large trajectories.
-            index = re.sub(r"(?<![\w.])minimum\(", "min(", index)
-            index = re.sub(r"(?<![\w.])maximum\(", "max(", index)
-        expr = (
-            (
-                f"tl.load({pointer}_ptr" + ("" if index == "0" else f" + {index}") + ")"
-                if "index" not in index
-                else f"tl.load({pointer}_ptr + {index}, mask=mask, other=0.0)"
-            )
-            if self.backend == "triton"
-            else f"{pointer}_ptr[{index}]"
+        expr = self.renderer.load(
+            pointer, index, self.storage.get(pointer), lane_index=lane_index
         )
-        layout = self.storage.get(pointer)
-        if layout is not None and layout.dtype != "float32":
-            # Storage precision is independent of the existing FP32 scalar
-            # equations. Convert in registers, never by copying input tensors.
-            expr = (
-                f"({expr}).to(tl.float32)"
-                if self.backend == "triton"
-                else f"float({expr})"
-                if self.backend == "cupy"
-                else f'T.Cast("float32", {expr})'
-            )
-        if self.backend == "triton" and lane_index and "index" not in index:
-            # An expanded scalar has one storage address but remains one
-            # logical value per lane, including loop-carried state adjoints.
-            expr = f"tl.broadcast_to({expr}, (BLOCK,))"
         self.lines.append(f"{local} = {expr}")
 
     def store(self, pointer, index, local):
         index = self.storage_index(pointer, index)
-        self.lines.append(
-            f"tl.store({pointer}_ptr + {index}, {local}, mask=mask)"
-            if self.backend == "triton"
-            else f"{pointer}_ptr[{index}] = {local}"
-        )
+        self.lines.append(self.renderer.store(pointer, index, local))
 
     def statements(self, lines):
         self.lines.extend(lines)
@@ -247,14 +211,7 @@ class _Source:
         """Append an optional sparse output sink after shared model math."""
         if not layout:
             return
-        if self.backend != "triton":
-            raise ValueError("Direct spike-list emission requires the Triton renderer")
         n_source, n_output, capacity = layout
-        if n_output % self.n:
-            raise ValueError(
-                "Producer output must have whole receptor lanes per neuron"
-            )
-        self.has_spike_list = True
         for name, size in (
             ("spike_indices", capacity),
             ("spike_cumulative", capacity),
@@ -263,21 +220,9 @@ class _Source:
             ("spike_accumulation", n_output),
         ):
             self.pointer(name, size)
-        self.lines.append("tl.static_assert(BLOCK == 128)")
-        self.lines.append(
-            f"_emit_spike_list({value}, index, mask, spike_degree_ptr, "
-            "spike_indices_ptr, spike_cumulative_ptr, spike_counts_ptr, "
-            f"{n_source}, BLOCK)"
-        )
-        # Each lane clears exactly the receptor slots whose drive it consumed.
-        # Other CTAs may still be reading their own slots: clearing by a flat
-        # output index instead would race when there are multiple receptors.
-        receptors = n_output // self.n
-        for receptor in range(receptors):
-            self.lines.append(
-                f"tl.store(spike_accumulation_ptr + index * {receptors} + {receptor}, "
-                "0.0, mask=mask)"
-            )
+        emission = self.renderer.emit_spike_list(value, self.n, layout)
+        self.lines.extend(emission.lines)
+        self.has_spike_list |= emission.feature == "spike_list"
 
     def emit_gradient_activity(self, spec, *, prefix="", time=None):
         """Store exact output-adjoint support declared by the model
@@ -289,214 +234,19 @@ class _Source:
                 "Gradient activity requires declared compact spike support"
             )
         self.pointer("gradient_activity", self.n * self.n_step)
-        # Keep NaNs active conservatively; they are not known derivative zeros.
-        expression = f"where(abs({prefix}{scalar}) >= {width!r}, 0.0, 1.0)"
         layout = self.storage.get("gradient_activity")
-        if self.backend == "triton" and layout is not None and layout.dtype == "int32":
-            from ....sparse.runtime.activity import GradientList
-
-            capacity = ((self.n + 127) // 128) * 128
-            blocks = capacity // 128
-            size = GradientList.size(self.n)
-            base = "gradient_activity_ptr"
-            if time is not None:
-                base += f" + {time} * {size}"
-            self.has_gradient_list = True
-            self.lines.extend(
-                [
-                    "tl.static_assert(BLOCK == 128)",
-                    f"gradient_tape = {base}",
-                    f"gradient_active = mask & ~ (abs({prefix}{scalar}) >= {width!r})",
-                    "tl.store(gradient_tape + index, gradient_active, mask=mask)",
-                    "_emit_active_list(gradient_active, index, "
-                    f"gradient_tape + {capacity}, "
-                    f"gradient_tape + {3 * capacity}, BLOCK)",
-                    "_emit_active_list(gradient_active | "
-                    f"(mask & ({prefix}output != 0.0)), "
-                    f"index, gradient_tape + {2 * capacity}, "
-                    f"gradient_tape + {3 * capacity + blocks}, BLOCK)",
-                ]
-            )
-            return
-        self.store("gradient_activity", self.index("output", time), expression)
+        emission = self.renderer.emit_gradient_activity(
+            scalar, width, prefix, time, self.n, self.n_step, layout
+        )
+        self.lines.extend(emission.lines)
+        self.has_gradient_list |= emission.feature == "gradient_list"
 
     def render(self):
-        if self.backend == "triton":
-            lines = []
-            for line in self.lines:
-                if line.strip() in ("END_IF", "END_REPLAY"):
-                    continue
-                if line.endswith(" = 0.0"):
-                    line = (
-                        line.rsplit(" = ", 1)[0]
-                        + " = tl.full((BLOCK,), 0.0, tl.float32)"
-                    )
-                for old, new in (
-                    ("fma", "tl.fma"),
-                    ("exp", "libdevice.exp" if self.precise_exp else "tl.exp"),
-                    ("expm1", "libdevice.expm1"),
-                    ("where", "tl.where"),
-                    ("maximum", "tl.maximum"),
-                    ("minimum", "tl.minimum"),
-                    ("abs", "tl.abs"),
-                ):
-                    line = re.sub(rf"(?<![\w.]){old}\(", new + "(", line)
-                lines.append(line)
-            args = ", ".join(name + "_ptr" for name, _ in self.pointers)
-            return (
-                "import triton\nimport triton.language as tl\n"
-                "from triton.language.extra import libdevice\n"
-                + (
-                    "from btorch.sparse.runtime.kernels_triton_spikelist "
-                    "import _emit_active_list\n"
-                    if self.has_gradient_list
-                    else ""
-                )
-                + (
-                    "from btorch.sparse.runtime.kernels_triton_spikelist "
-                    "import _emit_spike_list\n"
-                    if self.has_spike_list
-                    else ""
-                )
-                + "@triton.jit\n"
-                f"def cell_kernel({args}, BLOCK: tl.constexpr):\n"
-                "    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n"
-                f"    mask = index < {self.n}\n"
-                + "\n".join("    " + line for line in lines)
-                + "\n"
-            )
-        if self.backend == "cupy":
-            declared = {"index", "time", "replay"}
-            lines = []
-            for line in self.lines:
-                indentation = len(line) - len(line.lstrip())
-                line = line.strip()
-                if line.startswith("for time in"):
-                    reverse = "-1, -1" in line
-                    line = (
-                        f"for (int time = {self.n_step - 1}; time >= 0; --time) {{"
-                        if reverse
-                        else f"for (int time = 0; time < {self.n_step}; ++time) {{"
-                    )
-                elif line.startswith("for replay_offset in range("):
-                    end = line.removeprefix("for replay_offset in range(").removesuffix(
-                        "):"
-                    )
-                    line = (
-                        f"for (int replay_offset = 0; replay_offset < {end}; "
-                        "++replay_offset) {"
-                    )
-                elif line.startswith("if ") and line.endswith(":"):
-                    condition = line[3:-1].replace(" and ", " && ").replace("//", "/")
-                    line = f"if ({condition}) {{"
-                elif line in ("END", "END_IF", "END_REPLAY"):
-                    line = "}"
-                else:
-                    for old, new in (
-                        ("fma", "fmaf"),
-                        ("exp", "expf"),
-                        ("expm1", "expm1f"),
-                        ("maximum", "fmaxf"),
-                        ("minimum", "fminf"),
-                        ("abs", "fabsf"),
-                    ):
-                        line = re.sub(rf"(?<![\w.]){old}\(", new + "(", line)
-                    lhs = line.split(" = ", 1)[0]
-                    if lhs.isidentifier() and lhs not in declared:
-                        declared.add(lhs)
-                        line = "float " + line
-                    # Keep constants in FP32, including operations before assignment.
-                    line = re.sub(
-                        r"(?<![\w.])(\d+\.\d+(?:e[-+]?\d+)?)(?![\w.])", r"\1f", line
-                    )
-                    line += ";"
-                line = line.replace("//", "/")
-                lines.append(" " * indentation + line)
-            types = {
-                "float16": "__half",
-                "bfloat16": "__nv_bfloat16",
-                "float64": "double",
-                "bool": "bool",
-                "uint8": "unsigned char",
-                "int8": "signed char",
-                "int16": "short",
-                "int32": "int",
-                "int64": "long long",
-            }
-            args = ", ".join(
-                types.get(self.storage[name].dtype, "float") + "* " + name + "_ptr"
-                if name in self.storage
-                else "float* " + name + "_ptr"
-                for name, _ in self.pointers
-            )
-            return (
-                "#include <cuda_fp16.h>\n#include <cuda_bf16.h>\n"
-                "__device__ __forceinline__ float where(\n"
-                "    bool condition, float x, float y) { return condition ? x : y; }\n"
-                f'extern "C" __global__ void cell_kernel({args}) {{\n'
-                "  int index = blockIdx.x * blockDim.x + threadIdx.x;\n"
-                f"  if (index < {self.n}) {{\n"
-                + "\n".join("    " + line for line in lines)
-                + "\n  }\n}\n"
-            )
-        # TileLang mutable register arrays make state and adjoint updates across
-        # the serial time loop explicit, avoiding SSA rebinding ambiguities.
-        locals_ = sorted(
-            {
-                line.strip().split(" = ", 1)[0]
-                for line in self.lines
-                if " = " in line and line.strip().split(" = ", 1)[0].isidentifier()
-            }
-        )
-        lines = []
-        for line in self.lines:
-            if line.strip() in ("END", "END_IF", "END_REPLAY"):
-                continue
-            line = line.replace("range(", "T.serial(")
-            line = re.sub(
-                r"(?<![\w.])fma\(",
-                'T.call_pure_extern("float32", "fmaf", ',
-                line,
-            )
-            if self.precise_exp:
-                line = re.sub(
-                    r"(?<![\w.])exp\(",
-                    'T.call_pure_extern("float32", "expf", ',
-                    line,
-                )
-            exp_substitutions = () if self.precise_exp else (("exp", "T.exp"),)
-            for old, new in (
-                *exp_substitutions,
-                ("expm1", "_btorch_expm1"),
-                ("where", "T.if_then_else"),
-                ("maximum", "T.max"),
-                ("minimum", "T.min"),
-                ("abs", "T.abs"),
-            ):
-                line = re.sub(rf"(?<![\w.]){old}\(", new + "(", line)
-            for name in locals_:
-                line = re.sub(rf"\b{name}\b", name + "[0]", line)
-            lines.append(line)
-        args = ", ".join(
-            f'{name}_ptr: T.Tensor(({size},), "'
-            f'{self.storage[name].dtype if name in self.storage else "float32"}")'
-            for name, size in self.pointers
-        )
-        return (
-            "import tilelang\nimport tilelang.language as T\n"
-            "def _btorch_expm1(value):\n"
-            '    return T.call_pure_extern("float32", "expm1f", value)\n'
-            "@tilelang.jit\ndef build_kernel():\n"
-            f"    @T.prim_func\n    def cell_kernel({args}):\n"
-            f"        with T.Kernel({(self.n + 127) // 128}, threads=128) as block:\n"
-            + "".join(
-                f'            {name} = T.alloc_local((1,), "float32")\n'
-                for name in locals_
-            )
-            + "            index = block * 128 + T.get_thread_binding()\n"
-            + f"            if index < {self.n}:\n"
-            + "\n".join("                " + line for line in lines)
-            + "\n    return cell_kernel\n"
+        return self.renderer.render(
+            self.lines,
+            tuple(self.pointers),
+            self.has_spike_list,
+            self.has_gradient_list,
         )
 
 
@@ -541,52 +291,21 @@ def _generate_source(
     checkpoint_state = residual.checkpoint_state
     checkpoint_interval = residual.checkpoint_interval
     if checkpoint_state is not None and (
-        spec.model != "glif3" or checkpoint_state != "Iasc" or checkpoint_interval != 16
+        template.replay_state is None
+        or checkpoint_state != template.checkpoint_state
+        or checkpoint_interval != template.checkpoint_interval
     ):
         raise NotImplementedError(
-            "Only block-16 GLIF adaptation checkpoints are supported"
+            "Checkpoint replay must be declared by the model definition"
         )
     checkpoint_count = (
         max((n_step - 1) // checkpoint_interval, 0) if checkpoint_state else 0
     )
-    checkpoint_block = "(time >> 4)"
     source = _Source(backend, n, n_step, modes, precise_exp, storage)
+    checkpoint_block = f"(time {source.renderer.division} {checkpoint_interval or 1})"
     source.pointer("dt", 1)
     source.load("dt", "dt", "0")
-    if backend == "triton":
-        source.lines.append(
-            "tl.device_assert((index != 0) | ((dt == dt) & (dt > 0.0) & "
-            '(dt < float("inf"))), "dt must be finite and positive")'
-        )
-        if spec.model == "alpha_billeh":
-            source.lines.append(
-                "tl.device_assert((index != 0) | (dt == 1.0), "
-                '"AlphaPSCBilleh requires dt == 1")'
-            )
-    elif backend == "cupy":
-        source.lines.append(
-            "if (index == 0 && !(isfinite(dt) && dt > 0.0)) "
-            '__assertfail("dt must be finite and positive", __FILE__, __LINE__, '
-            "__func__, sizeof(char))"
-        )
-        if spec.model == "alpha_billeh":
-            source.lines.append(
-                "if (index == 0 && !(dt == 1.0)) "
-                '__assertfail("AlphaPSCBilleh requires dt == 1", __FILE__, '
-                "__LINE__, __func__, sizeof(char))"
-            )
-    else:
-        # Use TileLang's stack-aware assertion path, retaining diagnostics.
-        # One predicate covers both validity checks without two device asserts.
-        source.lines.append(
-            "T.device_assert(index != 0 or (T.isfinite(dt) and dt > 0.0), "
-            '"dt must be finite and positive")'
-        )
-        if spec.model == "alpha_billeh":
-            source.lines.append(
-                "T.device_assert(index != 0 or dt == 1.0, "
-                '"AlphaPSCBilleh requires dt == 1")'
-            )
+    source.lines.extend(source.renderer.validate_dt(template.required_dt))
     size = lambda name: n * modes if template.extra_dims(name) else n
     source.pointer("x_seq", n * n_step)
     if spec.surrogate == "poisson" and spec.poisson.spiking and not backward:
@@ -607,7 +326,7 @@ def _generate_source(
     for name in parameters:
         base, _ = _mode_name(name, modes)
         index = (
-            _parameter_index(name, layouts[base], modes, backend)
+            _parameter_index(name, layouts[base], modes, source.renderer)
             if base in layouts
             else source.index(name)
         )
@@ -643,10 +362,12 @@ def _generate_source(
             source.emit_spike_list("output", spike_list)
         for name in history_names:
             scalars = (
-                tuple(f"Iasc_{i}" for i in range(modes)) if name == "Iasc" else (name,)
+                tuple(f"{name}_{i}" for i in range(modes))
+                if template.extra_dims(name)
+                else (name,)
             )
             for scalar in scalars:
-                value = scalar if name.endswith("_charged") else scalar + "_next"
+                value = scalar + "_next" if name in template.state_names else scalar
                 source.store(name + "_seq", source.index(scalar, "time"), value)
         if checkpoint_state is not None and checkpoint_count:
             checkpoint_start = len(source.lines)
@@ -654,14 +375,18 @@ def _generate_source(
                 f"if (time + 1) % {checkpoint_interval} == 0 and time + 1 < {n_step}:"
             )
             scalars = (
-                tuple(f"Iasc_{i}" for i in range(modes))
-                if checkpoint_state == "Iasc"
+                tuple(f"{checkpoint_state}_{i}" for i in range(modes))
+                if template.extra_dims(checkpoint_state)
                 else (checkpoint_state,)
             )
             for scalar in scalars:
                 source.store(
                     checkpoint_state + "_checkpoint",
-                    source.index(scalar, "((time + 1) >> 4) - 1"),
+                    source.index(
+                        scalar,
+                        f"((time + 1) {source.renderer.division} "
+                        f"{checkpoint_interval}) - 1",
+                    ),
                     scalar + "_next",
                 )
             source.lines[checkpoint_start + 1 :] = [
@@ -670,8 +395,7 @@ def _generate_source(
             source.lines.append("END_IF")
         source.statements(f"{name}_prev = {name}_next" for name in states)
         source.lines[start:] = ["    " + line for line in source.lines[start:]]
-        if backend == "cupy":
-            source.lines.append("END")
+        source.lines.append("END")
         for name in states:
             base, _ = _mode_name(name, modes)
             source.store(base + "_final", source.index(name), name + "_prev")
@@ -769,15 +493,9 @@ def _generate_source(
                 )
                 mode = _mode_name(name, modes)[1]
                 condition = f"{replay_time} < time"
-                source.lines += [
-                    f"replay_L_{mode} = -k_{mode}",
-                    f"replay_D_{mode} = replay_L_{mode} * {name}_prev",
-                    *_exp_euler_forward(f"replay_{mode}", f"replay_L_{mode}", "dt"),
-                    f"{name}_prev = where({condition}, {name}_prev + "
-                    f"replay_{mode}_phi * replay_D_{mode}, {name}_prev)",
-                    f"{name}_prev = where({condition}, {name}_prev + "
-                    f"asc_amps_{mode} * {replay_output}, {name}_prev)",
-                ]
+                source.statements(
+                    template.replay_state(name, mode, replay_output, condition)
+                )
                 source.lines[replay_start + 1 :] = [
                     "    " + line for line in source.lines[replay_start + 1 :]
                 ]
@@ -797,8 +515,13 @@ def _generate_source(
                     )
                 else:
                     source.lines.append("grad_r_" + name + " = 0.0")
-                source.lines.append(f"grad_s_{name} = grad_s_{name} + grad_r_{name}")
-        for name in ("v_charged", "u_charged"):
+                if base not in fragments.deferred_records:
+                    source.lines.append(
+                        f"grad_s_{name} = grad_s_{name} + grad_r_{name}"
+                    )
+        for name in template.history_names:
+            if name in template.state_names:
+                continue
             if name in history_names and history_presence[name]:
                 source.load(
                     "grad_r_" + name,
@@ -814,6 +537,14 @@ def _generate_source(
         # stage. Removing unrequested leaves preserves every state adjoint and
         # input derivative needed by a trainable upstream encoder.
         for statement in fragments.backward:
+            if isinstance(statement, RecordCotangent):
+                if statement.name in history_names:
+                    for name in states:
+                        if _mode_name(name, modes)[0] == statement.name:
+                            source.lines.append(
+                                f"grad_s_{name} = grad_s_{name} + grad_r_{name}"
+                            )
+                continue
             lhs = statement.split(" = ", 1)[0]
             if lhs.startswith("grad_p_"):
                 base, _ = _mode_name(lhs[len("grad_p_") :], modes)
@@ -829,8 +560,7 @@ def _generate_source(
                     f"sum_grad_{name} = sum_grad_{name} + grad_p_{name}"
                 )
         source.lines[start:] = ["    " + line for line in source.lines[start:]]
-        if backend == "cupy":
-            source.lines.append("END")
+        source.lines.append("END")
         state_targets = dict(zip(template.state_names, targets.states))
         for name in states:
             base, _ = _mode_name(name, modes)
@@ -921,33 +651,6 @@ def generate_source(
     )
 
 
-class _TritonPreciseDivision(ast.NodeTransformer):
-    """Lower generated floating division without touching integer floor
-    division."""
-
-    def visit_BinOp(self, node):
-        node = self.generic_visit(node)
-        if not isinstance(node.op, ast.Div):
-            return node
-        return ast.copy_location(
-            ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id="tl", ctx=ast.Load()),
-                    attr="div_rn",
-                    ctx=ast.Load(),
-                ),
-                args=(node.left, node.right),
-                keywords=(),
-            ),
-            node,
-        )
-
-
-def _triton_precise_division(source):
-    tree = _TritonPreciseDivision().visit(ast.parse(source))
-    return ast.unparse(ast.fix_missing_locations(tree)) + "\n"
-
-
 @functools.lru_cache(maxsize=256)
 def _compile_cached(
     backend,
@@ -957,60 +660,14 @@ def _compile_cached(
     tilelang_toolchain_stamp=None,
     tilelang_target=None,
 ):
-    if backend == "cupy":
-        import cupy
-
-        options = []
-        if not enable_fp_fusion:
-            options.append("--fmad=false")
-        if precise_division:
-            options.append("--prec-div=true")
-        kernel = cupy.RawKernel(source, "cell_kernel", options=tuple(options))
-        kernel.compile()
-        return kernel
-    if backend == "triton" and precise_division:
-        source = _triton_precise_division(source)
-    if backend == "tilelang":
-        # TileLang's fast-math pass controls broader approximations. Its device
-        # compiler flags enter both of its disk-cache keys. A harmless macro
-        # prevents binaries built by another CUDA toolkit from satisfying this
-        # compile while keeping contraction and division independent.
-        if tilelang_toolchain_stamp is None:
-            raise RuntimeError("TileLang compilation requires a toolchain stamp")
-        flags = [f"-DBTORCH_TILELANG_TOOLCHAIN_{tilelang_toolchain_stamp}=1"]
-        if not enable_fp_fusion:
-            flags.append("--fmad=false")
-        if precise_division:
-            flags.append("--prec-div=true")
-        if tilelang_target is None:
-            raise RuntimeError("TileLang compilation requires a resolved device target")
-        source = source.replace(
-            "@tilelang.jit",
-            f"@tilelang.jit(target={tilelang_target!r}, compile_flags={flags!r})",
-            1,
-        )
-    filename = f"<btorch-{backend}-cell-{uuid.uuid4().hex}>"
-    linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
-    namespace = {}
-    try:
-        exec(compile(source, filename, "exec"), namespace)
-        kernel = (
-            namespace["cell_kernel"]
-            if backend == "triton"
-            else namespace["build_kernel"]()
-        )
-        if backend == "tilelang":
-            # TileLang's Python builder leaves temporary frame cycles holding
-            # its caller. Release them at cold compilation, before CUDA Graph
-            # Trees checkpoint the trajectory's saved-tensor lifetimes.
-            gc.collect()
-        # Eviction may leave a kernel alive in a caller or the backend cache.
-        # Keep inspectable source until that object itself is released.
-        weakref.finalize(kernel, linecache.cache.pop, filename, None)
-    except BaseException:
-        linecache.cache.pop(filename, None)
-        raise
-    return kernel
+    """Compile source through the selected backend runtime."""
+    return get_runtime(backend).compile(
+        source,
+        enable_fp_fusion,
+        precise_division,
+        tilelang_toolchain_stamp,
+        tilelang_target,
+    )
 
 
 def _compiler_version(executable, description):
@@ -1096,8 +753,10 @@ def _compile(
     # Source generation is device-independent. Compiled TileLang callables
     # own a concrete target; its compiler still owns executable/device reuse.
     with _device_scope(device):
-        toolchain_stamp = _tilelang_toolchain_stamp() if backend == "tilelang" else None
-        target = _current_tilelang_target() if backend == "tilelang" else None
+        runtime = get_runtime(backend)
+        toolchain_stamp, target = runtime.compile_context(
+            _tilelang_toolchain_stamp, _current_tilelang_target
+        )
         return _compile_cached(
             backend,
             source,
@@ -1106,24 +765,6 @@ def _compile(
             toolchain_stamp,
             target,
         )
-
-
-def _launch_cupy(kernel, args, n):
-    """Launch a RawKernel against Torch-owned storage on Torch's stream."""
-    import cupy
-    import numpy
-
-    with cupy.cuda.Device(args[0].device.index):
-        stream = cupy.cuda.Stream.from_external(
-            torch.cuda.current_stream(args[0].device)
-        )
-        with stream:
-            # RawKernel copies each NumPy scalar's bytes into the matching
-            # pointer parameter. The tensor tuple stays alive through the
-            # asynchronous launch, while avoiding per-argument DLPack and
-            # CuPy array wrappers.
-            pointers = tuple(numpy.uintp(arg.data_ptr()) for arg in args)
-            kernel(((n + 127) // 128,), (128,), pointers)
 
 
 def _launch_kernel(
@@ -1141,19 +782,14 @@ def _launch_kernel(
     if not n:
         return
     with _device_scope(args[0].device):
-        if backend == "triton":
-            options = {}
-            if debug is not None:
-                options["debug"] = debug
-            if num_warps is not None:
-                options["num_warps"] = num_warps
-            kernel[((n + 127) // 128,)](
-                *args, BLOCK=128, enable_fp_fusion=enable_fp_fusion, **options
-            )
-        elif backend == "cupy":
-            _launch_cupy(kernel, args, n)
-        else:
-            kernel(*args)
+        get_runtime(backend).launch(
+            kernel,
+            args,
+            n,
+            enable_fp_fusion=enable_fp_fusion,
+            debug=debug,
+            num_warps=num_warps,
+        )
 
 
 def _launch(
@@ -1210,16 +846,13 @@ def _launch(
     )
     args = tuple(_storage_span(buffers[name], size) for name, size in pointers)
     num_warps = None
-    if backend == "triton" and backward and spec.model == "alpha":
+    if backward and get_template(spec).reverse_parameter_warps:
         targets = _normalize_gradient_targets(get_template(spec), gradient_targets)
-        if not targets.input and (
-            parameter_mask is None or "tau_syn" in parameter_mask
-        ):
-            # Without the input-VJP store, the tau reverse encounters a
-            # load-dependency scheduling cliff with four warps on sm120.
-            # Two warps retain independent lanes per thread and recover
-            # latency while preserving the omitted-output storage contract.
-            num_warps = 2
+        if not targets.input:
+            for parameter, warps in get_template(spec).reverse_parameter_warps:
+                if parameter_mask is None or parameter in parameter_mask:
+                    num_warps = warps
+                    break
     _launch_kernel(
         backend,
         kernel,
@@ -1340,9 +973,9 @@ def _load_prepared_parameters(
         declaration = declarations[name]
         source.pointer(pointer_prefix + name, layout.span)
         offset = _parameter_index(
-            declaration.shape_source, layout, source.modes, source.backend
+            declaration.shape_source, layout, source.modes, source.renderer
         )
-        offset = re.sub(r"\bindex\b", f"({index})", offset)
+        offset = substitute_expression(offset, {"index": index})
         source.load(
             scalar_prefix + declaration.scalar_name, pointer_prefix + name, offset
         )

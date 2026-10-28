@@ -320,9 +320,8 @@ plain `backend="torch"` PSC multi-step convolution starts from rest, truncates i
 impulse response at `kernel_len`, and does not update state; use
 `backend=KernelOptions(neuron="torch")` for the stateful reference path.
 
-`ConductancePSC` has an exact-class standalone adapter. With `step_mode="m"`,
-pass `v_seq` by keyword to execute the same stateful conductance recurrence as
-repeated single steps:
+With `ConductancePSC(step_mode="m")`, pass `v_seq` by keyword to compute current
+from a voltage sequence:
 
 ```python
 current_seq = conductance_psc(z_seq, v_seq=v_seq)
@@ -342,11 +341,9 @@ Backend selection affects the no-voltage sequence contract:
   produce the conductance sequence, then apply `g * (E - v_seq)` as an ordinary
   Torch expression. Omitting voltage emits the stateful CUBA conductance.
 
-The exact native adapter supports standalone single-step and sequence calls,
-dense and sparse connections, delay continuation, gradients, inference, and
-CUDA Graph training replay. This is functional support, not a performance
-parity claim. `ConductancePSC` remains outside the general cell layout:
-subclasses and native `RecurrentNN` preparation are rejected.
+Native backends support standalone single-step and sequence calls with dense
+or sparse connections, delay continuation, gradients and CUDA Graph replay.
+Native recurrent COBA execution is not supported.
 
 Use `ConductanceRecurrentNN` for a connected Torch COBA network:
 

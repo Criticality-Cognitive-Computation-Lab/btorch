@@ -51,6 +51,8 @@ adjoints; `needs_input_grad` trims returned gradients, not the recurrence itself
 For a new model, `register_model_template` requires named declarations, state
 shape extensions, history shape sources and trusted one-step forward/backward
 callbacks. Registering a backend name alone does not define new equations.
+To generate the same model for multiple backends, see
+[generated kernel model contracts](../design/kernel_generation.md).
 
 ## Generate and validate
 
@@ -63,11 +65,15 @@ callback implementation for reuse by an external package.
 The public developer helper needs no pytest dependency:
 
 ```python
-from btorch.models.kernels.testing import ParityCase, check_backend_parity
+from btorch.models.kernels.testing import (
+    ParityCase, ParityOptions, check_backend_parity,
+)
 
-report = check_backend_parity("lab_cell", [
-    ParityCase(x_seq, states, parameters, spec, history),
-])
+report = check_backend_parity(
+    "lab_cell",
+    [ParityCase(x_seq, states, parameters, spec, history)],
+    options=ParityOptions(modes=("training", "inference")),
+)
 report.assert_close()
 ```
 
@@ -82,19 +88,14 @@ Check long trajectories and each surrogate/reset option you support. Reports nam
 the failing tensor and coordinate and identify the first divergent spike timestep.
 Spikes must match exactly; continuous tensors use configurable tolerances.
 
-Each supplied case also checks these situations by default:
-
-- Empty and single-step sequences, and a noncontiguous view of the same drive.
-- All declared state and charged-state records, even if the supplied case does
-  not request them.
-- Input-only, state-only and parameter-only gradients; frozen inputs; a trainable
-  downstream readout; `no_grad` and `inference_mode`.
-- Two chunks with differentiable state continuation, and two outstanding
-  forward calls followed by one combined backward.
-
-Use `ParityOptions(check_edge_cases=False, check_continuation=False)` to isolate
-a failure. The helper keeps your supplied dtype and parameter values; add cases
-for each precision, shape, broadcast, long sequence and model option you advertise.
+The comparator does not manufacture an edge-case matrix. Add explicit named cases
+for the behaviors your kernel supports: empty and single-step sequences,
+noncontiguous drives, declared state or charged records, input/state/parameter
+gradients, frozen inputs, `no_grad` and `inference_mode`, differentiable chunk
+continuation, and multiple outstanding forwards. Keep each case tied to the
+physical or compiler behavior it is meant to catch. The helper keeps your
+supplied dtype and parameter values; add cases for each precision, shape,
+broadcast, long sequence and model option you advertise.
 
 `ParityOptions(compile=True, capture=True)` requests fullgraph and warmed-up CUDA
 replay checks. CPU capture is an explicit skip. Inspect `report.skipped`; a skip

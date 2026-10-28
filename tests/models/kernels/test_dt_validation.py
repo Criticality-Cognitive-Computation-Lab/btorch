@@ -24,15 +24,19 @@ def _assert_device_asserted(result):
 @pytest.mark.parametrize("backend", GPU_BACKENDS)
 def test_primitive_source_contains_backend_device_timestep_assertions(backend):
     source, _ = generate_source(backend, NeuronSpec("if"), 4, 3, ())
+    # Python AST rendering chooses quote/parenthesis style. Check the actual
+    # finite/positive predicate, while subprocess cases below execute failures.
+    source = source.replace("'", '"')
     if backend == "triton":
         assert "tl.device_assert" in source
         assert 'dt < float("inf")' in source
     elif backend == "cupy":
         assert "#include <assert.h>" not in source
-        assert "index == 0 && !(isfinite(dt) && dt > 0.0f)" in source
+        assert "index == 0 && !(isfinite(dt) && dt > 0.0" in source
         assert '__assertfail("dt must be finite and positive"' in source
     else:
-        assert "index != 0 or (T.isfinite(dt[0]) and dt[0] > 0.0)" in source
+        assert "T.isfinite(dt[0])" in source
+        assert "dt[0] > 0.0" in source
         compile(source, "<tilelang-dt-validation>", "exec")
 
 

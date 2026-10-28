@@ -9,7 +9,6 @@ from .registry import _NATIVE_GPU_BACKENDS
 
 NeuronBackend = str
 ConnectionBackend = Literal["auto", "triton", "cusparse", "torch"]
-_PRECISE_DIVISION_DEFAULT_MODELS = frozenset(("alif", "elif"))
 
 
 @dataclass(frozen=True)
@@ -101,11 +100,18 @@ def normalize_backend(backend: str | KernelOptions) -> KernelOptions:
 
 def resolve_model_options(backend: str | KernelOptions, *models: str) -> KernelOptions:
     """Apply model defaults to shorthand backends while preserving options."""
+    from .contracts import NeuronSpec
+    from .templates import get_template, has_generated_model
+
     options = normalize_backend(backend)
     if (
         isinstance(backend, str)
         and options.neuron in _NATIVE_GPU_BACKENDS
-        and any(model in _PRECISE_DIVISION_DEFAULT_MODELS for model in models)
+        and any(
+            has_generated_model(model)
+            and get_template(NeuronSpec(model)).default_precise_division
+            for model in models
+        )
     ):
         return replace(options, precise_division=True)
     return options

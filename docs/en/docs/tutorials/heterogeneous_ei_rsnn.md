@@ -231,7 +231,7 @@ routes through the connection:
 from btorch.sparse import runtime
 
 print(conn.explain())
-with runtime.use_backend("aten"):
+with runtime.use_backend("cusparse"):
     reference = conn(torch.randn(2, n_neuron, device=device))
 ```
 

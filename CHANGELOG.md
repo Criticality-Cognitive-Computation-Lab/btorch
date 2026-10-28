@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Kernel model contracts now use registered `ModelTemplate` state/record
+  metadata and shared forward/reverse fragments across primitive and fused
+  renderers. Kernel parity uses the canonical `ModelParityCase` comparator and
+  explicit named physical/VJP cases, including local extensions, instead of a
+  routine model/backend/dtype Cartesian matrix.
 - CUDA Graph inference warms/captures bounded `RecurrentNN` chunks and reuses
   full chunks across `torch.split` segments. `chunk_size=200` is the default.
   A shorter final segment has its own shape-specific capture, so a call uses at

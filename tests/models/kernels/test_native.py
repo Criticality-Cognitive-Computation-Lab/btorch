@@ -6,9 +6,12 @@ import torch
 
 from btorch.models.kernels.native import (
     KernelBinding,
-    ModelParityCase,
-    check_model_parity,
     load_kernel_package,
+)
+from btorch.models.kernels.testing import (
+    ModelParityCase,
+    ModelParityOptions,
+    check_model_parity,
 )
 
 
@@ -194,7 +197,11 @@ def test_alternative_gradient_oracle_and_missing_gradient():
         [ModelParityCase("detached", lambda x: x.clone(), lambda x: x.detach(), (x,))]
     )
     assert not missing.passed
-    assert "candidate grad=False" in missing.comparisons[-1].detail
+    assert any(
+        "candidate grad=False" in item.detail
+        for item in missing.comparisons
+        if "/training/backward/" in item.name
+    )
 
 
 def test_expanded_zero_stride_input():
@@ -405,6 +412,99 @@ def test_parity_rejects_integer_routing_off_by_one():
     assert all(item.first_mismatch == (0,) for item in report.comparisons)
 
 
+def test_parity_preserves_fp64_sub_float32_gradient_errors():
+    class SlightlyWrongGradient(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x):
+            return x.clone()
+
+        @staticmethod
+        def backward(ctx, grad):
+            # This offset is below float32 resolution near one, but remains a
+            # real defect in an FP64 VJP and must not disappear in comparison.
+            return grad + 5e-8
+
+    x = torch.tensor([1.0, 2.0], dtype=torch.float64, requires_grad=True)
+    report = check_model_parity(
+        [
+            ModelParityCase(
+                "fp64_vjp",
+                lambda value: value.clone(),
+                SlightlyWrongGradient.apply,
+                (x,),
+            )
+        ],
+        options=ModelParityOptions(atol=1e-9, rtol=0.0, modes=("training",)),
+    )
+    assert not report.passed
+    assert any(
+        "fp64_vjp/training/backward/input/0" == item.name for item in report.comparisons
+    )
+
+
+def test_parity_reports_complex_imaginary_mismatch():
+    x = torch.tensor([1.0 + 2.0j], dtype=torch.complex128)
+    report = check_model_parity(
+        [
+            ModelParityCase(
+                "complex",
+                lambda value: value,
+                lambda value: value + 1e-3j,
+                (x,),
+            )
+        ],
+        options=ModelParityOptions(check_gradients=False, modes=("inference",)),
+    )
+    assert not report.passed
+    assert report.comparisons[0].max_abs_error == pytest.approx(1e-3)
+
+
+def test_parity_names_first_spike_divergence():
+    expected = torch.tensor([[0, 0], [0, 1], [0, 0]], dtype=torch.int64)
+    actual = expected.clone()
+    actual[2, 1] = 1
+    report = check_model_parity(
+        [
+            ModelParityCase(
+                "spikes",
+                lambda: {"spikes": expected},
+                lambda: {"spikes": actual},
+                (),
+                exact_outputs=("['spikes']",),
+            )
+        ],
+        options=ModelParityOptions(check_gradients=False, modes=("inference",)),
+    )
+    assert not report.passed
+    assert report.comparisons[0].first_spike_divergence == 2
+    assert "['spikes']" in report.comparisons[0].name
+
+
+def test_parity_preserves_mixed_dtype_alias_views():
+    storage = torch.arange(12.0, dtype=torch.float32).reshape(3, 4)
+    x = storage[:, ::2]
+    state = torch.tensor([0.5, 1.5], dtype=torch.float64)
+
+    def model(value, initial, repeated):
+        assert value is repeated
+        assert value.stride() == (4, 2)
+        return {"value": value.to(torch.float64) + initial}
+
+    report = check_model_parity(
+        [
+            ModelParityCase(
+                "mixed_alias",
+                model,
+                model,
+                (x, state, x),
+                input_names=("x", "state", "x_alias"),
+            )
+        ],
+        options=ModelParityOptions(check_gradients=False, modes=("inference",)),
+    )
+    report.assert_close()
+
+
 def test_comparison_rejects_wrong_device_before_copying():
     from btorch.models.kernels.testing import _compare
 
@@ -418,8 +518,6 @@ def test_comparison_rejects_wrong_device_before_copying():
 
 
 def test_inference_only_parity_with_grad_requiring_encoder_inputs():
-    from btorch.models.kernels.native import ModelParityOptions
-
     calls = []
 
     def inference(x):

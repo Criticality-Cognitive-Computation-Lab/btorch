@@ -1,17 +1,19 @@
 """Verify public stateful adapters against the original step recurrence."""
 
 import copy
+from dataclasses import replace
 from itertools import product
 
 import pytest
 import torch
 from torch import nn
 
-from btorch.models import environ
+from btorch.models import environ, functional
 from btorch.models.kernels.options import KernelOptions
 from btorch.models.neurons.lif import LIF
 from btorch.models.rnn import RecurrentNN
 from btorch.models.synapse import AlphaPSC
+from tests.models.kernels.cases import glif_alpha_case, izh_dual_case
 from tests.models.kernels.helpers import (
     GPU_BACKENDS,
     require_cuda_backend,
@@ -539,6 +541,82 @@ def test_gpu_sparse_fullgraph_training_and_cudagraph_replay(backend):
                 state["neuron.v"], reference_state["neuron.v"], atol=2e-5, rtol=2e-5
             )
         assert rnn._cudagraph_runner.n_captures == 3
+
+        # A math-policy change must capture the selected kernels and preserve
+        # the continued physical trajectory, not merely change a version tuple.
+        rnn.backend = KernelOptions(
+            neuron=backend,
+            connection="cusparse",
+            enable_fp_fusion=False,
+            precise_division=True,
+        )
+        with torch.no_grad():
+            captured, state = rnn(drive)
+            reference_spikes, reference_state = reference(drive)
+            torch.testing.assert_close(captured, reference_spikes)
+            torch.testing.assert_close(
+                state["neuron.v"], reference_state["neuron.v"], atol=2e-5, rtol=2e-5
+            )
+        assert rnn._cudagraph_runner.n_captures == 4
+
+
+# The public examples are the cohesive network factories. These two explicit
+# cases keep the end-to-end state/weight VJP contract visible without creating
+# a model/backend/dtype product in the routine suite.
+@pytest.mark.parametrize(
+    "network_factory",
+    [
+        pytest.param(glif_alpha_case, id="glif3-alpha-delay-heterogeneous"),
+        pytest.param(izh_dual_case, id="izhikevich-dual-heterogeneous"),
+    ],
+)
+def test_public_network_case_matches_python_state_and_weight_vjp(
+    network_factory, reference_backend
+):
+    model = network_factory(backend=reference_backend)
+    functional.init_net_state(model, batch_size=1, device="cpu", dtype=torch.float32)
+    with torch.no_grad():
+        model.neuron.v.copy_(model.neuron.v_rest)
+    reference = copy.deepcopy(model)
+    reference.backend = replace(model.backend, neuron="torch")
+    states = functional.named_hidden_states(model)
+    reference_states = functional.named_hidden_states(reference)
+    for value in (*states.values(), *reference_states.values()):
+        value.requires_grad_()
+    for parameter in (*model.parameters(), *reference.parameters()):
+        parameter.requires_grad_()
+    x = torch.randn(5, 1, model.neuron.size, requires_grad=True)
+    x_reference = x.detach().clone().requires_grad_()
+    with environ.context(dt=1.0):
+        actual, records = model(x)
+        expected, expected_records = reference(x_reference)
+        actual_loss = actual.sum() + sum(
+            value.square().sum() for value in records.values()
+        )
+        expected_loss = expected.sum() + sum(
+            value.square().sum() for value in expected_records.values()
+        )
+        actual_loss.backward()
+        expected_loss.backward()
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+    for name, value in records.items():
+        torch.testing.assert_close(value, expected_records[name], atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(x.grad, x_reference.grad, atol=2e-5, rtol=2e-5)
+    for name, value in states.items():
+        torch.testing.assert_close(
+            value.grad,
+            reference_states[name].grad,
+            atol=2e-5,
+            rtol=2e-5,
+        )
+    reference_parameters = dict(reference.named_parameters())
+    for name, value in model.named_parameters():
+        torch.testing.assert_close(
+            value.grad,
+            reference_parameters[name].grad,
+            atol=2e-5,
+            rtol=2e-5,
+        )
 
 
 # Module adaptation needs scalar/mode/multi-state pairs, not every pairing

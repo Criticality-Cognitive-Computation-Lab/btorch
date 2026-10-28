@@ -1,5 +1,6 @@
 """Validate fused cells read original broadcast parameter storage."""
 
+import ast
 import copy
 
 import pytest
@@ -63,9 +64,27 @@ def test_fused_source_specializes_parameter_storage_and_receptor_coordinates():
     assert sizes["neuron_c_m"] == 2
     assert sizes["psc_tau_syn"] == 3
     assert sizes["psc_g_max"] == 3
-    assert "(((index * 2 + 0)) % 2) * 2" in source
-    assert "(((index * 2 + 1)) % 2) * 2" in source
-    assert "((index * 2 + 0) // 2) % 3" in source
+    # Evaluate the generated pointer offsets, not formatting-specific
+    # parentheses. Receptor tau uses strided storage; gain follows neuron
+    # coordinates independently of batch and receptor.
+    assignments = {
+        node.targets[0].id: node.value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+    }
+    for receptor in (0, 1):
+        for name, expected in (
+            ("tau_syn", [receptor * 2] * 6),
+            ("g_max", [0, 1, 2, 0, 1, 2]),
+        ):
+            load = assignments[f"psc_{receptor}_{name}"]
+            offset = load.args[0].right
+            expression = compile(ast.Expression(offset), "<parameter-offset>", "eval")
+            actual = [
+                eval(expression, {"__builtins__": {}}, {"index": lane})
+                for lane in range(6)
+            ]
+            assert actual == expected
 
     # A dense view has different address arithmetic and must not collide with
     # the strided program in the bounded fused-source cache.

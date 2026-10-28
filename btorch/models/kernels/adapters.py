@@ -12,32 +12,15 @@ _connection_contexts = {}
 
 
 def _model_layout(module):
-    # Exact classes protect subclass equations from being silently replaced.
-    from ..neurons.alif import ALIF, ELIF
-    from ..neurons.glif import GLIF3
-    from ..neurons.izhikevich import Izhikevich
-    from ..neurons.lif import IF, LIF
-    from ..synapse import AlphaPSC, AlphaPSCBilleh, DualExponentialPSC, ExponentialPSC
     from .contracts import NeuronSpec
     from .templates import get_template
 
-    models = {
-        LIF: "lif",
-        IF: "if",
-        ALIF: "alif",
-        ELIF: "elif",
-        GLIF3: "glif3",
-        Izhikevich: "izhikevich",
-        AlphaPSC: "alpha",
-        ExponentialPSC: "exponential",
-        AlphaPSCBilleh: "alpha_billeh",
-        DualExponentialPSC: "dual_exponential",
-    }
-    if type(module) not in models:
+    # A subclass changes equations unless it explicitly redeclares its binding.
+    model = type(module).__dict__.get("kernel_model")
+    if model is None:
         raise NotImplementedError(
             f"No cell backend template for {type(module).__name__}"
         )
-    model = models[type(module)]
     template = get_template(
         NeuronSpec(model, refractory=getattr(module, "_use_refractory", False))
     )
@@ -45,13 +28,13 @@ def _model_layout(module):
 
 
 def validate_module(module, options: KernelOptions) -> None:
-    """Reject modules without a general or exact-class sequence adapter."""
-    from ..synapse import ConductancePSC, HeterSynapsePSC
-
-    # ConductancePSC has an exact-class standalone sequence adapter. Keeping it
-    # out of _model_layout makes recurrent preparation reject COBA until the
-    # scheduler has an explicit voltage-observation contract.
-    if type(module) not in (ConductancePSC, HeterSynapsePSC):
+    """Reject modules without an explicitly bound sequence implementation."""
+    # Composite modules own their sequence composition (for example, a
+    # conductance PSC needs the voltage sequence).  Require the hook on the
+    # concrete class, just as ``kernel_model`` is required below, so a
+    # subclass that changes equations cannot silently reuse an incompatible
+    # adapter.
+    if type(module).__dict__.get("_kernel_sequence") is None:
         _model_layout(module)
     if options.merge_synapse:
         raise ValueError(
@@ -150,12 +133,17 @@ def _prepare_cell_from_layout(module, x_seq: Tensor, layout):
             damping=float(function.damping_factor),
             refractory=getattr(module, "_use_refractory", False),
         )
+    from .templates import get_template
+
+    template = get_template(NeuronSpec(**kwargs))
     states = []
     for name in state_names:
         value = getattr(module, name)
         if value is None:
             raise RuntimeError(f"Initialize {name} before invoking a cell sequence")
-        shape = (*x_seq.shape[1:], module.n_Iasc) if name == "Iasc" else x_seq.shape[1:]
+        ndim = template.extra_dims(name)
+        extra = module._memories_rv[name].sizes[-ndim:] if ndim else ()
+        shape = (*x_seq.shape[1:], *extra)
         if not isinstance(value, Tensor):
             value = x_seq.new_full(shape, value, dtype=torch.float32)
         else:
@@ -180,9 +168,14 @@ def neuron_sequence(module, x_seq: Tensor) -> Tensor:
     from .operators import run_multi_step
 
     spec, names, states, parameters = prepare_cell(module, x_seq)
-    requested = ("v_charged",) if module.pre_spike_v else ()
-    if "u_pre_spike" in module._memories_rv:
-        requested += ("u_charged",)
+    from .templates import get_template
+
+    attributes = dict(get_template(spec).record_attributes)
+    requested = tuple(
+        name
+        for name, attribute in attributes.items()
+        if attribute in module._memories_rv
+    )
     result = run_multi_step(
         x_seq,
         states,
@@ -197,7 +190,7 @@ def neuron_sequence(module, x_seq: Tensor) -> Tensor:
         if x_seq.shape[0]:
             setattr(
                 module,
-                "v_pre_spike" if name == "v_charged" else "u_pre_spike",
+                attributes[name],
                 value[-1],
             )
     return result[0]
@@ -210,7 +203,6 @@ def _psc_sequence(module, z_seq: Tensor, *, layout=None) -> Tensor:
     # Reuse the existing connection and delay APIs. A call-scoped sparse route
     # avoids planning or rebuilding topology once for every timestep.
     from ..rnn import _sparse_run_scope
-    from ..synapse import HeterSynapsePSC
     from .operators import run_multi_step
 
     options = normalize_backend(module.backend)
@@ -218,16 +210,6 @@ def _psc_sequence(module, z_seq: Tensor, *, layout=None) -> Tensor:
         connection_scope(options),
         _sparse_run_scope(module, z_seq) if z_seq.shape[0] else nullcontext(),
     ):
-        if isinstance(module, HeterSynapsePSC):
-            source, leading, has_receptor_axis = module._flatten_input(z_seq)
-            if module.delayed_spike is not None:
-                module._validate_delayed_input(has_receptor_axis, z_seq.shape)
-                source = delay_sequence(module, source)
-            output = psc_sequence(module.base_psc, source)
-            result = module._reshape_sum_receptor(output, leading)
-            if z_seq.shape[0]:
-                module.psc = result[-1]
-            return result
         source = (
             z_seq.reshape(*z_seq.shape[: -len(module.n_neuron)], -1)
             if len(module.n_neuron) > 1
@@ -253,25 +235,10 @@ def _psc_sequence(module, z_seq: Tensor, *, layout=None) -> Tensor:
 
 def psc_sequence(module, z_seq: Tensor) -> Tensor:
     """Propagate connections separately and execute stateful PSC dynamics."""
+    hook = type(module).__dict__.get("_kernel_sequence")
+    if hook is not None:
+        return hook(module, z_seq)
     return _psc_sequence(module, z_seq)
-
-
-def conductance_sequence(module, z_seq: Tensor, v_seq: Tensor | None = None) -> Tensor:
-    """Reuse exponential state kernels for an exact ConductancePSC sequence."""
-    from ..synapse import ConductancePSC
-
-    if type(module) is not ConductancePSC:
-        raise TypeError("conductance_sequence requires an exact ConductancePSC")
-    conductance = _psc_sequence(
-        module,
-        z_seq,
-        layout=("exponential", ("psc",), ("tau_syn",)),
-    )
-    if v_seq is None:
-        return conductance
-    padding = conductance.ndim - v_seq.ndim
-    voltage = v_seq.reshape(v_seq.shape[0], *((1,) * padding), *v_seq.shape[1:])
-    return conductance * (module.E - voltage)
 
 
 def delay_sequence(module, source: Tensor) -> Tensor:

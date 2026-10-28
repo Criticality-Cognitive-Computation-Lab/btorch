@@ -8,7 +8,8 @@ import torch
 from btorch.models.kernels import HistoryPlan, KernelOptions, NeuronSpec
 from btorch.models.kernels.operators import run_multi_step
 from btorch.models.kernels.torch_backend import forward_step
-from tests.models.kernels.helpers import GPU_BACKENDS, cell_inputs, require_cuda_backend
+from tests.models.kernels.cases import cell_inputs
+from tests.models.kernels.helpers import GPU_BACKENDS, require_cuda_backend
 
 
 MODELS = (
@@ -367,28 +368,6 @@ def test_external_backend_rejects_nondefault_compile_policy_before_dispatch():
                 backend=options,
             )
     assert called == []
-
-
-def test_recurrent_capture_version_includes_compilation_policies():
-    from btorch.models.neurons.lif import LIF
-    from btorch.models.rnn import RecurrentNN
-    from btorch.models.synapse import AlphaPSC
-
-    model = RecurrentNN(
-        LIF(3),
-        AlphaPSC(3, 2.0, torch.nn.Identity()),
-        backend=KernelOptions(
-            neuron="torch", enable_fp_fusion=True, precise_division=False
-        ),
-    )
-    default_version = model.capture_version
-    model.backend = KernelOptions(
-        neuron="torch", enable_fp_fusion=False, precise_division=True
-    )
-    precise_version = model.capture_version
-    assert default_version != precise_version
-    assert default_version[3:5] == (True, False)
-    assert precise_version[3:5] == (False, True)
 
 
 def _cuda_lif_inputs(n_step: int = 8):

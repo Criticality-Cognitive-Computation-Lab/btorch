@@ -1,13 +1,22 @@
-"""Declare named models and fixed forward/reverse stages without an IR."""
+"""Register model-local state, record, transition and reverse contracts."""
 
+import importlib
 import math
+import pkgutil
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as replace_template
 
 import torch
 
 from .contracts import NeuronSpec
+
+
+@dataclass(frozen=True)
+class RecordCotangent:
+    """Join a record adjoint at an explicit reverse stage boundary."""
+
+    name: str
 
 
 @dataclass(frozen=True)
@@ -16,14 +25,19 @@ class BackendFragments:
 
     Args:
         forward: Statements in the fixed charge, adapt, fire, reset order.
-        backward: Statements in the reverse reset, fire, adapt, charge order.
-        record_vjp_after: State-record cotangents that must be joined after a
-            declared reverse statement to preserve floating-point association.
+        backward: Ordered scalar assignments interleaved with explicit
+            :class:`RecordCotangent` joins for paired reverse composition.
     """
 
     forward: tuple[str, ...]
-    backward: tuple[str, ...]
-    record_vjp_after: tuple[tuple[str, str], ...] = ()
+    backward: tuple[str | RecordCotangent, ...]
+
+    @property
+    def deferred_records(self) -> tuple[str, ...]:
+        """Return adjoints whose ordering is declared within reverse stages."""
+        return tuple(
+            stage.name for stage in self.backward if isinstance(stage, RecordCotangent)
+        )
 
 
 @dataclass(frozen=True)
@@ -64,6 +78,22 @@ class ModelTemplate:
         recurrent_checkpoint: Whether this template supports the current paired
             recurrent checkpoint representation. This is a capability, not a
             request to enable checkpointing for every use of the template.
+        fragments: Model-local scalar forward/reverse stage builder. None leaves
+            execution to explicitly registered tensor callbacks.
+        supports_refractory: Permit adding the shared refractory state contract.
+        required_dt: Optional exact timestep required by the model equations.
+        checkpoint_state: Physical state reconstructed by replay_state.
+        checkpoint_interval: Primitive reverse checkpoint block length.
+        module_factory: Independent original Torch Module constructor, called on
+            CPU with (spec, states, neuron_count); it must not use generated math.
+        parameter_attributes: Parameter names mapped to Module storage attributes.
+        record_attributes: Auxiliary record names mapped to registered memories.
+        replay_state: Ordered scalar reconstruction stage for checkpoint_state.
+        reverse_parameter_warps: Declared reverse scheduling hints by parameter,
+            used only when input VJPs are omitted by a compatible renderer.
+        output_state: State equal to the output, allowing trajectory alias reuse.
+        default_precise_division: Accurate division for shorthand backends;
+            explicit KernelOptions always take precedence.
         spike_gradient_input: Forward scalar register passed to the spike
             surrogate, if its output adjoint enters only through that
             surrogate. This permits exact support masking without suppressing
@@ -81,10 +111,25 @@ class ModelTemplate:
     prepare_parameters: Callable | None = None
     recurrent_checkpoint: bool = False
     spike_gradient_input: str | None = None
+    fragments: Callable | None = None
+    supports_refractory: bool = False
+    required_dt: float | None = None
+    checkpoint_state: str | None = None
+    checkpoint_interval: int = 0
+    module_factory: Callable | None = None
+    parameter_attributes: tuple[tuple[str, str], ...] = ()
+    record_attributes: tuple[tuple[str, str], ...] = ()
+    replay_state: Callable | None = None
+    reverse_parameter_warps: tuple[tuple[str, int], ...] = ()
+    output_state: str | None = None
+    default_precise_division: bool = False
 
     def extra_dims(self, name: str) -> int:
         """Return the declared trailing state/parameter axis count."""
-        return dict((*self.state_extra_dims, *self.parameter_extra_dims)).get(name, 0)
+        dimensions = dict((*self.state_extra_dims, *self.parameter_extra_dims))
+        return dimensions.get(
+            name, dimensions.get(dict(self.history_sources).get(name), 0)
+        )
 
     def history_state_name(self, name: str) -> str:
         """Look up the state supplying a declared history's shape.
@@ -156,71 +201,52 @@ def residual_template(spec: NeuronSpec, requested: tuple[str, ...]) -> ResidualT
         # Reverse reuses the sampled raster. Replaying random draws would change
         # both reset semantics and the user's global generator continuation.
         return ResidualTemplate(template.state_names, save_output=True)
-    if spec.model == "glif3" and "Iasc" not in requested:
+    if (
+        template.checkpoint_state is not None
+        and template.checkpoint_state not in requested
+    ):
         return ResidualTemplate(
-            tuple(name for name in template.state_names if name != "Iasc"),
-            "Iasc",
-            16,
+            tuple(
+                name
+                for name in template.state_names
+                if name != template.checkpoint_state
+            ),
+            template.checkpoint_state,
+            template.checkpoint_interval,
             True,
         )
     return ResidualTemplate(template.state_names)
 
 
-_MODELS = {
-    "lif": (("v",), ("v_threshold", "v_reset", "c_m", "tau")),
-    "if": (("v",), ("v_threshold", "v_reset", "c_m")),
-    "alif": (
-        ("v", "g_k"),
-        (
-            "v_threshold",
-            "v_reset",
-            "c_m",
-            "g_leak",
-            "E_leak",
-            "E_k",
-            "tau_adapt",
-            "dg_k",
-        ),
-    ),
-    "elif": (
-        ("v", "g_k"),
-        (
-            "v_threshold",
-            "v_reset",
-            "c_m",
-            "g_leak",
-            "E_leak",
-            "E_k",
-            "tau_adapt",
-            "dg_k",
-            "delta_T",
-            "v_T",
-        ),
-    ),
-    "glif3": (
-        ("v", "Iasc"),
-        ("v_threshold", "v_reset", "c_m", "tau", "v_rest", "k", "asc_amps"),
-    ),
-    "izhikevich": (
-        ("v", "u"),
-        ("v_threshold", "v_reset", "c_m", "k", "v_rest", "v_peak", "a", "b", "d"),
-    ),
-    "exponential": (("psc",), ("tau_syn",)),
-    "alpha": (("psc", "h"), ("tau_syn", "g_max")),
-    "alpha_billeh": (("psc", "h"), ("tau_syn", "syn_decay")),
-    "dual_exponential": (("psc", "g_rise", "g_decay"), ("tau_rise", "tau_decay", "a")),
-}
-
-
+_TEMPLATES: dict[str, ModelTemplate] = {}
 _EXTERNAL_MODELS: dict[str, tuple[ModelTemplate, Callable, Callable | None]] = {}
+_DEFINITIONS_LOADED = False
+
+
+def _load_definitions():
+    global _DEFINITIONS_LOADED
+    if _DEFINITIONS_LOADED:
+        return
+    _DEFINITIONS_LOADED = True
+    from . import definitions
+
+    for module in pkgutil.iter_modules(definitions.__path__):
+        importlib.import_module(f"{definitions.__name__}.{module.name}")
+
+
+def has_generated_model(name: str) -> bool:
+    """Report whether a registered definition supplies GPU mathematics."""
+    _load_definitions()
+    return name in _TEMPLATES and _TEMPLATES[name].fragments is not None
+
+
 _MODEL_REVISIONS: dict[str, int] = {}
 
 
 def model_template_revision(name: str) -> int:
     """Return the declaration revision used to validate outstanding
     backwards."""
-    if name in _MODELS:
-        return 1
+    _load_definitions()
     if name in _MODEL_REVISIONS:
         return _MODEL_REVISIONS[name]
     raise ValueError(f"Unknown cell template {name!r}")
@@ -229,7 +255,7 @@ def model_template_revision(name: str) -> int:
 def register_model_template(
     template: ModelTemplate,
     *,
-    forward_step: Callable,
+    forward_step: Callable | None = None,
     backward_step: Callable | None = None,
     replace: bool = False,
 ) -> None:
@@ -248,14 +274,17 @@ def register_model_template(
         ValueError: When names or declaration are inconsistent or duplicate.
         TypeError: When reference callbacks are not callable.
     """
+    _load_definitions()
     if not isinstance(template, ModelTemplate):
         raise TypeError("template must be a ModelTemplate")
     if not re.fullmatch(r"[a-z][a-z0-9_]*", template.name):
         raise ValueError("Model names must be lowercase Python identifiers")
-    if template.name in _MODELS or (template.name in _EXTERNAL_MODELS and not replace):
+    if template.name in _TEMPLATES and not replace:
         raise ValueError(f"Model template {template.name!r} is already registered")
-    if not callable(forward_step) or (
-        backward_step is not None and not callable(backward_step)
+    if (
+        (forward_step is None and template.fragments is None)
+        or (forward_step is not None and not callable(forward_step))
+        or (backward_step is not None and not callable(backward_step))
     ):
         raise TypeError("forward_step and any supplied backward_step must be callable")
     for names in (
@@ -290,7 +319,37 @@ def register_model_template(
             and sources.get(name) not in template.state_names
         ):
             raise ValueError(f"History {name!r} needs an explicit state shape source")
-    _EXTERNAL_MODELS[template.name] = template, forward_step, backward_step
+    for bindings, names, kind in (
+        (template.parameter_attributes, template.parameter_names, "parameter"),
+        (template.record_attributes, template.history_names, "record"),
+    ):
+        if len(dict(bindings)) != len(bindings) or any(
+            name not in names or not attribute.isidentifier()
+            for name, attribute in bindings
+        ):
+            raise ValueError(f"Invalid {kind} attribute bindings for {template.name}")
+    if (
+        template.output_state is not None
+        and template.output_state not in template.state_names
+    ):
+        raise ValueError("output_state must name a physical state")
+    if template.checkpoint_state is not None and (
+        template.checkpoint_state not in template.state_names
+        or template.checkpoint_interval < 1
+        or not callable(template.replay_state)
+    ):
+        raise ValueError(
+            "Checkpoint state requires a positive interval and replay stage"
+        )
+    if template.required_dt is not None and (
+        not math.isfinite(template.required_dt) or template.required_dt <= 0
+    ):
+        raise ValueError("required_dt must be finite and positive")
+    _TEMPLATES[template.name] = template
+    if forward_step is not None:
+        _EXTERNAL_MODELS[template.name] = template, forward_step, backward_step
+    else:
+        _EXTERNAL_MODELS.pop(template.name, None)
     _MODEL_REVISIONS[template.name] = _MODEL_REVISIONS.get(template.name, 0) + 1
 
 
@@ -298,17 +357,6 @@ def get_reference_callbacks(spec: NeuronSpec):
     """Look up explicit external recurrences without parsing their code."""
     entry = _EXTERNAL_MODELS.get(spec.model)
     return None if entry is None else entry[1:]
-
-
-def _prepare_glif_parameters(spec, parameters, *, backward):
-    from ..ode import _exp_euler_coefficient
-
-    tau = parameters["tau"]
-    phi, delta = _exp_euler_coefficient(-1.0 / tau, spec.dt)
-    values = {"glif_phi_coefficient": phi}
-    if backward:
-        values["glif_delta_coefficient"] = delta
-    return values
 
 
 def prepare_parameters(spec, parameters, *, backward=False):
@@ -324,10 +372,12 @@ def prepare_parameters(spec, parameters, *, backward=False):
 
 def get_template(spec: NeuronSpec) -> ModelTemplate:
     """Resolve a named cell and validate its static supported options."""
-    if spec.model in _EXTERNAL_MODELS:
-        return _EXTERNAL_MODELS[spec.model][0]
-    if spec.model not in _MODELS:
+    _load_definitions()
+    if spec.model not in _TEMPLATES:
         raise NotImplementedError(f"Unsupported cell template: {spec.model!r}")
+    template = _TEMPLATES[spec.model]
+    if template.fragments is None:
+        return template
     if spec.surrogate not in (
         "sigmoid",
         "atan",
@@ -348,7 +398,7 @@ def get_template(spec: NeuronSpec) -> ModelTemplate:
         raise ValueError(
             "surrogate_width requires a finite positive deterministic support"
         )
-    state_names, parameter_names = _MODELS[spec.model]
+    state_names, parameter_names = template.state_names, template.parameter_names
     if spec.poisson is not None:
         if "v" not in state_names and "u" not in state_names:
             raise NotImplementedError(
@@ -374,42 +424,18 @@ def get_template(spec: NeuronSpec) -> ModelTemplate:
     ):
         raise ValueError("dt must be finite and positive")
     if (
-        spec.model == "alpha_billeh"
+        template.required_dt is not None
         and not isinstance(spec.dt, torch.Tensor)
-        and spec.dt != 1
+        and spec.dt != template.required_dt
     ):
-        raise ValueError("AlphaPSCBilleh requires dt == 1")
-    if spec.refractory:
-        if spec.model not in ("lif", "if", "alif", "elif", "glif3"):
-            raise ValueError(f"{spec.model} does not support a refractory state")
-        state_names += ("refractory",)
-        parameter_names += ("tau_ref",)
-    history_names = state_names
-    if "v" in state_names:
-        history_names += ("v_charged",)
-    if "u" in state_names:
-        history_names += ("u_charged",)
-    return ModelTemplate(
-        spec.model,
-        state_names,
-        parameter_names,
-        history_names,
-        (("Iasc", 1),) if spec.model == "glif3" else (),
-        tuple(
-            (name, name.removesuffix("_charged"))
-            for name in history_names
-            if name.endswith("_charged")
-        ),
-        parameter_extra_dims=(("k", 1), ("asc_amps", 1))
-        if spec.model == "glif3"
-        else (),
-        prepared_parameters=(
-            PreparedParameter("glif_phi_coefficient", "glif_phi", "tau"),
-            PreparedParameter("glif_delta_coefficient", "glif_delta", "tau"),
-        )
-        if spec.model == "glif3"
-        else (),
-        prepare_parameters=_prepare_glif_parameters if spec.model == "glif3" else None,
-        recurrent_checkpoint=spec.model in ("lif", "exponential"),
-        spike_gradient_input="norm" if "v" in state_names else None,
+        raise ValueError(f"{template.name} requires dt == {template.required_dt:g}")
+    if not spec.refractory:
+        return template
+    if not template.supports_refractory:
+        raise ValueError(f"{spec.model} does not support a refractory state")
+    return replace_template(
+        template,
+        state_names=state_names + ("refractory",),
+        parameter_names=parameter_names + ("tau_ref",),
+        history_names=template.history_names + ("refractory",),
     )
