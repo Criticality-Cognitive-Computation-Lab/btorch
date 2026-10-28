@@ -1,13 +1,15 @@
 """CUDA graph capture/replay for stateful multi-step loops.
 
 A T-step RNN over a small network is launch-bound: the kernels are tiny and the
-CPU cannot queue them fast enough to keep the GPU busy. Capturing the whole loop
-collapses T*k launches into a single replay.
+CPU cannot queue them fast enough to keep the GPU busy. Capturing a chunk
+collapses its device launches into one replay. RecurrentNN
+warms and captures only a bounded chunk, then replays it across the sequence;
+its explicit chunk_size controls that boundary.
 
 This composes with ``torch.compile`` rather than competing with it: Inductor
 still fuses the unroll block, and the graph is captured around the resulting
 compiled kernels, so the two wins stack. Measured on the launch-bound regime
-(T=500, batch=1, hidden=32) against eager:
+(T=500, batch=1, hidden=32, explicit whole-sequence chunk) against eager:
 
     torch.compile(mode="reduce-overhead")   4.1x   (one replay per unroll block)
     capture around eager                    3.2x   (one replay, unfused kernels)
@@ -336,7 +338,22 @@ class CudaGraphRunner:
             k: (v.detach().clone() if torch.is_tensor(v) else v)
             for k, v in named_hidden_states(module).items()
         }
+        amp_enabled = torch.is_autocast_enabled("cuda")
+        amp_dtype = torch.get_autocast_dtype("cuda")
 
+        def invoke(*inputs):
+            # A cached autocast weight from warm-up would become an immutable
+            # graph input. Record the conversion itself so optimizer updates
+            # remain visible on replay without invalidating the graph.
+            with torch.autocast(
+                "cuda", enabled=amp_enabled, dtype=amp_dtype, cache_enabled=False
+            ):
+                return fn(*inputs, **kwargs)
+
+        static_args = tuple(
+            value.detach().clone() if torch.is_tensor(value) else value
+            for value in args
+        )
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
@@ -346,14 +363,11 @@ class CudaGraphRunner:
             # the graph is being recorded.
             for _ in range(max(1, self.warmup)):
                 set_hidden_states(module, snapshot)
-                fn(*args, **kwargs)
+                invoke(*static_args)
         torch.cuda.current_stream().wait_stream(stream)
         torch.cuda.synchronize()
 
         # Freeze inputs and initial state at addresses the graph can hard-wire.
-        static_args = tuple(
-            a.detach().clone() if torch.is_tensor(a) else a for a in args
-        )
         static_state_in = {
             k: v.detach().clone() for k, v in snapshot.items() if torch.is_tensor(v)
         }
@@ -371,7 +385,7 @@ class CudaGraphRunner:
         try:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                outputs = fn(*static_args, **kwargs)
+                outputs = invoke(*static_args)
         finally:
             if gc_was_enabled:
                 gc.enable()

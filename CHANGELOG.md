@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- CUDA Graph inference warms/captures bounded `RecurrentNN` chunks and reuses
+  full chunks across `torch.split` segments. `chunk_size=200` is the default.
+  A shorter final segment has its own shape-specific capture, so a call uses at
+  most two graph shapes: the full chunk and its remainder. Warm-up never runs
+  the complete long sequence. Examples expose `--chunk-size`; there is no
+  chunk-mode argument.
 - `btorch.analysis.compute_input_scale` calibrates external drive using the
   actual recurrent model while restoring its memories and recording policy.
 - The Izhikevich example defaults to 60k neurons, 33,072,348 edges, ~5 Hz and
@@ -422,6 +428,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `tests/benchmark/test_ode.py` -> `tests/benchmark/test_ode_bench.py`.
 
 ### Fixed
+
+- CUDA Graph replay observes in-place parameter updates under autocast by
+  capturing weight conversion instead of retaining warm-up's autocast cache.
+  Replacing recurrent parameters/buffers or changing scalar `dt` invalidates
+  the capture; in-place optimizer updates reuse it.
 - Sparse connections: Dale reference signs and the constraint structure (group
   ids, base weights) are now part of the `state_dict`. Previously the signs were
   derived from the construction-time matrix, so they were stale after

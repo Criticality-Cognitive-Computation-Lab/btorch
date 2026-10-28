@@ -24,6 +24,8 @@ current edges. The twin shares no code with the sparse execution path or with
 the capture machinery, so agreeing with it means the right wiring was used.
 """
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 from torch import nn
@@ -581,6 +583,97 @@ def test_network_backend_participant_preserves_parameter_replay():
     assert (old != new).sum() > 100
     assert torch.equal(_run(graphed, drive)[0], new)
     assert runner.n_captures == 1
+
+
+def test_recurrent_capture_version_tracks_tensor_values_and_dt():
+    """Capture topology follows tensor identity while replay reads new values.
+
+    This is the intended user workflow for an optimizer or AMP update: mutate
+    an existing parameter in place and replay the graph. Replacing a parameter,
+    or changing the scalar ``dt`` that a captured kernel receives from Python,
+    changes the capture contract and causes exactly one recapture.
+    """
+
+    def run(net: RecurrentNN, drive: torch.Tensor, *, dt: float, amp: bool):
+        reset_net_state(net, batch_size=B)
+        autocast = torch.autocast(DEVICE, dtype=torch.float16) if amp else nullcontext()
+        with torch.no_grad(), environ.context(dt=dt), autocast:
+            output = net(drive)[0]
+            # Include physical state: identical spike bins alone could hide a
+            # stale weight or dt when voltages remain below threshold.
+            return torch.cat(
+                (output.flatten(), net.neuron.v.flatten(), net.synapse.psc.flatten())
+            )
+
+    drive = _drive()
+    eager = _dense_network()
+    graphed = _dense_network(cudagraph=True)
+    runner = graphed._cudagraph_runner
+
+    assert torch.equal(
+        run(graphed, drive, dt=1.0, amp=False),
+        run(eager, drive, dt=1.0, amp=False),
+    )
+    assert runner.n_captures == 1
+    version = graphed.capture_version
+
+    # Optimizer-style updates preserve the allocation and are visible to replay.
+    with torch.no_grad():
+        eager.synapse.linear.weight.mul_(1.5)
+        graphed.synapse.linear.weight.mul_(1.5)
+    assert graphed.capture_version == version
+    assert torch.equal(
+        run(graphed, drive, dt=1.0, amp=False),
+        run(eager, drive, dt=1.0, amp=False),
+    )
+    assert runner.n_captures == 1
+
+    # AMP uses the same address-stable contract after its graph has warmed up.
+    torch.testing.assert_close(
+        run(graphed, drive, dt=1.0, amp=True),
+        run(eager, drive, dt=1.0, amp=True),
+        atol=2e-3,
+        rtol=2e-3,
+    )
+    amp_captures = runner.n_captures
+    amp_version = graphed.capture_version
+    with torch.no_grad():
+        eager.synapse.linear.weight.add_(0.25)
+        graphed.synapse.linear.weight.add_(0.25)
+    assert graphed.capture_version == amp_version
+    torch.testing.assert_close(
+        run(graphed, drive, dt=1.0, amp=True),
+        run(eager, drive, dt=1.0, amp=True),
+        atol=2e-3,
+        rtol=2e-3,
+    )
+    assert runner.n_captures == amp_captures
+
+    # A replacement changes the address token and must not replay the old graph.
+    with torch.no_grad():
+        eager.synapse.linear.weight = nn.Parameter(
+            eager.synapse.linear.weight.detach().clone() * -1.1
+        )
+        graphed.synapse.linear.weight = nn.Parameter(
+            graphed.synapse.linear.weight.detach().clone() * -1.1
+        )
+    assert graphed.capture_version != amp_version
+    torch.testing.assert_close(
+        run(graphed, drive, dt=1.0, amp=False),
+        run(eager, drive, dt=1.0, amp=False),
+    )
+    assert runner.n_captures == amp_captures + 1
+
+    # ``dt`` is a host scalar in this path, so changing it specializes a new
+    # graph even though all parameter addresses remain stable.
+    dt_version = graphed.capture_version
+    with environ.context(dt=2.0):
+        assert graphed.capture_version != dt_version
+    torch.testing.assert_close(
+        run(graphed, drive, dt=2.0, amp=False),
+        run(eager, drive, dt=2.0, amp=False),
+    )
+    assert runner.n_captures == amp_captures + 2
 
 
 def test_runner_versions_callable_for_state_outside_the_module():

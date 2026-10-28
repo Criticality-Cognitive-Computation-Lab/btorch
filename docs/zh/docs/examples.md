@@ -17,10 +17,15 @@ python -m examples.rsnn_izhikevich
 
 无需额外设置。脚本复用 btorch 的 `FixedIndegree` 采样器生成精确边数，校准持续异质
 输入，运行 5000 步、每步 1 ms，并输出相同记录策略下 push eager、pull CUDA Graph、
-push CUDA Graph 的计时。构图、编译、校准、保存不计入稳态时间；公共 replay 的
-输入/状态复制和返回结果的所有权复制计入时间。一次 RTX 5090 实测平均 5.035 Hz：
-push eager 338 ms、pull Graph 1571 ms、push Graph 74 ms，分别加速约 4.6×、21.3×。
-这是该合成示例的一次实测，不保证其他硬件或网络达到同样加速比。
+push CUDA Graph 的计时。首个计时调用包含首块 JIT 和 Graph 设置；构图、校准、CPU
+校验/传输以及写入记录文件单独计时，保留磁盘缓存。公共 replay 的输入、状态和返回
+结果所有权复制计入 replay 时间。基准固定网络、共享校准和策略顺序，因此只描述该
+合成电路，不构成进程冷启动的单独结论，也不保证其他硬件达到相同结果。
+
+CUDA Graph 默认按 200 个时间步预热和捕获。完整 chunk 复用同一个 Graph，
+较短的尾部使用第二个 Graph。例如 413 步会重放 200 步 Graph 两次，
+再重放一次 13 步 Graph。通过 `--chunk-size` 修改长度；在 Python API 中，
+`chunk_size=None` 关闭外层分块。
 
 默认保存 `fig/rsnn_izhikevich/recordings.pt`（本配置约 6.7 GiB），旁边的 JSON
 保存配置、实测率和计时。六个张量形状均为 `[time, batch, neuron]`：
@@ -59,7 +64,9 @@ python -m examples.rsnn_izhikevich --neurons 256 --density .05 --steps 256 --mod
 ```
 
 `--mode both` 先推理再训练；训练阶段关闭显式推理 capture，`--compile` 使用 Torch
-自己的训练图机制。每个 epoch 重置物理 memories，优化 `--target-rate-hz` 和电压惩罚。
+的 `reduce-overhead` 训练图机制。训练保留现有 functional BPTT、checkpoint 和 CPU
+offload 行为；chunk 化 CUDA Graph 重放只用于推理。每个 epoch 重置物理 memories，
+优化 `--target-rate-hz` 和电压惩罚。
 GLIF 在 optimizer 更新后通过 `constrain_net(network)` 保持 Dale 符号，Izhikevich
 权重不受符号约束。`--edges E` 可覆盖 density，指定精确总边数。
 

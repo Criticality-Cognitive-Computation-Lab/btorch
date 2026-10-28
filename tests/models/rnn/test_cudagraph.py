@@ -283,3 +283,43 @@ def test_whole_step_training_capture_matches_eager():
     torch.cuda.synchronize()
 
     assert torch.allclose(model.rnn_cell.W_x, ref.rnn_cell.W_x, atol=1e-4)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("unroll", [False, 8])
+def test_default_graph_warms_bounded_chunks_and_reuses_capture(monkeypatch, unroll):
+    """A long trial must not become several full-sequence warm-up runs."""
+    # Cover both a whole-chunk cell call and a fixed unroll block without
+    # multiplying this scheduling check across models or renderer backends.
+    eager, graphed = _pair()
+    eager.unroll = graphed.unroll = unroll
+    x = torch.randn(600, B, INPUT_DIM, device="cuda")
+    seen_lengths = []
+    original = graphed._stacked_chunk_forward
+
+    def observed(*args, **kwargs):
+        # Python executes during warm-up and capture, never on replay. Logging
+        # the actual numerical callback makes a full-sequence settle regression
+        # visible even if the final output still looks numerically correct.
+        seen_lengths.append(args[0].shape[0])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(graphed, "_stacked_chunk_forward", observed)
+    reference = _run(eager, x)
+    actual = _run(graphed, x)
+    torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+    assert seen_lengths == [200] * 4
+    assert graphed._cudagraph_runner.n_captures == 1
+
+    # Both equal-size chunks must use the same captured kernel sequence, and
+    # the next call must continue the true final state rather than a warm-up
+    # or capture-time state. The returned first histories must stay unchanged.
+    frozen = (actual[0].clone(), {k: v.clone() for k, v in actual[1].items()})
+    before = list(seen_lengths)
+    torch.testing.assert_close(graphed(x * 0.9), eager(x * 0.9), atol=0, rtol=0)
+    # A different total duration still reuses the warmed 200-step graph when
+    # splitting produces that same shape; no new JIT/capture is necessary.
+    longer = torch.cat((x, x[:400]), dim=0)
+    torch.testing.assert_close(graphed(longer), eager(longer), atol=0, rtol=0)
+    assert seen_lengths == before
+    torch.testing.assert_close(actual, frozen, atol=0, rtol=0)

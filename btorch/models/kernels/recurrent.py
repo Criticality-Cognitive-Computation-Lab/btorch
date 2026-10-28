@@ -217,16 +217,22 @@ def prepare_merged_state(module):
 
 
 def recurrent_sequence(
-    module, x_seq, x_syn=None, *, loop_args=None, _chunk=False, **kwargs
+    module,
+    x_seq,
+    x_syn=None,
+    *,
+    loop_args=None,
+    _chunk=False,
+    uniform_seq=None,
+    **kwargs,
 ):
     """Execute a complete recurrent trajectory with explicit tensor inputs."""
     from ..rnn import _sparse_run_scope
 
     if kwargs or loop_args not in (None, (0,), (0, 1)):
         raise ValueError("Cell recurrent sequences accept time-major x and x_syn only")
-    if not _chunk and (
-        module.chunk_size or module.grad_checkpoint or module.cpu_offload
-    ):
+    chunked = module.chunk_size is not None and x_seq.shape[0] > module.chunk_size
+    if not _chunk and (chunked or module.grad_checkpoint or module.cpu_offload):
         # Bind sparse execution before checkpoint snapshots are taken. Preparing
         # it inside the first chunk would save a different topology/task-value
         # input list than recomputation restores, and repeat preparation per
@@ -367,6 +373,7 @@ def recurrent_sequence(
             charged_names,
             options,
             cell,
+            uniform_seq,
         )
     with connection_scope(options), _sparse_run_scope(module, x_seq):
         connection_spec, connection_parameters, topology = _prepare_connection(
@@ -392,6 +399,7 @@ def recurrent_sequence(
             charged_names,
             options,
             cell,
+            uniform_seq,
         )
 
 
@@ -415,6 +423,7 @@ def _execute(
     charged_names,
     options,
     cell,
+    uniform_seq=None,
 ):
     from .operators import poisson_uniforms
     from .recurrent_operator import inference, training
@@ -567,7 +576,18 @@ def _execute(
             "Native recurrent Poisson execution requires a built-in GPU backend"
         )
     if poisson is not None and poisson.spiking:
-        uniform_seq = poisson_uniforms(x_seq)
+        if uniform_seq is None:
+            uniform_seq = poisson_uniforms(x_seq)
+        elif (
+            uniform_seq.shape != x_seq.shape
+            or uniform_seq.device != x_seq.device
+            or uniform_seq.dtype != torch.float32
+            or uniform_seq.requires_grad
+        ):
+            raise ValueError(
+                "Poisson uniforms must be non-differentiable FP32 values with "
+                "the time-first input shape and device"
+            )
     else:
         uniform_seq = x_seq.new_empty(0, dtype=torch.float32)
     arguments = (

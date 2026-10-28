@@ -3,7 +3,7 @@
     python -m examples.rsnn_izhikevich
 
 Defaults: CUDA/Triton, 60,000 neurons, exactly 33,072,348 edges, 5000 steps
-at 1 ms, calibrated 5 Hz mean activity, and CUDA Graph inference. The script
+at 1 ms, calibrated 5 Hz mean activity, and 200-step CUDA Graph chunks. The script
 prints matched push-eager / pull-graph / push-graph timings with all recordings
 on, then saves v, u, spike, total PSC, signed EPSC and IPSC under fig/.
 FP32 push is not bitwise reproducible, even with fixed seeds or CUDA Graphs.
@@ -85,6 +85,7 @@ def build_model(options: ExampleOptions) -> RecurrentNN:
         ),
         update_state_names=records,
         cudagraph=options.cudagraph,
+        chunk_size=options.chunk_size,
     ).to(options.device)
 
 
@@ -119,6 +120,7 @@ if __name__ == "__main__":
             sparse_backend="triton",
             method="push",
             cudagraph=True,
+            chunk_size=200,
         ),
         execution=RunOptions(
             steps=5000,

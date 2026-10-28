@@ -19,12 +19,19 @@ No extra parameters are needed. The script constructs the exact edge count using
 btorch's `FixedIndegree` sampler, calibrates sustained heterogeneous current,
 and runs 5000 steps at 1 ms. It prints matched **push eager**, **pull CUDA Graph**,
 and **push CUDA Graph** timings, with the same recordings enabled in every case.
-Compilation, capture, calibration, saving and analysis are outside the warm timings;
-public replay's input/state copies and output ownership copies are included.
-One RTX 5090 run measured 5.035 Hz, 338 ms push eager, 1571 ms pull Graph,
-and 74 ms push Graph: 4.6x over push eager and 21.3x over pull Graph.
-These measurements depend on hardware and circuit activity, and are not a
-promise for every GPU or input. This is the example's synthetic circuit.
+The first timed call includes first-chunk JIT and graph setup. Network
+construction, calibration, CPU validation/transfers, and writing the recording
+archive are measured separately; disk caches remain enabled. Public replay input,
+state, and output-ownership copies are part of the replay timing. The benchmark
+uses one fixed configuration and policy order with shared calibration, so its
+numbers describe this synthetic circuit rather than an isolated process-cold
+claim or a guarantee for every GPU.
+
+CUDA Graph warm-up and capture use chunks of 200 timesteps by default. Full
+chunks reuse one graph; a shorter final chunk uses a second graph. For example,
+413 steps replay the 200-step graph twice and the 13-step graph once.
+Use `--chunk-size` to change this length. In the Python API, `chunk_size=None`
+disables outer chunking.
 
 The default archive is `fig/rsnn_izhikevich/recordings.pt` (about 6.7 GiB for
 this configuration), with adjacent JSON run metadata and timings. Each tensor
@@ -68,7 +75,9 @@ python -m examples.rsnn_izhikevich --neurons 256 --density .05 --steps 256 --mod
 ```
 
 `--mode both` runs inference and training. Inference capture is disabled for
-training; `--compile` uses Torch's training graph machinery. Each epoch starts
+training; `--compile` uses Torch's `reduce-overhead` training graph machinery.
+Training keeps the existing functional BPTT, checkpointing, and CPU-offload
+behavior; chunked CUDA Graph replay is an inference-only feature. Each epoch starts
 from fresh physical memories and fits `--target-rate-hz` plus a voltage penalty.
 This demonstrates gradients through neuron parameters and recurrent weights;
 it is not a scientific fitting task. Changing neuron count or density changes

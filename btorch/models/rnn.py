@@ -204,7 +204,11 @@ class RecurrentNNAbstract(base.MemoryModule):
 
     * Inference: ``cudagraph=True`` captures the loop's device work and replays
       it (see ``cudagraph.py``). It is the fastest option and composes with
-      ``torch.compile`` and ``cpu_offload``, but is inference-only.
+      ``torch.compile`` and ``cpu_offload``, but is inference-only. Warm-up,
+      capture and replay use fixed-length ``torch.split`` chunks controlled by
+      ``chunk_size`` (default 200). Equal-length chunks share a capture;
+      a short final chunk gets its own capture.
+      ``None`` explicitly opts out of outer chunking.
     * Training: wrap the module in ``torch.compile(model, mode="reduce-overhead")``
       instead. Its CUDAGraph Trees capture forward and backward separately, so it
       is correct through ``backward()`` and composes with ``grad_checkpoint`` and
@@ -225,7 +229,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         update_state_names: Sequence[str] | None = None,
         step_mode: StepMode = "m",
         unroll: int | bool = 8,
-        chunk_size: int | None = None,
+        chunk_size: int | None = 200,
         cpu_offload: bool = False,
         grad_checkpoint: bool = False,
         save_grad_history: bool = False,
@@ -467,32 +471,26 @@ class RecurrentNNAbstract(base.MemoryModule):
             T, loop_args = self._detect_loop_args(*args)
         else:
             T = args[loop_args[0]].shape[0]
+        if any(args[i].shape[0] != T for i in loop_args):
+            raise ValueError("Loop inputs must share the same time dimension")
 
         unroll_size = T if self.unroll is False else int(self.unroll)
 
-        # Large chunk size. If chunk_size is None: with grad_checkpoint on, each
-        # unroll block is its own chunk (so it is the checkpoint unit); otherwise
-        # the whole sequence is a single chunk.
-        if self.chunk_size is None:
+        # Inner unroll blocks already support short tails; outer chunk lengths
+        # need not be multiples of unroll, including the final short chunk.
+        large_chunk_size = self.chunk_size
+        if large_chunk_size is None:
             large_chunk_size = unroll_size if self.grad_checkpoint else T
-        else:
-            large_chunk_size = self.chunk_size
-            if self.unroll is not False and large_chunk_size % unroll_size != 0:
-                raise ValueError(
-                    f"chunk_size ({large_chunk_size}) must be a multiple of "
-                    f"unroll ({unroll_size})"
-                )
+        if large_chunk_size < 1:
+            raise ValueError("chunk_size must be positive or None")
 
         return T, loop_args, unroll_size, large_chunk_size
 
     def _iter_large_chunks(
         self, args: Sequence, loop_args: Sequence[int], chunk_size: int
     ):
-        """Yield each large chunk's positional args.
-
-        Only the loop args are split along time (``torch.split`` returns zero-copy
-        views); every other arg passes through unchanged at its position.
-        """
+        """Yield fixed-length time views, with a possibly shorter final
+        chunk."""
         yield from _split_loop_args(args, loop_args, chunk_size)
 
     # NOTE: `disable(recursive=False)` here is load-bearing, not cosmetic. It keeps
@@ -590,8 +588,8 @@ class RecurrentNNAbstract(base.MemoryModule):
         graph.
 
         The capture boundary sits at the large chunk rather than the whole loop.
-        With the default ``chunk_size=None`` the two coincide (one chunk spans T),
-        so this is still a single replay per call. When the sequence *is* chunked,
+        The default ``chunk_size=200`` bounds warm-up and capture. With
+        explicit ``chunk_size=None`` one chunk spans T. When chunked,
         each chunk replays and every host-side step -- the ``cpu_offload`` moves,
         the accumulation, the final concat -- stays out here in eager python,
         where a replay cannot swallow it.
@@ -604,18 +602,44 @@ class RecurrentNNAbstract(base.MemoryModule):
         )
         z_chunks = []
         state_chunks = {}
+        from .kernels.operators import poisson_uniforms
+        from .kernels.options import normalize_backend
+        from .surrogate import PoissonRandomSpike, Truncated
+
+        function = getattr(getattr(self, "neuron", None), "surrogate_function", None)
+        while isinstance(function, Truncated):
+            function = function.surrogate
+        poisson_spiking = (
+            isinstance(function, PoissonRandomSpike)
+            and function.spiking
+            and normalize_backend(self.backend).neuron != "torch"
+        )
         for chunk_args in self._iter_large_chunks(args, loop_args, large_chunk_size):
+            uniform = (
+                poisson_uniforms(chunk_args[loop_args[0]]) if poisson_spiking else None
+            )
+            capture_args = (*chunk_args, uniform) if poisson_spiking else chunk_args
 
             def fn(*inner_args):
+                if poisson_spiking:
+                    inner_args, inner_uniform = inner_args[:-1], inner_args[-1]
+                else:
+                    inner_uniform = None
+                step_kwargs = dict(kwargs)
+                if poisson_spiking:
+                    step_kwargs["uniform_seq"] = inner_uniform
                 return self._stacked_chunk_forward(
-                    *inner_args, loop_args=loop_args, unroll_size=unroll_size, **kwargs
+                    *inner_args,
+                    loop_args=loop_args,
+                    unroll_size=unroll_size,
+                    **step_kwargs,
                 )
 
             # Offloading copies out of the pool itself, so skip the runner's clone.
             z, states = self._cudagraph_runner(
                 self,
                 fn,
-                chunk_args,
+                capture_args,
                 clone_outputs=not self.cpu_offload,
                 incompatible=self._cudagraph_incompatibilities(),
             )
@@ -760,7 +784,7 @@ class RecurrentNN(RecurrentNNAbstract):
         *,
         update_state_names: Sequence[str] | None = None,
         unroll: int | bool = 8,
-        chunk_size: int | None = None,
+        chunk_size: int | None = 200,
         cpu_offload: bool = False,
         grad_checkpoint: bool = False,
         allow_buffer: bool = False,
@@ -836,8 +860,7 @@ class RecurrentNN(RecurrentNNAbstract):
 
     @property
     def capture_version(self) -> tuple:
-        """Invalidate captured trajectories when implementation choices
-        change."""
+        """Track execution choices and tensors wired into captured kernels."""
         from .kernels.options import resolve_model_options
         from .kernels.registry import cell_backend_revision
         from .neurons.alif import ALIF, ELIF
@@ -846,7 +869,7 @@ class RecurrentNN(RecurrentNNAbstract):
         options = resolve_model_options(
             self.backend, *(() if neuron_model is None else (neuron_model,))
         )
-        return (
+        execution = (
             self.gradient,
             None if self.update_state_names is None else tuple(self.update_state_names),
             self.allow_buffer,
@@ -858,6 +881,50 @@ class RecurrentNN(RecurrentNNAbstract):
             options.precise_exp,
             cell_backend_revision(options.neuron),
             options.connection_method,
+        )
+
+        parameters = tuple(
+            (name, self._capture_tensor_token(value))
+            for name, value in self.named_parameters()
+        )
+        buffers = []
+        for module_name, module in self.named_modules():
+            memories = getattr(module, "_memories_rv", {})
+            for name, value in module.named_buffers(recurse=False):
+                if name in memories:
+                    continue
+                qualified_name = f"{module_name}.{name}" if module_name else name
+                buffers.append((qualified_name, self._capture_tensor_token(value)))
+
+        dt = environ.all().get("dt")
+        if torch.is_tensor(dt):
+            dt_token = ("tensor", self._capture_tensor_token(dt))
+            if dt.device.type == "cpu":
+                # A host scalar becomes a kernel argument at capture time rather
+                # than a device-memory read. Its address can stay fixed while the
+                # captured value becomes stale, so an in-place write must recapture.
+                try:
+                    revision = ("version", dt._version)
+                except RuntimeError:
+                    # Inference tensors have no version counter. CPU values are
+                    # cheap to inspect and scalar dt is the supported capture use.
+                    revision = ("value", dt.item())
+                dt_token = (*dt_token, revision)
+        else:
+            dt_token = ("value", dt)
+        return (*execution, tuple(parameters), tuple(buffers), dt_token)
+
+    @staticmethod
+    def _capture_tensor_token(value: Tensor) -> tuple:
+        """Describe a non-state tensor address wired into a CUDA graph."""
+        stride = tuple(value.stride()) if value.layout == torch.strided else ()
+        return (
+            id(value),
+            value.data_ptr(),
+            value.device,
+            value.dtype,
+            tuple(value.shape),
+            stride,
         )
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
@@ -1040,53 +1107,6 @@ class ConductanceRecurrentNN(RecurrentNN):
         >>> spikes, states = network(input_sequence)
     """
 
-    @staticmethod
-    def _capture_tensor_token(value: Tensor) -> tuple:
-        """Describe a non-state tensor address wired into a CUDA graph."""
-        stride = tuple(value.stride()) if value.layout == torch.strided else ()
-        return (
-            id(value),
-            value.data_ptr(),
-            value.device,
-            value.dtype,
-            tuple(value.shape),
-            stride,
-        )
-
-    @property
-    def capture_version(self) -> tuple:
-        """Track tensor replacements and scalar time-step specialization."""
-        parameters = tuple(
-            (name, self._capture_tensor_token(value))
-            for name, value in self.named_parameters()
-        )
-        buffers = []
-        for module_name, module in self.named_modules():
-            memories = getattr(module, "_memories_rv", {})
-            for name, value in module.named_buffers(recurse=False):
-                if name in memories:
-                    continue
-                qualified_name = f"{module_name}.{name}" if module_name else name
-                buffers.append((qualified_name, self._capture_tensor_token(value)))
-
-        dt = environ.all().get("dt")
-        if torch.is_tensor(dt):
-            dt_token = ("tensor", self._capture_tensor_token(dt))
-            if dt.device.type == "cpu":
-                # A host scalar becomes a kernel argument at capture time rather
-                # than a device-memory read. Its address can stay fixed while the
-                # captured value becomes stale, so an in-place write must recapture.
-                try:
-                    revision = ("version", dt._version)
-                except RuntimeError:
-                    # Inference tensors have no version counter. CPU values are
-                    # cheap to inspect and scalar dt is the supported capture use.
-                    revision = ("value", dt.item())
-                dt_token = (*dt_token, revision)
-        else:
-            dt_token = ("value", dt)
-        return (*super().capture_version, tuple(parameters), tuple(buffers), dt_token)
-
     def _reject_native_conductance_recurrence(self) -> None:
         """Validate the explicit Torch COBA schedule before state advances."""
         if type(self.synapse) is not synapse.ConductancePSC:
@@ -1162,7 +1182,10 @@ class ApicalRecurrentNN(RecurrentNN):
         update_state_names: Dotted state names to expose in the returned
             state dictionary.
         unroll: Inner unroll block size.
-        chunk_size: Outer chunk size for gradient checkpointing / offloading.
+        chunk_size: Fixed outer chunk length (default 200), using torch.split.
+            A short final chunk uses its own CUDA Graph capture.
+            Applies to checkpointing, offloading and CUDA Graph warm-up/replay.
+            None uses the full sequence, or an unroll block with checkpointing.
         cpu_offload: Move chunk outputs to CPU during forward.
         grad_checkpoint: Use ``torch.utils.checkpoint`` on large chunks.
         allow_buffer: Allow collecting hidden states from non-MemoryModule
@@ -1180,7 +1203,7 @@ class ApicalRecurrentNN(RecurrentNN):
         *,
         update_state_names: Sequence[str] | None = None,
         unroll: int | bool = 8,
-        chunk_size: int | None = None,
+        chunk_size: int | None = 200,
         cpu_offload: bool = False,
         grad_checkpoint: bool = False,
         allow_buffer: bool = False,

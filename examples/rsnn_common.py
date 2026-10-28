@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,7 @@ class ExampleOptions:
     sparse_backend: str = "auto"
     method: str = "auto"
     cudagraph: bool = False
+    chunk_size: int | None = 200
 
 
 @dataclass(frozen=True)
@@ -141,13 +143,26 @@ def compare_inference(network: RecurrentNN, inputs: torch.Tensor) -> dict[str, f
                     functional.set_hidden_states(network, initial)
                     return network(inputs)
 
-                # Settle compilation/capture before timing. Returned histories
-                # are deliberately released between calls, including warm-up.
+                # Include first-call JIT, chunk warm-up and capture separately
+                # from replay timings. Calibration may already have compiled
+                # kernels, so its wall time is reported independently as well.
+                torch.cuda.synchronize()
+                started = time.perf_counter()
                 trial()
+                torch.cuda.synchronize()
+                timings[f"{label} first call"] = (time.perf_counter() - started) * 1000
                 timings[label] = do_bench(
                     trial, warmup=1, rep=3, return_mode="median", timing_method="cpu"
                 )
                 print(f"{label}: {timings[label]:.3f} ms", flush=True)
+                print(
+                    f"{label} first call (including setup): "
+                    f"{timings[f'{label} first call']:.3f} ms",
+                    flush=True,
+                )
+                if graph:
+                    captures = len(network._cudagraph_runner.entries)
+                    print(f"cached chunk graphs: {captures}")
         fastest = timings["push CUDA Graph"]
         print(
             f"push CUDA Graph speedup: {timings['pull CUDA Graph'] / fastest:.2f}x "
@@ -190,6 +205,12 @@ def main(
         help="approximate fixed-indegree fraction",
     )
     parser.add_argument("--steps", type=int, default=execution.steps)
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=defaults.chunk_size,
+        help="RecurrentNN chunk size; also bounds graph warm-up/capture",
+    )
     parser.add_argument(
         "--target-rate-hz",
         type=float,
@@ -249,6 +270,7 @@ def main(
         args.neurons < 1
         or args.steps < 1
         or args.epochs < 1
+        or (args.chunk_size is not None and args.chunk_size < 1)
         or not 0 < args.density <= 1
         or args.dt <= 0
         or not 0 < args.target_rate_hz < 1000 / args.dt
@@ -260,6 +282,7 @@ def main(
         **{name: getattr(args, name) for name in ExampleOptions.__dataclass_fields__}
     )
     adapter = RSNNSonataIO()
+    started = time.perf_counter()
     if args.import_sonata:
         loaded = adapter.import_network(
             args.import_sonata,
@@ -275,14 +298,19 @@ def main(
         if type(network.neuron) is not expected_type:
             parser.error("Imported circuit does not match this example")
         network.cudagraph = args.cudagraph
+        network.chunk_size = args.chunk_size
     else:
         network, dt = build_model(options), args.dt
+    if args.device.split(":")[0] == "cuda":
+        torch.cuda.synchronize()
+    print(f"network construction: {time.perf_counter() - started:.3f} s", flush=True)
     n = network.neuron.n_neuron[0]
     # Inputs and spikes are [time, batch, neuron]; currents are in pA.
     inputs = stimulus(kind, args.steps, n, args.device)
     initialize(network, args.device)
     # Constant Izh drive needs only one stored row. Calibrate a short window;
     # the full inference run below separately checks its measured rate.
+    started = time.perf_counter()
     scale, rate = compute_input_scale(
         network, inputs[:512], target_hz=args.target_rate_hz, dt_ms=dt
     )
@@ -291,17 +319,15 @@ def main(
         if kind == "izhikevich"
         else inputs * scale
     )
+    calibration_ms = (time.perf_counter() - started) * 1000
     print(
-        f"calibration: target={args.target_rate_hz:g}Hz measured={rate:.3f}Hz",
+        f"calibration (including first-use JIT): {calibration_ms / 1000:.3f} s; "
+        f"target={args.target_rate_hz:g}Hz measured={rate:.3f}Hz",
         flush=True,
     )
     # Recording every state is useful for this tutorial but not required for
     # native fused inference. Large runs should disable unneeded records.
-    run = (
-        torch.compile(network, fullgraph=True, mode="reduce-overhead")
-        if args.compile
-        else network
-    )
+    run = torch.compile(network, mode="reduce-overhead") if args.compile else network
     with environ.context(dt=dt):
         if args.mode in ("inference", "both"):
             network.eval()
@@ -318,9 +344,18 @@ def main(
                     flush=True,
                 )
                 timings = compare_inference(network, inputs)
+                for label in ("push eager", "pull CUDA Graph", "push CUDA Graph"):
+                    print(
+                        f"{label} total (calibration/JIT + first sequence): "
+                        f"{calibration_ms + timings[f'{label} first call']:.3f} ms",
+                        flush=True,
+                    )
             initialize(network, args.device)
             with torch.inference_mode():
                 spikes, records = run(inputs)
+                if args.device.split(":")[0] == "cuda":
+                    torch.cuda.synchronize()
+                started = time.perf_counter()
                 rate = spikes.mean().item() * 1000 / dt
                 print(f"inference: firing={rate:.3f}Hz", flush=True)
                 if abs(rate - args.target_rate_hz) > 0.5:
@@ -336,7 +371,13 @@ def main(
                             **{k: v.cpu() for k, v in records.items()},
                         }
                     )
+                    transfer_seconds = time.perf_counter() - started
+                    print(
+                        f"CPU validation/record transfer: {transfer_seconds:.3f} s",
+                        flush=True,
+                    )
                     args.recordings.parent.mkdir(parents=True, exist_ok=True)
+                    started = time.perf_counter()
                     torch.save(saved, args.recordings)
                     args.recordings.with_suffix(".json").write_text(
                         json.dumps(
@@ -351,6 +392,7 @@ def main(
                                 input_scale=scale,
                                 seed=args.seed,
                                 cudagraph=network.cudagraph,
+                                chunk_size=network.chunk_size,
                                 neuron_backend=args.neuron_backend,
                                 sparse_backend=args.sparse_backend,
                                 method=args.method,
@@ -360,6 +402,10 @@ def main(
                             indent=2,
                         )
                         + "\n"
+                    )
+                    print(
+                        f"disk writing: {time.perf_counter() - started:.3f} s",
+                        flush=True,
                     )
                     print(
                         f"recordings: {args.recordings} ({', '.join(saved)})",

@@ -365,6 +365,58 @@ def test_recurrent_poisson_inference_has_no_backward_history(backend, monkeypatc
     assert not any(shape[:3] == (5, 2, 4) for shape in allocations.shapes)
 
 
+def test_recurrent_poisson_cudagraph_shapes_preserve_state_and_rng():
+    """Match shape-specific split captures for stochastic durations."""
+    require_cuda_backend("triton")
+    eager = _build(ALIF, "dense", "triton")
+    captured = copy.deepcopy(eager)
+    captured.cudagraph = True
+    drive = torch.linspace(0.22, 0.78, 413 * 2 * 4, device="cuda").reshape(413, 2, 4)
+    events = torch.zeros_like(drive)
+    sequences = (
+        (drive[:13], events[:13]),
+        (drive, events),
+        (drive[:31], events[:31]),
+    )
+
+    with (
+        torch.random.fork_rng(devices=[torch.cuda.current_device()]),
+        torch.inference_mode(),
+    ):
+        torch.cuda.manual_seed(4751)
+        initial_rng = torch.cuda.get_rng_state()
+        expected_results = []
+        with environ.context(dt=0.27):
+            for current_drive, current_events in sequences:
+                expected_results.append(eager(current_drive, current_events))
+        expected_rng = torch.cuda.get_rng_state()
+
+        torch.cuda.set_rng_state(initial_rng)
+        actual_results = []
+        with environ.context(dt=0.27):
+            for current_drive, current_events in sequences:
+                actual_results.append(captured(current_drive, current_events))
+        actual_rng = torch.cuda.get_rng_state()
+
+    for (actual, actual_records), (expected, expected_records) in zip(
+        actual_results, expected_results, strict=True
+    ):
+        torch.testing.assert_close(actual, expected, atol=6e-6, rtol=6e-5)
+        assert actual_records.keys() == expected_records.keys()
+        for name in RECORDS:
+            torch.testing.assert_close(
+                actual_records[name],
+                expected_records[name],
+                atol=6e-6,
+                rtol=6e-5,
+            )
+    for actual_state, expected_state in zip(
+        _final(captured), _final(eager), strict=True
+    ):
+        torch.testing.assert_close(actual_state, expected_state, atol=6e-6, rtol=6e-5)
+    assert torch.equal(actual_rng, expected_rng)
+
+
 @pytest.mark.parametrize("input_module", (torch.nn.Dropout(0.2), torch.nn.RReLU()))
 @pytest.mark.parametrize("spiking", (False, True))
 def test_stochastic_input_module_is_rejected_before_rng_or_callback(

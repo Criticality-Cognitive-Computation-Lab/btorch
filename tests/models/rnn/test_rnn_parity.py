@@ -65,13 +65,26 @@ def test_rnn_native_parity(T, unroll):
     ), "Bias grad mismatch"
 
 
-def test_rnn_chunk_size_guard():
-    """Test that chunk_size must be a multiple of unroll."""
-
-    rnn = make_rnn(SimpleRNNCell, unroll=4, chunk_size=6)(input_size=3, hidden_size=4)
-    x = torch.randn(10, 2, 3)
-    with pytest.raises(ValueError, match="must be a multiple of unroll"):
-        rnn(x)
+def test_rnn_unaligned_chunks_preserve_state_and_gradients():
+    """Unaligned chunks preserve records, state and full input/weight VJPs."""
+    torch.manual_seed(42)
+    reference = make_rnn(SimpleRNNCell, unroll=4, chunk_size=None)(3, 4)
+    actual = make_rnn(SimpleRNNCell, unroll=4, chunk_size=6, grad_checkpoint=True)(3, 4)
+    actual.load_state_dict(reference.state_dict())
+    x = torch.randn(10, 2, 3, requires_grad=True)
+    y = x.detach().clone().requires_grad_(True)
+    reset_net_state(reference, batch_size=2)
+    reset_net_state(actual, batch_size=2)
+    expected = reference(x)
+    observed = actual(y)
+    torch.testing.assert_close(observed, expected)
+    # Include both the trajectory and the live final memory in the loss, so
+    # checkpoint replay cannot silently drop cross-chunk state dependencies.
+    (expected[0].square().sum() + reference.rnn_cell.h.square().sum()).backward()
+    (observed[0].square().sum() + actual.rnn_cell.h.square().sum()).backward()
+    torch.testing.assert_close(y.grad, x.grad)
+    for param, oracle in zip(actual.parameters(), reference.parameters()):
+        torch.testing.assert_close(param.grad, oracle.grad)
 
 
 def test_rnn_remainder_blocks():
