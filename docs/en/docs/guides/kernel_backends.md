@@ -21,7 +21,7 @@ use. Cell backends reuse the existing sparse runtime; selecting a cell backend
 does not migrate or duplicate sparse algorithms.
 
 `neuron` selects the implementation shared by neuron and PSC dynamics;
-`connection` selects `"triton"`, `"cusparse"`, `"torch"`, or `"auto"`.
+`connection` selects `"triton"`, `"tilelang"`, `"cusparse"`, `"torch"`, or `"auto"`.
 `"cusparse"` requests native CUDA CSR products through PyTorch, for FP32/FP64;
 its weight VJP uses the shared PyTorch sampled edge-gradient implementation.
 `"torch"` is the general reference, including CPU and gather/scatter fallbacks.
@@ -29,9 +29,34 @@ its weight VJP uses the shared PyTorch sampled edge-gradient implementation.
 requests `"pull"` (destination-driven) or `"push"` (spike-list SpMSpV).
 The default `"auto"` inherits the sparse connection's method and activity hints.
 An explicit request overrides hints and raises if the device, dtype, batching,
-determinism setting or backend cannot implement it. Currently explicit push
-requires CUDA, Triton, FP32, unbatched weights and nondeterministic accumulation.
+determinism setting or backend cannot implement it. Explicit push requires a
+supported CUDA sparse backend and nondeterministic accumulation.
 Dense connections are unaffected by this sparse-only option.
+
+## Preparation and autotuning
+
+Eligible GPU kernels automatically compare two CUDA kernel configurations during
+preparation. Triton and TileLang use their native autotuners; CuPy uses its
+CUDA-event profiler. Prepared execution calls the selected executable directly.
+The first call includes compilation and tuning; measure it separately from
+warmed execution.
+
+Triton and TileLang retain their own tuning results. Reusing an execution
+contract neither repeats the search nor allocates trial storage. Trial tensors
+are not retained by cached tuners; prepared kernels retain only live arguments.
+
+Trials use isolated writable storage, preserving aliases and strides. Small
+workloads and workloads exceeding the trial-memory budget retain heuristics.
+Spike-list block ownership and queue capacities stay fixed. Consumers prepared
+before their device queues are populated also retain heuristics, rather than
+benchmarking uninitialized indices. TileLang stages that accumulate outputs use
+its public profiler with a reset before each repeat.
+
+Warm the intended RecurrentNN chunk before CUDA Graph capture; first-use
+compilation and tuning belong outside capture. Repeated capture reuses a warmed
+selection or heuristic. Selected
+configurations are cached within the process; backend compilation caches can
+also reuse binaries across processes.
 
 For a standalone sparse connection, use `SparseConnection(..., method="push")`
 or assign `connection.method = "pull"` between runs. For a runtime override:

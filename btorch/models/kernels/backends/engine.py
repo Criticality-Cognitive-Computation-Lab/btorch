@@ -15,6 +15,7 @@ from pathlib import Path
 
 import torch
 
+from ....sparse.runtime.activity import BLOCK_SIZE
 from ....utils.kernel import storage_span
 from ..contracts import surrogate_support
 from ..program import substitute_expression
@@ -201,6 +202,7 @@ class _Source:
         )
         self.pointers = []
         self.lines = []
+        self.epilogue = []
         self.has_spike_list = False
         self.has_gradient_list = False
 
@@ -242,16 +244,19 @@ class _Source:
         if not layout:
             return
         n_source, n_output, capacity = layout
+        if capacity != -(-self.n // BLOCK_SIZE) * BLOCK_SIZE:
+            raise ValueError("Spike-list capacity must match the producer block layout")
         for name, size in (
             ("spike_indices", capacity),
             ("spike_cumulative", capacity),
-            ("spike_counts", capacity // 128),
+            ("spike_counts", capacity // BLOCK_SIZE),
             ("spike_degree", n_source),
             ("spike_accumulation", n_output),
         ):
             self.pointer(name, size)
         emission = self.renderer.emit_spike_list(value, self.n, layout)
         self.lines.extend(emission.lines)
+        self.epilogue.extend(emission.epilogue)
         self.has_spike_list |= emission.feature == "spike_list"
 
     def emit_gradient_activity(self, spec, *, prefix="", time=None):
@@ -280,6 +285,7 @@ class _Source:
             tuple(self.pointers),
             self.has_spike_list,
             self.has_gradient_list,
+            self.epilogue,
         )
 
 
@@ -729,6 +735,8 @@ def _compile_cached(
     tilelang_target=None,
 ):
     """Compile source through the selected backend runtime."""
+    if torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Warm generated kernels before CUDA Graph capture")
     return get_runtime(backend).compile(
         source,
         enable_fp_fusion,
@@ -845,6 +853,7 @@ def _launch_kernel(
     enable_fp_fusion=True,
     debug=None,
     num_warps=None,
+    writes=(),
 ):
     """Launch primitive or fused kernels with the same lane and stream
     contract."""
@@ -859,6 +868,7 @@ def _launch_kernel(
             enable_fp_fusion=enable_fp_fusion,
             debug=debug,
             num_warps=num_warps,
+            writes=writes,
         )
 
 
@@ -882,6 +892,7 @@ def _launch(
     precise_exp=False,
     spike_list=(),
     gradient_activity=False,
+    outputs=(),
 ):
     if not n:
         return
@@ -949,6 +960,7 @@ def _launch(
         enable_fp_fusion=enable_fp_fusion,
         debug=True,
         num_warps=num_warps,
+        writes=tuple(i for i, (name, _) in enumerate(pointers) if name in outputs),
     )
 
 
@@ -1160,6 +1172,18 @@ def forward(
             device=x_seq.device,
             dtype=torch.float32,
         )
+    outputs = {
+        "output_seq",
+        "gradient_activity",
+        "spike_indices",
+        "spike_cumulative",
+        "spike_counts",
+        "spike_accumulation",
+        *(name + "_final" for name in template.state_names),
+        *(name + "_seq" for name in history_names),
+    }
+    if residual.checkpoint_state is not None:
+        outputs.add(residual.checkpoint_state + "_checkpoint")
     _launch(
         backend,
         spec,
@@ -1176,6 +1200,7 @@ def forward(
         precise_exp=precise_exp,
         spike_list=() if spike_list is None else spike_list.producer_layout,
         gradient_activity=gradient_activity is not None,
+        outputs=outputs,
     )
     return (
         buffers["output_seq"],
@@ -1299,6 +1324,11 @@ def backward(
         buffers["grad_" + name] = torch.empty(
             target(name), device=x_seq.device, dtype=torch.float32
         )
+    outputs = {
+        "grad_x_seq",
+        *("grad_" + name for name in parameter_mask),
+        *("grad_" + name + "_init" for name in template.state_names),
+    }
     _launch(
         backend,
         spec,
@@ -1317,6 +1347,7 @@ def backward(
         residual_template=residual,
         prepared_parameter_layouts=prepared_parameter_layouts,
         precise_exp=precise_exp,
+        outputs=outputs,
     )
     grad_states = tuple(
         buffers["grad_" + name + "_init"].sum_to_size(value.shape).to(value.dtype)

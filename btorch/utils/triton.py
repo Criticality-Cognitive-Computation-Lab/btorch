@@ -19,7 +19,9 @@ def _unaligned_kernel(kernel, changing):
     )
 
 
-def prepare_launch(kernel, args, grid, constants, *, changing=(), **options):
+def prepare_launch(
+    kernel, args, grid, constants, *, changing=(), writes=(), work=0, **options
+):
     """Resolve an executable once for stable dtypes and trailing constexprs.
 
     Callers own tensor layouts and scalar widths throughout the invocation.
@@ -29,6 +31,11 @@ def prepare_launch(kernel, args, grid, constants, *, changing=(), **options):
     """
     if changing:
         kernel = _unaligned_kernel(kernel, tuple(changing))
+    from .autotune import triton_config
+
+    options = triton_config(
+        kernel, args, grid, constants, options, writes=writes, work=work
+    )
     executable = kernel.warmup(*args, grid=grid, **dict(constants), **options)
     launch = executable[grid + (1,) * (3 - len(grid))]
     constexprs = tuple(value for _name, value in constants)

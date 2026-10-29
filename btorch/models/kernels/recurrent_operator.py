@@ -743,9 +743,11 @@ def _trajectory(
     step_outputs = None
     prepared_connection = None
     spike_list = None
+    from .backends.renderers import get_runtime
+
     if (
         use_fused
-        and backend == "triton"
+        and get_runtime(backend).supports_spike_list
         and spec["connection"] == "sparse"
         and not spec["delay"]
         and not x_syn_seq.numel()

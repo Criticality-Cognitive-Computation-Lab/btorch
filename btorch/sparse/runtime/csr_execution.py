@@ -18,6 +18,59 @@ from .activity import GradientList
 from .backend import KernelCache
 
 
+def stage_outputs(name):
+    """Declare mutable ABI slots shared by both sparse renderers."""
+    return {
+        "csr_matvec": (6, 7, 18),
+        "hub_combine": (3,),
+        "edge_grad": (4,),
+        "listed_output": (2,),
+        "pack_spikes": (2, 3, 4, 5),
+        "push_packed": (8,),
+        "pack_tasks": (3, 4, 5),
+        "direct_tasks": (7,),
+        "hash_tasks": (7, 8, 9),
+        "push_dense": (6,),
+    }[name]
+
+
+def stage_inputs(name, constants=()):
+    """Declare the invocation slots whose storage may change between steps."""
+    if name == "csr_matvec":
+        return (
+            (5,)
+            + ((15,) if constants[5] else ())
+            + ((17,) if constants[6] else ())
+            + ((19, 20) if constants[7] else ())
+        )
+    return {
+        "hub_combine": (),
+        "edge_grad": (2, 3),
+        "listed_output": (1,),
+        "push_dense": (4, 6),
+        "push_packed": (4, 5, 6, 7, 8),
+        "pack_spikes": (0,),
+        "pack_tasks": (0,),
+        "direct_tasks": (0,),
+        "hash_tasks": (0,),
+    }[name]
+
+
+def stage_work(name, args, grid):
+    """Estimate mathematical work without inspecting device tensor values."""
+    match name:
+        case "csr_matvec":
+            return args[2].numel() * args[10] * (grid[1] // args[11])
+        case "edge_grad":
+            return args[5] * args[6] * grid[1]
+        case "hub_combine":
+            return args[4] * grid[1]
+        case "listed_output":
+            return args[2].numel()
+        case _:
+            raise KeyError(name)
+
+
 def _check_input(value, expected):
     if tensor_layout(value) != expected:
         raise ValueError("Sparse input layout/dtype changed; prepare a new execution")

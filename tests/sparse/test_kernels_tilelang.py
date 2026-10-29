@@ -6,6 +6,7 @@ precision, noncontiguous operands and prepared graph replay/gradient
 accumulation.
 """
 
+import gc
 import weakref
 
 import pytest
@@ -147,11 +148,22 @@ def test_local_spike_lists_and_persistent_fanout_match_triton():
             atol=1e-11,
             rtol=1e-11,
         )
-    # Dropping an invocation must release its queue/output immediately; a
-    # launch closure retaining its own execution creates a per-chunk cycle
-    # that keeps GPU workspaces alive until Python's cyclic collector runs.
-    released = weakref.ref(a.output)
+    # TileLang's cold macro parser inspects the caller stack and leaves frame
+    # cycles until collection. Isolate that one-time compiler lifetime from the
+    # prepared execution contract: repeated chunks must release their queues
+    # immediately, without collecting Python cycles on the execution path.
     del actual, a, execute
+    gc.collect()
+    a = tile.prepare_spike_list(*args, cache=KernelCache())
+    actual = a(x)
+    torch.testing.assert_close(
+        actual,
+        kernels_torch.csr_matvec(c.crow, c.col, values, x),
+        atol=1e-11,
+        rtol=1e-11,
+    )
+    released = weakref.ref(a.output)
+    del actual, a
     assert released() is None
     # Check the shared input guard after the lifetime check: an exception's
     # traceback deliberately retains its frame until Python collects it.

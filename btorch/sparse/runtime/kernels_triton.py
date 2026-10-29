@@ -481,6 +481,7 @@ def _launch(cache, name, kernel, device_index, grid, args, const_names, consts, 
 class _Execution:
     def __init__(self, cache):
         self.cache = cache
+        self.stages = {}
 
     def launch(self, name, grid, args, const_names, consts, warps):
         kernel = {
@@ -489,17 +490,23 @@ class _Execution:
             "edge_grad": _edge_grad_kernel,
             "listed_output": _listed_matvec_output_kernel,
         }[name]
-        _launch(
-            self.cache,
-            name,
-            kernel,
-            args[0].device.index,
-            grid,
-            args,
-            const_names,
-            consts,
-            warps,
-        )
+        stage = self.stages.get(name)
+        if stage is None:
+            from ...utils.triton import prepare_launch
+            from .csr_execution import stage_inputs, stage_outputs, stage_work
+
+            stage = prepare_launch(
+                kernel,
+                args,
+                grid,
+                tuple(zip(const_names, consts, strict=True)),
+                changing=stage_inputs(name, consts),
+                writes=stage_outputs(name),
+                work=stage_work(name, args, grid),
+                num_warps=warps,
+            )
+            self.stages[name] = stage
+        stage(args)
 
 
 # ------------------------------------------------------------ derived layouts

@@ -16,6 +16,8 @@ import uuid
 import weakref
 from dataclasses import dataclass
 
+from ....sparse.runtime.activity import BLOCK_SIZE
+
 
 _MATH_NAMES = {
     "abs",
@@ -31,10 +33,11 @@ _FLOAT_DTYPES = {"float16", "bfloat16", "float64"}
 
 @dataclass(frozen=True)
 class RendererEmission:
-    """Source lines and capability flags emitted by a renderer helper."""
+    """Emit lane-local statements and an optional block-wide epilogue."""
 
     lines: tuple[str, ...]
     feature: str | None = None
+    epilogue: tuple[str, ...] = ()
 
 
 class _TritonPreciseDivision(ast.NodeTransformer):
@@ -219,7 +222,7 @@ class SourceRenderer:
             floor_division=self.floor_division,
         )
 
-    def render(self, lines, pointers, has_spike_list, has_gradient_list):
+    def render(self, lines, pointers, has_spike_list, has_gradient_list, epilogue=()):
         raise NotImplementedError
 
 
@@ -318,7 +321,7 @@ class TritonRenderer(SourceRenderer):
             scalar, width, prefix, time, n, n_step, layout
         )
 
-    def render(self, lines, pointers, has_spike_list, has_gradient_list):
+    def render(self, lines, pointers, has_spike_list, has_gradient_list, epilogue=()):
         rendered = []
         for raw in lines:
             indentation = raw[: len(raw) - len(raw.lstrip())]
@@ -424,7 +427,7 @@ class CuPyRenderer(SourceRenderer):
     def cast_load(self, expression, dtype):
         return f"float({expression})"
 
-    def render(self, lines, pointers, has_spike_list, has_gradient_list):
+    def render(self, lines, pointers, has_spike_list, has_gradient_list, epilogue=()):
         declared = {"index", "time", "replay"}
         rendered = []
         for raw in lines:
@@ -527,6 +530,33 @@ class TileLangRenderer(SourceRenderer):
     }
     precise_exp_call = "__tilelang_exp__"
 
+    def emit_spike_list(self, value, n, layout):
+        n_source, n_output, capacity = layout
+        if n_output % n:
+            raise ValueError(
+                "Producer output must have whole receptor lanes per neuron"
+            )
+        receptors = n_output // n
+        return RendererEmission(
+            (
+                "spike_selected[T.get_thread_binding()] = "
+                f'T.Cast("int32", {value} != 0.0)',
+            ),
+            "spike_list",
+            (
+                "_emit_spike_list(spike_selected, spike_degree_ptr, "
+                "spike_indices_ptr, spike_cumulative_ptr, spike_counts_ptr, "
+                f"block, {n_source}, {BLOCK_SIZE})",
+                f"for lane in T.Parallel({BLOCK_SIZE}):",
+                f"    if block * {BLOCK_SIZE} + lane < {n}:",
+                *(
+                    f"        spike_accumulation_ptr[(block * {BLOCK_SIZE} + lane) * "
+                    f"{receptors} + {receptor}] = 0.0"
+                    for receptor in range(receptors)
+                ),
+            ),
+        )
+
     def validate_dt(self, required_dt=None):
         lines = [
             "T.device_assert(index != 0 or (T.isfinite(dt) and dt > 0.0), "
@@ -569,7 +599,7 @@ class TileLangRenderer(SourceRenderer):
     def cast_load(self, expression, dtype):
         return f'T.Cast("float32", {expression})'
 
-    def render(self, lines, pointers, has_spike_list, has_gradient_list):
+    def render(self, lines, pointers, has_spike_list, has_gradient_list, epilogue=()):
         locals_ = sorted(
             {
                 statement.targets[0].id
@@ -598,18 +628,51 @@ class TileLangRenderer(SourceRenderer):
         )
         return (
             "import tilelang\nimport tilelang.language as T\n"
-            "def _btorch_expm1(value):\n"
+            + f"TUNABLE_THREADS = {not has_spike_list!r}\n"
+            + (
+                "from btorch.sparse.runtime.tilelang_csr import emit_spike_list "
+                "as _emit_spike_list\n"
+                if has_spike_list
+                else ""
+            )
+            + "def _btorch_expm1(value):\n"
             '    return T.call_pure_extern("float32", "expm1f", value)\n'
-            "@tilelang.jit\ndef build_kernel():\n"
-            f"    @T.prim_func\n    def cell_kernel({args}):\n"
-            f"        with T.Kernel({(self.n + 127) // 128}, threads=128) as block:\n"
+            + (
+                "@tilelang.jit\ndef build_kernel():\n"
+                if has_spike_list
+                else "@tilelang.jit\ndef build_kernel(threads=128):\n"
+            )
+            + f"    @T.prim_func\n    def cell_kernel({args}):\n"
+            + (
+                f"        with T.Kernel({-(-self.n // BLOCK_SIZE)}, "
+                f"threads={BLOCK_SIZE}) as block:\n"
+                if has_spike_list
+                else f"        with T.Kernel(T.ceildiv({self.n}, threads), "
+                "threads=threads) as block:\n"
+            )
             + "".join(
                 f'            {name} = T.alloc_local((1,), "float32")\n'
                 for name in locals_
             )
-            + "            index = block * 128 + T.get_thread_binding()\n"
+            + (
+                "            spike_selected = "
+                f'T.alloc_fragment(({BLOCK_SIZE},), "int32")\n'
+                "            T.annotate_layout({spike_selected: tilelang.Fragment(\n"
+                f"                ({BLOCK_SIZE},), forward_thread_fn=lambda i: i, "
+                "forward_index_fn=lambda i: 0)})\n"
+                "            T.clear(spike_selected)\n"
+                if has_spike_list
+                else ""
+            )
+            + (
+                f"            index = block * {BLOCK_SIZE} + T.get_thread_binding()\n"
+                if has_spike_list
+                else "            index = block * threads + T.get_thread_binding()\n"
+            )
             + f"            if index < {self.n}:\n"
             + "\n".join("                " + line for line in rendered)
+            + "\n"
+            + "\n".join("            " + line for line in epilogue)
             + "\n    return cell_kernel\n"
         )
 
@@ -620,6 +683,7 @@ class RendererRuntime:
     name = ""
     supports_dynamic_steps = False
     supports_pointer_offsets = False
+    supports_spike_list = False
 
     def argument(self, value, span):
         """Expose the pointer ABI without changing a tensor's storage."""
@@ -630,10 +694,10 @@ class RendererRuntime:
         """Prepare a sequence's argument views for a tensor-based ABI."""
         return tuple(self.argument(row, span) for row in value.unbind(0))
 
-    def prepare_launch(self, kernel, args, n, *, changing, enable_fp_fusion):
+    def prepare_launch(self, kernel, args, n, *, changing, enable_fp_fusion, writes=()):
         """Bind launch policy for an invocation with stable argument
         layouts."""
-        del args, changing
+        del args, changing, writes
         return functools.partial(
             self.launch,
             kernel,
@@ -651,17 +715,27 @@ class RendererRuntime:
         raise NotImplementedError
 
     def launch(
-        self, kernel, args, n, *, steps=None, enable_fp_fusion, debug, num_warps
+        self,
+        kernel,
+        args,
+        n,
+        *,
+        steps=None,
+        enable_fp_fusion,
+        debug,
+        num_warps,
+        writes=(),
     ):
         raise NotImplementedError
 
 
 class TritonRuntime(RendererRuntime):
+    supports_spike_list = True
     name = "triton"
     supports_dynamic_steps = True
     supports_pointer_offsets = True
 
-    def prepare_launch(self, kernel, args, n, *, changing, enable_fp_fusion):
+    def prepare_launch(self, kernel, args, n, *, changing, enable_fp_fusion, writes=()):
         # Row views can change alignment even when shape/strides are constant.
         # Specialize dtype/layout once, but never assume the first row's pointer
         # alignment for changing arguments. Static parameters retain alignment.
@@ -673,6 +747,8 @@ class TritonRuntime(RendererRuntime):
             ((n + 127) // 128,),
             (("BLOCK", 128),),
             changing=changing,
+            writes=writes,
+            work=n,
             enable_fp_fusion=enable_fp_fusion,
         )
 
@@ -690,7 +766,16 @@ class TritonRuntime(RendererRuntime):
             raise
 
     def launch(
-        self, kernel, args, n, *, steps=None, enable_fp_fusion, debug, num_warps
+        self,
+        kernel,
+        args,
+        n,
+        *,
+        steps=None,
+        enable_fp_fusion,
+        debug,
+        num_warps,
+        writes=(),
     ):
         options = {}
         if debug is not None:
@@ -698,6 +783,21 @@ class TritonRuntime(RendererRuntime):
         if num_warps is not None:
             options["num_warps"] = num_warps
         call_args = (*args, steps) if steps is not None else args
+        if writes:
+            from ....utils.autotune import triton_config
+
+            # Sequence kernels submit once; only recurrent stages need a
+            # reusable argument owner. Keep the primitive launch lightweight.
+            options = triton_config(
+                kernel,
+                call_args,
+                ((n + 127) // 128,),
+                (("BLOCK", 128),),
+                {**options, "enable_fp_fusion": enable_fp_fusion},
+                writes=writes,
+                work=n,
+            )
+            options.pop("enable_fp_fusion")
         kernel[((n + 127) // 128,)](
             *call_args, BLOCK=128, enable_fp_fusion=enable_fp_fusion, **options
         )
@@ -708,15 +808,17 @@ class CuPyRuntime(RendererRuntime):
     supports_dynamic_steps = True
     supports_pointer_offsets = True
 
-    def prepare_launch(self, kernel, args, n, *, changing, enable_fp_fusion):
+    def prepare_launch(self, kernel, args, n, *, changing, enable_fp_fusion, writes=()):
         del enable_fp_fusion
         import cupy
         import torch
 
+        from ....utils.autotune import cupy_block
         from ....utils.kernel import PreparedLaunch
 
         device = args[0].device.index
-        grid = ((n + 127) // 128,)
+        block = cupy_block(kernel, args, n, writes)
+        grid = (-(-n // block),)
         stream = cupy.cuda.Stream.from_external(torch.cuda.current_stream(device))
 
         def launch(*pointers):
@@ -726,7 +828,7 @@ class CuPyRuntime(RendererRuntime):
             current = torch.cuda.current_stream(device)
             if current.cuda_stream != stream.ptr:
                 stream = cupy.cuda.Stream.from_external(current)
-            kernel(grid, (128,), pointers, stream=stream)
+            kernel(grid, (block,), pointers, stream=stream)
 
         return PreparedLaunch(launch, list(args), tuple(changing), ())
 
@@ -744,12 +846,23 @@ class CuPyRuntime(RendererRuntime):
         return kernel
 
     def launch(
-        self, kernel, args, n, *, steps=None, enable_fp_fusion, debug, num_warps
+        self,
+        kernel,
+        args,
+        n,
+        *,
+        steps=None,
+        enable_fp_fusion,
+        debug,
+        num_warps,
+        writes=(),
     ):
         del enable_fp_fusion, debug, num_warps
         import cupy
         import numpy
         import torch
+
+        from ....utils.autotune import cupy_block
 
         with cupy.cuda.Device(args[0].device.index):
             stream = cupy.cuda.Stream.from_external(
@@ -760,11 +873,36 @@ class CuPyRuntime(RendererRuntime):
                 call_args = (
                     (*pointers, numpy.int32(steps)) if steps is not None else pointers
                 )
-                kernel(((n + 127) // 128,), (128,), call_args)
+                block = cupy_block(kernel, args, n, writes, steps=steps)
+                kernel((-(-n // block),), (block,), call_args)
 
 
 class TileLangRuntime(RendererRuntime):
+    supports_spike_list = True
     name = "tilelang"
+
+    def __init__(self):
+        self.factories = weakref.WeakKeyDictionary()
+
+    def prepare_launch(self, kernel, args, n, *, changing, enable_fp_fusion, writes=()):
+        del changing, enable_fp_fusion
+        from ....utils.autotune import outputs_are_disjoint, tilelang_kernel
+
+        factory = self.factories.get(kernel)
+        if factory is not None:
+            # Generated forward/reverse destinations are final stores, with
+            # register-local accumulators. Aliasing a state input is the only
+            # additional dependency between repeated generated executions.
+            kernel = tilelang_kernel(
+                factory,
+                (),
+                args,
+                writes,
+                4,
+                work=n,
+                overwrite=outputs_are_disjoint(args, writes),
+            )
+        return lambda arguments: kernel(*arguments)
 
     def argument(self, value, span):
         # Unlike pointer-only runtimes, TileLang validates the flat buffer ABI.
@@ -803,6 +941,8 @@ class TileLangRuntime(RendererRuntime):
         try:
             exec(compile(source, filename, "exec"), namespace)
             kernel = namespace["build_kernel"]()
+            if namespace.get("TUNABLE_THREADS", False):
+                self.factories[kernel] = namespace["build_kernel"]
             gc.collect()
             return _retain_source(kernel, filename)
         except BaseException:
@@ -810,10 +950,26 @@ class TileLangRuntime(RendererRuntime):
             raise
 
     def launch(
-        self, kernel, args, n, *, steps=None, enable_fp_fusion, debug, num_warps
+        self,
+        kernel,
+        args,
+        n,
+        *,
+        steps=None,
+        enable_fp_fusion,
+        debug,
+        num_warps,
+        writes=(),
     ):
-        del n, enable_fp_fusion, debug, num_warps, steps
-        kernel(*args)
+        del debug, num_warps, steps
+        self.prepare_launch(
+            kernel,
+            args,
+            n,
+            changing=(),
+            enable_fp_fusion=enable_fp_fusion,
+            writes=writes,
+        )(args)
 
 
 _RUNTIME_TYPES = {

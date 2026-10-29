@@ -385,6 +385,8 @@ class _FusedStep:
     argument_indices: dict[str, int] = field(init=False)
     arguments: list = field(init=False)
     runtime: object = field(init=False, repr=False)
+    bound_launch: object = field(default=None, init=False, repr=False)
+    bound_slots: tuple = field(default=(), init=False, repr=False)
 
     def __post_init__(self):
         self.runtime = get_runtime(self.backend)
@@ -460,15 +462,31 @@ class _FusedStep:
         )
         for (name, _size), value in zip(declarations, values):
             self.arguments[self.argument_indices[name]] = value
+        changing = tuple(self.argument_indices[name] for name, _ in declarations)
         with _device_scope(self.buffers["neuron_input"].device):
-            self.runtime.launch(
-                self.kernel,
-                self.arguments,
-                self.n,
-                enable_fp_fusion=self.enable_fp_fusion,
-                debug=None,
-                num_warps=None,
-            )
+            if self.bound_launch is None or self.bound_slots != changing:
+                self.bound_launch = self.runtime.prepare_launch(
+                    self.kernel,
+                    self.arguments,
+                    self.n,
+                    changing=changing,
+                    enable_fp_fusion=self.enable_fp_fusion,
+                    writes=self._writes(),
+                )
+                self.bound_slots = changing
+            self.bound_launch(self.arguments)
+
+    def _writes(self):
+        outputs = self.output_shapes.keys() | {
+            "spike_indices",
+            "spike_cumulative",
+            "spike_counts",
+            "spike_accumulation",
+            "gradient_activity",
+        }
+        return tuple(
+            i for i, (name, _) in enumerate(self.declarations) if name in outputs
+        )
 
     def prepare_launch(self, bindings):
         """Bind a trajectory's invariant layouts before its repeated stages.
@@ -496,6 +514,7 @@ class _FusedStep:
                 self.n,
                 changing=tuple(index for index, _name, _size in updates),
                 enable_fp_fusion=self.enable_fp_fusion,
+                writes=variant._writes(),
             )
         if self.runtime.supports_pointer_offsets:
             args, owners = launch.arguments, launch.owners

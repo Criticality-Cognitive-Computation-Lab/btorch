@@ -70,6 +70,7 @@ options = KernelOptions(
 `use_method("push")`。后端选择与传播方法独立；FP16/BF16/FP32/FP64、混合 dtype、
 自动求导与 CUDA Graph 的契约不变。push 仍使用非确定性的浮点原子累加。
 
-目前 TileLang 神经元输出稠密脉冲，由 TileLang packing 内核生成块内列表，
-因此相比 Triton 神经元直接生成列表多一次 packing 启动。此差异不改变模型方程
-或稀疏算法；需要确定性的稀疏归约时选择 `connection_method="pull"`。
+没有延迟或外部突触输入时，TileLang 神经元/PSC 模板在同一次启动中直接生成
+块内脉冲列表并清零受体累加区；内部每步只需融合的神经元/PSC 生产者和 fanout
+两个内核。独立连接、延迟源和外部突触输入仍由 TileLang packing 后再执行 fanout。
+需要确定性的稀疏归约时选择 `connection_method="pull"`。

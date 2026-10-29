@@ -23,6 +23,23 @@ Cell 后端复用现有 sparse runtime，不重复实现 sparse 算法。
 AlphaPSCBilleh、DualExponentialPSC。六种确定性的内置 surrogate 保持 btorch
 本身的归一化导数。暂不支持的自定义 surrogate 或可训练超参数会明确报错。
 
+## 准备与自动调优
+
+适用的 GPU kernel 在准备阶段自动比较两个 CUDA kernel 配置。Triton 和 TileLang
+使用各自的原生 autotuner，CuPy 使用其 CUDA-event profiler。准备完成后直接
+调用选定的可执行 kernel；首次调用包含编译和调优，应与预热后的运行时间分开测量。
+
+Triton 和 TileLang 自己保存调优结果。复用相同执行配置时不重复搜索，也不分配
+试运行存储。已缓存的调优器不持有试运行张量；已准备的 kernel 只持有实际运行的参数。
+
+调优使用独立的可写存储，保留别名和 stride。小规模计算、超过试运行内存预算的
+计算，以及设备队列尚未填充的消费者保留启发式配置；不改变 spike-list 的 block
+归属或队列容量。TileLang 的累加阶段使用公开 profiler，每次试运行前恢复缓冲区。
+
+CUDA Graph capture 前只需预热实际的 RecurrentNN chunk；首次编译和调优须在
+capture 外完成。重复 capture 不启动搜索，
+而是复用已选配置或启发式配置。配置选择缓存在进程内，后端编译缓存仍可跨进程复用。
+
 ## 运行 RSNN 示例
 
 `examples/rsnn.py` 展示含传播延迟的 GLIF3 + 异质 AlphaPSC；

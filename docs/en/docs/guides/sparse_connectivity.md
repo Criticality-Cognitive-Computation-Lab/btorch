@@ -1726,13 +1726,13 @@ options = KernelOptions(
 )
 ```
 
-A TileLang neuron currently emits a dense spike tensor; a TileLang packing
-kernel forms block-local spike lists before fanout. Direct list emission from
-the neuron remains available with the Triton neuron renderer. Thus an
-all-TileLang push step has one extra packing launch. This does not change the
-model equations or the selected sparse algorithm. Both backends support the
-same dtype promotion, autograd and CUDA Graph contracts; push accumulation
-remains nondeterministic.
+Without delays or external synaptic input, the TileLang neuron/PSC template
+emits block-local spike lists and clears receptor accumulation in the same
+launch. An interior push step uses one fused neuron/PSC producer and one
+fanout kernel. Standalone connections, delayed sources and external synaptic
+inputs use TileLang packing before fanout. Both backends preserve dtype
+promotion, autograd and CUDA Graph contracts; push accumulation remains
+nondeterministic.
 
 ## Migration from `SparseConn`
 

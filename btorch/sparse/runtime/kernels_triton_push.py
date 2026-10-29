@@ -283,20 +283,26 @@ def _kernels(cache: KernelCache):
 class _Execution:
     def __init__(self, cache):
         self.cache = cache
+        self.stages = {}
 
     def launch(self, name, grid, args, const_names, consts, warps):
         kernel = _kernels(self.cache)[0 if name == "push_packed" else 1]
-        kernels_triton._launch(
-            self.cache,
-            name,
-            kernel,
-            args[0].device.index,
-            grid,
-            args,
-            const_names,
-            consts,
-            warps,
-        )
+        stage = self.stages.get(name)
+        if stage is None:
+            from ...utils.triton import prepare_launch
+
+            stage = prepare_launch(
+                kernel,
+                args,
+                grid,
+                tuple(zip(const_names, consts, strict=True)),
+                changing=csr_execution.stage_inputs(name),
+                writes=(6,) if name == "push_dense" else (),
+                work=args[1].numel(),
+                num_warps=warps,
+            )
+            self.stages[name] = stage
+        stage(args)
 
 
 def spike_push_dense(

@@ -26,6 +26,8 @@ class _Execution:
 
     def __init__(self):
         self.stages = {}
+        self.inputs = {}
+        self.scalar_positions = {}
 
     def _stage(self, name, grid, args, const_names, consts, warps):
         del const_names
@@ -54,7 +56,31 @@ class _Execution:
             shapes = tuple(tuple(view.shape) for view in views)
             dtypes = tuple(str(arg.dtype).removeprefix("torch.") for arg in tensors)
             device_grid = (*grid, *(1 for _ in range(3 - len(grid))))
-            kernel = factory(shapes, dtypes, scalars, consts, device_grid, warps * 32)
+            from ...utils.autotune import tilelang_kernel
+
+            # Queue consumers are bound before discovery has filled their
+            # indices. Never benchmark them on uninitialized queue storage.
+            tunable = name in (
+                "csr_matvec",
+                "hub_combine",
+                "edge_grad",
+                "listed_output",
+            )
+            positions = [
+                i for i, arg in enumerate(args) if isinstance(arg, torch.Tensor)
+            ]
+            writes = tuple(
+                positions.index(i) for i in csr_execution.stage_outputs(name)
+            )
+            kernel = tilelang_kernel(
+                factory,
+                (shapes, dtypes, scalars, consts, device_grid),
+                views,
+                writes,
+                warps,
+                work=csr_execution.stage_work(name, args, grid) if tunable else 0,
+                overwrite=name != "csr_matvec" or not consts[6],
+            )
             layouts = tuple(
                 (arg.shape, arg.stride(), arg.dtype, arg.device) for arg in tensors
             )
@@ -67,6 +93,13 @@ class _Execution:
                 [arg.data_ptr() for arg in tensors],
             )
             self.stages[name] = stage
+            self.inputs[name] = tuple(
+                (position, positions.index(position))
+                for position in csr_execution.stage_inputs(name, consts)
+            )
+            self.scalar_positions[name] = tuple(
+                i for i, arg in enumerate(args) if not isinstance(arg, torch.Tensor)
+            )
         if metadata != stage[4]:
             raise ValueError("Sparse launch metadata changed; prepare a new execution")
         return stage
@@ -87,11 +120,18 @@ class _Execution:
             pointers[index] = pointer
 
     def launch(self, name, grid, args, const_names, consts, warps):
-        stage = self._stage(name, grid, args, const_names, consts, warps)
-        for index, tensor in enumerate(
-            arg for arg in args if isinstance(arg, torch.Tensor)
-        ):
-            self._argument(stage, index, tensor)
+        stage = self.stages.get(name)
+        if stage is None:
+            stage = self._stage(name, grid, args, const_names, consts, warps)
+        elif (
+            grid,
+            consts,
+            warps,
+            tuple(args[i] for i in self.scalar_positions[name]),
+        ) != stage[4]:
+            raise ValueError("Sparse launch metadata changed; prepare a new execution")
+        for position, index in self.inputs[name]:
+            self._argument(stage, index, args[position])
         stage[0](*stage[2])
 
     def prepare(self, name, grid, args, const_names, consts, warps, *, changing):
@@ -300,22 +340,16 @@ def _bind_spike_list(execution, x):
         queue.counts,
         queue.output,
     ]
-    pack = runtime.prepare(
-        "pack_spikes",
-        (-(-max(x.numel(), queue.output.numel()) // SPIKE_BLOCK),),
-        pack_arguments,
-        (),
-        (
-            queue.n_sources,
-            x.numel(),
-            queue.output.numel(),
-            SPIKE_BLOCK,
-            x.stride(0),
-            x.stride(1),
-        ),
-        4,
-        changing=(0,),
+    pack_grid = (-(-max(x.numel(), queue.output.numel()) // SPIKE_BLOCK),)
+    pack_constants = (
+        queue.n_sources,
+        x.numel(),
+        queue.output.numel(),
+        SPIKE_BLOCK,
+        x.stride(0),
+        x.stride(1),
     )
+    pack = None
     consume = runtime.prepare(
         "push_packed",
         (programs * queue.counts.numel(),),
@@ -327,6 +361,19 @@ def _bind_spike_list(execution, x):
     )
 
     def emit(input):
+        nonlocal pack
+        # Direct neuron producers never submit dense packing. Bind that
+        # separate operation only on its first use, as the Triton packer does.
+        if pack is None:
+            pack = runtime.prepare(
+                "pack_spikes",
+                pack_grid,
+                pack_arguments,
+                (),
+                pack_constants,
+                4,
+                changing=(0,),
+            )
         pack_arguments[0] = input
         pack(pack_arguments)
 

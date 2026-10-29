@@ -9,6 +9,36 @@ import tilelang
 import tilelang.language as T
 
 
+@T.macro
+def emit_spike_list(selected, degree, indices, cumulative, counts, group, n_in, BLOCK):
+    """Emit block-local source indices and int64 fanout prefixes.
+
+    Every thread participates, including masked tail lanes. Producers
+    supply zero for inactive lanes and own clearing their receptor
+    accumulation.
+    """
+    rank = T.alloc_fragment((BLOCK,), "int32")
+    count = T.alloc_fragment((1,), "int32")
+    fanout = T.alloc_fragment((BLOCK,), "int64")
+    prefix = T.alloc_fragment((BLOCK,), "int64")
+    for lane in T.Parallel(BLOCK):
+        fanout[lane] = T.if_then_else(
+            selected[lane] != 0, degree[(group * BLOCK + lane) % n_in], 0
+        )
+    # A separate reduction avoids replicating the entire scan in each thread
+    # merely to read its last element for the block's active count.
+    T.reduce_sum(selected, count, dim=0)
+    T.cumsum(selected, rank)
+    T.cumsum(fanout, prefix)
+    for lane in T.Parallel(BLOCK):
+        if selected[lane] != 0:
+            at = group * BLOCK + rank[lane] - 1
+            indices[at] = group * BLOCK + lane
+            cumulative[at] = prefix[lane]
+    if T.get_thread_binding() == 0:
+        counts[group] = count[0]
+
+
 @tilelang.jit
 def matvec(shapes, dtypes, scalars, tiles, grid, threads):
     n_seg, n_rows, n_sample, n_sample_block, n_tmp, val_stride, x_stride = scalars
@@ -336,10 +366,6 @@ def pack_spikes(shapes, dtypes, scalars, tiles, grid, threads):
     ):
         with T.Kernel(grid[0], threads=threads) as group:
             selected = T.alloc_fragment((BLOCK,), "int32")
-            rank = T.alloc_fragment((BLOCK,), "int32")
-            count = T.alloc_fragment((1,), "int32")
-            fanout = T.alloc_fragment((BLOCK,), "int64")
-            prefix = T.alloc_fragment((BLOCK,), "int64")
             for lane in T.Parallel(BLOCK):
                 index = group * BLOCK + lane
                 if index < n_output:
@@ -359,21 +385,9 @@ def pack_spikes(shapes, dtypes, scalars, tiles, grid, threads):
                         ),
                         0,
                     )
-                    fanout[lane] = T.if_then_else(
-                        selected[lane] != 0, degree[index % n_in], 0
-                    )
-                # Reading rank[-1] forces a replicated 128-lane rank array
-                # in each thread. Reduce the count independently, as Triton
-                # does, so scan ranks retain one lane per thread.
-                T.reduce_sum(selected, count, dim=0)
-                T.cumsum(selected, rank)
-                T.cumsum(fanout, prefix)
-                for lane in T.Parallel(BLOCK):
-                    if selected[lane] != 0:
-                        at = group * BLOCK + rank[lane] - 1
-                        indices[at] = group * BLOCK + lane
-                        cumulative[at] = prefix[lane]
-                counts[group] = count[0]
+                emit_spike_list(
+                    selected, degree, indices, cumulative, counts, group, n_in, BLOCK
+                )
 
     return kernel
 

@@ -407,7 +407,11 @@ def test_cupy_push_inference_then_training_matches_torch():
 
 def test_tilelang_neuron_and_connection_training_and_graph_replay(monkeypatch):
     """Use TileLang for both components without hidden Triton propagation."""
-    from btorch.sparse.runtime import kernels_triton, kernels_triton_tasks
+    from btorch.sparse.runtime import (
+        kernels_tilelang,
+        kernels_triton,
+        kernels_triton_tasks,
+    )
 
     require_cuda_backend("tilelang")
     native = _network(
@@ -436,6 +440,25 @@ def test_tilelang_neuron_and_connection_training_and_graph_replay(monkeypatch):
     monkeypatch.setattr(kernels_triton, "_launch", forbidden)
     monkeypatch.setattr(kernels_triton_tasks._Execution, "launch", forbidden)
     monkeypatch.setattr(kernels_triton_spikelist, "prepare_spike_list", forbidden)
+    prepare = kernels_tilelang._Execution.prepare
+    forward_only = True
+
+    def prepare_without_packing(self, name, *args, **kwargs):
+        submit = prepare(self, name, *args, **kwargs)
+        if name != "pack_spikes":
+            return submit
+
+        def pack(arguments):
+            # Forward/inference must consume neuron-emitted queues directly.
+            # Reverse recomputes the terminal PSC drive from saved dense spikes,
+            # which legitimately uses TileLang packing once.
+            if forward_only:
+                raise AssertionError("TileLang forward submitted standalone packing")
+            submit(arguments)
+
+        return pack
+
+    monkeypatch.setattr(kernels_tilelang._Execution, "prepare", prepare_without_packing)
     with environ.context(dt=0.25):
         output, records = native(x)
         expected, ref_records = reference(xr)
@@ -444,6 +467,7 @@ def test_tilelang_neuron_and_connection_training_and_graph_replay(monkeypatch):
             torch.testing.assert_close(
                 records[name].to("cuda"), ref_records[name], atol=2e-6, rtol=2e-5
             )
+        forward_only = False
         actual = torch.autograd.grad(
             output.square().sum() + sum(v.square().sum() for v in records.values()),
             roots,
@@ -459,6 +483,7 @@ def test_tilelang_neuron_and_connection_training_and_graph_replay(monkeypatch):
         # shorter final split remains eager, while full chunks replay.
         native.grad_checkpoint = native.cpu_offload = False
         native.cudagraph = True
+        forward_only = True
         from btorch.models.functional import reset_net_state
 
         reset_net_state(native)
@@ -470,4 +495,62 @@ def test_tilelang_neuron_and_connection_training_and_graph_replay(monkeypatch):
             for name in states:
                 torch.testing.assert_close(
                     states[name], golden_states[name], atol=2e-6, rtol=2e-5
+                )
+
+
+def test_tilelang_neuron_emits_ragged_lists_and_clears_receptors():
+    """Retain exact int64 prefixes and tail counts across dense/silent
+    reuse."""
+    from btorch.models.kernels.backends.engine import forward
+    from btorch.models.kernels.contracts import NeuronSpec
+    from btorch.models.kernels.torch_backend import forward_step
+    from btorch.sparse.runtime.spike_list import SPIKE_BLOCK, SpikeList
+
+    require_cuda_backend("tilelang")
+    batch, neurons, receptors = 2, 259, 3
+    count = batch * neurons
+    groups = -(-count // SPIKE_BLOCK)
+    capacity = groups * SPIKE_BLOCK
+    # A sample boundary lies inside a producer block and the final block is
+    # partial. Large degrees expose any float conversion in the prefix scan.
+    degree = torch.arange(neurons, device="cuda", dtype=torch.int64) * 123456789 + 1
+    queue = SpikeList(
+        torch.full((capacity,), -1, device="cuda", dtype=torch.int32),
+        torch.full((capacity,), -1, device="cuda", dtype=torch.int64),
+        torch.full((groups,), -1, device="cuda", dtype=torch.int32),
+        degree,
+        torch.empty(batch, neurons * receptors, device="cuda"),
+        neurons,
+    )
+    x = torch.zeros(1, batch, neurons * 2, device="cuda")[..., ::2]
+    state = (torch.zeros(batch, neurons, device="cuda"),)
+    parameters = tuple(torch.tensor(v, device="cuda") for v in (1.0, 0.0, 1.0, 2.0))
+    spec = NeuronSpec("lif", dt=1.0, hard_reset=True)
+    with torch.no_grad():
+        for mode in ("sparse", "dense", "silent"):
+            if mode == "sparse":
+                x[:, :, (0, 127, 128, 258)] = 2
+            else:
+                x.fill_(2 if mode == "dense" else 0)
+            queue.output.fill_(float("nan"))
+            output, final, records = forward(
+                "tilelang", x, state, parameters, spec, ("v",), spike_list=queue
+            )
+            expected, expected_final, _ = forward_step(x[0], state, parameters, spec)
+            torch.testing.assert_close(output[0], expected)
+            torch.testing.assert_close(final[0], expected_final[0])
+            torch.testing.assert_close(records[0][0], expected_final[0])
+            torch.testing.assert_close(queue.output, torch.zeros_like(queue.output))
+            for group in range(groups):
+                start = group * SPIKE_BLOCK
+                selected = expected.flatten()[start : start + SPIKE_BLOCK].nonzero()
+                selected = selected.flatten() + start
+                size = selected.numel()
+                assert queue.counts[group].item() == size
+                torch.testing.assert_close(
+                    queue.indices[start : start + size].long(), selected
+                )
+                torch.testing.assert_close(
+                    queue.cumulative[start : start + size],
+                    degree[selected % neurons].cumsum(0),
                 )

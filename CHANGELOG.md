@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Bounded preparation-time GPU autotuning through native Triton/TileLang
+  autotuners and CuPy profiling, with isolated trial storage and direct prepared
+  launches. Retain native tuner caches without retaining trial tensors.
+  Fixed-layout and uninitialized-queue stages retain heuristics.
+
+- TileLang neuron/PSC templates directly emit spike lists for eligible sparse
+  push recurrence, removing standalone packing from interior timesteps.
+
 - Add a complete TileLang sparse CUDA backend for pull, spike-list push,
   direct/hash tasks and full connection VJPs. Sparse layouts and algorithm
   preparation are shared with Triton; each backend keeps its own device

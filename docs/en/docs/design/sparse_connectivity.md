@@ -378,7 +378,7 @@ The route snapshot binds this capability alongside its forward and backward
 kernels. CUDA pull reuses its output, hub-reduction and sample-layout buffers;
 spike-list push reuses block-local source lists, degree prefixes, counts and
 output storage. The prepared propagation exposes an optional producer
-destination to the template renderer. An eligible Triton neuron epilogue writes
+destination to the template renderer. An eligible Triton or TileLang neuron epilogue writes
 the list and local prefix while producing spikes, and clears the accumulation
 slots whose drive it has consumed. The existing packed fanout consumes those
 lists directly. No host activity read or per-step route selection is introduced.
@@ -491,7 +491,7 @@ weights select pull. Backend and determinism constraints still apply.
 | `"push"` | device spike list or prepared task queues | runs for every call once selected, even above hinted activity; no host count read; capturable; float atomics |
 | `"adaptive-push"` | Torch host-packed reference | falls back to pull above the density limit; not capturable |
 
-For native Triton recurrence without delays or external synaptic input, both
+For native Triton or TileLang recurrence without delays or external synaptic input, both
 the initial neuron and the fused PSC/next-neuron template emit lists directly.
 An interior step uses one packed fanout and one fused producer kernel. This is
 independent of the neuron/PSC model equations and requires no additional public

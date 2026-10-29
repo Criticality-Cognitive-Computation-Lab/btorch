@@ -132,23 +132,43 @@ def _prepare_spike_list_launch(execution, x):
         x.stride(1),
     ]
 
+    pack_arguments = [
+        x,
+        queue.degree,
+        queue.indices,
+        queue.cumulative,
+        queue.counts,
+        queue.output,
+    ]
+    pack_launch = None
+
     def pack(input):
-        _pack_spike_list_kernel[
-            (-(-max(input.numel(), queue.output.numel()) // SPIKE_BLOCK),)
-        ](
-            input,
-            queue.degree,
-            queue.indices,
-            queue.cumulative,
-            queue.counts,
-            queue.output,
-            queue.n_sources,
-            input.numel(),
-            queue.output.numel(),
-            SPIKE_BLOCK,
-            x.stride(0),
-            x.stride(1),
-        )
+        nonlocal pack_launch
+        pack_arguments[0] = input
+        if pack_launch is None:
+            pack_launch = prepare_launch(
+                _pack_spike_list_kernel,
+                pack_arguments,
+                (-(-max(input.numel(), queue.output.numel()) // SPIKE_BLOCK),),
+                tuple(
+                    zip(
+                        ("N", "N_INPUT", "N_OUTPUT", "BLOCK", "X_BATCH", "X_SOURCE"),
+                        (
+                            queue.n_sources,
+                            input.numel(),
+                            queue.output.numel(),
+                            SPIKE_BLOCK,
+                            x.stride(0),
+                            x.stride(1),
+                        ),
+                        strict=True,
+                    )
+                ),
+                changing=(0,),
+                writes=(2, 3, 4, 5),
+                work=input.numel(),
+            )
+        pack_launch(pack_arguments)
 
     execution.pack = pack
     execution.launch = prepare_launch(
