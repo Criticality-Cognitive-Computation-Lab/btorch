@@ -5,7 +5,7 @@ import math
 import pkgutil
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, replace as replace_template
+from dataclasses import dataclass, field, replace as replace_template
 
 import torch
 
@@ -123,13 +123,23 @@ class ModelTemplate:
     reverse_parameter_warps: tuple[tuple[str, int], ...] = ()
     output_state: str | None = None
     default_precise_division: bool = False
+    _extra_dimensions: dict[str, int] = field(init=False, repr=False, compare=False)
+    _history_sources: dict[str, str] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        # Stable metadata must exist before Dynamo traces the first call.
+        # Lazy properties would change the template dictionary after tracing
+        # and invalidate guards when a subsequent eager reference reads them.
+        dimensions = dict((*self.state_extra_dims, *self.parameter_extra_dims))
+        extra = dict(dimensions)
+        for name, source in self.history_sources:
+            extra.setdefault(name, dimensions.get(source, 0))
+        object.__setattr__(self, "_extra_dimensions", extra)
+        object.__setattr__(self, "_history_sources", dict(self.history_sources))
 
     def extra_dims(self, name: str) -> int:
         """Return the declared trailing state/parameter axis count."""
-        dimensions = dict((*self.state_extra_dims, *self.parameter_extra_dims))
-        return dimensions.get(
-            name, dimensions.get(dict(self.history_sources).get(name), 0)
-        )
+        return self._extra_dimensions.get(name, 0)
 
     def history_state_name(self, name: str) -> str:
         """Look up the state supplying a declared history's shape.
@@ -146,7 +156,7 @@ class ModelTemplate:
         Raises:
             KeyError: If no state shape is declared for the history.
         """
-        return name if name in self.state_names else dict(self.history_sources)[name]
+        return name if name in self.state_names else self._history_sources[name]
 
 
 @dataclass(frozen=True)

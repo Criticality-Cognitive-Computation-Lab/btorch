@@ -187,7 +187,9 @@ def _triton_bench(call, **_):
 
 
 @lru_cache(maxsize=128)
-def _triton_autotuner(kernel, signature, constants, options, writes, default):
+def _triton_autotuner(
+    kernel, signature, constants, options, writes, default, persistent
+):
     import triton
 
     if torch.cuda.is_current_stream_capturing():
@@ -195,15 +197,31 @@ def _triton_autotuner(kernel, signature, constants, options, writes, default):
     # Retain the decorated callable, not a second copy of its chosen Config.
     # This object is scoped to one static execution contract, so best_config
     # belongs to this contract. Runtime sequence length is deliberately absent.
+    config_options = {
+        name: value
+        for name, value in options
+        if name in ("num_stages", "num_ctas", "maxnreg")
+    }
+    compiler_options = {
+        name: value
+        for name, value in options
+        if name not in ("num_warps", *config_options)
+    }
     return triton.autotune(
-        configs=[triton.Config({}, num_warps=w) for w in execution_candidates(default)],
-        key=[],
+        configs=[
+            triton.Config(compiler_options, num_warps=w, **config_options)
+            for w in execution_candidates(default)
+        ],
+        key=[name for name, _value in constants],
         pre_hook=_reset_trial,
         do_bench=_triton_bench,
+        cache_results=persistent,
     )(kernel)
 
 
-def triton_config(kernel, args, grid, constants, options, *, writes, work):
+def triton_config(
+    kernel, args, grid, constants, options, *, writes, work, runtime_step_index=None
+):
     """Read the native tuner's selected configuration during preparation."""
     if not writes or work < 4096:
         return options
@@ -213,8 +231,8 @@ def triton_config(kernel, args, grid, constants, options, *, writes, work):
     # length likewise does not change the execution specialization.
     signature = tuple(
         (value.dtype, value.device) if isinstance(value, torch.Tensor) else value
-        for name, value in zip(kernel.arg_names, args)
-        if name != "n_steps"
+        for index, value in enumerate(args)
+        if index != runtime_step_index
     )
     tuner = _triton_autotuner(
         kernel,
@@ -223,6 +241,15 @@ def triton_config(kernel, args, grid, constants, options, *, writes, work):
         tuple(options.items()),
         tuple(writes),
         default,
+        # Native disk keys contain constexpr values and pointer dtypes, but
+        # cannot describe unnamed runtime scalars supplied by this launcher.
+        # Persist only contracts whose remaining extents/layouts live in the
+        # generated source or named constexprs. Dynamic sequence length is
+        # deliberately excluded: trials execute one step.
+        all(
+            isinstance(value, torch.Tensor) or index == runtime_step_index
+            for index, value in enumerate(args)
+        ),
     )
     with _LOCK:
         if not hasattr(tuner, "best_config"):
@@ -230,15 +257,9 @@ def triton_config(kernel, args, grid, constants, options, *, writes, work):
                 return options
             with _trial_inputs(args, writes) as trial:
                 scratch = trial.inputs()
-                for index, name in enumerate(kernel.arg_names[: len(scratch)]):
-                    if name == "n_steps":
-                        scratch[index] = min(scratch[index], 1)
-                launch_options = {
-                    name: value
-                    for name, value in options.items()
-                    if name != "num_warps"
-                }
-                tuner[grid](*scratch, **dict(constants), **launch_options)
+                if runtime_step_index is not None:
+                    scratch[runtime_step_index] = min(scratch[runtime_step_index], 1)
+                tuner[grid](*scratch, **dict(constants))
         return {**options, "num_warps": tuner.best_config.num_warps}
 
 

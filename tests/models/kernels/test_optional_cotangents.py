@@ -24,9 +24,12 @@ MODELS = (
 )
 
 
-def _bind_custom_op(operator, args, kwargs):
-    """Bind a CustomOpDef call to the named implementation parameters."""
-    return inspect.signature(operator._init_fn).bind(*args, **kwargs).arguments
+def _bind_reverse(args, kwargs):
+    """Bind reverse arguments without depending on a Torch wrapper
+    implementation."""
+    from btorch.models.kernels.operators import _reverse_impl
+
+    return inspect.signature(_reverse_impl).bind(*args, **kwargs).arguments
 
 
 def _inputs(model: str, n_step: int = 4):
@@ -123,7 +126,7 @@ def test_partial_history_keeps_other_cotangents_absent(monkeypatch):
     observed = {}
 
     def capture(*args, **kwargs):
-        arguments = _bind_custom_op(original_reverse, args, kwargs)
+        arguments = _bind_reverse(args, kwargs)
         observed["grad_output"] = arguments["grad_output"]
         observed["grad_final"] = arguments["grad_final"]
         observed["grad_history"] = arguments["grad_history"]
@@ -172,7 +175,7 @@ def test_encoder_gradient_and_primary_psc_residual_stay_optional(monkeypatch):
     observed = {}
 
     def capture(*args, **kwargs):
-        arguments = _bind_custom_op(original_reverse, args, kwargs)
+        arguments = _bind_reverse(args, kwargs)
         observed["grad_output"] = arguments["grad_output"]
         observed["grad_final"] = arguments["grad_final"]
         observed["grad_history"] = arguments["grad_history"]
@@ -288,7 +291,7 @@ def test_outstanding_forwards_preserve_their_compilation_policies(monkeypatch):
     observed = []
 
     def capture(*args, **kwargs):
-        arguments = _bind_custom_op(original_reverse, args, kwargs)
+        arguments = _bind_reverse(args, kwargs)
         observed.append((arguments["enable_fp_fusion"], arguments["precise_division"]))
         return original_reverse(*args, **kwargs)
 
@@ -404,7 +407,7 @@ def test_native_optional_output_and_final_gradients_with_broadcast_parameters(
     zero_like_shapes = []
 
     def capture(*args, **kwargs):
-        arguments = _bind_custom_op(original_reverse, args, kwargs)
+        arguments = _bind_reverse(args, kwargs)
         observed["grad_output"] = arguments["grad_output"]
         observed["grad_final"] = arguments["grad_final"]
         observed["grad_history"] = arguments["grad_history"]

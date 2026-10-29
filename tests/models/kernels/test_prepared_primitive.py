@@ -8,6 +8,7 @@ dtypes.
 
 import gc
 import weakref
+from dataclasses import replace
 
 import pytest
 import torch
@@ -152,22 +153,27 @@ def test_cached_validation_does_not_accept_an_invalid_replacement():
         )
 
 
-def test_outstanding_primitive_forwards_keep_independent_full_vjps():
+@pytest.mark.parametrize("backend", ("torch", "triton"))
+def test_outstanding_primitive_forwards_keep_independent_full_vjps(backend):
     """Two live forwards retain independent full VJPs and golden parity."""
+    if backend != "torch":
+        require_cuda_backend(backend)
+    device = "cpu" if backend == "torch" else "cuda"
     spec = NeuronSpec("lif", dt=0.25, hard_reset=True)
-    state = torch.zeros(2, 3, requires_grad=True)
+    state = torch.zeros(2, 3, device=device, requires_grad=True)
     parameters = tuple(
-        torch.tensor(value, requires_grad=True) for value in (0.8, -0.1, 1.2, 3.0)
+        torch.tensor(value, device=device, requires_grad=True)
+        for value in (0.8, -0.1, 1.2, 3.0)
     )
-    x_first = torch.randn(4, 2, 3, requires_grad=True)
-    x_second = torch.randn(3, 2, 3, requires_grad=True)
+    x_first = torch.randn(4, 2, 3, device=device, requires_grad=True)
+    x_second = torch.randn(3, 2, 3, device=device, requires_grad=True)
     history = HistoryPlan(requested=("v",))
 
     first = run_multi_step(
-        x_first, (state,), parameters, spec, history, backend="torch"
+        x_first, (state,), parameters, spec, history, backend=backend
     )
     second = run_multi_step(
-        x_second, (state,), parameters, spec, history, backend="torch"
+        x_second, (state,), parameters, spec, history, backend=backend
     )
     first_expected = python_module_sequence(
         x_first, (state,), parameters, spec, history.requested
@@ -212,6 +218,7 @@ def test_prepared_native_plan_reuses_source_for_new_runtime_values(
 ):
     """Each renderer reuses a warmed plan for new values and outputs."""
     require_cuda_backend(backend)
+    engine._forward_plan.cache_clear()
     engine._kernel_plan.cache_clear()
     engine._generate_source.cache_clear()
     engine._compile_cached.cache_clear()
@@ -231,14 +238,17 @@ def test_prepared_native_plan_reuses_source_for_new_runtime_values(
     state = (torch.zeros(4, device="cuda"),)
     first = torch.randn(5, 4, device="cuda")
     second = first + 0.25
+    second_spec = replace(spec, dt=0.5)
 
     with torch.inference_mode():
         first_result = run_multi_step(first, state, parameters, spec, backend=backend)
-        warmed = engine._kernel_plan.cache_info()
-        second_result = run_multi_step(second, state, parameters, spec, backend=backend)
-    repeated = engine._kernel_plan.cache_info()
+        warmed = engine._forward_plan.cache_info()
+        second_result = run_multi_step(
+            second, state, parameters, second_spec, backend=backend
+        )
+    repeated = engine._forward_plan.cache_info()
     first_expected = python_module_sequence(first, state, parameters, spec)
-    second_expected = python_module_sequence(second, state, parameters, spec)
+    second_expected = python_module_sequence(second, state, parameters, second_spec)
     for actual, expected in zip(
         first_result, _flat_sequence(first_expected), strict=True
     ):
@@ -260,3 +270,113 @@ def test_prepared_native_plan_reuses_source_for_new_runtime_values(
     del second, state, parameters
     gc.collect()
     assert all(reference() is None for reference in references)
+
+
+def test_native_empty_sequences_preserve_continuation_without_launch(monkeypatch):
+    """Empty time preserves initial state; empty neuron axes launch no work."""
+    require_cuda_backend("triton")
+    spec = NeuronSpec("lif", dt=0.25)
+    parameters = tuple(
+        torch.tensor(value, device="cuda") for value in (0.8, 0.0, 1.2, 3.0)
+    )
+
+    def unexpected_launch(*args, **kwargs):
+        pytest.fail("An empty primitive must not launch a CUDA kernel")
+
+    monkeypatch.setattr(engine, "_launch", unexpected_launch)
+    for steps, neurons in ((0, 4), (3, 0)):
+        state = torch.full((neurons,), 0.3, device="cuda")
+        output, final, histories = engine.forward(
+            "triton",
+            torch.empty(steps, neurons, device="cuda"),
+            (state,),
+            parameters,
+            spec,
+            ("v",),
+        )
+        torch.testing.assert_close(final[0], state)
+        assert output.shape == histories[0].shape == (steps, neurons)
+        assert output.numel() == histories[0].numel() == 0
+        # Continuation storage is independently owned, including T=0.
+        if neurons:
+            assert final[0].data_ptr() != state.data_ptr()
+
+
+def test_gradient_producer_rebinds_shared_storage_without_changing_results():
+    """Disjoint views in one storage get a distinct, safe producer plan."""
+    require_cuda_backend("tilelang")
+    from btorch.sparse.runtime.activity import GradientList
+
+    engine._forward_plan.cache_clear()
+    steps, neurons = 2, 4
+    tape_width = GradientList.size(neurons)
+    shared = torch.zeros(
+        steps * (neurons + tape_width), device="cuda", dtype=torch.int32
+    )
+    x = shared[: steps * neurons].view(torch.float32).reshape(steps, neurons)
+    x.copy_(torch.tensor([[0.1, 0.4, 0.8, 1.2]], device="cuda"))
+    shared_tape = shared[steps * neurons :].reshape(steps, tape_width)
+    separate_tape = torch.zeros_like(shared_tape)
+    state = (torch.zeros(neurons, device="cuda"),)
+    parameters = tuple(
+        torch.tensor(value, device="cuda") for value in (0.8, 0.0, 1.2, 3.0)
+    )
+    spec = NeuronSpec("lif", dt=0.25, surrogate_width=1.0)
+    first = engine.forward(
+        "tilelang",
+        x.clone(),
+        state,
+        parameters,
+        spec,
+        ("v",),
+        gradient_activity=separate_tape,
+    )
+    warmed = engine._forward_plan.cache_info()
+    second = engine.forward(
+        "tilelang",
+        x,
+        state,
+        parameters,
+        spec,
+        ("v",),
+        gradient_activity=shared_tape,
+    )
+    assert engine._forward_plan.cache_info().misses == warmed.misses + 1
+    expected = python_module_sequence(x, state, parameters, spec, ("v",))
+    for actual in (first, second):
+        for value, reference in zip(
+            _flat_sequence(actual), _flat_sequence(expected), strict=True
+        ):
+            torch.testing.assert_close(value, reference, atol=5e-5, rtol=5e-5)
+    torch.testing.assert_close(shared_tape, separate_tape, rtol=0, atol=0)
+
+
+def test_sequence_operator_functional_and_autograd_contracts():
+    """Check functional storage, fake shapes and compiled VJPs at the
+    boundary."""
+    # Without CustomOpDef's eager alias scan, the functional schema is still
+    # mandatory. opcheck independently checks writes/aliases, fake metadata
+    # and autograd registration, including AOT execution with dynamic shapes.
+    # Numerical full-root VJPs are covered by the outstanding-forwards case.
+    x = torch.linspace(0.1, 1.2, 24).reshape(4, 2, 3).requires_grad_()
+    state = torch.zeros(2, 3, requires_grad=True)
+    parameters = [
+        torch.tensor(value, requires_grad=True) for value in (0.8, -0.1, 1.2, 3.0)
+    ]
+    encoded = operators.encode_spec(NeuronSpec("lif"))
+    dt = torch.tensor(0.25)
+    torch.library.opcheck(
+        operators._training, (x, [state], parameters, encoded, "v", "torch", dt)
+    )
+    torch.library.opcheck(
+        operators._inference,
+        (
+            x.detach(),
+            [state.detach()],
+            [value.detach() for value in parameters],
+            encoded,
+            "v",
+            "torch",
+            dt,
+        ),
+    )

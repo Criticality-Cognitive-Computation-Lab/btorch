@@ -21,14 +21,17 @@ from .templates import (
 )
 
 
-if not hasattr(torch.library, "custom_op"):
+if not hasattr(torch.library, "register_autograd"):
     raise NotImplementedError(
-        "Cell sequence backends require PyTorch >= 2.4 with torch.library.custom_op"
+        "Cell sequence backends require PyTorch >= 2.4 "
+        "with torch.library.register_autograd"
     )
 
 
-@torch.library.custom_op("btorch_cells::environment_dt", mutates_args=())
-def environment_dt(x_seq: Tensor, model: str) -> Tensor:
+_library = torch.library.Library("btorch_cells", "FRAGMENT")
+
+
+def _environment_dt_impl(x_seq: Tensor, model: str) -> Tensor:
     """Read the invocation timestep without specializing the compiled graph."""
     from .. import environ
 
@@ -41,7 +44,17 @@ def environment_dt(x_seq: Tensor, model: str) -> Tensor:
     return torch.full((), dt, device=x_seq.device, dtype=torch.float32)
 
 
-@environment_dt.register_fake
+# Register through the public dispatcher API. Unlike CustomOpDef, this does
+# not scan every input/output alias on each call. Implementations must honor
+# the declared functional schema; numerical and alias contracts are tested.
+_library.define(
+    "environment_dt" + torch.library.infer_schema(_environment_dt_impl, mutates_args=())
+)
+_library.impl("environment_dt", _environment_dt_impl, "CompositeExplicitAutograd")
+environment_dt = torch.ops.btorch_cells.environment_dt.default
+
+
+@torch.library.register_fake("btorch_cells::environment_dt", lib=_library)
 def _fake_environment_dt(x_seq, model):
     return x_seq.new_empty((), dtype=torch.float32)
 
@@ -51,13 +64,15 @@ def _setup_environment_dt(ctx, inputs, output):
     ctx.mark_non_differentiable(output)
 
 
-environment_dt.register_autograd(
-    lambda ctx, gradient: (None, None), setup_context=_setup_environment_dt
+torch.library.register_autograd(
+    "btorch_cells::environment_dt",
+    lambda ctx, gradient: (None, None),
+    setup_context=_setup_environment_dt,
+    lib=_library,
 )
 
 
-_poisson_library = torch.library.Library("btorch_cells", "FRAGMENT")
-_poisson_library.define(
+_library.define(
     "poisson_uniforms(Tensor x_seq) -> Tensor",
     tags=(torch.Tag.nondeterministic_seeded,),
 )
@@ -79,17 +94,15 @@ def _setup_poisson_uniforms(ctx, inputs, output):
     ctx.mark_non_differentiable(output)
 
 
-_poisson_library.impl(
-    "poisson_uniforms", _poisson_uniforms_impl, "CompositeExplicitAutograd"
-)
+_library.impl("poisson_uniforms", _poisson_uniforms_impl, "CompositeExplicitAutograd")
 torch.library.register_fake(
-    "btorch_cells::poisson_uniforms", _fake_poisson_uniforms, lib=_poisson_library
+    "btorch_cells::poisson_uniforms", _fake_poisson_uniforms, lib=_library
 )
 torch.library.register_autograd(
     "btorch_cells::poisson_uniforms",
     lambda ctx, gradient: (None,),
     setup_context=_setup_poisson_uniforms,
-    lib=_poisson_library,
+    lib=_library,
 )
 
 
@@ -371,8 +384,7 @@ def _forward(
     return [output, *final, *histories]
 
 
-@torch.library.custom_op("btorch_cells::inference", mutates_args=())
-def _inference(
+def _inference_impl(
     x_seq: Tensor,
     states: list[Tensor],
     parameters: list[Tensor],
@@ -400,8 +412,7 @@ def _inference(
     )
 
 
-@torch.library.custom_op("btorch_cells::training", mutates_args=())
-def _training(
+def _training_impl(
     x_seq: Tensor,
     states: list[Tensor],
     parameters: list[Tensor],
@@ -429,6 +440,15 @@ def _training(
         uniform_seq,
         precise_exp,
     )
+
+
+_sequence_schema = torch.library.infer_schema(_inference_impl, mutates_args=())
+_library.define("inference" + _sequence_schema)
+_library.define("training" + _sequence_schema)
+_library.impl("inference", _inference_impl, "CompositeExplicitAutograd")
+_library.impl("training", _training_impl, "CompositeExplicitAutograd")
+_inference = torch.ops.btorch_cells.inference.default
+_training = torch.ops.btorch_cells.training.default
 
 
 def _fake_forward(
@@ -459,10 +479,10 @@ def _fake_forward(
     ]
 
 
-_inference.register_fake(_fake_forward)
+torch.library.register_fake("btorch_cells::inference", _fake_forward, lib=_library)
 
 
-@_training.register_fake
+@torch.library.register_fake("btorch_cells::training", lib=_library)
 def _fake_training(
     x_seq,
     states,
@@ -498,19 +518,7 @@ def _fake_training(
     return result
 
 
-@torch.library.custom_op(
-    "btorch_cells::reverse",
-    mutates_args=(),
-    schema="(Tensor x_seq, Tensor[] states, Tensor[] parameters, str encoded, "
-    "str history_names, Tensor[] histories, Tensor[] residuals, Tensor? grad_output, "
-    "str residual_encoded, Tensor? residual_output, "
-    "Tensor?[] grad_final, Tensor?[] grad_history, str backend, bool[] needs, "
-    "bool enable_fp_fusion, bool precise_division, bool precise_exp, "
-    "int backend_revision, "
-    "int model_revision, Tensor dt) "
-    "-> Tensor?[]",
-)
-def _reverse(
+def _reverse_impl(
     x_seq: Tensor,
     states: list[Tensor],
     parameters: list[Tensor],
@@ -591,7 +599,19 @@ def _reverse(
     ]
 
 
-@_reverse.register_fake
+_library.define(
+    "reverse(Tensor x_seq, Tensor[] states, Tensor[] parameters, str encoded, "
+    "str history_names, Tensor[] histories, Tensor[] residuals, Tensor? grad_output, "
+    "str residual_encoded, Tensor? residual_output, "
+    "Tensor?[] grad_final, Tensor?[] grad_history, str backend, bool[] needs, "
+    "bool enable_fp_fusion, bool precise_division, bool precise_exp, "
+    "int backend_revision, int model_revision, Tensor dt) -> Tensor?[]"
+)
+_library.impl("reverse", _reverse_impl, "CompositeExplicitAutograd")
+_reverse = torch.ops.btorch_cells.reverse.default
+
+
+@torch.library.register_fake("btorch_cells::reverse", lib=_library)
 def _fake_reverse(
     x_seq,
     states,
@@ -734,7 +754,9 @@ def _backward(ctx, grad_results):
     )
 
 
-_training.register_autograd(_backward, setup_context=_setup_context)
+torch.library.register_autograd(
+    "btorch_cells::training", _backward, setup_context=_setup_context, lib=_library
+)
 
 
 def run_multi_step(
@@ -788,20 +810,21 @@ def run_multi_step(
         history.names,
     )
     stochastic = spec.surrogate == "poisson" and spec.poisson is not None
-    precision_tensors = [
-        ("x_seq", x_seq),
-        *(
-            (f"initial {name}", value)
-            for name, value in zip(template.state_names, states)
-        ),
-        *(
-            (f"parameter {name}", value)
-            for name, value in zip(template.parameter_names, parameters)
-        ),
-    ]
-    if uniform_seq is not None:
-        precision_tensors.append(("uniform_seq", uniform_seq))
-    _validate_poisson_fp32(spec, precision_tensors)
+    if spec.poisson is not None:
+        precision_tensors = [
+            ("x_seq", x_seq),
+            *(
+                (f"initial {name}", value)
+                for name, value in zip(template.state_names, states)
+            ),
+            *(
+                (f"parameter {name}", value)
+                for name, value in zip(template.parameter_names, parameters)
+            ),
+        ]
+        if uniform_seq is not None:
+            precision_tensors.append(("uniform_seq", uniform_seq))
+        _validate_poisson_fp32(spec, precision_tensors)
     if isinstance(spec.dt, Tensor):
         if spec.dt.ndim or not spec.dt.is_floating_point():
             raise ValueError("dt tensors must be floating-point scalars")
@@ -844,8 +867,6 @@ def run_multi_step(
             )
     elif uniform_seq is not None:
         raise ValueError("Explicit uniforms require a Poisson surrogate")
-    if uniform_seq is None:
-        uniform_seq = x_seq.new_empty(0, dtype=torch.float32)
     needs_backward = torch.is_grad_enabled() and any(
         value.requires_grad for value in (x_seq, *states, *parameters)
     )

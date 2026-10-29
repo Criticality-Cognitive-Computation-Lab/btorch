@@ -82,6 +82,8 @@ def test_native_triton_trials_do_not_advance_state_and_capture_uses_winner(monke
         (("N", source.numel()), ("BLOCK", 128)),
         writes=(1,),
         work=source.numel(),
+        num_stages=2,
+        enable_fp_fusion=False,
     )
     # Preparation may run many candidates; the live state has not advanced.
     torch.testing.assert_close(state, torch.full_like(state, 2), rtol=0, atol=0)
@@ -102,6 +104,8 @@ def test_native_triton_trials_do_not_advance_state_and_capture_uses_winner(monke
         (("N", source.numel()), ("BLOCK", 128)),
         writes=(1,),
         work=source.numel(),
+        num_stages=2,
+        enable_fp_fusion=False,
     )
     # Repreparing a new chunk reuses the native Config without rerunning a
     # candidate or retaining the earlier chunk's scratch storage.

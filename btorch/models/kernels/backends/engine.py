@@ -8,7 +8,9 @@ intermediate is created.
 
 import functools
 import hashlib
+import math
 import subprocess
+import threading
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -16,7 +18,6 @@ from pathlib import Path
 import torch
 
 from ....sparse.runtime.activity import BLOCK_SIZE
-from ....utils.kernel import storage_span
 from ..contracts import surrogate_support
 from ..program import substitute_expression
 from ..templates import (
@@ -972,6 +973,21 @@ def _launch_kernel(
         )
 
 
+@dataclass(frozen=True)
+class _PrimitiveLaunch:
+    runtime: object
+    pointers: tuple
+    recipe: object
+    dynamic_steps: bool
+
+    def __call__(self, buffers, steps):
+        args = tuple(
+            self.runtime.argument(buffers[name], size) for name, size in self.pointers
+        )
+        with _device_scope(args[0].device):
+            self.recipe(args, steps if self.dynamic_steps else None)
+
+
 def _launch(
     backend,
     spec,
@@ -993,6 +1009,8 @@ def _launch(
     spike_list=(),
     gradient_activity=False,
     outputs=(),
+    cache_recipe=True,
+    execute=True,
 ):
     if not n:
         return
@@ -1046,7 +1064,12 @@ def _launch(
         cell_backend_revision(backend),
         buffers["x_seq"].device.index,
     )
-    args = tuple(storage_span(buffers[name], size) for name, size in pointers)
+    # Pointer-only renderers consume the tensor's existing data pointer.  The
+    # generated source already carries shape/stride metadata for noncanonical
+    # views, so constructing a fresh ``as_strided`` storage span here only
+    # adds Python/Torch work.  TileLang overrides ``argument`` because its
+    # public ABI requires a flat storage view.
+    args = tuple(runtime.argument(buffers[name], size) for name, size in pointers)
     num_warps = None
     if backward and get_template(spec).reverse_parameter_warps:
         targets = _normalize_gradient_targets(get_template(spec), gradient_targets)
@@ -1055,17 +1078,21 @@ def _launch(
                 if parameter_mask is None or parameter in parameter_mask:
                     num_warps = warps
                     break
-    _launch_kernel(
-        runtime,
-        kernel,
-        args,
-        n,
-        steps=n_step if dynamic_steps else None,
-        enable_fp_fusion=enable_fp_fusion,
-        debug=True,
-        num_warps=num_warps,
-        writes=tuple(i for i, (name, _) in enumerate(pointers) if name in outputs),
-    )
+    with _device_scope(args[0].device):
+        prepare = runtime.get_recipe if cache_recipe else runtime.prepare_recipe
+        recipe = prepare(
+            kernel,
+            args,
+            n,
+            steps=n_step if dynamic_steps else None,
+            enable_fp_fusion=enable_fp_fusion,
+            debug=True,
+            num_warps=num_warps,
+            writes=tuple(i for i, (name, _) in enumerate(pointers) if name in outputs),
+        )
+        if execute:
+            recipe(args, n_step if dynamic_steps else None)
+    return _PrimitiveLaunch(runtime, pointers, recipe, dynamic_steps)
 
 
 def _dt_buffer(dt, reference):
@@ -1077,16 +1104,6 @@ def _dt_buffer(dt, reference):
     # ``full`` fills device storage directly; unlike ``tensor([dt], device=...)``
     # it does not introduce a host-to-device copy during CUDA graph capture.
     return torch.full((1,), dt, device=reference.device, dtype=torch.float32)
-
-
-def _kernel_arguments(buffers, declarations, strided_names):
-    """Bind the declared ABI while preserving broadcast parameter storage."""
-    return tuple(
-        storage_span(buffers[name], size)
-        if name in strided_names
-        else buffers[name].reshape(-1)
-        for name, size in declarations
-    )
 
 
 def _layout(value, target_shape):
@@ -1119,7 +1136,7 @@ def _parameter_buffers(parameters):
     converted = {}
     for tensor in parameters:
         if id(tensor) not in converted:
-            converted[id(tensor)] = tensor.resolve_neg()
+            converted[id(tensor)] = tensor.resolve_neg() if tensor.is_neg() else tensor
     return tuple(converted[id(tensor)] for tensor in parameters)
 
 
@@ -1137,7 +1154,9 @@ def _prepare(x_seq, states, parameters, spec, *, preserve_parameters=False):
     buffers = {"x_seq": x_seq, "dt": _dt_buffer(spec.dt, x_seq)}
     buffers.update(
         {
-            name + "_init": tensor.expand(target(name))
+            name + "_init": (
+                tensor if tensor.shape == target(name) else tensor.expand(target(name))
+            )
             for name, tensor in zip(template.state_names, states)
         }
     )
@@ -1195,6 +1214,112 @@ def _prepare_parameters(values, template, target):
     return converted, layouts
 
 
+@dataclass
+class _ForwardPlan:
+    """Keep primitive binding metadata and an executable, never live
+    tensors."""
+
+    template: object
+    shape: tuple
+    modes: int
+    targets: dict
+    expand_states: tuple
+    parameter_layouts: tuple
+    prepared_parameter_layouts: tuple | None
+    outputs: frozenset
+    launch: _PrimitiveLaunch | None = None
+
+
+_forward_preparation_lock = threading.RLock()
+
+
+def _forward_layout(value, dynamic_first=False):
+    shape = tuple(value.shape)
+    if dynamic_first and shape:
+        shape = (None, *shape[1:])
+    return shape, tuple(value.stride()), value.dtype, value.device
+
+
+@functools.lru_cache(maxsize=256)
+def _forward_plan(
+    backend,
+    encoded,
+    revisions,
+    x,
+    states,
+    parameters,
+    coefficients,
+    auxiliary,
+    history_names,
+    residual,
+    policy,
+    spike_layout,
+    aliases,
+):
+    # All cache inputs are metadata. In particular neither runtime dt nor
+    # addresses enter the key; replacement tensors must be bound on every call.
+    del backend, revisions, auxiliary, policy, spike_layout, aliases
+    from ..operators import decode_spec
+
+    template = get_template(decode_spec(encoded))
+    shape = x[0][1:]
+    modes = (
+        states[template.state_names.index(template.state_extra_dims[0][0])][0][-1]
+        if template.state_extra_dims
+        else 0
+    )
+    targets = {
+        name: (*shape, modes) if template.extra_dims(name) else shape
+        for name in (
+            *template.state_names,
+            *template.parameter_names,
+            *template.history_names,
+        )
+    }
+    layouts = tuple(
+        _cached_layout(value[0], value[1], targets[name])
+        for name, value in zip(template.parameter_names, parameters)
+    )
+    declarations = {item.name: item for item in template.prepared_parameters}
+    undeclared = {name for name, _ in coefficients} - declarations.keys()
+    if undeclared:
+        raise ValueError(f"Undeclared prepared parameters: {sorted(undeclared)}")
+    prepared = tuple(
+        (
+            name,
+            _cached_layout(
+                value[0], value[1], targets[declarations[name].shape_source]
+            ),
+        )
+        for name, value in coefficients
+    )
+    outputs = {
+        "output_seq",
+        "gradient_activity",
+        "spike_indices",
+        "spike_cumulative",
+        "spike_counts",
+        "spike_accumulation",
+        *(name + "_final" for name in template.state_names),
+        *(name + "_seq" for name in history_names),
+    }
+    if residual.checkpoint_state is not None:
+        outputs.add(residual.checkpoint_state + "_checkpoint")
+    return _ForwardPlan(
+        template,
+        shape,
+        modes,
+        targets,
+        tuple(
+            value[0] != targets[name]
+            for name, value in zip(template.state_names, states)
+        ),
+        layouts,
+        prepared or None,
+        frozenset(outputs),
+    )
+
+
 def forward(
     backend,
     x_seq,
@@ -1214,29 +1339,80 @@ def forward(
 ):
     """Execute inference or training forward using exactly requested
     storage."""
-    template, shape, modes, target, buffers, parameter_layouts = _prepare(
-        x_seq, states, parameters, spec, preserve_parameters=True
-    )
-    coefficient_buffers, prepared_parameter_layouts = _prepare_parameters(
-        prepared_parameters, template, target
-    )
-    buffers.update(coefficient_buffers)
-    if spike_list is not None:
-        buffers.update(spike_list.bindings())
+    from ..operators import encode_spec
+    from ..registry import cell_backend_revision
+
+    if x_seq.device.type != "cuda":
+        raise ValueError("GPU cell backends require CUDA tensors")
+    runtime = get_runtime(backend)
+    dynamic = runtime.supports_dynamic_steps and spike_list is None
+    parameters = _parameter_buffers(parameters)
+    coefficients = {
+        name: value.resolve_neg() if value.is_neg() else value
+        for name, value in (prepared_parameters or {}).items()
+    }
+    auxiliary = {} if spike_list is None else spike_list.bindings()
     if gradient_activity is not None:
-        buffers["gradient_activity"] = gradient_activity
+        auxiliary["gradient_activity"] = gradient_activity
     if spec.surrogate == "poisson" and spec.poisson.spiking:
         if uniform_seq is None:
             raise ValueError("Spiking Poisson kernels require explicit uniforms")
-        buffers["uniform_seq"] = uniform_seq
-    n_step = x_seq.shape[0]
+        auxiliary["uniform_seq"] = uniform_seq
+    template = get_template(spec)
     residual = residual_template or ResidualTemplate(template.state_names)
+    # External producer destinations may alias caller-owned operands. Unlike
+    # the freshly allocated primitive results, their alias pattern can affect
+    # safe autotuning. Compare storage identities only for this uncommon path.
+    aliases = ()
+    if spike_list is not None or gradient_activity is not None:
+        operands = (
+            x_seq,
+            *states,
+            *parameters,
+            *coefficients.values(),
+            *auxiliary.values(),
+        )
+        addresses = tuple(value.untyped_storage().data_ptr() for value in operands)
+        aliases = tuple(
+            (i, j)
+            for i, address in enumerate(addresses)
+            for j in range(i)
+            if address == addresses[j]
+        )
+    plan = _forward_plan(
+        backend,
+        encode_spec(spec),
+        (model_template_revision(spec.model), cell_backend_revision(backend)),
+        _forward_layout(x_seq, dynamic),
+        tuple(_forward_layout(value) for value in states),
+        tuple(_forward_layout(value) for value in parameters),
+        tuple((name, _forward_layout(value)) for name, value in coefficients.items()),
+        tuple(
+            (name, _forward_layout(value, dynamic and name.endswith("_seq")))
+            for name, value in auxiliary.items()
+        ),
+        tuple(history_names),
+        residual,
+        (enable_fp_fusion, precise_division, precise_exp),
+        () if spike_list is None else spike_list.producer_layout,
+        aliases,
+    )
+    template, modes, target = plan.template, plan.modes, plan.targets.__getitem__
+    buffers = {"x_seq": x_seq, "dt": _dt_buffer(spec.dt, x_seq)}
+    buffers.update(
+        (name + "_init", value.expand(target(name)) if expand else value)
+        for name, value, expand in zip(template.state_names, states, plan.expand_states)
+    )
+    buffers.update(zip(template.parameter_names, parameters))
+    buffers.update(coefficients)
+    buffers.update(auxiliary)
+    n_step = x_seq.shape[0]
     checkpoint_count = (
         max((n_step - 1) // residual.checkpoint_interval, 0)
         if residual.checkpoint_state
         else 0
     )
-    n = x_seq[0].numel() if n_step else x_seq.numel() // max(n_step, 1)
+    n = math.prod(plan.shape)
     # Empty sequences preserve initial state with the same FP32 policy.
     if not n_step:
         checkpoint = (
@@ -1274,36 +1450,37 @@ def forward(
             device=x_seq.device,
             dtype=torch.float32,
         )
-    outputs = {
-        "output_seq",
-        "gradient_activity",
-        "spike_indices",
-        "spike_cumulative",
-        "spike_counts",
-        "spike_accumulation",
-        *(name + "_final" for name in template.state_names),
-        *(name + "_seq" for name in history_names),
-    }
-    if residual.checkpoint_state is not None:
-        outputs.add(residual.checkpoint_state + "_checkpoint")
-    _launch(
-        backend,
-        spec,
-        buffers,
-        n,
-        n_step,
-        history_names,
-        modes,
-        parameter_layouts=parameter_layouts,
-        prepared_parameter_layouts=prepared_parameter_layouts,
-        enable_fp_fusion=enable_fp_fusion,
-        precise_division=precise_division,
-        residual_template=residual,
-        precise_exp=precise_exp,
-        spike_list=() if spike_list is None else spike_list.producer_layout,
-        gradient_activity=gradient_activity is not None,
-        outputs=outputs,
-    )
+    if plan.launch is None and n:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Warm primitive execution plans before CUDA Graph capture"
+            )
+        # Serialize cold publication only: a cached plan must never trigger two
+        # concurrent tuning trials against different invocation buffers.
+        with _forward_preparation_lock:
+            if plan.launch is None:
+                plan.launch = _launch(
+                    backend,
+                    spec,
+                    buffers,
+                    n,
+                    n_step,
+                    history_names,
+                    modes,
+                    parameter_layouts=plan.parameter_layouts,
+                    prepared_parameter_layouts=plan.prepared_parameter_layouts,
+                    enable_fp_fusion=enable_fp_fusion,
+                    precise_division=precise_division,
+                    residual_template=residual,
+                    precise_exp=precise_exp,
+                    spike_list=() if spike_list is None else spike_list.producer_layout,
+                    gradient_activity=gradient_activity is not None,
+                    outputs=plan.outputs,
+                    cache_recipe=False,
+                    execute=False,
+                )
+    if plan.launch is not None:
+        plan.launch(buffers, n_step)
     return (
         buffers["output_seq"],
         tuple(buffers[name + "_final"] for name in template.state_names),

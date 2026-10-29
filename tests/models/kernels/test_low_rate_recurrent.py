@@ -57,6 +57,23 @@ def test_low_rate_recurrent_states_continuation_and_input_vjp(
         None if compiled else 4.0,
     )
     reference = _network("torch", None)
+    if not training and not compiled:
+        from dataclasses import replace
+
+        from btorch.models.kernels import recurrent_operator
+
+        # An emitted-list route may expose only the single-step consumer.
+        # Sequence binding is an optimization capability, not a requirement
+        # for correct list propagation or continued physical state.
+        prepare = recurrent_operator._prepare_connection_forward
+
+        def without_sequence(*args):
+            execution = prepare(*args)
+            return replace(execution, prepare_sequence=None)
+
+        monkeypatch.setattr(
+            recurrent_operator, "_prepare_connection_forward", without_sequence
+        )
     if training:
         # The clipped derivative defines the mathematical oracle on both
         # sides; sparse BPTT changes execution, never the surrogate itself.

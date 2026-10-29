@@ -36,8 +36,19 @@ _TRITON_AVAILABLE = (
 )
 
 if _TRITON_AVAILABLE:
+    _PACK_TASKS_ARGS = [
+        "x_ptr",
+        "task_sources_ptr",
+        "task_hashable_ptr",
+        "direct_queue_ptr",
+        "hash_queue_ptr",
+        "counts_ptr",
+    ]
 
-    @triton.jit
+    @triton.jit(
+        do_not_specialize=_PACK_TASKS_ARGS,
+        do_not_specialize_on_alignment=_PACK_TASKS_ARGS,
+    )
     def _pack_tasks_kernel(
         x_ptr,
         task_sources_ptr,
@@ -77,7 +88,21 @@ if _TRITON_AVAILABLE:
             tl.store(queue_ptr, bucket)
             tl.store(queue_ptr + 1, task)
 
-    @triton.jit
+    _DIRECT_TASKS_ARGS = [
+        "x_ptr",
+        "weight_ptr",
+        "source_ptr",
+        "destination_ptr",
+        "task_indptr_ptr",
+        "queue_ptr",
+        "count_ptr",
+        "output_ptr",
+    ]
+
+    @triton.jit(
+        do_not_specialize=_DIRECT_TASKS_ARGS,
+        do_not_specialize_on_alignment=_DIRECT_TASKS_ARGS,
+    )
     def _direct_tasks_kernel(
         x_ptr,
         weight_ptr,
@@ -117,7 +142,23 @@ if _TRITON_AVAILABLE:
             )
             task_slot += num_programs
 
-    @triton.jit
+    _HASH_TASKS_ARGS = [
+        "x_ptr",
+        "weight_ptr",
+        "source_ptr",
+        "destination_ptr",
+        "task_indptr_ptr",
+        "queue_ptr",
+        "count_ptr",
+        "hash_keys_ptr",
+        "hash_values_ptr",
+        "output_ptr",
+    ]
+
+    @triton.jit(
+        do_not_specialize=_HASH_TASKS_ARGS,
+        do_not_specialize_on_alignment=_HASH_TASKS_ARGS,
+    )
     def _hash_tasks_kernel(
         x_ptr,
         weight_ptr,

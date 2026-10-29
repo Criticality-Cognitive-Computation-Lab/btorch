@@ -73,11 +73,14 @@ class PreparedPropagation:
     ``forward`` accepts ordinary activity. When ``spikes`` is present, a
     compatible generated producer may fill it and clear its accumulation
     buffer, then call ``from_spikes`` without packing the dense activity.
+    ``prepare_sequence`` binds a trajectory's stable activity storage and
+    returns an index-based consumer, avoiding per-step tensor rebinding.
     """
 
     forward: Callable
     spikes: SpikeList | None = None
     from_spikes: Callable | None = None
+    prepare_sequence: Callable | None = None
 
     def __call__(self, source):
         return self.forward(source)

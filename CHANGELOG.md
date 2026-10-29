@@ -9,9 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Prepare recurrent pointer schedules and spike-list sequence consumers once
+  per invocation, binding the current stream through public backend APIs.
+  Recurrent operators reuse public Torch dispatcher and autograd registrations.
+  Native Triton autotune disk results are reused for fully specified static
+  contracts. CUDA Graph capture suspends cyclic GC without forcing a full-heap
+  collection; PyTorch retains control of explicit collection policy.
+
+- Register primitive sequence operators through the public Torch dispatcher,
+  preserving fake kernels and explicit autograd without per-call CustomOpDef
+  wrappers. Pointer-based backends reuse original tensor views; preparation
+  avoids unused allocations and no-op conversions. Triton alignment policies
+  are declared at kernel definitions without JIT-object introspection.
+
 - Reuse tensor-free model metadata, validated layouts and prepared native
-  executables for primitive neuron/PSC sequences. Each invocation binds current
-  tensors; runtime timesteps, autograd ownership and compiler tracing are preserved.
+  executables for primitive neuron/PSC sequences, including storage descriptors
+  and backend launch bindings. Each invocation binds current tensors and owns
+  its results; runtime timesteps, autograd ownership and compiler tracing are preserved.
 
 - Bounded preparation-time GPU autotuning through native Triton/TileLang
   autotuners and CuPy profiling, with isolated trial storage and direct prepared

@@ -380,6 +380,27 @@ def _bind_spike_list(execution, x):
     execution.pack = emit
     execution.launch = consume
 
+    def bind_sequence(sequence):
+        # Own a separate ABI vector: later standalone calls must not inherit
+        # this sequence's last row through the ordinary prepared-stage cache.
+        stage = runtime.stages["push_packed"]
+        kernel, views = stage[0], list(stage[2])
+        span = storage_span(sequence[0]).numel()
+        rows = sequence.as_strided(
+            (sequence.shape[0], span),
+            (sequence.stride(0), 1),
+            sequence.storage_offset(),
+        ).unbind(0)
+
+        def forward(index):
+            views[4] = rows[index]
+            kernel(*views)
+            return queue.output
+
+        return forward
+
+    execution.bind_sequence = bind_sequence
+
 
 def prepare_spike_list(*args, **kwargs):
     """Prepare the same local queues and persistent fanout as Triton push."""

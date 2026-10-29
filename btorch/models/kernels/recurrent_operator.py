@@ -19,6 +19,9 @@ from .templates import (
 )
 
 
+_library = torch.library.Library("btorch_cells", "FRAGMENT")
+
+
 def _connection(source, parameters, topology, spec):
     kind = spec["connection"]
     if kind == "identity":
@@ -123,6 +126,11 @@ def _prepare_connection_forward(source, parameters, topology, spec):
         forward=with_bias(forward.forward),
         from_spikes=with_bias(forward.from_spikes)
         if forward.from_spikes is not None
+        else None,
+        prepare_sequence=(
+            lambda sequence: with_bias(forward.prepare_sequence(sequence))
+        )
+        if forward.prepare_sequence is not None
         else None,
     )
 
@@ -371,23 +379,18 @@ def _prepare_recurrent_step(
     def sequence(name, value, offset=0, *, keepdim=False):
         owners.append(value)
         slot_storage[name] = (value, offset)
-        base, stride = value.data_ptr(), value.stride(0) * value.element_size()
-
-        def pointer(time):
-            return base + (time + offset) * stride
 
         def tensor(time):
             index = time + offset
             return value[index : index + 1] if keepdim else value[index]
 
-        return pointer, tensor
+        return tensor
 
     def workspace(name):
         values = tuple(buffers[name] for buffers in worksets)
         owners.extend(values)
         slot_storage[name] = (values, 0)
-        pointers = tuple(value.data_ptr() for value in values)
-        return lambda time: pointers[time % 2], lambda time: values[time % 2]
+        return lambda time: values[time % 2]
 
     def previous(getter):
         return lambda time: getter(time - 1)
@@ -402,14 +405,14 @@ def _prepare_recurrent_step(
         for index, name in enumerate(template.state_names):
             final = prefix + name + "_final"
             record = histories.get(offset + index)
-            pointers, tensors = (
+            tensors = (
                 workspace(final)
                 if record is None
                 else sequence(final, record, record_offset)
             )
-            slots.append((final, pointers, tensors))
+            slots.append((final, tensors))
             initial = prefix + name + "_init"
-            slots.append((initial, previous(pointers), previous(tensors)))
+            slots.append((initial, previous(tensors)))
             storage, position = slot_storage[final]
             slot_storage[initial] = (storage, position - 1)
             readers.append(tensors)
@@ -419,12 +422,12 @@ def _prepare_recurrent_step(
     charged_views = []
     for name, record in charged_histories:
         final = "neuron_" + name + "_seq"
-        pointers, tensors = (
+        tensors = (
             workspace(final)
             if record is None
             else sequence(final, record, 1, keepdim=True)
         )
-        slots.append((final, pointers, tensors))
+        slots.append((final, tensors))
         charged_views.append(tensors)
     for name, value in (
         ("neuron_input", x_seq),
@@ -433,28 +436,43 @@ def _prepare_recurrent_step(
         ("neuron_uniform", uniform_seq),
     ):
         if value is not None:
-            pointers, tensors = sequence(name, value, 1)
-            slots.append((name, pointers, tensors))
+            slots.append((name, sequence(name, value, 1)))
 
-    bindings = {name: tensors(1) for name, _pointers, tensors in slots}
+    bindings = {name: tensors(1) for name, tensors in slots}
     bindings["drive"] = drive
     prepared = step.prepare_launch(bindings)
     arguments = prepared.arguments
-    updates = tuple(
-        (
-            *prepared.slots[name],
-            pointers if step.runtime.supports_pointer_offsets else tensors,
-        )
-        for name, pointers, tensors in slots
-    )
     drive_slot, drive_span = prepared.slots["drive"]
     if step.runtime.supports_pointer_offsets:
+        sequences = []
+        workspaces = ([], [])
+        for name, _tensors in slots:
+            index = prepared.slots[name][0]
+            storage, offset = slot_storage[name]
+            if isinstance(storage, Tensor):
+                stride = storage.stride(0) * storage.element_size()
+                base = storage.data_ptr() + offset * stride
+                if stride:
+                    sequences.append((index, base, stride))
+            else:
+                for parity, updates_at_parity in enumerate(workspaces):
+                    updates_at_parity.append(
+                        (index, storage[(parity + offset) % len(storage)].data_ptr())
+                    )
+        sequences = tuple(sequences)
+        workspaces = tuple(tuple(updates) for updates in workspaces)
+        last_drive = drive
 
         def run(time, drive):
-            for index, _span, getter in updates:
-                arguments[index] = getter(time)
-            prepared.owners[drive_slot] = drive
-            arguments[drive_slot] = drive.data_ptr()
+            nonlocal last_drive
+            for index, base, stride in sequences:
+                arguments[index] = base + time * stride
+            for index, pointer in workspaces[time % 2]:
+                arguments[index] = pointer
+            if drive is not last_drive:
+                last_drive = drive
+                prepared.owners[drive_slot] = drive
+                arguments[drive_slot] = drive.data_ptr()
             prepared.launch()
 
     else:
@@ -479,7 +497,7 @@ def _prepare_recurrent_step(
 
         updates = tuple(
             (prepared.slots[name][0], view_getter(name, prepared.slots[name][1]))
-            for name, _pointers, _tensors in slots
+            for name, _tensors in slots
         )
         last_drive = drive
         drive_argument = argument(drive, drive_span)
@@ -679,6 +697,7 @@ def _trajectory(
     dt,
     uniform_seq=None,
 ):
+    n_steps = x_seq.shape[0]
     if uniform_seq is not None and not uniform_seq.numel():
         uniform_seq = None
     spec = json.loads(encoded)
@@ -715,7 +734,7 @@ def _trajectory(
         from ...sparse.runtime.activity import GradientList
 
         gradient_activity = torch.empty(
-            (x_seq.shape[0], GradientList.size(output_seq[0].numel())),
+            (n_steps, GradientList.size(output_seq[0].numel())),
             dtype=torch.int32,
             device=x_seq.device,
         )
@@ -730,7 +749,7 @@ def _trajectory(
     checkpoint_interval = int(spec.get("paired_checkpoint_interval", 0))
     if checkpoint_interval and not use_fused:
         raise RuntimeError("Paired recurrent checkpoints require a native CUDA backend")
-    n_checkpoints = _checkpoint_count(x_seq.shape[0], checkpoint_interval)
+    n_checkpoints = _checkpoint_count(n_steps, checkpoint_interval)
     checkpoints = (
         [
             state.new_empty((n_checkpoints, *state.shape), dtype=torch.float32)
@@ -806,9 +825,7 @@ def _trajectory(
             )
             if spec["delay"] and name == len(initial_states) - 1:
                 dtype = ring.dtype
-            histories[name] = sample.new_empty(
-                (x_seq.shape[0], *sample.shape), dtype=dtype
-            )
+            histories[name] = sample.new_empty((n_steps, *sample.shape), dtype=dtype)
     prepared_source = (
         _prepare_source(
             spikes,
@@ -821,7 +838,14 @@ def _trajectory(
         else None
     )
     drive_shape = synapse_states[0].shape
-    for time_index in range(x_seq.shape[0]):
+    consume_sequence = (
+        prepared_connection.prepare_sequence(
+            output_seq.flatten(-len(spec["neuron_shape"]))
+        )
+        if spike_list is not None and prepared_connection.prepare_sequence is not None
+        else None
+    )
+    for time_index in range(n_steps):
         if not use_fused:
             spikes, neuron_states, neuron_charged = _cell_forward(
                 x_seq[time_index] + _current(synapse_states[0], spec),
@@ -836,7 +860,9 @@ def _trajectory(
                 prepared_parameters=prepared_parameters,
                 uniform=None if uniform_seq is None else uniform_seq[time_index],
             )
-        if prepared_source is not None:
+        if consume_sequence is not None and time_index:
+            drive = consume_sequence(time_index)
+        elif prepared_source is not None:
             source, ring = prepared_source(spikes, ring, time_index)
         else:
             source, ring = _source(
@@ -850,18 +876,19 @@ def _trajectory(
             prepared_connection = _prepare_connection_forward(
                 source, connection_parameters, topology, spec
             )
-        drive = (
-            prepared_connection.from_spikes(source)
-            if spike_list is not None
-            else prepared_connection(source)
-            if prepared_connection is not None
-            else _connection(source, connection_parameters, topology, spec)
-        )
+        if consume_sequence is None or not time_index:
+            drive = (
+                prepared_connection.from_spikes(source)
+                if spike_list is not None
+                else prepared_connection(source)
+                if prepared_connection is not None
+                else _connection(source, connection_parameters, topology, spec)
+            )
         if not spec.get("merge_receptors", 0) and drive.shape != drive_shape:
             drive = drive.reshape(drive_shape)
         current_spikes, current_neuron_states = spikes, neuron_states
         current_neuron_charged = neuron_charged
-        if use_fused and time_index + 1 < x_seq.shape[0]:
+        if use_fused and time_index + 1 < n_steps:
             if prepared_step is None:
                 prepared_step = prepare_fused_step(
                     x_seq[time_index + 1],
@@ -962,8 +989,9 @@ def _trajectory(
                         uniform_seq=uniform_seq,
                     )
                 step_launch.launch(time_index, drive)
-                spikes = output_seq[time_index + 1]
-                if time_index + 2 == x_seq.shape[0] or (
+                if consume_sequence is None:
+                    spikes = output_seq[time_index + 1]
+                if time_index + 2 == n_steps or (
                     checkpoint_interval and (time_index + 1) % checkpoint_interval == 0
                 ):
                     # Interior states stay in owned destinations. Only a
@@ -991,7 +1019,7 @@ def _trajectory(
         if (
             checkpoint_interval
             and (time_index + 1) % checkpoint_interval == 0
-            and time_index + 1 < x_seq.shape[0]
+            and time_index + 1 < n_steps
         ):
             checkpoint_index = time_index // checkpoint_interval
             # The paired loop carries the next neuron state alongside the
@@ -1002,7 +1030,14 @@ def _trajectory(
         if not use_fused or time_index == 0:
             output_seq[time_index].copy_(current_spikes)
         history_values = None
-        for name in history_names:
+        # Fused interior stages already store every requested record. Only
+        # the leading neuron and trailing PSC need host-scheduled copies.
+        copy_names = (
+            history_names
+            if not use_fused or time_index == 0 or time_index + 1 == n_steps
+            else ()
+        )
+        for name in copy_names:
             if name < 0:
                 continue
             if name == activity_index:
@@ -1012,7 +1047,7 @@ def _trajectory(
             ns, ss = len(neuron_states), len(synapse_states)
             direct = use_fused and (
                 (name < ns and time_index > 0)
-                or (ns <= name < ns + ss and time_index + 1 < x_seq.shape[0])
+                or (ns <= name < ns + ss and time_index + 1 < n_steps)
                 or (name >= len(initial_states) and time_index > 0)
                 or (spec["delay"] and name == len(initial_states) - 1)
             )
@@ -1027,7 +1062,7 @@ def _trajectory(
                 )
             value = history_values[int(name)]
             if name not in histories:
-                histories[name] = value.new_empty((x_seq.shape[0], *value.shape))
+                histories[name] = value.new_empty((n_steps, *value.shape))
             histories[name][time_index].copy_(value)
     # Custom operators must not alias their input or another output. Final
     # states are already independent tensor allocations for nonempty runs;
@@ -1049,8 +1084,7 @@ def _trajectory(
     ]
 
 
-@torch.library.custom_op("btorch_cells::recurrent_inference", mutates_args=())
-def inference(
+def _forward_impl(
     x_seq: Tensor,
     x_syn_seq: Tensor,
     states: list[Tensor],
@@ -1077,32 +1111,12 @@ def inference(
         )
 
 
-@torch.library.custom_op("btorch_cells::recurrent_training", mutates_args=())
-def training(
-    x_seq: Tensor,
-    x_syn_seq: Tensor,
-    states: list[Tensor],
-    parameters: list[Tensor],
-    topology: list[Tensor],
-    encoded: str,
-    history_names: list[int],
-    backend: str,
-    dt: Tensor,
-    uniform_seq: Tensor | None = None,
-) -> list[Tensor]:
-    with torch.cuda.device(x_seq.device) if x_seq.is_cuda else nullcontext():
-        return _trajectory(
-            x_seq,
-            x_syn_seq,
-            states,
-            parameters,
-            topology,
-            encoded,
-            history_names,
-            backend,
-            dt,
-            uniform_seq,
-        )
+_forward_schema = torch.library.infer_schema(_forward_impl, mutates_args=())
+for _name in ("recurrent_inference", "recurrent_training"):
+    _library.define(_name + _forward_schema)
+    _library.impl(_name, _forward_impl, "CompositeExplicitAutograd")
+inference = torch.ops.btorch_cells.recurrent_inference.default
+training = torch.ops.btorch_cells.recurrent_training.default
 
 
 def _fake(
@@ -1178,8 +1192,8 @@ def _fake(
     ]
 
 
-inference.register_fake(_fake)
-training.register_fake(_fake)
+torch.library.register_fake("btorch_cells::recurrent_inference", _fake, lib=_library)
+torch.library.register_fake("btorch_cells::recurrent_training", _fake, lib=_library)
 
 
 def _paired_checkpoint_state_reader(
@@ -1914,19 +1928,7 @@ def _reverse_impl(
     ]
 
 
-@torch.library.custom_op(
-    "btorch_cells::recurrent_reverse",
-    mutates_args=(),
-    schema=(
-        "(Tensor x_seq, Tensor x_syn_seq, Tensor spikes_seq, Tensor[] states, "
-        "Tensor[] parameters, Tensor[] topology, str encoded, int[] history_names, "
-        "Tensor[] histories, Tensor[] checkpoints, Tensor grad_output, "
-        "Tensor[] grad_states, "
-        "Tensor[] grad_history, bool[] needs, str backend, int backend_revision, "
-        "int[] model_revisions, Tensor dt) -> Tensor?[]"
-    ),
-)
-def reverse(
+def _reverse_operator_impl(
     x_seq: Tensor,
     x_syn_seq: Tensor,
     spikes_seq: Tensor,
@@ -1983,7 +1985,20 @@ def reverse(
     ]
 
 
-@reverse.register_fake
+_library.define(
+    "recurrent_reverse"
+    "(Tensor x_seq, Tensor x_syn_seq, Tensor spikes_seq, Tensor[] states, "
+    "Tensor[] parameters, Tensor[] topology, str encoded, int[] history_names, "
+    "Tensor[] histories, Tensor[] checkpoints, Tensor grad_output, "
+    "Tensor[] grad_states, "
+    "Tensor[] grad_history, bool[] needs, str backend, int backend_revision, "
+    "int[] model_revisions, Tensor dt) -> Tensor?[]"
+)
+_library.impl("recurrent_reverse", _reverse_operator_impl, "CompositeExplicitAutograd")
+reverse = torch.ops.btorch_cells.recurrent_reverse.default
+
+
+@torch.library.register_fake("btorch_cells::recurrent_reverse", lib=_library)
 def _fake_reverse(
     x_seq,
     x_syn_seq,
@@ -2132,4 +2147,6 @@ def _backward(ctx, grad_results):
     )
 
 
-training.register_autograd(_backward, setup_context=_setup)
+torch.library.register_autograd(
+    "btorch_cells::recurrent_training", _backward, setup_context=_setup, lib=_library
+)

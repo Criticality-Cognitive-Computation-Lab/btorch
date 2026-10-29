@@ -92,6 +92,7 @@ class _PreparedSpikeList:
     programs: int = 1
     pack: object = field(default=None, init=False, repr=False)
     launch: object = field(default=None, init=False, repr=False)
+    bind_sequence: object = field(default=None, init=False, repr=False)
     arguments: list = field(default_factory=list, init=False, repr=False)
 
     def _check_input(self, input):
@@ -118,6 +119,21 @@ class _PreparedSpikeList:
         """Consume an emitted list; its producer already cleared the output."""
         self._check_input(input)
         return self.output if self.spikes is None else self._consume(input)
+
+    def prepare_sequence(self, sequence):
+        """Bind emitted spike rows once, retaining their storage ownership."""
+        self._check_input(sequence[0])
+        if self.spikes is None:
+            return lambda index: self.output
+        launch = self.bind_sequence(sequence)
+        if self.spikes.output is self.output:
+            return launch
+
+        def forward(index):
+            self.output.copy_(launch(index))
+            return self.output
+
+        return forward
 
 
 def prepare_spike_list(

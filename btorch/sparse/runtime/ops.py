@@ -542,10 +542,37 @@ def _build_source_push(
             require_task=True,
         )
 
+        flat_shape = flat.shape
+        source_shape = x.shape
+        output_shape = (*source_shape[:-1], crow.shape[0] - 1)
+
         def restore_shape(callback):
-            return lambda input: callback(input.reshape(flat.shape)).reshape(
-                *input.shape[:-1], crow.shape[0] - 1
-            )
+            def forward(input):
+                shape = input.shape
+                output = callback(
+                    input if shape == flat_shape else input.reshape(flat_shape)
+                )
+                target = (
+                    output_shape
+                    if shape == source_shape
+                    else (*shape[:-1], output_shape[-1])
+                )
+                return output if output.shape == target else output.reshape(target)
+
+            return forward
+
+        def prepare_sequence(sequence):
+            source = sequence.reshape(sequence.shape[0], *flat_shape)
+            consume = execute.prepare_sequence(source)
+            target = (*sequence.shape[1:-1], output_shape[-1])
+            output = execute.output
+            output = output if output.shape == target else output.reshape(target)
+
+            def forward(index):
+                consume(index)
+                return output
+
+            return forward
 
         return PreparedPropagation(
             restore_shape(execute),
@@ -553,6 +580,7 @@ def _build_source_push(
             restore_shape(execute.from_spikes)
             if push_kernel == "spike_push_list"
             else None,
+            prepare_sequence if push_kernel == "spike_push_list" else None,
         )
 
     return RouteImplementation(

@@ -28,14 +28,14 @@ def _completed_runner() -> tuple[CudaGraphRunner, weakref.ReferenceType]:
     return runner, weakref.ref(graph)
 
 
-def test_capture_collects_stale_graph_cycles_and_suspends_gc_while_recording():
-    """Collect old graphs before recording and defer collection during it.
+def test_capture_defers_stale_graph_collection_while_recording():
+    """Defer cyclic graph destruction until recording has finished.
 
     A completed ``torch.cuda.CUDAGraph`` destroys its capture resources when
     its owner is reclaimed. Destroying one while this runner is recording
-    invalidates the new capture, so completed runners in reference cycles must
-    be swept before capture and automatic cyclic GC must stay off until the
-    recording pass has left the capture context.
+    invalidates the new capture, so automatic cyclic GC must stay off until
+    recording has left the capture context. Stale cycles can safely survive
+    capture and be reclaimed afterward, without a forced full-heap sweep.
     """
     gc_was_enabled = gc.isenabled()
     thresholds = gc.get_threshold()
@@ -70,8 +70,8 @@ def test_capture_collects_stale_graph_cycles_and_suspends_gc_while_recording():
             # automatic collection can reclaim this real graph owner and
             # invalidate the active capture.
             if calls == 2:
-                # The pre-capture sweep must have reclaimed the older cycle
-                # before any CUDA recording work begins.
+                # Both pre-existing and newly discarded graph cycles must
+                # survive the active capture even under aggressive GC.
                 stale_graph_alive_while_recording.append(stale_graph() is not None)
                 late_runner._test_cycle = late_runner
                 late_runner = None
@@ -83,16 +83,14 @@ def test_capture_collects_stale_graph_cycles_and_suspends_gc_while_recording():
             return 1.5 * value - 0.125
 
         # Keep automatic collection out of the uncaptured settle pass so the
-        # runner's explicit pre-capture sweep is what reclaims the first graph.
-        # The recording pass lowers the threshold itself to force the condition.
+        # recording pass is what encounters the aggressive-GC condition.
         gc.set_threshold(10**9, 10**9, 10**9)
         gc.enable()
         with torch.inference_mode():
             first_actual = runner(module, operation, (first,))
             second_actual = runner(module, operation, (second,))
 
-        assert stale_graph() is None
-        assert stale_graph_alive_while_recording == [False]
+        assert stale_graph_alive_while_recording == [True]
         assert late_graph_alive_while_recording == [True]
         assert recording_gc_states == [True, False]
         assert gc.isenabled()
@@ -104,6 +102,7 @@ def test_capture_collects_stale_graph_cycles_and_suspends_gc_while_recording():
         # The cycle created during recording is ordinary garbage once capture
         # has ended, and an explicit collection may reclaim its graph safely.
         gc.collect()
+        assert stale_graph() is None
         assert late_graph() is None
     finally:
         gc.set_threshold(*thresholds)
@@ -113,8 +112,8 @@ def test_capture_collects_stale_graph_cycles_and_suspends_gc_while_recording():
             gc.disable()
 
 
-def test_capture_with_gc_disabled_still_collects_and_preserves_state():
-    """Reclaim stale graphs explicitly without enabling the caller's GC."""
+def test_capture_preserves_disabled_gc_and_defers_graph_collection():
+    """Respect caller-managed collection while safely recording a new graph."""
     gc_was_enabled = gc.isenabled()
     thresholds = gc.get_threshold()
     gc.disable()
@@ -136,13 +135,14 @@ def test_capture_with_gc_disabled_still_collects_and_preserves_state():
         with torch.inference_mode():
             actual = runner(module, operation, (value,))
 
-        # Explicit collection is independent of automatic GC being enabled, so
-        # the sweep must still destroy the stale graph. The recording pass must
-        # leave the caller's disabled state untouched.
-        assert stale_graph() is None
+        # A caller disabling cyclic GC retains control of collection. This
+        # stale graph must not invalidate capture or force an expensive sweep.
+        assert stale_graph() is not None
         assert gc_states == [False, False]
         assert not gc.isenabled()
         torch.testing.assert_close(actual, 0.75 * value + 0.5, atol=0, rtol=0)
+        gc.collect()
+        assert stale_graph() is None
     finally:
         gc.set_threshold(*thresholds)
         if gc_was_enabled:

@@ -47,6 +47,11 @@ specify a spike surrogate derivative or detached-reset semantics. Validate the
 generated VJPs against the original Torch model, including nonzero initial
 states and losses on records.
 
+Sequence boundaries use public `torch.library` schemas with fake kernels and
+explicit first-order autograd. Implementations must return fresh, non-aliasing
+outputs and leave inputs unchanged. Validate these contracts with
+`torch.library.opcheck` alongside numerical full-VJP comparisons.
+
 ## Prepare and render
 
 Model definitions describe the mathematics. Preparation binds tensor layouts,
@@ -55,11 +60,17 @@ reconstruct state during backward declare `checkpoint_state`,
 `checkpoint_interval` and `replay_state`; models that precompute coefficients
 declare `prepared_parameters` and `prepare_parameters`.
 
+Primitive sequences reuse tensor-free layout and launch plans, binding current
+tensors and allocating independent results on each invocation. Changed layouts,
+dtypes or model options require a new plan; the runtime `dt` remains dynamic.
+Warm the intended layouts before CUDA Graph capture.
+
 Recurrent preparation also binds the repeated stage's argument slots and
 storage layout. Pointer-only runtimes use the original tensor storage;
 TileLang exposes its flat buffer ABI. Changing sequence rows must not inherit
 the first row's alignment specialization. Prepared Triton launches resolve the
-executable once and continue to use the current stream and profiler hooks.
+executable once and retain profiler hooks. A recurrent invocation binds its
+current CUDA stream once; the next invocation selects its stream afresh.
 Prepared pointer arguments retain their owning tensors. Triton and CuPy interior stages
 update positional slots with byte offsets computed from the actual time stride;
 state views are materialized at checkpoint and final-state boundaries. The
@@ -67,6 +78,11 @@ neuron/PSC template metadata supplies the state ordering for every model.
 TileLang retains prepared tensor views and launches through its public kernel
 call interface; execution-backend argument and stream handling remain TileLang's
 responsibility.
+
+Spike-list propagation can bind a complete trajectory during preparation and
+consume rows by timestep index, reusing the producer's device queue. This
+retains the original storage and avoids constructing and validating a new
+tensor view at every interior step.
 
 Primitive and fused generation apply separate namespaces to the shared scalar
 stages. Backend renderers provide tensor access, math intrinsics and source

@@ -333,7 +333,12 @@ if triton is not None:
             acc += tl.load(base + start[:, None] + pos[None, :], mask=mask, other=0)
         return tl.sum(acc, axis=1)
 
-    @triton.jit
+    _LISTED_OUTPUT_ARGS = ["partial", "mask", "output", "row_start"]
+
+    @triton.jit(
+        do_not_specialize=_LISTED_OUTPUT_ARGS,
+        do_not_specialize_on_alignment=_LISTED_OUTPUT_ARGS,
+    )
     def _listed_matvec_output_kernel(
         partial,
         mask,

@@ -188,6 +188,14 @@ def _cell_metadata(model, options, revision):
     )
 
 
+def _cell_tensor(value: Tensor, device: torch.device) -> Tensor:
+    """Keep existing FP32 storage; convert only when the cell policy requires
+    it."""
+    if value.dtype == torch.float32 and value.device == device:
+        return value
+    return value.to(device=device, dtype=torch.float32)
+
+
 def _prepare_cell_from_layout(module, x_seq: Tensor, layout):
     """Bind current tensors to a cached, immutable mathematical contract."""
     from .operators import environment_dt
@@ -201,6 +209,7 @@ def _prepare_cell_from_layout(module, x_seq: Tensor, layout):
         model, _cell_options(module), model_template_revision(model)
     )
     states = []
+    device = x_seq.device
     for name, ndim in zip(state_names, dimensions):
         value = getattr(module, name)
         if value is None:
@@ -210,18 +219,17 @@ def _prepare_cell_from_layout(module, x_seq: Tensor, layout):
         if not isinstance(value, Tensor):
             value = x_seq.new_full(shape, value, dtype=torch.float32)
         else:
-            value = value.to(device=x_seq.device, dtype=torch.float32)
+            value = _cell_tensor(value, device)
         states.append(value)
     parameters = tuple(
-        getattr(module, name).to(device=x_seq.device, dtype=torch.float32)
-        for name in parameter_names
+        _cell_tensor(getattr(module, name), device) for name in parameter_names
     )
-    return (
-        replace(spec, dt=environment_dt(x_seq, model)),
-        state_names,
-        tuple(states),
-        parameters,
-    )
+    # The timestep reads only metadata. Do not build an autograd context
+    # merely because the drive carries gradients. State/parameter binding
+    # above remains differentiable.
+    with torch.no_grad():
+        dt = environment_dt(x_seq, model)
+    return replace(spec, dt=dt), state_names, tuple(states), parameters
 
 
 def prepare_cell(module, x_seq: Tensor):

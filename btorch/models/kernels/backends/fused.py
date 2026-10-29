@@ -519,7 +519,7 @@ class _FusedStep:
             )
         if self.runtime.supports_pointer_offsets:
             args, owners = launch.arguments, launch.owners
-            submit = launch.submit
+            submit = self.runtime.bind_current_stream(launch)
         else:
             owners = args
             submit = functools.partial(launch, args)

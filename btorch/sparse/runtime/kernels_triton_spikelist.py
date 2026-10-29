@@ -24,6 +24,14 @@ except ImportError:  # CPU installations do not need Triton.
 
 
 if triton is not None:
+    _PACK_SPIKE_LIST_ARGS = [
+        "x",
+        "degree",
+        "active",
+        "cumulative",
+        "counts",
+        "output",
+    ]
 
     @triton.jit
     def _emit_active_list(selected, index, active, counts, BLOCK: tl.constexpr):
@@ -56,7 +64,10 @@ if triton is not None:
         prefix = tl.cumsum(fanout)
         tl.store(cumulative + slot, prefix, mask=firing)
 
-    @triton.jit
+    @triton.jit(
+        do_not_specialize=_PACK_SPIKE_LIST_ARGS,
+        do_not_specialize_on_alignment=_PACK_SPIKE_LIST_ARGS,
+    )
     def _pack_spike_list_kernel(
         x,
         degree,
@@ -199,6 +210,26 @@ def _prepare_spike_list_launch(execution, x):
         launch.submit()
 
     execution.launch = consume
+
+    def bind_sequence(sequence):
+        import torch
+
+        base = sequence.data_ptr()
+        stride = sequence.stride(0) * sequence.element_size()
+        arguments = list(launch.arguments)
+        submit = launch.launch
+        constants = launch.constants
+        output = queue.output
+        stream = torch.cuda.current_stream(sequence.device)
+
+        def forward(index, _owner=sequence):
+            arguments[4] = base + index * stride
+            submit(*arguments, *constants, stream=stream.cuda_stream)
+            return output
+
+        return forward
+
+    execution.bind_sequence = bind_sequence
 
 
 def spike_push_list(

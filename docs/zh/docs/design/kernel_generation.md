@@ -38,12 +38,20 @@ Fragment 构造函数返回 `BackendFragments`。前向阶段使用 Python 表�
 请显式提供反向方程。仅追踪前向操作无法指定 spike 替代梯度或 detached-reset
 语义。使用原始 Torch 模型校验生成的 VJP，包括非零初始状态与记录上的损失。
 
+序列边界通过公开的 `torch.library` schema、fake kernel 与显式一阶 autograd 注册。
+实现必须返回独立、不共享存储的输出，并保持输入不变。使用
+`torch.library.opcheck` 检查这些契约，并结合数值全 VJP 对比验证。
+
 ## 准备与渲染
 
 模型定义描述数学语义；准备阶段绑定张量布局、预计算系数、残差存储及编译内核。
 在反向中重建状态的模型声明 `checkpoint_state`、`checkpoint_interval` 和
 `replay_state`；需要预计算系数的模型声明 `prepared_parameters` 与
 `prepare_parameters`。
+
+独立序列内核复用不持有张量的布局与启动计划；每次调用绑定当前张量，并分配独立的
+结果存储。布局、dtype 或模型选项变化时重新准备计划，运行时 `dt` 保持动态。
+CUDA Graph 捕获前应预热所需布局。
 
 循环执行的准备阶段还绑定重复阶段的参数位置与存储布局。仅接收指针的运行时
 直接使用原张量存储；TileLang 使用其扁平缓冲区 ABI。序列中不同时间行的指针
@@ -54,6 +62,10 @@ CUDA stream 并保留 profiler hooks。
 的状态顺序均来自神经元与 PSC 模板元数据。
 TileLang 保留预先绑定的张量视图，并通过公开的内核调用接口启动；执行后端的
 参数与 stream 处理仍由 TileLang 负责。
+
+每次循环网络调用在准备阶段绑定当前 CUDA stream；下一次调用重新选择 stream，
+并保留后端的性能分析钩子。spike-list 传播可预先绑定完整序列，按时间步索引消费
+神经元直接生成的设备队列，复用原始存储，避免在每个内部时间步创建和验证张量视图。
 
 独立内核与融合内核为共享标量阶段设置各自的命名空间。后端渲染器提供张量访问、
 数学函数与源码外壳，不包含模型方程。编译扩展前，可通过

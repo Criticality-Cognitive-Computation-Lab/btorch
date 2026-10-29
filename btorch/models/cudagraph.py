@@ -382,12 +382,11 @@ class CudaGraphRunner:
 
         # Completed runners and entries form reference cycles. Reclaiming one
         # during an active capture resets its stream and invalidates the capture
-        # (``cudaErrorStreamCaptureInvalidated``). Collect stale graphs before
-        # recording, then suspend automatic cyclic GC until capture ends.
-        # Snapshot the caller's setting first so finalizers run by the explicit
-        # collection cannot change which state is restored.
+        # (``cudaErrorStreamCaptureInvalidated``). Suspend automatic cyclic GC
+        # until capture ends. Leave forced collection to torch.cuda.graph:
+        # scanning the entire Python heap on every capture is expensive and
+        # is unnecessary for preventing collection during recording.
         gc_was_enabled = gc.isenabled()
-        gc.collect()
         gc.disable()
         try:
             graph = torch.cuda.CUDAGraph()

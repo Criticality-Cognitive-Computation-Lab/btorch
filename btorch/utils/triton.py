@@ -1,22 +1,6 @@
 """Prepare Triton executables for invocation-owned, stable argument layouts."""
 
-import functools
-
 from .kernel import PreparedLaunch
-
-
-@functools.lru_cache(maxsize=128)
-def _unaligned_kernel(kernel, changing):
-    import triton
-
-    return triton.jit(
-        kernel.fn,
-        do_not_specialize=kernel.do_not_specialize,
-        do_not_specialize_on_alignment=list(
-            set(kernel.do_not_specialize_on_alignment)
-            | {kernel.arg_names[index] for index in changing}
-        ),
-    )
 
 
 def prepare_launch(
@@ -25,16 +9,17 @@ def prepare_launch(
     """Resolve an executable once for stable dtypes and trailing constexprs.
 
     Callers own tensor layouts and scalar widths throughout the invocation.
-    ``changing`` identifies pointers whose addresses can change alignment,
-    such as sequence rows. Their first address must not specialize the binary.
-    The compiled launch retains Triton's current-stream and profiler hooks.
+    ``changing`` identifies argument slots rebound by :class:`PreparedLaunch`.
+    Kernels must declare any pointer alignment policy at their public
+    ``@triton.jit`` declaration; preparation does not inspect or rebuild JIT
+    objects. The compiled launch retains Triton's current-stream and profiler
+    hooks.
     """
     launch, constexprs = _prepare_executable(
         kernel,
         args,
         grid,
         constants,
-        changing=changing,
         writes=writes,
         work=work,
         options=options,
@@ -49,7 +34,15 @@ def prepare_launch(
 
 
 def prepare_launch_recipe(
-    kernel, args, grid, constants, *, changing=(), writes=(), work=0, **options
+    kernel,
+    args,
+    grid,
+    constants,
+    *,
+    writes=(),
+    work=0,
+    runtime_step_index=None,
+    **options,
 ):
     """Prepare a tensor-free Triton launch recipe.
 
@@ -57,24 +50,24 @@ def prepare_launch_recipe(
     whose runtime arguments include a scalar extent such as ``n_steps``.
     The returned launch callable owns only Triton's executable metadata; the
     caller supplies all pointer arguments on every invocation.
+    ``runtime_step_index`` identifies the dynamic sequence length, excluded
+    from tuning specialization and limited to one step during trials.
     """
     return _prepare_executable(
         kernel,
         args,
         grid,
         constants,
-        changing=changing,
         writes=writes,
         work=work,
         options=options,
+        runtime_step_index=runtime_step_index,
     )
 
 
 def _prepare_executable(
-    kernel, args, grid, constants, *, changing, writes, work, options
+    kernel, args, grid, constants, *, writes, work, options, runtime_step_index=None
 ):
-    if changing:
-        kernel = _unaligned_kernel(kernel, tuple(changing))
     from .autotune import triton_config
 
     options = triton_config(
@@ -85,6 +78,7 @@ def _prepare_executable(
         options,
         writes=writes,
         work=work,
+        runtime_step_index=runtime_step_index,
     )
     executable = kernel.warmup(*args, grid=grid, **dict(constants), **options)
     launch = executable[grid + (1,) * (3 - len(grid))]

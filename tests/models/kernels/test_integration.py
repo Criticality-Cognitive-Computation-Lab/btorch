@@ -21,10 +21,16 @@ from tests.models.kernels.helpers import (
 )
 
 
-def test_compiled_cell_reads_changed_environment_dt_without_retracing():
+def test_compiled_cell_reads_changed_environment_dt_without_retracing(monkeypatch):
     # A timestep is an invocation input, including when the caller supplies a
     # Python scalar through environ. Compare continued membrane states against
     # the existing Python model: subthreshold spikes alone would hide a stale dt.
+    from btorch.models.kernels import NeuronSpec, templates
+
+    # Earlier numerical cases must not prewarm lazy template metadata and mask
+    # a first-call Dynamo guard invalidation when eager execution follows it.
+    template = templates.get_template(NeuronSpec("lif"))
+    monkeypatch.setitem(templates._TEMPLATES, "lif", replace(template))
     cell = LIF(2, backend=KernelOptions(), step_mode="m")
     cell.init_state(batch_size=1, dtype=torch.float32)
     reference = copy.deepcopy(cell)
@@ -108,6 +114,46 @@ def test_recurrent_eval_retains_encoder_and_continuation_gradients():
     torch.testing.assert_close(
         synapse.linear.weight.grad, reference.synapse.linear.weight.grad
     )
+
+
+def test_recurrent_operator_functional_and_autograd_contracts(monkeypatch):
+    """Check recurrent storage, fake metadata and compiled autograd
+    together."""
+    from btorch.models.kernels import recurrent_operator
+
+    # Capture the real adapter's ABI instead of maintaining a second encoded
+    # network definition. opcheck independently detects accidental input writes,
+    # returned aliases, wrong fake shapes and unregistered training gradients.
+    # Physical state and parameter VJPs have separate golden comparisons.
+    model = RecurrentNN(
+        LIF(3, trainable_param={"tau"}),
+        AlphaPSC(3, 2.0, nn.Linear(3, 3, bias=False)),
+        backend=KernelOptions(),
+        update_state_names=("neuron.v", "synapse.psc"),
+    ).float()
+    model.neuron.init_state(batch_size=2, dtype=torch.float32)
+    model.synapse.init_state(batch_size=2, dtype=torch.float32)
+    operator = recurrent_operator.training
+    arguments = []
+
+    def record(*args):
+        arguments.append(args)
+        return operator(*args)
+
+    monkeypatch.setattr(recurrent_operator, "training", record)
+    x = torch.linspace(0.1, 1.2, 24).reshape(4, 2, 3).requires_grad_()
+    with environ.context(dt=0.25):
+        model(x)
+    torch.library.opcheck(operator, arguments[0])
+    inference_args = tuple(
+        value.detach()
+        if isinstance(value, torch.Tensor)
+        else [item.detach() for item in value]
+        if isinstance(value, list) and value and isinstance(value[0], torch.Tensor)
+        else value
+        for value in arguments[0]
+    )
+    torch.library.opcheck(recurrent_operator.inference, inference_args)
 
 
 def test_recurrent_fullgraph_encoder_readout():

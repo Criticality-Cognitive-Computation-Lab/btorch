@@ -370,11 +370,11 @@ class TritonRenderer(SourceRenderer):
             )
         return (
             imports
-            + (
-                "@triton.jit(do_not_specialize=['n_steps'])\n"
-                if self.dynamic_steps
-                else "@triton.jit\n"
-            )
+            + "@triton.jit("
+            + ("do_not_specialize=['n_steps'], " if self.dynamic_steps else "")
+            + "do_not_specialize_on_alignment="
+            + repr([name + "_ptr" for name, _ in pointers])
+            + ")\n"
             + f"def cell_kernel({args}, BLOCK: tl.constexpr):\n"
             + "    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n"
             + f"    mask = index < {self.n}\n"
@@ -732,7 +732,7 @@ class RendererRuntime:
         del kernel, args, n, steps, enable_fp_fusion, debug, num_warps, writes
         raise NotImplementedError
 
-    def launch_prepared(
+    def get_recipe(
         self,
         kernel,
         args,
@@ -769,12 +769,19 @@ class RendererRuntime:
                     writes=writes,
                 ),
             )
-        recipe(args, steps)
+        return recipe
+
+    def launch_prepared(self, kernel, args, n, **options):
+        self.get_recipe(kernel, args, n, **options)(args, options.get("steps"))
 
     def argument(self, value, span):
         """Expose the pointer ABI without changing a tensor's storage."""
         del span
         return value
+
+    def bind_current_stream(self, launch):
+        """Bind an invocation's repeated submissions to its active stream."""
+        return launch.submit
 
     def bind_rows(self, value, span):
         """Prepare a sequence's argument views for a tensor-based ABI."""
@@ -807,6 +814,23 @@ class TritonRuntime(RendererRuntime):
     supports_dynamic_steps = True
     supports_pointer_offsets = True
 
+    def bind_current_stream(self, prepared):
+        import torch
+
+        stream = torch.cuda.current_stream(prepared.owners[0].device)
+        launch, args, constants = (
+            prepared.launch,
+            prepared.arguments,
+            prepared.constants,
+        )
+
+        def submit():
+            # Use the public compiled grid callable, including profiler hooks.
+            # This binding lives only for the current trajectory invocation.
+            launch(*args, *constants, stream=stream.cuda_stream)
+
+        return submit
+
     def prepare_recipe(
         self, kernel, args, n, *, steps, enable_fp_fusion, debug, num_warps, writes=()
     ):
@@ -828,9 +852,9 @@ class TritonRuntime(RendererRuntime):
             call_args,
             grid,
             (("BLOCK", 128),),
-            changing=range(len(args)),
             writes=writes,
             work=n,
+            runtime_step_index=len(args) if steps is not None else None,
             **options,
         )
 

@@ -133,6 +133,30 @@ def test_local_spike_lists_and_persistent_fanout_match_triton():
             sl = slice(group * BLOCK_SIZE, group * BLOCK_SIZE + count)
             torch.testing.assert_close(a.spikes.indices[sl], b.spikes.indices[sl])
             torch.testing.assert_close(a.spikes.cumulative[sl], b.spikes.cumulative[sl])
+    # Sequence binding must preserve padded/offset source strides, clear silent
+    # queues, and leave standalone bindings intact. Packing here supplies the
+    # same producer contract as direct neuron emission; the consumer reads the
+    # requested row through the prebound sequence rather than a new Tensor view.
+    sequence = torch.zeros(3, 3, 519, device="cuda", dtype=x.dtype)[..., 1::2]
+    sequence[0, :, (0, 128, 258)] = 0.5
+    sequence[2].fill_(1)
+    for execute in (a, b):
+        consume = execute.prepare_sequence(sequence)
+        for index in range(sequence.shape[0]):
+            execute.pack(sequence[index])
+            torch.testing.assert_close(
+                consume(index),
+                kernels_torch.csr_matvec(c.crow, c.col, values, sequence[index]),
+                atol=1e-11,
+                rtol=1e-11,
+            )
+        x.fill_(0.75)
+        torch.testing.assert_close(
+            execute(x),
+            kernels_torch.csr_matvec(c.crow, c.col, values, x),
+            atol=1e-11,
+            rtol=1e-11,
+        )
     # A replaceable input may rebind storage while preserving its layout.
     # Both renderers must refresh the address, even when the Tensor object is
     # unchanged; cached flat TileLang views must not keep reading old spikes.
