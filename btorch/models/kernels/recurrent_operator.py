@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 
 import torch
@@ -1061,18 +1062,19 @@ def inference(
     dt: Tensor,
     uniform_seq: Tensor | None = None,
 ) -> list[Tensor]:
-    return _trajectory(
-        x_seq,
-        x_syn_seq,
-        states,
-        parameters,
-        topology,
-        encoded,
-        history_names,
-        backend,
-        dt,
-        uniform_seq,
-    )
+    with torch.cuda.device(x_seq.device) if x_seq.is_cuda else nullcontext():
+        return _trajectory(
+            x_seq,
+            x_syn_seq,
+            states,
+            parameters,
+            topology,
+            encoded,
+            history_names,
+            backend,
+            dt,
+            uniform_seq,
+        )
 
 
 @torch.library.custom_op("btorch_cells::recurrent_training", mutates_args=())
@@ -1088,18 +1090,19 @@ def training(
     dt: Tensor,
     uniform_seq: Tensor | None = None,
 ) -> list[Tensor]:
-    return _trajectory(
-        x_seq,
-        x_syn_seq,
-        states,
-        parameters,
-        topology,
-        encoded,
-        history_names,
-        backend,
-        dt,
-        uniform_seq,
-    )
+    with torch.cuda.device(x_seq.device) if x_seq.is_cuda else nullcontext():
+        return _trajectory(
+            x_seq,
+            x_syn_seq,
+            states,
+            parameters,
+            topology,
+            encoded,
+            history_names,
+            backend,
+            dt,
+            uniform_seq,
+        )
 
 
 def _fake(

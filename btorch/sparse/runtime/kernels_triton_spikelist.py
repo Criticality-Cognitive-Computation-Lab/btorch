@@ -171,7 +171,7 @@ def _prepare_spike_list_launch(execution, x):
         pack_launch(pack_arguments)
 
     execution.pack = pack
-    execution.launch = prepare_launch(
+    launch = prepare_launch(
         kernels_triton_push._kernels(execution.cache)[0],
         execution.arguments,
         (programs * queue.counts.numel(),),
@@ -189,6 +189,16 @@ def _prepare_spike_list_launch(execution, x):
         changing=(4,),
         num_warps=source_layout.BLOCK_WARPS,
     )
+
+    def consume(arguments):
+        # The shared SpikeList validates the source ABI before this callback.
+        # Refresh its owner and pointer once, retaining static launch arguments.
+        source = arguments[4]
+        launch.owners[4] = source
+        launch.arguments[4] = source.data_ptr()
+        launch.submit()
+
+    execution.launch = consume
 
 
 def spike_push_list(

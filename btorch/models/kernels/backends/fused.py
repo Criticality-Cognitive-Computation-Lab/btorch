@@ -494,6 +494,7 @@ class _FusedStep:
         Only the supplied tensors' addresses may change after preparation.
         The trajectory owns their shapes, strides and dtypes; standalone calls
         and reverse steps with variable layouts retain ``launch_into``.
+        The recurrent operator holds the CUDA device guard for the trajectory.
         """
         variant = self._layout_variant(bindings)
         buffers = {**variant.buffers, **bindings}
@@ -523,12 +524,8 @@ class _FusedStep:
             owners = args
             submit = functools.partial(launch, args)
 
-        def run():
-            with _device_scope(device):
-                submit()
-
         return _PreparedFusedLaunch(
-            run,
+            submit,
             args,
             {name: (index, size) for index, name, size in updates},
             owners,

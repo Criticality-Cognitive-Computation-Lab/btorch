@@ -156,6 +156,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Reduce recurrent CPU submission overhead by reusing trajectory device guards
+  and validated sparse bindings across timesteps.
+
 - `SpikeHistory` is renamed to `Delay`; PSC delay state is now
   `synapse.delayed_spike.history`. Circular cursor state is included in functional
   memory snapshots and follows history persistence. Migrate old state paths in
