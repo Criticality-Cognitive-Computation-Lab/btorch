@@ -3,6 +3,7 @@ VJPs."""
 
 import functools
 import math
+from dataclasses import replace
 
 import torch
 from torch import Tensor
@@ -97,19 +98,51 @@ poisson_uniforms = torch.ops.btorch_cells.poisson_uniforms.default
 
 def encode_spec(spec: NeuronSpec) -> str:
     """Encode immutable compile-specialized scalar choices."""
-    values = (
-        spec.model,
-        str(int(spec.hard_reset)),
-        str(int(spec.detach_reset)),
-        spec.surrogate,
-        str(spec.alpha),
-        str(spec.damping),
-        str(int(spec.refractory)),
-        "" if spec.surrogate_width is None else repr(spec.surrogate_width),
+    encode = (
+        _encode_choices.__wrapped__
+        if torch.compiler.is_compiling()
+        else _encode_choices
     )
-    if spec.poisson is None:
+    return encode(
+        (
+            spec.model,
+            spec.hard_reset,
+            spec.detach_reset,
+            spec.surrogate,
+            spec.alpha,
+            spec.damping,
+            spec.refractory,
+            spec.surrogate_width,
+            spec.poisson,
+        )
+    )
+
+
+@functools.lru_cache(maxsize=256)
+def _encode_choices(choices):
+    (
+        model,
+        hard_reset,
+        detach_reset,
+        surrogate,
+        alpha,
+        damping,
+        refractory,
+        width,
+        poisson,
+    ) = choices
+    values = (
+        model,
+        str(int(hard_reset)),
+        str(int(detach_reset)),
+        surrogate,
+        str(alpha),
+        str(damping),
+        str(int(refractory)),
+        "" if width is None else repr(width),
+    )
+    if poisson is None:
         return "|".join(values)
-    poisson = spec.poisson
     return "|".join(
         (
             *values,
@@ -124,6 +157,17 @@ def encode_spec(spec: NeuronSpec) -> str:
 
 def decode_spec(encoded: str, dt: float | Tensor = 1.0) -> NeuronSpec:
     """Restore a cell specification inside the tensor operator boundary."""
+    decode = (
+        _decode_choices.__wrapped__
+        if torch.compiler.is_compiling()
+        else _decode_choices
+    )
+    spec = decode(encoded)
+    return replace(spec, dt=dt) if isinstance(dt, Tensor) or dt != 1.0 else spec
+
+
+@functools.lru_cache(maxsize=256)
+def _decode_choices(encoded):
     values = encoded.split("|")
     if len(values) not in (8, 13):
         raise ValueError("Invalid encoded cell specification")
@@ -143,7 +187,7 @@ def decode_spec(encoded: str, dt: float | Tensor = 1.0) -> NeuronSpec:
     )
     return NeuronSpec(
         model,
-        dt,
+        1.0,
         bool(int(hard_reset)),
         bool(int(detach_reset)),
         surrogate,
@@ -237,6 +281,45 @@ def _validate_poisson_fp32(spec, tensors):
                 "Native Poisson lowering requires FP32 inputs, states, "
                 f"parameters, and uniforms; {name} has dtype {value.dtype}"
             )
+
+
+def _contract_layout(value):
+    return tuple(value.shape), tuple(value.stride()), value.dtype, value.device
+
+
+@functools.lru_cache(maxsize=256)
+def _validated_sequence_contract(encoded, revision, x, states, parameters, history):
+    """Validate tensor-free metadata once per mathematical/layout contract."""
+    spec = decode_spec(encoded)
+    template = get_template(spec)
+    if len(states) != len(template.state_names) or len(parameters) != len(
+        template.parameter_names
+    ):
+        raise ValueError("State or parameter count disagrees with the model template")
+    shape, _, dtype, device = x
+    if len(shape) < 1 or dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("Cell input requires time-first FP32, FP16 or BF16 tensors")
+    for name in history:
+        if name not in template.history_names:
+            raise ValueError(f"Unsupported history {name!r} for {spec.model}")
+    extra_dimensions = dict(template.state_extra_dims)
+    for name, (state_shape, _, state_dtype, state_device) in zip(
+        template.state_names, states
+    ):
+        extra = extra_dimensions.get(name, 0)
+        expected = (*shape, *state_shape[-extra:]) if extra else shape
+        if (
+            state_shape != expected
+            or state_device != device
+            or not state_dtype.is_floating_point
+        ):
+            raise ValueError(f"Invalid initial {name} shape, dtype or device")
+    for _, _, parameter_dtype, parameter_device in parameters:
+        if parameter_device != device or not parameter_dtype.is_floating_point:
+            raise ValueError(
+                "Cell parameters must be floating tensors on the input device"
+            )
+    return template
 
 
 def _forward(
@@ -688,38 +771,22 @@ def run_multi_step(
         options.precise_division,
         options.precise_exp,
     )
-    template = get_template(spec)
-    if len(states) != len(template.state_names) or len(parameters) != len(
-        template.parameter_names
-    ):
-        raise ValueError("State or parameter count disagrees with the model template")
-    if x_seq.ndim < 2 or x_seq.dtype not in (
-        torch.float16,
-        torch.bfloat16,
-        torch.float32,
-    ):
+    if x_seq.ndim < 2:
         raise ValueError("Cell input requires time-first FP32, FP16 or BF16 tensors")
-    for name in history.names:
-        if name not in template.history_names:
-            raise ValueError(f"Unsupported history {name!r} for {spec.model}")
-    for name, value in zip(template.state_names, states):
-        extra_dims = dict(template.state_extra_dims).get(name, 0)
-        expected = (
-            (*x_seq.shape[1:], *value.shape[-extra_dims:])
-            if extra_dims
-            else x_seq.shape[1:]
-        )
-        if (
-            value.shape != expected
-            or value.device != x_seq.device
-            or not value.is_floating_point()
-        ):
-            raise ValueError(f"Invalid initial {name} shape, dtype or device")
-    for value in parameters:
-        if value.device != x_seq.device or not value.is_floating_point():
-            raise ValueError(
-                "Cell parameters must be floating tensors on the input device"
-            )
+    encoded = encode_spec(spec)
+    validate = (
+        _validated_sequence_contract.__wrapped__
+        if torch.compiler.is_compiling()
+        else _validated_sequence_contract
+    )
+    template = validate(
+        encoded,
+        model_template_revision(spec.model),
+        (tuple(x_seq.shape[1:]), tuple(x_seq.stride()), x_seq.dtype, x_seq.device),
+        tuple(_contract_layout(value) for value in states),
+        tuple(_contract_layout(value) for value in parameters),
+        history.names,
+    )
     stochastic = spec.surrogate == "poisson" and spec.poisson is not None
     precision_tensors = [
         ("x_seq", x_seq),
@@ -825,7 +892,7 @@ def run_multi_step(
         x_seq,
         list(states),
         list(parameters),
-        encode_spec(spec),
+        encoded,
         "|".join(names) + (("#" + residual.encoded) if residual is not None else ""),
     )
     result = operator(

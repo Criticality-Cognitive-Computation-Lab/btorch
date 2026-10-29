@@ -23,6 +23,8 @@ Cell 后端复用现有 sparse runtime，不重复实现 sparse 算法。
 AlphaPSCBilleh、DualExponentialPSC。六种确定性的内置 surrogate 保持 btorch
 本身的归一化导数。暂不支持的自定义 surrogate 或可训练超参数会明确报错。
 
+独立神经元/PSC 序列调用复用模型元数据、已校验的布局和预备执行内核。每次调用读取当前状态与参数张量；修改 `dt` 不会重新编译内核。Triton 和 CuPy 还可跨序列长度复用内核；TileLang 目前按序列长度特化。
+
 ## 准备与自动调优
 
 适用的 GPU kernel 在准备阶段自动比较两个 CUDA kernel 配置。Triton 和 TileLang

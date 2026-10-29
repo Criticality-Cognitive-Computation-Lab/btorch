@@ -1,6 +1,8 @@
 """Prepare stateful modules for pure tensor sequence operators."""
 
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
+from functools import lru_cache
 
 import torch
 from torch import Tensor
@@ -12,8 +14,7 @@ _connection_contexts = {}
 
 
 def _model_layout(module):
-    from .contracts import NeuronSpec
-    from .templates import get_template
+    from .templates import model_template_revision
 
     # A subclass changes equations unless it explicitly redeclares its binding.
     model = type(module).__dict__.get("kernel_model")
@@ -21,10 +22,31 @@ def _model_layout(module):
         raise NotImplementedError(
             f"No cell backend template for {type(module).__name__}"
         )
-    template = get_template(
-        NeuronSpec(model, refractory=getattr(module, "_use_refractory", False))
+    lookup = (
+        _cached_model_layout.__wrapped__
+        if torch.compiler.is_compiling()
+        else _cached_model_layout
     )
+    return lookup(
+        model, getattr(module, "_use_refractory", False), model_template_revision(model)
+    )
+
+
+@lru_cache(maxsize=128)
+def _cached_model_layout(model, refractory, revision):
+    from .contracts import NeuronSpec
+    from .templates import get_template
+
+    template = get_template(NeuronSpec(model, refractory=refractory))
     return model, template.state_names, template.parameter_names
+
+
+@lru_cache(maxsize=128)
+def _cell_records(model, refractory, revision):
+    from .contracts import NeuronSpec
+    from .templates import get_template
+
+    return get_template(NeuronSpec(model, refractory=refractory)).record_attributes
 
 
 def validate_module(module, options: KernelOptions) -> None:
@@ -62,34 +84,18 @@ def connection_scope(options: KernelOptions):
         yield
 
 
-def _prepare_cell_from_layout(module, x_seq: Tensor, layout):
-    """Normalize tensors for one explicitly selected cell layout."""
-    from .contracts import NeuronSpec
-    from .operators import environment_dt
-
-    model, state_names, parameter_names = layout
-    kwargs = {"model": model, "dt": environment_dt(x_seq, model)}
+def _cell_options(module):
+    """Read mathematical choices without retaining the module or its
+    tensors."""
     if hasattr(module, "surrogate_function"):
         from .. import surrogate
 
         function = module.surrogate_function
+        width = None
         if isinstance(function, surrogate.Truncated):
-            kwargs["surrogate_width"] = function.support
+            width = function.support
             while isinstance(function, surrogate.Truncated):
                 function = function.surrogate
-        names = {
-            surrogate.Sigmoid: "sigmoid",
-            surrogate.ATan: "atan",
-            surrogate.Erf: "erf",
-            surrogate.SuperSpike: "superspike",
-            surrogate.Triangle: "triangle",
-            surrogate.ATanApprox: "atan_approx",
-            surrogate.PoissonRandomSpike: "poisson",
-        }
-        if type(function) not in names:
-            raise NotImplementedError(
-                "Cell kernels require a supported built-in surrogate"
-            )
         if not isinstance(function.damping_factor, (float, int)):
             raise NotImplementedError(
                 "Surrogate hyperparameters must be non-trainable scalars"
@@ -107,7 +113,7 @@ def _prepare_cell_from_layout(module, x_seq: Tensor, layout):
                 raise NotImplementedError(
                     "Poisson hyperparameters must be non-trainable scalars"
                 )
-            kwargs["poisson"] = PoissonOptions(
+            poisson = PoissonOptions(
                 function.spiking,
                 float(function.tau),
                 float(function.rho),
@@ -116,6 +122,7 @@ def _prepare_cell_from_layout(module, x_seq: Tensor, layout):
             )
             alpha = 1.0
         else:
+            poisson = None
             if not function.spiking:
                 raise NotImplementedError(
                     "Deterministic surrogate kernels require spiking=True"
@@ -125,23 +132,79 @@ def _prepare_cell_from_layout(module, x_seq: Tensor, layout):
                     "Surrogate hyperparameters must be non-trainable scalars"
                 )
             alpha = float(function.alpha)
-        kwargs.update(
-            hard_reset=module.hard_reset,
-            detach_reset=module.detach_reset,
-            surrogate=names[type(function)],
-            alpha=alpha,
-            damping=float(function.damping_factor),
-            refractory=getattr(module, "_use_refractory", False),
+        return (
+            type(function),
+            alpha,
+            float(function.damping_factor),
+            width,
+            poisson,
+            module.hard_reset,
+            module.detach_reset,
+            getattr(module, "_use_refractory", False),
         )
+    return ()
+
+
+@lru_cache(maxsize=128)
+def _cell_metadata(model, options, revision):
+    """Bind only immutable model semantics, never live state or parameters."""
+    from .contracts import NeuronSpec
     from .templates import get_template
 
-    template = get_template(NeuronSpec(**kwargs))
+    kwargs = {"model": model}
+    if options:
+        from .. import surrogate
+
+        function, alpha, damping, width, poisson, reset, detach, refractory = options
+        names = {
+            surrogate.Sigmoid: "sigmoid",
+            surrogate.ATan: "atan",
+            surrogate.Erf: "erf",
+            surrogate.SuperSpike: "superspike",
+            surrogate.Triangle: "triangle",
+            surrogate.ATanApprox: "atan_approx",
+            surrogate.PoissonRandomSpike: "poisson",
+        }
+        if function not in names:
+            raise NotImplementedError(
+                "Cell kernels require a supported built-in surrogate"
+            )
+        kwargs.update(
+            surrogate=names[function],
+            alpha=alpha,
+            damping=damping,
+            surrogate_width=width,
+            poisson=poisson,
+            hard_reset=reset,
+            detach_reset=detach,
+            refractory=refractory,
+        )
+    spec = NeuronSpec(**kwargs)
+    template = get_template(spec)
+    return (
+        spec,
+        tuple(template.extra_dims(name) for name in template.state_names),
+        template.record_attributes,
+    )
+
+
+def _prepare_cell_from_layout(module, x_seq: Tensor, layout):
+    """Bind current tensors to a cached, immutable mathematical contract."""
+    from .operators import environment_dt
+    from .templates import model_template_revision
+
+    model, state_names, parameter_names = layout
+    metadata = (
+        _cell_metadata.__wrapped__ if torch.compiler.is_compiling() else _cell_metadata
+    )
+    spec, dimensions, _ = metadata(
+        model, _cell_options(module), model_template_revision(model)
+    )
     states = []
-    for name in state_names:
+    for name, ndim in zip(state_names, dimensions):
         value = getattr(module, name)
         if value is None:
             raise RuntimeError(f"Initialize {name} before invoking a cell sequence")
-        ndim = template.extra_dims(name)
         extra = module._memories_rv[name].sizes[-ndim:] if ndim else ()
         shape = (*x_seq.shape[1:], *extra)
         if not isinstance(value, Tensor):
@@ -153,7 +216,12 @@ def _prepare_cell_from_layout(module, x_seq: Tensor, layout):
         getattr(module, name).to(device=x_seq.device, dtype=torch.float32)
         for name in parameter_names
     )
-    return NeuronSpec(**kwargs), state_names, tuple(states), parameters
+    return (
+        replace(spec, dt=environment_dt(x_seq, model)),
+        state_names,
+        tuple(states),
+        parameters,
+    )
 
 
 def prepare_cell(module, x_seq: Tensor):
@@ -168,13 +236,16 @@ def neuron_sequence(module, x_seq: Tensor) -> Tensor:
     from .operators import run_multi_step
 
     spec, names, states, parameters = prepare_cell(module, x_seq)
-    from .templates import get_template
+    from .templates import model_template_revision
 
-    attributes = dict(get_template(spec).record_attributes)
+    record_layout = (
+        _cell_records.__wrapped__ if torch.compiler.is_compiling() else _cell_records
+    )
+    records = record_layout(
+        spec.model, spec.refractory, model_template_revision(spec.model)
+    )
     requested = tuple(
-        name
-        for name, attribute in attributes.items()
-        if attribute in module._memories_rv
+        name for name, attribute in records if attribute in module._memories_rv
     )
     result = run_multi_step(
         x_seq,
@@ -186,6 +257,7 @@ def neuron_sequence(module, x_seq: Tensor) -> Tensor:
     )
     for name, value in zip(names, result[1 : 1 + len(names)]):
         setattr(module, name, value)
+    attributes = dict(records)
     for name, value in zip(requested, result[1 + len(names) :]):
         if x_seq.shape[0]:
             setattr(

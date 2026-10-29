@@ -78,6 +78,7 @@ def test_runtime_length_canonicalizes_noncontiguous_time_storage():
 @pytest.mark.parametrize("backend", ("triton", "cupy"))
 def test_runtime_length_preserves_forward_and_full_vjp(backend):
     _require_backend(backend)
+    engine._kernel_plan.cache_clear()
     engine._compile_cached.cache_clear()
     engine._generate_source.cache_clear()
     for steps in (1, 7):
@@ -155,7 +156,8 @@ def test_runtime_length_preserves_forward_and_full_vjp(backend):
 
     compile_info = engine._compile_cached.cache_info()
     assert compile_info.misses == 2
-    assert compile_info.hits >= 2
+    # Both forward and reverse reuse their prepared executable across T.
+    assert engine._kernel_plan.cache_info().hits >= 2
 
 
 def test_runtime_length_glif_checkpoint_forward_and_vjp_noncontiguous():

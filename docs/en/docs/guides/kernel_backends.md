@@ -33,6 +33,11 @@ determinism setting or backend cannot implement it. Explicit push requires a
 supported CUDA sparse backend and nondeterministic accumulation.
 Dense connections are unaffected by this sparse-only option.
 
+Standalone neuron/PSC sequence calls reuse model metadata, validated layouts and
+prepared executables. Each call reads the current state and parameter tensors;
+changing `dt` does not recompile a kernel. Triton and CuPy also reuse kernels
+across sequence lengths; TileLang currently specializes the sequence length.
+
 ## Preparation and autotuning
 
 Eligible GPU kernels automatically compare two CUDA kernel configurations during

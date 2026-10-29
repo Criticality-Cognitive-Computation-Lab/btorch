@@ -14,6 +14,7 @@ import linecache
 import re
 import uuid
 import weakref
+from collections import OrderedDict
 from dataclasses import dataclass
 
 from ....sparse.runtime.activity import BLOCK_SIZE
@@ -685,6 +686,91 @@ class RendererRuntime:
     supports_pointer_offsets = False
     supports_spike_list = False
 
+    def __init__(self):
+        # Recipes contain only executable objects and immutable launch
+        # metadata. Invocation tensors are deliberately excluded so a
+        # primitive call cannot retain an autograd graph or a previous output.
+        self._recipes = OrderedDict()
+
+    @staticmethod
+    def _argument_contract(args):
+        layouts = []
+        for value in args:
+            # Source generation already specializes the original logical
+            # shapes/strides. These launch arguments are storage spans, so
+            # only pointer ABI dtype/device affect the recipe; sequence length
+            # and storage addresses must remain dynamic for Triton/CuPy.
+            layouts.append((value.dtype, value.device))
+        return tuple(layouts)
+
+    def _recipe_key(
+        self, kernel, args, n, steps, enable_fp_fusion, debug, num_warps, writes
+    ):
+        contract = self._argument_contract(args)
+        return (
+            id(kernel),
+            contract,
+            n,
+            steps is not None,
+            enable_fp_fusion,
+            debug,
+            num_warps,
+            tuple(writes),
+        )
+
+    def _remember_recipe(self, key, recipe):
+        self._recipes[key] = recipe
+        self._recipes.move_to_end(key)
+        while len(self._recipes) > 128:
+            self._recipes.popitem(last=False)
+        return recipe
+
+    def prepare_recipe(
+        self, kernel, args, n, *, steps, enable_fp_fusion, debug, num_warps, writes=()
+    ):
+        """Prepare a tensor-free launch recipe for repeated primitive calls."""
+        del kernel, args, n, steps, enable_fp_fusion, debug, num_warps, writes
+        raise NotImplementedError
+
+    def launch_prepared(
+        self,
+        kernel,
+        args,
+        n,
+        *,
+        steps=None,
+        enable_fp_fusion,
+        debug,
+        num_warps,
+        writes=(),
+    ):
+        key = self._recipe_key(
+            kernel,
+            args,
+            n,
+            steps,
+            enable_fp_fusion,
+            debug,
+            num_warps,
+            writes,
+        )
+        recipe = self._recipes.get(key)
+        if recipe is None:
+            recipe = self._remember_recipe(
+                key,
+                self.prepare_recipe(
+                    kernel,
+                    args,
+                    n,
+                    steps=steps,
+                    enable_fp_fusion=enable_fp_fusion,
+                    debug=debug,
+                    num_warps=num_warps,
+                    writes=writes,
+                ),
+            )
+        recipe(args, steps)
+
     def argument(self, value, span):
         """Expose the pointer ABI without changing a tensor's storage."""
         del span
@@ -699,7 +785,7 @@ class RendererRuntime:
         layouts."""
         del args, changing, writes
         return functools.partial(
-            self.launch,
+            self.launch_prepared,
             kernel,
             n=n,
             enable_fp_fusion=enable_fp_fusion,
@@ -714,26 +800,50 @@ class RendererRuntime:
     def compile(self, source, enable_fp_fusion, precise_division, stamp, target):
         raise NotImplementedError
 
-    def launch(
-        self,
-        kernel,
-        args,
-        n,
-        *,
-        steps=None,
-        enable_fp_fusion,
-        debug,
-        num_warps,
-        writes=(),
-    ):
-        raise NotImplementedError
-
 
 class TritonRuntime(RendererRuntime):
     supports_spike_list = True
     name = "triton"
     supports_dynamic_steps = True
     supports_pointer_offsets = True
+
+    def prepare_recipe(
+        self, kernel, args, n, *, steps, enable_fp_fusion, debug, num_warps, writes=()
+    ):
+        from ....utils.triton import prepare_launch_recipe
+
+        grid = ((n + 127) // 128,)
+        options = {}
+        if debug is not None:
+            options["debug"] = debug
+        if num_warps is not None:
+            options["num_warps"] = num_warps
+        call_args = (*args, steps) if steps is not None else args
+        options = {
+            **options,
+            "enable_fp_fusion": enable_fp_fusion,
+        }
+        launch, constexprs = prepare_launch_recipe(
+            kernel,
+            call_args,
+            grid,
+            (("BLOCK", 128),),
+            changing=range(len(args)),
+            writes=writes,
+            work=n,
+            **options,
+        )
+
+        def invoke(current_args, current_steps, _kernel=kernel):
+            del _kernel
+            call_args = (
+                (*current_args, current_steps)
+                if current_steps is not None
+                else current_args
+            )
+            launch(*call_args, *constexprs)
+
+        return invoke
 
     def prepare_launch(self, kernel, args, n, *, changing, enable_fp_fusion, writes=()):
         # Row views can change alignment even when shape/strides are constant.
@@ -765,48 +875,37 @@ class TritonRuntime(RendererRuntime):
             linecache.cache.pop(filename, None)
             raise
 
-    def launch(
-        self,
-        kernel,
-        args,
-        n,
-        *,
-        steps=None,
-        enable_fp_fusion,
-        debug,
-        num_warps,
-        writes=(),
-    ):
-        options = {}
-        if debug is not None:
-            options["debug"] = debug
-        if num_warps is not None:
-            options["num_warps"] = num_warps
-        call_args = (*args, steps) if steps is not None else args
-        if writes:
-            from ....utils.autotune import triton_config
-
-            # Sequence kernels submit once; only recurrent stages need a
-            # reusable argument owner. Keep the primitive launch lightweight.
-            options = triton_config(
-                kernel,
-                call_args,
-                ((n + 127) // 128,),
-                (("BLOCK", 128),),
-                {**options, "enable_fp_fusion": enable_fp_fusion},
-                writes=writes,
-                work=n,
-            )
-            options.pop("enable_fp_fusion")
-        kernel[((n + 127) // 128,)](
-            *call_args, BLOCK=128, enable_fp_fusion=enable_fp_fusion, **options
-        )
-
 
 class CuPyRuntime(RendererRuntime):
     name = "cupy"
     supports_dynamic_steps = True
     supports_pointer_offsets = True
+
+    def prepare_recipe(
+        self, kernel, args, n, *, steps, enable_fp_fusion, debug, num_warps, writes=()
+    ):
+        del enable_fp_fusion, debug, num_warps
+        import cupy
+        import numpy
+        import torch
+
+        from ....utils.autotune import cupy_block
+
+        device = args[0].device.index
+        block = cupy_block(kernel, args, n, writes, steps=steps)
+
+        def invoke(current_args, current_steps):
+            stream = cupy.cuda.Stream.from_external(torch.cuda.current_stream(device))
+            with cupy.cuda.Device(device), stream:
+                pointers = tuple(numpy.uintp(arg.data_ptr()) for arg in current_args)
+                call_args = (
+                    (*pointers, numpy.int32(current_steps))
+                    if current_steps is not None
+                    else pointers
+                )
+                kernel((-(-n // block),), (block,), call_args)
+
+        return invoke
 
     def prepare_launch(self, kernel, args, n, *, changing, enable_fp_fusion, writes=()):
         del enable_fp_fusion
@@ -845,44 +944,39 @@ class CuPyRuntime(RendererRuntime):
         kernel.compile()
         return kernel
 
-    def launch(
-        self,
-        kernel,
-        args,
-        n,
-        *,
-        steps=None,
-        enable_fp_fusion,
-        debug,
-        num_warps,
-        writes=(),
-    ):
-        del enable_fp_fusion, debug, num_warps
-        import cupy
-        import numpy
-        import torch
-
-        from ....utils.autotune import cupy_block
-
-        with cupy.cuda.Device(args[0].device.index):
-            stream = cupy.cuda.Stream.from_external(
-                torch.cuda.current_stream(args[0].device)
-            )
-            with stream:
-                pointers = tuple(numpy.uintp(arg.data_ptr()) for arg in args)
-                call_args = (
-                    (*pointers, numpy.int32(steps)) if steps is not None else pointers
-                )
-                block = cupy_block(kernel, args, n, writes, steps=steps)
-                kernel((-(-n // block),), (block,), call_args)
-
 
 class TileLangRuntime(RendererRuntime):
     supports_spike_list = True
     name = "tilelang"
 
     def __init__(self):
+        super().__init__()
         self.factories = weakref.WeakKeyDictionary()
+
+    def prepare_recipe(
+        self, kernel, args, n, *, steps, enable_fp_fusion, debug, num_warps, writes=()
+    ):
+        del steps, enable_fp_fusion, debug, num_warps
+        from ....utils.autotune import outputs_are_disjoint, tilelang_kernel
+
+        factory = self.factories.get(kernel)
+        executable = kernel
+        if factory is not None:
+            executable = tilelang_kernel(
+                factory,
+                (),
+                args,
+                writes,
+                4,
+                work=n,
+                overwrite=outputs_are_disjoint(args, writes),
+            )
+
+        def invoke(current_args, _current_steps, _kernel=kernel):
+            del _kernel
+            executable(*current_args)
+
+        return invoke
 
     def prepare_launch(self, kernel, args, n, *, changing, enable_fp_fusion, writes=()):
         del changing, enable_fp_fusion
@@ -949,28 +1043,6 @@ class TileLangRuntime(RendererRuntime):
             linecache.cache.pop(filename, None)
             raise
 
-    def launch(
-        self,
-        kernel,
-        args,
-        n,
-        *,
-        steps=None,
-        enable_fp_fusion,
-        debug,
-        num_warps,
-        writes=(),
-    ):
-        del debug, num_warps, steps
-        self.prepare_launch(
-            kernel,
-            args,
-            n,
-            changing=(),
-            enable_fp_fusion=enable_fp_fusion,
-            writes=writes,
-        )(args)
-
 
 _RUNTIME_TYPES = {
     "triton": TritonRuntime,
@@ -981,7 +1053,8 @@ _RUNTIME_TYPES = {
 
 @functools.lru_cache(maxsize=3)
 def get_runtime(name):
-    """Return the stateless compiler/launcher for one source backend."""
+    """Return the compiler and bounded launch recipes for one source
+    backend."""
     runtime = _RUNTIME_TYPES.get(name)
     if runtime is None:
         raise ValueError(f"Unknown source runtime {name!r}")

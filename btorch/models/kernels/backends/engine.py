@@ -48,43 +48,84 @@ class _TensorStorage:
     dynamic_first: bool = False
 
 
-def _tensor_storage(buffers, physical_names=(), dynamic_names=()):
-    """Describe views requiring typed pointers or noncanonical addressing."""
+def _is_contiguous_shape(shape, stride, numel):
+    if not numel:
+        return True
+    expected = 1
+    for size, step in zip(reversed(shape), reversed(stride)):
+        if size > 1 and step != expected:
+            return False
+        expected *= size
+    return True
+
+
+@functools.lru_cache(maxsize=512)
+def _cached_tensor_storage(descriptors):
+    """Build storage metadata without retaining invocation tensors."""
     entries = []
-    for name, value in sorted(buffers.items()):
-        dynamic_first = name in dynamic_names and value.ndim > 0
-        if value.dtype == torch.float32 and value.is_contiguous() and not dynamic_first:
+    for (
+        name,
+        original_shape,
+        stride,
+        dtype,
+        numel,
+        physical_index,
+        dynamic_first,
+    ) in descriptors:
+        shape = original_shape
+        if (
+            dtype == "float32"
+            and not dynamic_first
+            and _is_contiguous_shape(shape, stride, numel)
+        ):
             continue
-        shape = tuple(value.shape)
         if dynamic_first:
-            # The time extent is invocation data.  The trailing dimensions and
-            # strides still describe the caller's storage layout.
             shape = (None, *shape[1:])
             span = 0
         else:
             span = (
                 0
-                if not value.numel()
-                else 1
-                + sum(
-                    (size - 1) * stride
-                    for size, stride in zip(value.shape, value.stride())
-                )
+                if not numel
+                else 1 + sum((size - 1) * step for size, step in zip(shape, stride))
             )
         entries.append(
             (
                 name,
                 _TensorStorage(
                     shape,
-                    tuple(value.stride()),
-                    str(value.dtype).removeprefix("torch."),
+                    stride,
+                    dtype,
                     span,
-                    name in physical_names,
+                    physical_index,
                     dynamic_first,
                 ),
             )
         )
     return tuple(entries)
+
+
+def _tensor_storage(buffers, physical_names=(), dynamic_names=()):
+    """Describe views requiring typed pointers or noncanonical addressing."""
+    descriptors = []
+    for name, value in sorted(buffers.items()):
+        dynamic_first = name in dynamic_names and value.ndim > 0
+        shape = tuple(value.shape)
+        numel = value.numel()
+        if dynamic_first:
+            shape = (None, *shape[1:])
+            numel = 0
+        descriptors.append(
+            (
+                name,
+                shape,
+                tuple(value.stride()),
+                str(value.dtype).removeprefix("torch."),
+                numel,
+                name in physical_names,
+                dynamic_first,
+            )
+        )
+    return _cached_tensor_storage(tuple(descriptors))
 
 
 @dataclass(frozen=True)
@@ -726,6 +767,65 @@ def generate_source(
 
 
 @functools.lru_cache(maxsize=256)
+def _kernel_plan(
+    backend,
+    spec,
+    n,
+    n_step,
+    history_names,
+    modes,
+    backward,
+    parameter_mask,
+    parameter_layouts,
+    gradient_presence,
+    residual_template,
+    prepared_parameter_layouts,
+    gradient_targets,
+    precise_exp,
+    storage,
+    spike_list,
+    gradient_activity,
+    enable_fp_fusion,
+    precise_division,
+    template_revision,
+    backend_revision,
+    device_index,
+):
+    """Return a tensor-free source, pointer ABI and compiled executable."""
+    # Revision values are explicit cache inputs even though the current source
+    # renderer derives its own model revision. Backend registration changes
+    # must never reuse an executable from an older contract.
+    del template_revision, backend_revision
+    source, pointers = generate_source(
+        backend,
+        spec,
+        n,
+        n_step,
+        history_names,
+        modes,
+        backward,
+        parameter_mask,
+        parameter_layouts,
+        gradient_presence=gradient_presence,
+        residual_template=residual_template,
+        prepared_parameter_layouts=prepared_parameter_layouts,
+        gradient_targets=gradient_targets,
+        precise_exp=precise_exp,
+        storage=storage,
+        spike_list=spike_list,
+        gradient_activity=gradient_activity,
+    )
+    kernel = _compile(
+        backend,
+        source,
+        enable_fp_fusion,
+        precise_division,
+        device=torch.device("cuda", device_index),
+    )
+    return kernel, pointers
+
+
+@functools.lru_cache(maxsize=256)
 def _compile_cached(
     backend,
     source,
@@ -860,7 +960,7 @@ def _launch_kernel(
     if not n:
         return
     with _device_scope(args[0].device):
-        runtime.launch(
+        runtime.launch_prepared(
             kernel,
             args,
             n,
@@ -901,46 +1001,50 @@ def _launch(
     strided_names = set(get_template(spec).parameter_names)
     if prepared_parameter_layouts is not None:
         strided_names.update(name for name, _ in prepared_parameter_layouts)
-    source, pointers = generate_source(
+    storage = _tensor_storage(
+        buffers,
+        strided_names,
+        ()
+        if not dynamic_steps
+        else {
+            name
+            for name in buffers
+            if name == "x_seq"
+            or name == "uniform_seq"
+            or name == "output_seq"
+            or name == "gradient_activity"
+            or name.endswith("_seq")
+            or name.endswith("_checkpoint")
+        },
+    )
+    semantic_spec = replace(spec, dt=1.0)
+    from ..registry import cell_backend_revision
+
+    kernel, pointers = _kernel_plan(
         backend,
-        spec,
+        semantic_spec,
         n,
-        n_step,
-        history_names,
+        n_step if not dynamic_steps or spike_list else 0,
+        tuple(history_names),
         modes,
         backward,
-        parameter_mask,
-        parameter_layouts,
-        prepared_parameter_layouts=prepared_parameter_layouts,
-        gradient_presence=gradient_presence,
-        gradient_targets=gradient_targets,
-        residual_template=residual_template,
-        precise_exp=precise_exp,
-        storage=_tensor_storage(
-            buffers,
-            strided_names,
-            ()
-            if not dynamic_steps
-            else {
-                name
-                for name in buffers
-                if name == "x_seq"
-                or name == "uniform_seq"
-                or name == "output_seq"
-                or name == "gradient_activity"
-                or name.endswith("_seq")
-                or name.endswith("_checkpoint")
-            },
-        ),
-        spike_list=spike_list,
-        gradient_activity=gradient_activity,
-    )
-    kernel = _compile(
-        backend,
-        source,
+        None if parameter_mask is None else tuple(parameter_mask),
+        None if parameter_layouts is None else tuple(parameter_layouts),
+        gradient_presence,
+        residual_template or ResidualTemplate(get_template(spec).state_names),
+        None
+        if prepared_parameter_layouts is None
+        else tuple(prepared_parameter_layouts),
+        gradient_targets,
+        precise_exp,
+        storage,
+        tuple(spike_list),
+        gradient_activity,
         enable_fp_fusion,
         precise_division,
-        device=buffers["x_seq"].device,
+        model_template_revision(spec.model),
+        cell_backend_revision(backend),
+        buffers["x_seq"].device.index,
     )
     args = tuple(storage_span(buffers[name], size) for name, size in pointers)
     num_warps = None
@@ -986,29 +1090,27 @@ def _kernel_arguments(buffers, declarations, strided_names):
 
 
 def _layout(value, target_shape):
-    if len(value.shape) > len(target_shape):
-        raise ValueError(
-            f"Parameter shape {tuple(value.shape)} cannot broadcast to {target_shape}"
-        )
-    padding = len(target_shape) - value.ndim
-    for dimension, target in zip(value.shape, target_shape[padding:]):
+    return _cached_layout(
+        tuple(value.shape), tuple(value.stride()), tuple(target_shape)
+    )
+
+
+@functools.lru_cache(maxsize=512)
+def _cached_layout(shape, stride, target_shape):
+    if len(shape) > len(target_shape):
+        raise ValueError(f"Parameter shape {shape} cannot broadcast to {target_shape}")
+    padding = len(target_shape) - len(shape)
+    for dimension, target in zip(shape, target_shape[padding:]):
         if dimension not in (1, target):
             raise ValueError(
-                "Parameter shape "
-                f"{tuple(value.shape)} cannot broadcast to {target_shape}"
+                f"Parameter shape {shape} cannot broadcast to {target_shape}"
             )
     span = (
         0
-        if not value.numel()
-        else 1
-        + sum(
-            (dimension - 1) * stride
-            for dimension, stride in zip(value.shape, value.stride())
-        )
+        if any(size == 0 for size in shape)
+        else 1 + sum((dimension - 1) * step for dimension, step in zip(shape, stride))
     )
-    return _ParameterLayout(
-        tuple(value.shape), tuple(value.stride()), tuple(target_shape), span
-    )
+    return _ParameterLayout(shape, stride, target_shape, span)
 
 
 def _parameter_buffers(parameters):

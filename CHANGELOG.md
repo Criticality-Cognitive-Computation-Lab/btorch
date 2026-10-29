@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Reuse tensor-free model metadata, validated layouts and prepared native
+  executables for primitive neuron/PSC sequences. Each invocation binds current
+  tensors; runtime timesteps, autograd ownership and compiler tracing are preserved.
+
 - Bounded preparation-time GPU autotuning through native Triton/TileLang
   autotuners and CuPy profiling, with isolated trial storage and direct prepared
   launches. Retain native tuner caches without retaining trial tensors.
