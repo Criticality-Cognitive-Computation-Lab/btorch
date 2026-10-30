@@ -212,19 +212,20 @@ def _prepare_spike_list_launch(execution, x):
     execution.launch = consume
 
     def bind_sequence(sequence):
+        from functools import partial
+
         import torch
 
         base = sequence.data_ptr()
         stride = sequence.stride(0) * sequence.element_size()
-        arguments = list(launch.arguments)
-        submit = launch.launch
-        constants = launch.constants
+        arguments = [*launch.arguments, *launch.constants]
         output = queue.output
         stream = torch.cuda.current_stream(sequence.device)
+        submit = partial(launch.launch, stream=stream.cuda_stream)
 
-        def forward(index, _owner=sequence):
+        def forward(index, _owners=(sequence, stream)):
             arguments[4] = base + index * stride
-            submit(*arguments, *constants, stream=stream.cuda_stream)
+            submit(*arguments)
             return output
 
         return forward

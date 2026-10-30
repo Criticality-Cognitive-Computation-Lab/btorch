@@ -32,10 +32,160 @@ def _build(**kwargs):
 
 def _pair(**kwargs):
     """An eager reference and a cudagraph model sharing the same weights."""
-    eager = _build(**kwargs)
+    eager = _build(cudagraph=False, **kwargs)
     graphed = _build(cudagraph=True, **kwargs)
     graphed.rnn_cell.load_state_dict(eager.rnn_cell.state_dict())
     return eager, graphed
+
+
+def test_auto_graph_inference_and_training_preserve_continuation_and_vjp():
+    """Choose replay for inference and retain ordinary autograd for
+    training."""
+    eager = _build(cudagraph=False, chunk_size=8)
+    automatic = _build(chunk_size=8)
+    # Strided input and a short tail exercise fresh input copies and the eager
+    # remainder after two equal-sized replays. Live memories must match too.
+    x = torch.randn(19, B, INPUT_DIM * 2, device="cuda")[..., ::2]
+    with torch.inference_mode():
+        # The cell's initial unbatched memory broadcasts on the first chunk.
+        # Capture must then bind the expanded state before reusing later chunks.
+        expected, _ = eager(x)
+        actual, _ = automatic(x)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        for name, value in named_hidden_states(eager).items():
+            torch.testing.assert_close(named_hidden_states(automatic)[name], value)
+        assert automatic._cudagraph_runner.n_captures == 2
+
+    # An upstream trainable input still needs a complete VJP. Automatic graph
+    # selection must not be inferred from eval(), frozen parameters, or whether
+    # a previous call happened to capture an inference graph.
+    inputs = [x.detach().clone().requires_grad_() for _ in range(2)]
+    gradients = []
+    for model, value in zip((eager, automatic), inputs, strict=True):
+        model.eval()
+        model.requires_grad_(False)
+        output, _ = _run(model, value)
+        gradients.append(torch.autograd.grad(output.square().sum(), value))
+    for actual, expected in zip(*gradients, strict=True):
+        torch.testing.assert_close(actual, expected)
+    assert automatic._cudagraph_runner.n_captures == 2
+
+
+@torch.inference_mode()
+def test_cudagraph_outer_call_ingests_inplace_inference_state_edits():
+    """In-place edits need no tensor version counter to reach the next call."""
+    eager, graphed = _pair(chunk_size=8)
+    x = torch.randn(T, B, INPUT_DIM, device="cuda")
+    first, _ = _run(graphed, x)
+    saved = first.clone()
+    _run(eager, x)
+    # Inference tensors have no version counter. A runner that infers an
+    # unchanged state from object identity would silently lose this edit.
+    for model in (eager, graphed):
+        model.rnn_cell.h.add_(0.25)
+    changed = x.flip(0)
+    expected, _ = eager(changed)
+    actual, _ = graphed(changed)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(first, saved, atol=0, rtol=0)
+    assert graphed._cudagraph_runner.n_captures == 1
+
+
+@torch.no_grad()
+def test_cudagraph_cross_state_aliases_and_initial_state_output():
+    """Copy swapped memories simultaneously and preserve an old-state
+    output."""
+    from btorch.models.base import MemoryModule
+    from btorch.models.cudagraph import CudaGraphRunner
+
+    class SwappingMemories(MemoryModule):
+        def __init__(self):
+            super().__init__()
+            self.register_memory("left", 7.0, (1,))
+            self.register_memory("right", 9.0, (1,))
+            self.init_state(device="cuda")
+
+        def forward(self, x):
+            old = self.left
+            self.left, self.right = self.right, self.left
+            return old, old + x
+
+    eager, captured = SwappingMemories(), SwappingMemories()
+    runner = CudaGraphRunner(warmup=1)
+    kept = None
+    for value in (1.0, 2.0, 3.0):
+        x = torch.full((1,), value, device="cuda")
+        expected = eager(x)
+        actual = runner(captured, captured, (x,))
+        for result, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(result, reference, atol=0, rtol=0)
+        for name, state in named_hidden_states(eager).items():
+            torch.testing.assert_close(getattr(captured, name), state, atol=0, rtol=0)
+        if kept is None:
+            kept = actual[0]
+        torch.testing.assert_close(kept, torch.full_like(kept, 7.0))
+    assert runner.n_captures == 1
+
+
+@torch.no_grad()
+def test_nested_tensor_drive_stays_eager_or_requires_an_explicit_tensor_input():
+    """Never capture a container while silently freezing its tensor
+    addresses."""
+
+    class NestedDrive(SimpleRNNCell):
+        def forward(self, x, *, drive):
+            return super().forward(x + drive[0])
+
+    models = []
+    for graph in (False, None, True):
+        torch.manual_seed(42)
+        constructor = make_rnn(NestedDrive, cudagraph=graph, chunk_size=8)
+        models.append(constructor(INPUT_DIM, H).cuda())
+    x = torch.randn(T, B, INPUT_DIM, device="cuda")
+    # The second call replaces the nested tensor with fresh storage. Ordinary
+    # execution must observe that drive; explicit capture refuses the structure
+    # rather than retaining the first call's nested tensor as an immutable input.
+    for drive in (
+        [torch.randn(B, INPUT_DIM, device="cuda")],
+        [torch.randn(B, INPUT_DIM, device="cuda")],
+        [0.125],
+    ):
+        expected, _ = models[0](x, drive=drive)
+        actual, _ = models[1](x, drive=drive)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        with pytest.raises(TypeError, match="nested tensor containers"):
+            models[2](x, drive=drive)
+    assert models[1]._cudagraph_runner.n_captures == 0
+
+
+@torch.no_grad()
+def test_cpu_scalar_memory_stays_eager_until_it_moves_to_cuda():
+    """Retain Torch's valid CPU-scalar promotion before the state is CUDA-
+    ready."""
+    from btorch.models.base import MemoryModule
+
+    class ScalarMemory(MemoryModule):
+        def __init__(self):
+            super().__init__()
+            self.register_memory("total", 0.0, ())
+            self.init_state(device="cpu")
+
+        def forward(self, x):
+            self.total = self.total + x.sum()
+            return x + self.total
+
+    eager = make_rnn(ScalarMemory, cudagraph=False, chunk_size=8)()
+    automatic = make_rnn(ScalarMemory, chunk_size=8)()
+    required = make_rnn(ScalarMemory, cudagraph=True, chunk_size=8)()
+    x = torch.randn(17, 2, device="cuda")
+    for captures in (0, 1):
+        expected, _ = eager(x)
+        actual, _ = automatic(x)
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(automatic.rnn_cell.total, eager.rnn_cell.total)
+        assert automatic._cudagraph_runner.n_captures == captures
+    with pytest.raises(RuntimeError, match="hidden states on a CUDA"):
+        required(x)
 
 
 def _run(model, x):

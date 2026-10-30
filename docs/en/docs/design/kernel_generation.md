@@ -60,17 +60,25 @@ reconstruct state during backward declare `checkpoint_state`,
 `checkpoint_interval` and `replay_state`; models that precompute coefficients
 declare `prepared_parameters` and `prepare_parameters`.
 
-Primitive sequences reuse tensor-free layout and launch plans, binding current
-tensors and allocating independent results on each invocation. Changed layouts,
-dtypes or model options require a new plan; the runtime `dt` remains dynamic.
+Primitive forward and reverse sequences reuse tensor-free layout and launch
+plans, binding current inputs, saved tensors and cotangents and allocating
+independent results on each invocation. Saved-tensor hooks still control tape
+storage; restored tensor layouts participate in reverse preparation. Changed
+layouts, dtypes or model options require a new plan; the runtime `dt` remains dynamic.
 Warm the intended layouts before CUDA Graph capture.
 
 Recurrent preparation also binds the repeated stage's argument slots and
-storage layout. Pointer-only runtimes use the original tensor storage;
+storage layout. Paired stages reuse tensor-free plans across chunks, binding
+current states, parameters, coefficients and runtime `dt` on each invocation.
+Cached plans retain no input, recording or backward tensors.
+Pointer-only runtimes use the original tensor storage;
 TileLang exposes its flat buffer ABI. Changing sequence rows must not inherit
 the first row's alignment specialization. Prepared Triton launches resolve the
 executable once and retain profiler hooks. A recurrent invocation binds its
 current CUDA stream once; the next invocation selects its stream afresh.
+Triton reuses the compiled argument ABI without repeating JIT preparation.
+CuPy recurrent calls also bind their invocation's stream through its public API;
+standalone calls continue to select the caller's current stream.
 Prepared pointer arguments retain their owning tensors. Triton and CuPy interior stages
 update positional slots with byte offsets computed from the actual time stride;
 state views are materialized at checkpoint and final-state boundaries. The
@@ -78,6 +86,19 @@ neuron/PSC template metadata supplies the state ordering for every model.
 TileLang retains prepared tensor views and launches through its public kernel
 call interface; execution-backend argument and stream handling remain TileLang's
 responsibility.
+
+Native paired reverse stages reuse model/layout plans across calls and bind
+stream-specific argument slots once per trajectory layout. Gradient working
+sets remain invocation-owned; changed cotangent or restored tensor layouts
+select another prepared variant. Native CSR stages likewise reuse tensor-free
+launch recipes, while backend autotuners retain their execution configurations.
+
+The cuSPARSE route prepares CSR tensors, transposed values and dense workspaces
+once per recurrent invocation. Standalone products keep their one-off execution
+path. Both paths retain explicit input and stored-edge weight VJPs, including
+checkpoint replay and CPU offload; preparation never caches trainable values
+across invocations. Capture training preparation with the backward operation so
+value refreshes replay after optimizer updates.
 
 Spike-list propagation can bind a complete trajectory during preparation and
 consume rows by timestep index, reusing the producer's device queue. This

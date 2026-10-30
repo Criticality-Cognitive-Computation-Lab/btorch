@@ -659,6 +659,8 @@ def test_native_inference_has_no_checkpoint_outputs_or_autograd_tape(
     from btorch.models.kernels import recurrent_operator
 
     model = _model(backend, "cuda")
+    # Inspect one inference operator invocation, independently of graph warm-up.
+    model.cudagraph = False
     model.requires_grad_(False)
     model.neuron.v.requires_grad_(False)
     model.synapse.psc.requires_grad_(False)

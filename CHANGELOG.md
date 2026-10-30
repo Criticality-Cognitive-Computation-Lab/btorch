@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Support native recurrent BPTT with bounded forward/reverse CUDA Graph replay.
+  Preserve independent chunk tapes, cross-chunk state adjoints, checkpointing
+  and CPU offload without requiring torch.compile. Reuse offloaded CPU trace
+  snapshots while preserving transfer gradients and mutation checks.
+
+- Reuse tensor-free primitive/paired reverse plans and native CSR launch
+  recipes while rebinding current tensors, cotangents and runtime timesteps.
+  Prepare cuSPARSE CSR tensors and transposed values once per recurrent
+  backward invocation, preserving full BPTT, AMP, checkpoint/offload and capture.
+
+- Use bounded chunk CUDA Graph replay automatically for compatible recurrent
+  CUDA inference; retain explicit eager/capture selection and ordinary training
+  autograd. Prepare replay bindings once per sequence and carry state between
+  chunks inside the graph. Preserve caller-owned recordings and live state
+  edits. Eager fused stages skip empty recording bookkeeping and reuse one
+  positional launch argument vector.
+
+- Reuse tensor-free paired-stage plans, broadcast validation and recurrent
+  metadata across chunks. Bind current tensors and runtime timesteps on each
+  call; reuse Triton executables and public CuPy stream bindings. Remove
+  redundant output allocation and prepared-consumer submission wrappers.
+
 - Prepare recurrent pointer schedules and spike-list sequence consumers once
   per invocation, binding the current stream through public backend APIs.
   Recurrent operators reuse public Torch dispatcher and autograd registrations.

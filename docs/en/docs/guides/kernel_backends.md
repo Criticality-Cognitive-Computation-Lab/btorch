@@ -38,6 +38,22 @@ prepared executables. Each call reads the current state and parameter tensors;
 changing `dt` does not recompile a kernel. Triton and CuPy also reuse kernels
 across sequence lengths; TileLang currently specializes the sequence length.
 
+## CUDA Graph inference
+
+`RecurrentNN` defaults to `cudagraph=None`: compatible CUDA inference uses graph
+replay automatically. Run inference under `torch.no_grad()` or
+`torch.inference_mode()`. Calls requiring gradients retain ordinary autograd;
+use `torch.compile(model, mode="reduce-overhead")` for training graphs.
+Set `cudagraph=False` for eager submission, or `True` to require capture and
+report incompatible options explicitly.
+
+Warm-up and capture are bounded by `chunk_size=200`. Equal-sized chunks reuse
+one graph; a shorter final chunk runs eagerly. Live memories are read at the
+start of each call, including resets and in-place edits. Replays write into
+one owned full-sequence recording destination, so results survive later calls.
+`cpu_offload=True` places that destination on CPU; otherwise full recordings
+require GPU storage proportional to the sequence length.
+
 ## Preparation and autotuning
 
 Eligible GPU kernels automatically compare two CUDA kernel configurations during
@@ -177,8 +193,9 @@ renderers retain the support mask and their existing execution paths.
 Delay queues and external synaptic inputs currently retain full propagation
 adjoints because their dependencies extend beyond the surrogate. Checkpointing,
 CPU offload and compiled training keep the same public state interface;
-`torch.compile(mode="reduce-overhead")` can capture training, while the explicit
-`cudagraph=True` option remains for inference.
+native `RecurrentNN(..., cudagraph=True)` captures bounded forward and reverse
+chunks while autograd retains each chunk's tape and propagates state gradients
+across chunk boundaries. It does not require `torch.compile`.
 
 For longer training sequences, combine checkpointing with CPU offload:
 
@@ -193,7 +210,9 @@ network = RecurrentNN(
 Checkpointing recomputes private activations during backward. CPU offload moves
 saved private tensors and returned histories to host memory while parameters
 and caller inputs remain on their original devices. Returned histories remain
-differentiable. With offload enabled, full traces use CPU memory proportional
+differentiable. When a returned trace is already saved for backward on CPU,
+offload reuses that snapshot and preserves its transfer gradient and mutation
+checks. With offload enabled, full traces use CPU memory proportional
 to sequence length; GPU recording buffers stay bounded by chunk size. Model
 weights and caller-owned GPU inputs remain resident. Select only the records
 you need, or use `update_state_names=()` to omit state traces.
@@ -359,9 +378,19 @@ Explicit synaptic inputs and delay updates use
 invocation-owned forward buffers rather than allocating new tensors each step.
 
 This uses the existing `RecurrentNN` options for chunking, gradient checkpointing
-and CPU offload. Explicit `cudagraph=True` remains inference-only; supported
-compiled training capture uses `torch.compile(mode="reduce-overhead")`. There is
-no additional user-facing workspace or preparation API.
+and CPU offload. Native `cudagraph=True` also supports BPTT: forward and reverse
+have separate reusable staging buffers, and each outstanding chunk owns its
+saved tensors. A shorter final chunk runs eagerly. Checkpoint recomputation and
+CPU transfers remain outside graph capture; requesting full traces still needs
+storage proportional to sequence length. There is no additional user-facing
+workspace or preparation API.
+
+For compiled training, use `cudagraph=False` with
+`torch.compile(mode="reduce-overhead")`. Inductor captures eligible regions;
+graph breaks and outstanding chunk outputs can prevent replay or trigger Graph
+Trees lifetime errors. Avoid nesting this mode inside explicit manual capture.
+In the RSNN examples, `--cudagraph` selects native chunk replay and
+`--no-cudagraph --compile` selects Inductor's training path.
 
 Explicit kernel options select a stateful PSC sequence recurrence. The historical
 plain `backend="torch"` PSC multi-step convolution starts from rest, truncates its

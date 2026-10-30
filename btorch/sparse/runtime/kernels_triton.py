@@ -487,6 +487,7 @@ class _Execution:
     def __init__(self, cache):
         self.cache = cache
         self.stages = {}
+        self.recipes = csr_execution.stage_recipes(cache, "triton")
 
     def launch(self, name, grid, args, const_names, consts, warps):
         kernel = {
@@ -497,18 +498,33 @@ class _Execution:
         }[name]
         stage = self.stages.get(name)
         if stage is None:
-            from ...utils.triton import prepare_launch
+            from ...utils.kernel import PreparedLaunch
+            from ...utils.triton import prepare_launch_recipe
             from .csr_execution import stage_inputs, stage_outputs, stage_work
 
-            stage = prepare_launch(
-                kernel,
-                args,
-                grid,
-                tuple(zip(const_names, consts, strict=True)),
-                changing=stage_inputs(name, consts),
-                writes=stage_outputs(name),
-                work=stage_work(name, args, grid),
-                num_warps=warps,
+            key = (
+                id(kernel),
+                csr_execution.stage_signature(name, grid, args, consts, warps),
+            )
+            recipe = self.recipes.get(key)
+            if recipe is None:
+                launch, constants = prepare_launch_recipe(
+                    kernel,
+                    args,
+                    grid,
+                    tuple(zip(const_names, consts, strict=True)),
+                    writes=stage_outputs(name),
+                    work=stage_work(name, args, grid),
+                    num_warps=warps,
+                )
+                # Retain the source object as well as the executable, so a
+                # replaced JIT object cannot collide through Python id reuse.
+                recipe = csr_execution.remember_stage(
+                    self.recipes, key, (kernel, launch, constants)
+                )
+            _, launch, constants = recipe
+            stage = PreparedLaunch(
+                launch, list(args), stage_inputs(name, consts), constants
             )
             self.stages[name] = stage
         stage(args)

@@ -15,6 +15,7 @@ N]``; the logical spike tensor stays dense so surrogate gradients are exact.
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from itertools import count
 
 import torch
@@ -22,6 +23,7 @@ from torch import Tensor
 from torch.library import custom_op
 
 from . import (
+    kernels_cusparse,
     kernels_tilelang,
     kernels_torch,
     kernels_triton,
@@ -49,13 +51,23 @@ registry.register(
     device="cuda",
     priority=1,
     available=torch.cuda.is_available,
+    prepare_execution=kernels_cusparse.prepare_matvec,
+)
+registry.register(
+    "csr_backward",
+    "cusparse",
+    kernels_cusparse.backward,
+    device="cuda",
+    priority=1,
+    available=torch.cuda.is_available,
+    prepare_execution=kernels_cusparse.prepare_backward,
 )
 registry.register(
     "csr_matvec",
     "torch_sparse",
     kernels_torch.csr_matvec_torch_sparse,
     priority=-1,
-    available=kernels_torch.torch_sparse_available,
+    available=lru_cache(maxsize=1)(kernels_torch.torch_sparse_available),
 )
 
 
@@ -566,7 +578,9 @@ def _build_source_push(
             consume = execute.prepare_sequence(source)
             target = (*sequence.shape[1:-1], output_shape[-1])
             output = execute.output
-            output = output if output.shape == target else output.reshape(target)
+            if output.shape == target:
+                return consume
+            output = output.reshape(target)
 
             def forward(index):
                 consume(index)
@@ -1262,7 +1276,11 @@ def _register_route_specs() -> None:
     registry.register_route(
         RouteSpec(
             key=RouteKey("propagate", "post_pre_csr", "pull", "cusparse"),
-            kernel_bindings=(("csr_matvec", "cusparse"), ("edge_grad", "torch")),
+            kernel_bindings=(
+                ("csr_matvec", "cusparse"),
+                ("edge_grad", "torch"),
+                ("csr_backward", "cusparse"),
+            ),
             build=_build_pull,
             supports=lambda context: (
                 context is not None and context.dtype in kernels_torch._FLOAT_DTYPES

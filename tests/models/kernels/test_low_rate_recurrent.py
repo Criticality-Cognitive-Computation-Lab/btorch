@@ -130,8 +130,13 @@ def test_low_rate_recurrent_states_continuation_and_input_vjp(
         else:
             # A second call must start with the exact final physical state,
             # rather than resetting because the task queues were reused.
-            followup, states = run(x.flip(0))
-            ref_followup, ref_states = reference(x_ref.flip(0))
+            # The prepared plan must also bind new coefficients: neither
+            # updated parameter values nor the runtime dt belong in its cache.
+            native.neuron.tau.mul_(1.25)
+            reference.neuron.tau.mul_(1.25)
+            with environ.context(dt=0.5):
+                followup, states = run(x.flip(0))
+                ref_followup, ref_states = reference(x_ref.flip(0))
             torch.testing.assert_close(followup, ref_followup)
             for name in states:
                 torch.testing.assert_close(

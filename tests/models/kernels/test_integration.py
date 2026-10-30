@@ -1148,3 +1148,65 @@ def test_recurrent_rejects_higher_order_gradients_explicitly():
             torch.autograd.grad(loss, x, create_graph=True, retain_graph=True)
         gradient = torch.autograd.grad(loss, x)[0]
     assert torch.isfinite(gradient).all() and gradient.abs().sum() > 0
+
+
+def test_cusparse_checkpoint_offload_preserves_full_recurrent_vjp():
+    """Prepared CSR reverse keeps weight/state gradients through chunk
+    replay."""
+    from tests.models.kernels.test_recurrent_dual_exponential import (
+        _build,
+        _final,
+        _roots,
+    )
+
+    require_cuda_backend("cupy")
+    torch.manual_seed(492)
+    model = _build("delayed_sparse", "cupy")
+    model.backend = KernelOptions(
+        neuron="cupy",
+        connection="cusparse",
+        connection_method="pull",
+        enable_fp_fusion=False,
+        precise_division=True,
+    )
+    model.chunk_size, model.grad_checkpoint, model.cpu_offload = 4, True, True
+    reference = copy.deepcopy(model)
+    reference.backend = "torch"
+    reference.chunk_size = None
+    reference.grad_checkpoint = reference.cpu_offload = False
+    x = torch.linspace(0.2, 0.7, 72, device="cuda").reshape(9, 2, 4).requires_grad_()
+    events = torch.full_like(x, 0.03, requires_grad=True)
+    xr, er = (value.detach().clone().requires_grad_() for value in (x, events))
+    roots, reference_roots = _roots(model, x, events), _roots(reference, xr, er)
+    with environ.context(dt=0.3):
+        actual_output, actual_records = model(x, events)
+        expected_output, expected_records = reference(xr, er)
+    actual = (actual_output, *actual_records.values(), *_final(model))
+    expected = (expected_output, *expected_records.values(), *_final(reference))
+    cotangents = tuple(torch.randn_like(value) for value in actual)
+    # CPU offload changes only recording placement, never which physical roots
+    # participate. Match cotangents by name/order and move them to the oracle.
+    reference_cotangents = tuple(
+        gradient.to(value.device)
+        for gradient, value in zip(cotangents, expected, strict=True)
+    )
+    result = torch.autograd.grad(
+        actual, tuple(roots.values()), cotangents, allow_unused=True
+    )
+    golden = torch.autograd.grad(
+        expected,
+        tuple(reference_roots.values()),
+        reference_cotangents,
+        allow_unused=True,
+    )
+    for value, trusted in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            value.to(trusted.device), trusted, atol=6e-6, rtol=6e-5
+        )
+    for value, trusted, root in zip(result, golden, roots.values(), strict=True):
+        torch.testing.assert_close(
+            torch.zeros_like(root) if value is None else value,
+            torch.zeros_like(root) if trusted is None else trusted,
+            atol=7e-5,
+            rtol=7e-4,
+        )

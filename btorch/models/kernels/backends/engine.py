@@ -1215,7 +1215,7 @@ def _prepare_parameters(values, template, target):
 
 
 @dataclass
-class _ForwardPlan:
+class _PrimitivePlan:
     """Keep primitive binding metadata and an executable, never live
     tensors."""
 
@@ -1230,10 +1230,10 @@ class _ForwardPlan:
     launch: _PrimitiveLaunch | None = None
 
 
-_forward_preparation_lock = threading.RLock()
+_primitive_preparation_lock = threading.RLock()
 
 
-def _forward_layout(value, dynamic_first=False):
+def _sequence_layout(value, dynamic_first=False):
     shape = tuple(value.shape)
     if dynamic_first and shape:
         shape = (None, *shape[1:])
@@ -1241,7 +1241,7 @@ def _forward_layout(value, dynamic_first=False):
 
 
 @functools.lru_cache(maxsize=256)
-def _forward_plan(
+def _primitive_plan(
     backend,
     encoded,
     revisions,
@@ -1255,10 +1255,14 @@ def _forward_plan(
     policy,
     spike_layout,
     aliases,
+    reverse_signature=None,
 ):
     # All cache inputs are metadata. In particular neither runtime dt nor
     # addresses enter the key; replacement tensors must be bound on every call.
     del backend, revisions, auxiliary, policy, spike_layout, aliases
+    # Reverse signatures include saved/gradient layouts and target masks. They
+    # separate executables without retaining any autograd tape in this cache.
+    del reverse_signature
     from ..operators import decode_spec
 
     template = get_template(decode_spec(encoded))
@@ -1305,7 +1309,7 @@ def _forward_plan(
     }
     if residual.checkpoint_state is not None:
         outputs.add(residual.checkpoint_state + "_checkpoint")
-    return _ForwardPlan(
+    return _PrimitivePlan(
         template,
         shape,
         modes,
@@ -1379,16 +1383,16 @@ def forward(
             for j in range(i)
             if address == addresses[j]
         )
-    plan = _forward_plan(
+    plan = _primitive_plan(
         backend,
         encode_spec(spec),
         (model_template_revision(spec.model), cell_backend_revision(backend)),
-        _forward_layout(x_seq, dynamic),
-        tuple(_forward_layout(value) for value in states),
-        tuple(_forward_layout(value) for value in parameters),
-        tuple((name, _forward_layout(value)) for name, value in coefficients.items()),
+        _sequence_layout(x_seq, dynamic),
+        tuple(_sequence_layout(value) for value in states),
+        tuple(_sequence_layout(value) for value in parameters),
+        tuple((name, _sequence_layout(value)) for name, value in coefficients.items()),
         tuple(
-            (name, _forward_layout(value, dynamic and name.endswith("_seq")))
+            (name, _sequence_layout(value, dynamic and name.endswith("_seq")))
             for name, value in auxiliary.items()
         ),
         tuple(history_names),
@@ -1457,7 +1461,7 @@ def forward(
             )
         # Serialize cold publication only: a cached plan must never trigger two
         # concurrent tuning trials against different invocation buffers.
-        with _forward_preparation_lock:
+        with _primitive_preparation_lock:
             if plan.launch is None:
                 plan.launch = _launch(
                     backend,
@@ -1548,14 +1552,59 @@ def backward(
                 for index, parameter in enumerate(parameters)
             ),
         )
-    template, shape, modes, target, buffers, parameter_layouts = _prepare(
-        x_seq, states, parameters, spec, preserve_parameters=True
-    )
-    coefficient_buffers, prepared_parameter_layouts = _prepare_parameters(
-        prepared_parameters, template, target
-    )
-    buffers.update(coefficient_buffers)
+    from ..operators import encode_spec
+    from ..registry import cell_backend_revision
+
+    if x_seq.device.type != "cuda":
+        raise ValueError("GPU cell backends require CUDA tensors")
+    runtime = get_runtime(backend)
+    dynamic = runtime.supports_dynamic_steps
+    parameters = _parameter_buffers(parameters)
+    coefficients = {
+        name: value.resolve_neg() if value.is_neg() else value
+        for name, value in (prepared_parameters or {}).items()
+    }
     residual = residual_template or ResidualTemplate(template.state_names)
+    # Include every external reverse operand: saved-tensor hooks may restore
+    # different strides, and callers may supply partial/strided cotangents.
+    reverse_operands = (
+        *((value, True) for value in histories),
+        (grad_output, True),
+        *((value, False) for value in grad_final_states),
+        *((value, True) for value in grad_histories),
+        (residual_output, True),
+        *((value, True) for value in residuals),
+    )
+    plan = _primitive_plan(
+        backend,
+        encode_spec(spec),
+        (model_template_revision(spec.model), cell_backend_revision(backend)),
+        _sequence_layout(x_seq, dynamic),
+        tuple(_sequence_layout(value) for value in states),
+        tuple(_sequence_layout(value) for value in parameters),
+        tuple((name, _sequence_layout(value)) for name, value in coefficients.items()),
+        (),
+        tuple(history_names),
+        residual,
+        (enable_fp_fusion, precise_division, precise_exp),
+        (),
+        (),
+        (
+            tuple(needs),
+            tuple(
+                None if value is None else _sequence_layout(value, dynamic and sequence)
+                for value, sequence in reverse_operands
+            ),
+        ),
+    )
+    modes, target = plan.modes, plan.targets.__getitem__
+    buffers = {"x_seq": x_seq, "dt": _dt_buffer(spec.dt, x_seq)}
+    buffers.update(
+        (name + "_init", value.expand(target(name)) if expand else value)
+        for name, value, expand in zip(template.state_names, states, plan.expand_states)
+    )
+    buffers.update(zip(template.parameter_names, parameters))
+    buffers.update(coefficients)
     gradient_presence = _GradientPresence(
         grad_output is not None,
         tuple(grad is not None for grad in grad_final_states),
@@ -1564,7 +1613,7 @@ def backward(
     gradient_targets = _GradientTargets(
         bool(needs[0]), tuple(bool(value) for value in needs[1 : 1 + len(states)])
     )
-    n_step, n = x_seq.shape[0], buffers["x_seq"].numel() // max(x_seq.shape[0], 1)
+    n_step, n = x_seq.shape[0], math.prod(plan.shape)
     if grad_output is not None:
         buffers["grad_output_seq"] = grad_output
     if gradient_targets.input:
@@ -1608,26 +1657,35 @@ def backward(
         *("grad_" + name for name in parameter_mask),
         *("grad_" + name + "_init" for name in template.state_names),
     }
-    _launch(
-        backend,
-        spec,
-        buffers,
-        n,
-        n_step,
-        history_names,
-        modes,
-        backward=True,
-        parameter_mask=parameter_mask,
-        parameter_layouts=parameter_layouts,
-        gradient_presence=gradient_presence,
-        gradient_targets=gradient_targets,
-        enable_fp_fusion=enable_fp_fusion,
-        precise_division=precise_division,
-        residual_template=residual,
-        prepared_parameter_layouts=prepared_parameter_layouts,
-        precise_exp=precise_exp,
-        outputs=outputs,
-    )
+    if plan.launch is None and n:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Warm primitive reverse plans before CUDA Graph capture")
+        with _primitive_preparation_lock:
+            if plan.launch is None:
+                plan.launch = _launch(
+                    backend,
+                    spec,
+                    buffers,
+                    n,
+                    n_step,
+                    history_names,
+                    modes,
+                    backward=True,
+                    parameter_mask=parameter_mask,
+                    parameter_layouts=plan.parameter_layouts,
+                    gradient_presence=gradient_presence,
+                    gradient_targets=gradient_targets,
+                    enable_fp_fusion=enable_fp_fusion,
+                    precise_division=precise_division,
+                    residual_template=residual,
+                    prepared_parameter_layouts=plan.prepared_parameter_layouts,
+                    precise_exp=precise_exp,
+                    outputs=outputs,
+                    cache_recipe=False,
+                    execute=False,
+                )
+    if plan.launch is not None:
+        plan.launch(buffers, n_step)
     grad_states = tuple(
         buffers["grad_" + name + "_init"].sum_to_size(value.shape).to(value.dtype)
         if needs[1 + i]

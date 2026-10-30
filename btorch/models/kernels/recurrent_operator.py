@@ -4,6 +4,7 @@ import json
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
+from functools import lru_cache
 
 import torch
 from torch import Tensor
@@ -20,6 +21,12 @@ from .templates import (
 
 
 _library = torch.library.Library("btorch_cells", "FRAGMENT")
+
+
+@lru_cache(maxsize=256)
+def _recurrent_metadata(encoded):
+    """Decode static choices without retaining state or runtime dt."""
+    return json.loads(encoded)
 
 
 def _connection(source, parameters, topology, spec):
@@ -462,6 +469,11 @@ def _prepare_recurrent_step(
         sequences = tuple(sequences)
         workspaces = tuple(tuple(updates) for updates in workspaces)
         last_drive = drive
+        submit = prepared.launch
+        # Constants belong to the invocation's ABI just like fixed pointers.
+        # Keep one vector so each timestep expands it once, after changing only
+        # the temporal slots. The original prepared binding keeps its owners.
+        arguments = [*arguments, *prepared.constants]
 
         def run(time, drive):
             nonlocal last_drive
@@ -473,7 +485,7 @@ def _prepare_recurrent_step(
                 last_drive = drive
                 prepared.owners[drive_slot] = drive
                 arguments[drive_slot] = drive.data_ptr()
-            prepared.launch()
+            submit(*arguments)
 
     else:
         argument = step.runtime.argument
@@ -700,8 +712,7 @@ def _trajectory(
     n_steps = x_seq.shape[0]
     if uniform_seq is not None and not uniform_seq.numel():
         uniform_seq = None
-    spec = json.loads(encoded)
-    spec["dt"] = dt
+    spec = {**_recurrent_metadata(encoded), "dt": dt}
     neuron_spec, synapse_spec = (
         decode_spec(spec["neuron"], spec["dt"]),
         decode_spec(spec["synapse"], spec["dt"]),
@@ -717,15 +728,17 @@ def _trajectory(
     synapse_template = get_template(synapse_spec)
     ring = initial_states[-1] if spec["delay"] else x_seq.new_empty(0)
     histories = {}
-    output_seq = torch.empty_like(x_seq)
     charged_names = tuple(spec.get("charged_names", ()))
     enable_fp_fusion = bool(spec.get("enable_fp_fusion", True))
     precise_division = bool(spec.get("precise_division", False))
     precise_exp = bool(spec.get("precise_exp", False))
     use_fused = backend in _NATIVE_GPU_BACKENDS and x_seq.device.type == "cuda"
     output_dtype = x_seq.dtype
-    if use_fused or spec.get("save_compute_spikes"):
-        output_seq = torch.empty(x_seq.shape, device=x_seq.device, dtype=torch.float32)
+    output_seq = (
+        torch.empty(x_seq.shape, device=x_seq.device, dtype=torch.float32)
+        if use_fused or spec.get("save_compute_spikes")
+        else torch.empty_like(x_seq)
+    )
     activity_index = spec.get("gradient_activity")
     gradient_activity = (
         torch.empty_like(output_seq) if activity_index is not None else None
@@ -999,6 +1012,11 @@ def _trajectory(
                     neuron_states, synapse_states, neuron_charged = (
                         step_launch.state_views(time_index)
                     )
+                else:
+                    # Interior fused stages write their own histories. State
+                    # views and host-scheduled copies are needed only at the
+                    # trajectory/checkpoint boundaries below.
+                    continue
         else:
             if spec.get("merge_receptors", 0):
                 drive = drive.reshape(
@@ -1096,6 +1114,26 @@ def _forward_impl(
     dt: Tensor,
     uniform_seq: Tensor | None = None,
 ) -> list[Tensor]:
+    from .recurrent_graph import active_graphs
+
+    graphs = active_graphs()
+    if graphs is not None:
+        return graphs.run(
+            _trajectory,
+            (
+                x_seq,
+                x_syn_seq,
+                states,
+                parameters,
+                topology,
+                encoded,
+                history_names,
+                backend,
+                dt,
+                uniform_seq,
+            ),
+            fixed=(3, 4),
+        )
     with torch.cuda.device(x_seq.device) if x_seq.is_cuda else nullcontext():
         return _trajectory(
             x_seq,
@@ -1131,7 +1169,7 @@ def _fake(
     dt,
     uniform_seq=None,
 ):
-    spec = json.loads(encoded)
+    spec = _recurrent_metadata(encoded)
     charged_names = spec.get("charged_names", ())
     template = get_template(decode_spec(spec["neuron"]))
     state_names = template.state_names
@@ -1507,7 +1545,12 @@ def _reverse_paired(
     def add_parameters(values, start):
         for i, value in enumerate(values):
             if value is not None:
-                gradients[start + i] += value.sum_to_size(parameters[start + i].shape)
+                shape = parameters[start + i].shape
+                # Even sum_to_size(()) of an already scalar VJP launches a
+                # reduction; keep only genuinely required broadcast reductions.
+                gradients[start + i] += (
+                    value if value.shape == shape else value.sum_to_size(shape)
+                )
 
     grad_neuron_states = list(grad_states[:ns])
     grad_psc_states = list(grad_states[ns : ns + ss])
@@ -1928,6 +1971,18 @@ def _reverse_impl(
     ]
 
 
+def _validate_reverse_revisions(encoded, backend, backend_revision, model_revisions):
+    spec = _recurrent_metadata(encoded)
+    if cell_backend_revision(backend) != backend_revision or any(
+        model_template_revision(decode_spec(spec[name]).model) != revision
+        for name, revision in zip(("neuron", "synapse"), model_revisions)
+    ):
+        raise RuntimeError(
+            "Cell backend or model registration changed between forward and backward; "
+            "complete outstanding backward passes before replacing registrations"
+        )
+
+
 def _reverse_operator_impl(
     x_seq: Tensor,
     x_syn_seq: Tensor,
@@ -1948,16 +2003,8 @@ def _reverse_operator_impl(
     model_revisions: list[int],
     dt: Tensor,
 ) -> list[Tensor | None]:
-    spec = json.loads(encoded)
-    spec["dt"] = dt
-    if cell_backend_revision(backend) != backend_revision or any(
-        model_template_revision(decode_spec(spec[name]).model) != revision
-        for name, revision in zip(("neuron", "synapse"), model_revisions)
-    ):
-        raise RuntimeError(
-            "Cell backend or model registration changed between forward and backward; "
-            "complete outstanding backward passes before replacing registrations"
-        )
+    spec = {**_recurrent_metadata(encoded), "dt": dt}
+    _validate_reverse_revisions(encoded, backend, backend_revision, model_revisions)
     gradients = _reverse_impl(
         x_seq,
         x_syn_seq,
@@ -2026,6 +2073,9 @@ def _fake_reverse(
 
 
 def _setup(ctx, inputs, output):
+    from .recurrent_graph import active_graphs
+
+    ctx.graphs = None if torch.compiler.is_compiling() else active_graphs()
     (
         x_seq,
         x_syn_seq,
@@ -2040,7 +2090,7 @@ def _setup(ctx, inputs, output):
     ) = inputs
     ctx.counts = len(states), len(parameters), len(topology)
     ctx.encoded, ctx.history_names, ctx.backend = encoded, history_names, backend
-    spec = json.loads(encoded)
+    spec = _recurrent_metadata(encoded)
     neuron_spec = decode_spec(spec["neuron"])
     ctx.has_uniform = neuron_spec.poisson is not None and neuron_spec.poisson.spiking
     ctx.output_counts = (
@@ -2109,7 +2159,7 @@ def _backward(ctx, grad_results):
     ]
     nx, nxs, nstates, nparameters = ctx.needs_input_grad[:4]
     needs = [nx, nxs, *nstates, *nparameters]
-    gradients = reverse(
+    reverse_arguments = (
         x_seq,
         x_syn_seq,
         spikes_seq,
@@ -2128,6 +2178,17 @@ def _backward(ctx, grad_results):
         ctx.backend_revision,
         ctx.model_revisions,
         saved[-1],
+    )
+    if ctx.graphs is not None:
+        # A replay bypasses the operator's Python implementation, including
+        # its registration guard. Check outstanding tapes before every replay.
+        _validate_reverse_revisions(
+            ctx.encoded, ctx.backend, ctx.backend_revision, ctx.model_revisions
+        )
+    gradients = (
+        ctx.graphs.run(reverse, reverse_arguments, fixed=(4, 5))
+        if ctx.graphs is not None
+        else reverse(*reverse_arguments)
     )
     values = [g if need else None for g, need in zip(gradients, needs)]
     gradients = (

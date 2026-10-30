@@ -9,10 +9,16 @@ on, then saves v, u, spike, total PSC, signed EPSC and IPSC under fig/.
 FP32 push is not bitwise reproducible, even with fixed seeds or CUDA Graphs.
 
 The two heterogeneous dual-exponential receptors retain independent dynamics.
-For a small training run (inference capture is disabled during training):
+For a small BPTT run with bounded forward/backward CUDA Graphs:
 
     python -m examples.rsnn_izhikevich --neurons 256 --density .05 \
-        --steps 256 --mode train --compile
+        --steps 256 --mode train
+
+Training uses chunk checkpointing by default to bound private activation memory.
+Use --cpu-offload to also move saved tensors and traces to CPU, or
+--no-grad-checkpoint when enough GPU memory is available. These preserve
+cross-chunk BPTT; they do not detach the physical neuron/PSC states. To use
+Inductor's training capture instead, pass --no-cudagraph --compile.
 
 Use --no-compare to skip timing comparisons, --no-cudagraph for eager final
 inference, and --recordings PATH to choose the saved tensor archive. SONATA
@@ -124,6 +130,7 @@ if __name__ == "__main__":
             chunk_size=200,
         ),
         execution=RunOptions(
+            grad_checkpoint=True,
             steps=5000,
             target_rate_hz=5.0,
             mode="inference",

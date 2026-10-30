@@ -8,7 +8,8 @@ Two receptors use excitation/inhibition and distinct PSC time constants.
 Dale constraints preserve each source neuron's sign after optimizer updates.
 Delays span 0..3 bins; SONATA stores their physical values in milliseconds.
 Use --device cuda --neuron-backend triton --sparse-backend triton for native
-execution. --compile supports training; --cudagraph is inference-only.
+execution. --cudagraph supports native BPTT; --no-cudagraph --compile selects
+Inductor's training path. Long sequences can use --grad-checkpoint --cpu-offload.
 """
 
 import torch

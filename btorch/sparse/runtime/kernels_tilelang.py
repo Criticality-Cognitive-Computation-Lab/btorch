@@ -6,25 +6,32 @@ JIT kernel interface exclusively.
 """
 
 import importlib.util
+from functools import lru_cache
 
 import torch
 
 from ...utils.kernel import storage_span
 from . import csr_execution, csr_layout as csr
-from .backend import KernelCache
+from .backend import registry as _default_registry
+
+
+@lru_cache(maxsize=1)
+def _installed():
+    return importlib.util.find_spec("tilelang") is not None
 
 
 def is_available():
     """Return whether TileLang and a CUDA device are available."""
-    return (
-        importlib.util.find_spec("tilelang") is not None and torch.cuda.is_available()
-    )
+    return _installed() and torch.cuda.is_available()
 
 
 class _Execution:
     """Bind TileLang stages to one invocation's shapes and owned views."""
 
-    def __init__(self):
+    def __init__(self, cache=None):
+        self.recipes = csr_execution.stage_recipes(
+            _default_registry.kernels if cache is None else cache, "tilelang"
+        )
         self.stages = {}
         self.inputs = {}
         self.scalar_positions = {}
@@ -72,15 +79,25 @@ class _Execution:
             writes = tuple(
                 positions.index(i) for i in csr_execution.stage_outputs(name)
             )
-            kernel = tilelang_kernel(
-                factory,
-                (shapes, dtypes, scalars, consts, device_grid),
-                views,
-                writes,
-                warps,
-                work=csr_execution.stage_work(name, args, grid) if tunable else 0,
-                overwrite=name != "csr_matvec" or not consts[6],
+            key = (
+                id(factory),
+                csr_execution.stage_signature(name, grid, args, consts, warps),
             )
+            recipe = self.recipes.get(key)
+            if recipe is None:
+                kernel = tilelang_kernel(
+                    factory,
+                    (shapes, dtypes, scalars, consts, device_grid),
+                    views,
+                    writes,
+                    warps,
+                    work=csr_execution.stage_work(name, args, grid) if tunable else 0,
+                    overwrite=name != "csr_matvec" or not consts[6],
+                )
+                recipe = csr_execution.remember_stage(
+                    self.recipes, key, (factory, kernel)
+                )
+            _, kernel = recipe
             layouts = tuple(
                 (arg.shape, arg.stride(), arg.dtype, arg.device) for arg in tensors
             )
@@ -164,23 +181,29 @@ class _Execution:
 
 
 def _prepare_matvec(cache, crow, col, values, x):
-    return csr_execution._prepare_matvec(_Execution(), cache, crow, col, values, x)
+    return csr_execution._prepare_matvec(_Execution(cache), cache, crow, col, values, x)
 
 
 def _prepare_backward(cache, *args, **kwargs):
-    return csr_execution._prepare_backward(_Execution(), cache, *args, **kwargs)
+    return csr_execution._prepare_backward(_Execution(cache), cache, *args, **kwargs)
 
 
 def csr_matvec(crow, col, values, x):
     """Multiply destination-major CSR using the shared split-row algorithm."""
-    return _prepare_matvec(KernelCache(), crow, col, values, x)(x)
+    return _prepare_matvec(_default_registry.kernels, crow, col, values, x)(x)
 
 
 def edge_grad(crow, col, grad, x, n_vb):
     """Reduce sample products for each stored edge without an edge/sample
     tape."""
     return csr_execution._prepare_edge_grad(
-        _Execution(), KernelCache(), crow, col, grad, x, n_vb
+        _Execution(_default_registry.kernels),
+        _default_registry.kernels,
+        crow,
+        col,
+        grad,
+        x,
+        n_vb,
     )(grad, x)
 
 
@@ -190,7 +213,7 @@ def csr_backward(
     """Compute edge and input adjoints with shared gather and reduction
     stages."""
     return _prepare_backward(
-        KernelCache(),
+        _default_registry.kernels,
         crow,
         col,
         t_crow,
@@ -213,7 +236,7 @@ def register(registry, priority=5):
 
     def gradient(crow, col, grad, x, n_vb):
         return csr_execution._prepare_edge_grad(
-            _Execution(), cache, crow, col, grad, x, n_vb
+            _Execution(cache), cache, crow, col, grad, x, n_vb
         )(grad, x)
 
     def backward(*args):
@@ -268,7 +291,9 @@ def register(registry, priority=5):
         return csr_execution.packed_push(_Execution(), *args, cache=cache, **kwargs)
 
     def prepare_dense(*args, **kwargs):
-        return csr_execution.prepare_task_push(_Execution(), cache, *args, **kwargs)
+        return csr_execution.prepare_task_push(
+            _Execution(cache), cache, *args, **kwargs
+        )
 
     def dense_push(*args, **kwargs):
         return task_push(*args, **kwargs, cache=cache)

@@ -161,6 +161,8 @@ def test_cupy_native_profiler_does_not_retain_invocation_storage(monkeypatch):
     import importlib
     import weakref
 
+    import numpy
+
     cupy = pytest.importorskip("cupy")
     from btorch.models.kernels.backends.renderers import CuPyRuntime
     from btorch.utils import autotune
@@ -170,9 +172,9 @@ def test_cupy_native_profiler_does_not_retain_invocation_storage(monkeypatch):
     # profiler initialization must not attach that traceback to this invocation.
     size = 8193
     kernel = cupy.RawKernel(
-        f'extern "C" __global__ void update(const float* x, float* state) {{'
+        f'extern "C" __global__ void update(const float* x, float* state, int step) {{'
         f"int i = blockIdx.x * blockDim.x + threadIdx.x;"
-        f"if (i < {size}) state[2*i] += x[2*i];"
+        f"if (i < {size}) state[2*i] += (step + 1) * x[2*i];"
         "}",
         "update",
     )
@@ -204,7 +206,7 @@ def test_cupy_native_profiler_does_not_retain_invocation_storage(monkeypatch):
     runtime = CuPyRuntime()
     launch = runtime.prepare_launch(
         kernel,
-        [source, state],
+        [source, state, numpy.int32(1)],
         size,
         changing=(0, 1),
         enable_fp_fusion=True,
@@ -213,7 +215,7 @@ def test_cupy_native_profiler_does_not_retain_invocation_storage(monkeypatch):
     torch.testing.assert_close(state, torch.full_like(state, 2), rtol=0, atol=0)
     assert scratch_refs and all(ref() is None for ref in scratch_refs)
     launch.submit()
-    torch.testing.assert_close(state, 2 + source, rtol=0, atol=0)
+    torch.testing.assert_close(state, 2 + 2 * source, rtol=0, atol=0)
 
     def no_new_trial(*_, **__):
         pytest.fail("cached CuPy preparation repeated its trial allocation")
@@ -222,17 +224,20 @@ def test_cupy_native_profiler_does_not_retain_invocation_storage(monkeypatch):
     other_state = torch.full_like(state, 4).repeat_interleave(2)[::2]
     other = runtime.prepare_launch(
         kernel,
-        [source, other_state],
+        [source, other_state, numpy.int32(1)],
         size,
         changing=(0, 1),
         enable_fp_fusion=True,
         writes=(1,),
     )
+    # Scalar ABI arguments must participate in isolated trials and remain
+    # ordinary runtime values when the prepared kernel is captured.
+    other.arguments[2] = numpy.int32(3)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         other.submit()
     graph.replay()
-    torch.testing.assert_close(other_state, 4 + source, rtol=0, atol=0)
+    torch.testing.assert_close(other_state, 4 + 4 * source, rtol=0, atol=0)
     references = [
         weakref.ref(value)
         for tensor in (source, state, other_state)

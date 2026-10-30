@@ -25,6 +25,26 @@ AlphaPSCBilleh、DualExponentialPSC。六种确定性的内置 surrogate 保持 
 
 独立神经元/PSC 序列调用复用模型元数据、已校验的布局和预备执行内核。每次调用读取当前状态与参数张量；修改 `dt` 不会重新编译内核。Triton 和 CuPy 还可跨序列长度复用内核；TileLang 目前按序列长度特化。
 
+## CUDA Graph 推理
+
+`RecurrentNN` 默认使用 `cudagraph=None`：兼容的 CUDA 推理自动使用图重放。
+推理请使用 `torch.no_grad()` 或 `torch.inference_mode()`；需要梯度的调用仍走
+普通 autograd。原生后端显式设置 `cudagraph=True` 时，分别捕获有界 chunk 的
+forward 和 reverse。每个 chunk 的反向历史独立保存，状态梯度跨 chunk 传播，
+不隐式 detach。检查点重算和 CPU offload 在捕获边界外执行，较短的末块走 eager。
+通用 Torch runner 的手动捕获仍仅支持推理。
+
+`cudagraph=False` 选择 eager 提交，也可配合
+`torch.compile(model, mode="reduce-overhead")` 使用 Inductor 对合适区域的捕获。
+图中断和仍被反向引用的 chunk 输出可能限制 Graph Trees 重放；它不保证整次训练
+迭代捕获。不要将 reduce-overhead 嵌套到手动捕获内。
+
+预热与捕获由 `chunk_size=200` 限定。等长 chunk 复用同一张图，较短的末块使用
+eager。每次调用开始时读取当前 memory，包括 reset 和原地修改。各块结果写入
+独立持有的完整序列记录，后续调用不会覆盖它。`cpu_offload=True` 将记录放到
+CPU；否则完整记录所需的 GPU 存储仍与序列长度成正比。训练中已为反向保存到
+CPU 的记录复用同一数值快照，保留传输梯度和原地修改检查，避免再次传输。
+
 ## 准备与自动调优
 
 适用的 GPU kernel 在准备阶段自动比较两个 CUDA kernel 配置。Triton 和 TileLang
@@ -46,7 +66,8 @@ capture 外完成。重复 capture 不启动搜索，
 
 `examples/rsnn.py` 展示含传播延迟的 GLIF3 + 异质 AlphaPSC；
 `examples/rsnn_izhikevich.py` 展示 Izhikevich + 异质 DualExponentialPSC。
-两者均支持推理、训练和 SONATA 导入/导出，默认在 CPU 上运行小规模网络。
+两者均支持推理、训练和 SONATA 导入/导出。GLIF 示例默认是小规模 CPU 网络；
+Izhikevich 示例默认使用 60,000 神经元、33,072,348 条边和 CUDA Graph。
 
 ```bash
 python -m examples.rsnn --device cuda --neuron-backend triton --sparse-backend triton --compile
@@ -54,7 +75,9 @@ python -m examples.rsnn_izhikevich --device cuda --neuron-backend triton --spars
 ```
 
 `--method push` 显式选择 spike-list 传播；`--method pull` 选择 pull。
-`--compile` 支持训练，显式 `--cudagraph` 要求 `--mode inference --device cuda`。
+`--cudagraph` 要求 CUDA，支持原生后端的 BPTT chunk 重放。
+`--no-cudagraph --compile` 切换为 Inductor 训练路径。长序列可使用
+`--grad-checkpoint --cpu-offload`，不截断跨 chunk 的梯度。
 参见 [示例说明](../examples.md) 了解张量形状、状态初始化及模型映射。
 
 ## 梯度与精度

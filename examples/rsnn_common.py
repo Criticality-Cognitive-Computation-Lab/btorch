@@ -47,6 +47,7 @@ class RunOptions:
     mode: str = "both"
     compare: bool = False
     recordings: Path | None = None
+    grad_checkpoint: bool = False
 
 
 def build_connection(
@@ -253,10 +254,18 @@ def main(
     parser.add_argument("--export-sonata", type=Path)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument(
+        "--grad-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=execution.grad_checkpoint,
+    )
+    parser.add_argument(
+        "--cpu-offload", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument(
         "--cudagraph",
         action=argparse.BooleanOptionalAction,
         default=defaults.cudagraph,
-        help="capture inference; training uses --compile",
+        help="capture bounded native forward/backward chunks or inference",
     )
     parser.add_argument(
         "--compare",
@@ -333,7 +342,13 @@ def main(
     )
     # Recording every state is useful for this tutorial but not required for
     # native fused inference. Large runs should disable unneeded records.
-    run = torch.compile(network, mode="reduce-overhead") if args.compile else network
+    # Explicit native graphs own their staging/tapes. Do not nest Inductor's
+    # Graph Trees inside manual capture; compile surrounding computation only.
+    run = (
+        torch.compile(network, mode="default" if args.cudagraph else "reduce-overhead")
+        if args.compile
+        else network
+    )
     with environ.context(dt=dt):
         if args.mode in ("inference", "both"):
             network.eval()
@@ -352,7 +367,7 @@ def main(
                 timings = compare_inference(network, inputs)
             initialize(network, args.device)
             with torch.inference_mode():
-                spikes, records = run(inputs)
+                spikes, records = (network if args.cudagraph else run)(inputs)
                 if args.device.split(":")[0] == "cuda":
                     torch.cuda.synchronize()
                 started = time.perf_counter()
@@ -377,7 +392,6 @@ def main(
                         flush=True,
                     )
                     args.recordings.parent.mkdir(parents=True, exist_ok=True)
-                    started = time.perf_counter()
                     torch.save(saved, args.recordings)
                     args.recordings.with_suffix(".json").write_text(
                         json.dumps(
@@ -405,21 +419,19 @@ def main(
                         + "\n"
                     )
                     print(
-                        f"disk writing: {time.perf_counter() - started:.3f} s",
-                        flush=True,
-                    )
-                    print(
                         f"recordings: {args.recordings} ({', '.join(saved)})",
                         flush=True,
                     )
                     del saved
                 del spikes, records
         if args.mode in ("train", "both"):
-            # Explicit runner owns inference buffers. Training remains native
-            # autograd, or uses compile's own graph trees when requested.
+            # Training graphs own reusable staging only; autograd retains each
+            # chunk's private tape and carries adjoints across chunk boundaries.
             initialize(network, args.device)
             network.clear_cudagraph()
-            network.cudagraph = False
+            network.cudagraph = args.cudagraph and args.neuron_backend != "torch"
+            network.grad_checkpoint = args.grad_checkpoint
+            network.cpu_offload = args.cpu_offload
             network.train()
             optimizer = torch.optim.Adam(network.parameters(), lr=1e-3)
             for epoch in range(args.epochs):

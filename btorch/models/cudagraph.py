@@ -15,16 +15,18 @@ compiled kernels, so the two wins stack. Measured on the launch-bound regime
     capture around eager                    3.2x   (one replay, unfused kernels)
     capture around torch.compile()          5.0x   (one replay, fused kernels)
 
-Correctness rests on three things that in-place-ness makes subtle:
+Stateful capture requires a few ownership and validity rules:
 
 * btorch cells *rebind* their state (``self.h = tanh(...)``) rather than mutating
   it, so the address the graph reads at step 0 is not the one the module holds
   after ``reset_net_state``. The initial state is copied into the captured buffer
   on every replay, and the module is re-pointed at the captured final state
-  afterwards.
-* Replay writes into a private memory pool, so outputs are cloned out before
-  being returned -- otherwise the next replay would silently rewrite tensors the
-  caller is still holding.
+  afterwards. Equal-sized chunks within one sequence carry their state through
+  captured feedback copies where storage aliases permit it; every outer call
+  still reads the caller's live memories.
+* Replay writes into a private memory pool, so results must be copied out before
+  the next replay. RecurrentNN copies chunks into an owned sequence destination;
+  direct runner calls clone their outputs by default.
 * A graph is only valid for the shapes/dtypes it saw at capture, so entries are
   keyed by input signature and re-captured on a miss.
 * A graph is also only valid for the *structure* it saw at capture. Replay
@@ -69,12 +71,14 @@ Note it is *these* buffers, the runner's own, that are the problem. The cells'
 ``self.h = tanh(...)`` is a rebind, not an in-place mutation: it leaves the old
 tensor untouched at version 0, and is not what breaks backward.
 
-Training with CUDA graphs works via ``torch.compile(model, mode="reduce-overhead")``,
-whose cudagraph trees capture forward and backward as separate graphs (verified
-against eager grads, including with ``grad_checkpoint``). ``make_graphed_callables``
-is the equivalent manual API, but it warms up by running a backward, which this
-loop's state mutation defeats. The runner refuses grad-recording calls up front
-rather than let them fail later and elsewhere.
+This generic runner refuses grad-recording calls up front. Native RecurrentNN
+training uses a separate functional forward/reverse graph path: each chunk's
+saved tensors live outside reusable staging buffers, preserving full BPTT.
+It does not require torch.compile. For the generic Torch path,
+``torch.compile(model, mode="reduce-overhead")`` can capture eligible regions,
+but graph breaks and live outputs can limit Graph Trees reuse. A manual
+whole-step graph is another option when the complete training workload is
+capture-safe; this runner does not implement that training schedule.
 """
 
 import gc
@@ -169,6 +173,26 @@ def clone_graph_outputs(obj: Any) -> Any:
     return obj
 
 
+def _is_static_input(value: Any) -> bool:
+    """Accept hashable static inputs, excluding containers of live tensors."""
+    if torch.is_tensor(value):
+        return False
+    if isinstance(value, (tuple, frozenset)) and not all(
+        _is_static_input(item) for item in value
+    ):
+        return False
+    try:
+        hash(value)
+    except TypeError:
+        return False
+    return True
+
+
+def _state_signature(value: torch.Tensor | None) -> tuple | None:
+    """Describe a registered memory's logical copy contract."""
+    return None if value is None else (value.shape, value.dtype, value.device)
+
+
 class _Entry:
     """One captured graph, specialised to a single input signature.
 
@@ -183,8 +207,10 @@ class _Entry:
         "graph",
         "static_args",
         "static_kwargs",
-        "static_state_in",
-        "state_out",
+        "state_bindings",
+        "state_aliases",
+        "feedback",
+        "continuous",
         "outputs",
         "versions",
     )
@@ -194,19 +220,33 @@ class _Entry:
         graph: torch.cuda.CUDAGraph,
         static_args: tuple,
         static_kwargs: dict,
-        static_state_in: dict[str, torch.Tensor],
-        state_out: dict[str, Any],
+        state_bindings: tuple,
         outputs: Any,
+        feedback: bool = False,
+        state_aliases: bool = False,
         versions: tuple = (),
     ) -> None:
         self.graph = graph
         self.static_args = static_args
         self.static_kwargs = static_kwargs
-        self.static_state_in = static_state_in
-        self.state_out = state_out
+        self.state_bindings = state_bindings
+        self.feedback = feedback
+        self.state_aliases = state_aliases
+        self.continuous = all(
+            _state_signature(target) == _state_signature(output)
+            for _, _, target, output in state_bindings
+        )
         self.outputs = outputs
         # Capture versions (see the module docstring) this graph is valid for.
         self.versions = versions
+
+    def matches_state(self) -> bool:
+        """Check the logical state contract, allowing replacement
+        storage/strides."""
+        return all(
+            _state_signature(getattr(owner, attribute)) == _state_signature(target)
+            for owner, attribute, target, _ in self.state_bindings
+        )
 
 
 class CudaGraphRunner:
@@ -289,10 +329,23 @@ class CudaGraphRunner:
     ) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("cudagraph=True requires CUDA to be available.")
-        devices = {a.device for a in args if torch.is_tensor(a)}
+        if any(
+            not torch.is_tensor(value) and not _is_static_input(value) for value in args
+        ):
+            raise TypeError(
+                "CUDA Graph inputs must be tensors or hashable static values; "
+                "nested tensor containers are not supported. Pass tensor inputs "
+                "as separate positional or keyword arguments."
+            )
+        devices = {
+            value.device
+            for value in (*args, *named_hidden_states(module).values())
+            if torch.is_tensor(value)
+        }
         if any(d.type != "cuda" for d in devices):
             raise RuntimeError(
-                f"cudagraph=True requires all inputs on a CUDA device, got {devices}."
+                "cudagraph=True requires all inputs and hidden states on a CUDA "
+                f"device, got {devices}."
             )
         # Catch training *before* the forward. Inspecting the args alone is not
         # enough: the usual training shape is plain data plus parameters that
@@ -392,6 +445,45 @@ class CudaGraphRunner:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 outputs = invoke(*static_args)
+                # Carry the final recurrent state into the next replay's
+                # static input buffers on device. This is a regular captured
+                # PyTorch copy; it does not depend on private launch APIs.
+                captured_states = named_hidden_states(module)
+                # A returned view of the initial state must not be overwritten
+                # by feedback. Cross-state aliases (e.g. swapping two memories)
+                # likewise need the ordinary copy-in path between replays.
+                initial_storage = {
+                    value.untyped_storage().data_ptr()
+                    for value in static_state_in.values()
+                }
+
+                def aliases_initial(value):
+                    if torch.is_tensor(value):
+                        return value.untyped_storage().data_ptr() in initial_storage
+                    if isinstance(value, dict):
+                        return any(aliases_initial(item) for item in value.values())
+                    if isinstance(value, (list, tuple)):
+                        return any(aliases_initial(item) for item in value)
+                    return False
+
+                state_aliases = any(
+                    captured_states[name] is not target
+                    and aliases_initial(captured_states[name])
+                    for name, target in static_state_in.items()
+                )
+                feedback = (
+                    not aliases_initial(outputs)
+                    and not state_aliases
+                    and all(
+                        _state_signature(captured_states[name])
+                        == _state_signature(target)
+                        for name, target in static_state_in.items()
+                    )
+                )
+                if feedback:
+                    for name, target in static_state_in.items():
+                        if captured_states[name] is not target:
+                            target.copy_(captured_states[name])
         finally:
             if gc_was_enabled:
                 gc.enable()
@@ -409,42 +501,47 @@ class CudaGraphRunner:
         # Stamp with the versions read *after* capture: a submodule may settle
         # its own derived state lazily during warm-up (and bump its version
         # doing so), and the graph was recorded against the settled state.
+        # Resolve memory owners once; subsequent chunks need neither a module
+        # traversal nor repeated dotted-name parsing to preserve the interface.
+        state_bindings = tuple(
+            (
+                module.get_submodule(path) if path else module,
+                attribute,
+                static_state_in.get(name, snapshot.get(name)),
+                value,
+            )
+            for name, value in state_out.items()
+            for path, _, attribute in (name.rpartition("."),)
+        )
         return _Entry(
             graph,
             static_args,
             static_kwargs,
-            static_state_in,
-            state_out,
+            state_bindings,
             outputs,
+            feedback,
+            state_aliases,
             self._versions(module),
         )
 
-    def __call__(
+    def _prepare(
         self,
         module: torch.nn.Module,
         fn: Callable[..., Any],
         args: Sequence,
         kwargs: Mapping[str, Any] | None = None,
-        clone_outputs: bool = True,
         incompatible: Mapping[str, str] | None = None,
-    ) -> Any:
-        """Replay ``fn(*args, **kwargs)``, capturing it first if needed.
-
-        Set ``clone_outputs=False`` only if the caller copies the results out of
-        the pool itself before the next replay (``.cpu()`` counts); otherwise they
-        are live only until then.
-
-        ``incompatible`` maps option names the caller has enabled but capture
-        cannot honour to the reason; any entry is refused. The runner knows
-        nothing about the module's own options.
-        """
+    ) -> _Entry:
+        """Validate one logical invocation and prepare its reusable entry."""
         kwargs = kwargs or {}
         self._check_supported(module, (*args, *kwargs.values()), incompatible)
         self._check_submodules(module)
 
         key = self._key(args, kwargs)
         entry = self.entries.get(key)
-        if entry is not None and entry.versions != self._versions(module):
+        if entry is not None and (
+            entry.versions != self._versions(module) or not entry.matches_state()
+        ):
             # Recorded for a different structure (rewired topology, another
             # execution plan, ...): replaying it would silently compute with
             # the old one. Capture again, exactly like a first call. The stale
@@ -472,6 +569,43 @@ class CudaGraphRunner:
                 k: e for k, e in self.entries.items() if e.versions == entry.versions
             }
 
+        return entry
+
+    def __call__(
+        self,
+        module: torch.nn.Module,
+        fn: Callable[..., Any],
+        args: Sequence,
+        kwargs: Mapping[str, Any] | None = None,
+        clone_outputs: bool = True,
+        incompatible: Mapping[str, str] | None = None,
+    ) -> Any:
+        """Replay a stateful forward, capturing it first if needed.
+
+        ``clone_outputs=False`` borrows graph-pool results until the next replay;
+        the caller must copy them out. ``incompatible`` names enabled options
+        that capture cannot honour. Every call checks structure and inputs.
+        """
+        kwargs = kwargs or {}
+        entry = self._prepare(module, fn, args, kwargs, incompatible)
+        return self._replay_entry(entry, args, kwargs, clone_outputs)
+
+    def _replay_entry(
+        self,
+        entry: _Entry,
+        args: Sequence,
+        kwargs: Mapping[str, Any],
+        clone_outputs: bool,
+        *,
+        continuation: bool = False,
+    ) -> Any:
+        """Replay a validated entry and preserve state ownership.
+
+        Only equal-sized chunks inside one scheduler invocation may
+        reuse the graph's state feedback. An outer call always ingests
+        live memories, including in-place edits to inference tensors
+        without version counters.
+        """
         for static, incoming in zip(entry.static_args, args):
             if torch.is_tensor(static):
                 static.copy_(incoming)
@@ -479,15 +613,28 @@ class CudaGraphRunner:
             if torch.is_tensor(static):
                 static.copy_(kwargs[name])
 
-        # The caller may have reset or advanced the state since capture, and the
-        # cells rebind rather than mutate, so feed the state in by value.
-        current = named_hidden_states(module)
-        for name, buf in entry.static_state_in.items():
-            buf.copy_(current[name])
+        if not (continuation and entry.feedback):
+            incoming = (
+                tuple(
+                    getattr(owner, attribute).clone() if target is not None else None
+                    for owner, attribute, target, _ in entry.state_bindings
+                )
+                if entry.state_aliases
+                else None
+            )
+            for index, (owner, attribute, target, _) in enumerate(entry.state_bindings):
+                if target is not None:
+                    target.copy_(
+                        incoming[index]
+                        if incoming is not None
+                        else getattr(owner, attribute)
+                    )
 
         entry.graph.replay()
 
-        set_hidden_states(module, entry.state_out)
+        for owner, attribute, _target, output in entry.state_bindings:
+            if getattr(owner, attribute) is not output:
+                setattr(owner, attribute, output)
         return clone_graph_outputs(entry.outputs) if clone_outputs else entry.outputs
 
     def reset(self) -> None:

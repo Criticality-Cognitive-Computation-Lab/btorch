@@ -289,6 +289,7 @@ def test_native_cudagraph_delayed_sparse_continuation():
     """Match delayed sparse state across split and ragged graph replays."""
     require_cuda_backend("triton")
     eager = _build("delayed_sparse", "triton")
+    eager.cudagraph = False
     captured = copy.deepcopy(eager)
     captured.cudagraph = True
     inputs = torch.linspace(0.1, 0.7, 8, device="cuda").reshape(1, 2, 4)

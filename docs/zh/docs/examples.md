@@ -65,9 +65,13 @@ python -m examples.rsnn
 python -m examples.rsnn_izhikevich --neurons 256 --density .05 --steps 256 --mode train --compile
 ```
 
-`--mode both` 先推理再训练；训练阶段关闭显式推理 capture，`--compile` 使用 Torch
-的 `reduce-overhead` 训练图机制。训练保留现有 functional BPTT、checkpoint 和 CPU
-offload 行为；chunk 化 CUDA Graph 重放只用于推理。每个 epoch 重置物理 memories，
+`--mode both` 先推理再训练。原生 GPU 后端的 `--cudagraph` 分别捕获有界 chunk
+的 forward 与 reverse，不依赖 `torch.compile`。每个 chunk 独立保存反向历史，
+状态梯度跨 chunk 传播，较短的末块使用 eager。长序列可启用
+`--grad-checkpoint`（Izhikevich 训练默认开启）限制私有激活存储。
+`--cpu-offload` 还将保存的张量和记录移到 CPU；完整记录仍需与序列长度成正比的存储。`--no-cudagraph --compile` 选择 Inductor 的 reduce-overhead 路径；
+显式图开启时 `--compile` 使用 default 模式编译周边计算，避免嵌套 Graph Trees。
+每个 epoch 重置物理 memories，
 优化 `--target-rate-hz` 和电压惩罚。
 GLIF 在 optimizer 更新后通过 `constrain_net(network)` 保持 Dale 符号，Izhikevich
 权重不受符号约束。`--edges E` 可覆盖 density，指定精确总边数。

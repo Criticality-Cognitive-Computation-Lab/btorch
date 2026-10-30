@@ -341,7 +341,10 @@ def cupy_block(kernel, args, n, writes, *, steps=None):
             return _remember_profiled(key, 128)
         benchmark = _cupy_profiler()
         scratch, reset = scratch_arguments(args, writes)
-        pointers = tuple(numpy.uintp(arg.data_ptr()) for arg in scratch)
+        pointers = tuple(
+            numpy.uintp(arg.data_ptr()) if isinstance(arg, torch.Tensor) else arg
+            for arg in scratch
+        )
         if steps is not None:
             pointers += (numpy.int32(min(steps, 1)),)
         stream = cupy.cuda.Stream.from_external(

@@ -1,6 +1,8 @@
 """Prepare stateful recurrent modules for a whole tensor sequence operator."""
 
 import json
+from contextlib import nullcontext
+from functools import lru_cache
 
 import torch
 from torch import nn
@@ -54,7 +56,17 @@ def _reject_stochastic_input_composition(module):
 
 @torch.compiler.assume_constant_result
 def _encode_recurrent_spec(spec):
-    return json.dumps(spec, sort_keys=True)
+    return _encoded_recurrent_items(
+        tuple(
+            (name, tuple(value) if isinstance(value, list) else value)
+            for name, value in sorted(spec.items())
+        )
+    )
+
+
+@lru_cache(maxsize=256)
+def _encoded_recurrent_items(items):
+    return json.dumps(dict(items), sort_keys=True)
 
 
 @torch.compiler.assume_constant_result
@@ -231,6 +243,27 @@ def recurrent_sequence(
 
     if kwargs or loop_args not in (None, (0,), (0, 1)):
         raise ValueError("Cell recurrent sequences accept time-major x and x_syn only")
+    if (
+        not _chunk
+        and module.cudagraph is True
+        and torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
+    ):
+        from .recurrent_graph import RecurrentGraphs
+
+        steps = x_seq.shape[0]
+        if module.chunk_size is not None and steps > module.chunk_size:
+            sections = (steps + module.chunk_size - 1) // module.chunk_size
+            steps = (
+                module.chunk_size
+                if module.chunk_mode == "split"
+                else (steps + sections - 1) // sections
+            )
+        graphs = getattr(module, "_training_graphs", None)
+        if graphs is None or graphs.steps != steps:
+            module._training_graphs = RecurrentGraphs(
+                steps, module._cudagraph_runner.warmup
+            )
     chunked = module.chunk_size is not None and x_seq.shape[0] > module.chunk_size
     if not _chunk and (chunked or module.grad_checkpoint or module.cpu_offload):
         # Bind sparse execution before checkpoint snapshots are taken. Preparing
@@ -602,10 +635,36 @@ def _execute(
         options.neuron,
         torch.as_tensor(neuron_spec.dt, dtype=torch.float32, device=x_seq.device),
     )
-    result = operator(
-        *arguments,
-        *((uniform_seq,) if poisson is not None and poisson.spiking else ()),
+    graphs = getattr(module, "_training_graphs", None)
+    capture = (
+        needs_backward
+        and module.cudagraph is True
+        and graphs is not None
+        and x_seq.is_cuda
+        and options.neuron in _NATIVE_GPU_BACKENDS
+        and x_seq.shape[0] == graphs.steps
+        and not torch.compiler.is_compiling()
+        and not torch.cuda.is_current_stream_capturing()
     )
+    if capture:
+        from ..cudagraph import capture_versions
+        from .registry import cell_backend_revision
+        from .templates import model_template_revision
+
+        version = (
+            capture_versions(module),
+            cell_backend_revision(options.neuron),
+            model_template_revision(neuron_spec.model),
+            model_template_revision(synapse_spec.model),
+        )
+        if graphs.version != version:
+            graphs.stages.clear()
+            graphs.version = version
+    with graphs.activate() if capture else nullcontext():
+        result = operator(
+            *arguments,
+            *((uniform_seq,) if poisson is not None and poisson.spiking else ()),
+        )
     ns = len(neuron_names)
     for name, value in zip(neuron_names, result[1 : 1 + ns]):
         setattr(module.neuron, name, value)

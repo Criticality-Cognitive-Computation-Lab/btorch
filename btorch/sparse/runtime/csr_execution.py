@@ -6,6 +6,7 @@ remain identical across backends; no renderer selects a different sparse
 algorithm.
 """
 
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -16,6 +17,34 @@ from ...utils.kernel import tensor_layout
 from . import csr_layout as csr, kernels_torch, source_layout, task_layout as tasks
 from .activity import GradientList
 from .backend import KernelCache
+
+
+def stage_recipes(cache, backend):
+    """Keep bounded tensor-free launch metadata beside prepared CSR layouts."""
+    return cache.get(("csr", "stage_recipes", backend), OrderedDict)
+
+
+def stage_signature(name, grid, args, constants, warps):
+    """Describe a stage without retaining an invocation's tensors or
+    pointers."""
+    return (
+        name,
+        grid,
+        constants,
+        warps,
+        tuple(
+            tensor_layout(value) if isinstance(value, Tensor) else value
+            for value in args
+        ),
+    )
+
+
+def remember_stage(recipes, key, value):
+    recipes[key] = value
+    recipes.move_to_end(key)
+    while len(recipes) > 128:
+        recipes.popitem(last=False)
+    return value
 
 
 def stage_outputs(name):

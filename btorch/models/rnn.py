@@ -1,3 +1,4 @@
+import weakref
 from abc import abstractmethod
 from collections.abc import Callable, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
@@ -12,7 +13,7 @@ from torch.utils.checkpoint import checkpoint
 
 from . import base, environ, synapse
 from .base import StepMode
-from .cudagraph import CudaGraphRunner
+from .cudagraph import CudaGraphRunner, _is_static_input
 from .functional import filter_hidden_states, named_hidden_states, set_hidden_states
 from .gradients import BPTT
 
@@ -20,6 +21,23 @@ from .gradients import BPTT
 _sparse_scope_states: ContextVar[dict[int, tuple[int, tuple[int, torch.dtype]]]] = (
     ContextVar("btorch_sparse_run_scopes", default={})
 )
+_offload_snapshots: ContextVar[dict | None] = ContextVar(
+    "btorch_offload_snapshots", default=None
+)
+
+
+class _OffloadedTrace(torch.autograd.Function):
+    """Reuse an already offloaded value while retaining its transfer
+    adjoint."""
+
+    @staticmethod
+    def forward(ctx, value, snapshot):
+        ctx.device = value.device
+        return snapshot
+
+    @staticmethod
+    def backward(ctx, gradient):
+        return gradient.to(ctx.device), None
 
 
 def _restore_autograd_multithreading() -> None:
@@ -92,6 +110,12 @@ def _chunk_to_cpu(z, states: dict):
 
     def to_cpu(x):
         if isinstance(x, Tensor):
+            snapshots = _offload_snapshots.get()
+            entry = None if snapshots is None else snapshots.get(id(x))
+            if entry is not None:
+                owner, version, snapshot = entry
+                if owner() is x and x._version == version:
+                    return _OffloadedTrace.apply(x, snapshot)
             return x.cpu()
         # One transfer per chunk/record, preserving the existing list-of-steps
         # contract and its autograd edges without a copy launch per timestep.
@@ -143,6 +167,7 @@ def _offload_saved_tensors(
         yield
         return
     resident = {_tensor_storage_key(tensor) for tensor in persistent}
+    snapshots = {}
 
     def pack(tensor: Tensor):
         key = _tensor_storage_key(tensor)
@@ -165,7 +190,16 @@ def _offload_saved_tensors(
             # Hooks bypass SavedVariable's normal version check. Keep a detached
             # resident view and restore that check explicitly on unpack.
             return "resident", tensor.device, tensor.detach(), version
-        return "cpu", tensor.device, tensor.detach().cpu(), None
+        entry = snapshots.get(id(tensor))
+        if entry is not None and entry[0]() is tensor and entry[1] == version:
+            snapshot = entry[2]
+        else:
+            snapshot = tensor.detach().cpu()
+            # Weak owners prevent this memo from retaining a chunk's GPU tape.
+            snapshots[id(tensor)] = weakref.ref(tensor), version, snapshot
+        # Public traces may share this CPU snapshot. Preserve mutation checking
+        # when a caller edits a trace that backward still needs.
+        return "cpu", tensor.device, snapshot, snapshot._version
 
     def unpack(value):
         kind, device, tensor, version = value
@@ -173,8 +207,12 @@ def _offload_saved_tensors(
             raise RuntimeError("a saved recurrent tensor was modified in-place")
         return tensor if kind == "resident" else tensor.to(device)
 
-    with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
-        yield
+    token = _offload_snapshots.set(snapshots)
+    try:
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+            yield
+    finally:
+        _offload_snapshots.reset(token)
 
 
 def _sparse_run_arguments(loop_tensor: Tensor) -> tuple[int, torch.dtype]:
@@ -288,20 +326,26 @@ class RecurrentNNAbstract(base.MemoryModule):
 
     CUDA-graph acceleration comes in two flavours, one per use case:
 
-    * Inference: ``cudagraph=True`` captures the loop's device work and replays
-      it (see ``cudagraph.py``). It is the fastest option and composes with
+    * Inference: ``cudagraph=None`` automatically captures compatible CUDA
+      inference; ``cudagraph=True`` explicitly requires capture, while
+      ``cudagraph=False`` opts out. The runner captures the loop's device work
+      and replays it (see ``cudagraph.py``). It composes with
       ``torch.compile`` and ``cpu_offload``, but is inference-only. Warm-up,
       capture and replay use pieces of at most ``chunk_size`` steps (default
       200). ``chunk_mode="split"`` uses torch.split; ``"chunk"`` uses
       torch.chunk with ceil(T / chunk_size) sections. A shorter final piece
       runs eagerly rather than creating a graph used only once per sequence.
-      ``None`` explicitly opts out of outer chunking.
-    * Training: wrap the module in ``torch.compile(model, mode="reduce-overhead")``
-      instead. Its CUDAGraph Trees capture forward and backward separately, so it
-      is correct through ``backward()`` and composes with ``grad_checkpoint`` and
-      ``cpu_offload`` -- call ``torch.compiler.cudagraph_mark_step_begin()`` once
-      per iteration. ``cudagraph=True`` refuses grad-recording calls and points
-      here.
+      ``chunk_size=None`` explicitly opts out of outer chunking.
+    * Native training: ``cudagraph=True`` captures the functional forward and
+      reverse of a bounded chunk separately. Autograd owns private chunk tapes
+      and carries state adjoints across chunks; no implicit detach is inserted.
+      Checkpointing and CPU offload remain outside capture. The generic Torch
+      runner is still inference-only. Alternatively, use ``cudagraph=False``
+      with ``torch.compile(model, mode="reduce-overhead")`` for eligible compiled
+      regions. Graph breaks and live chunk outputs can limit Graph Trees; this
+      does not promise whole-iteration capture. Call
+      ``torch.compiler.cudagraph_mark_step_begin()`` per completed training
+      iteration, never between chunks with outstanding backward work.
 
     A captured graph is tied to the structure it was recorded for. Submodules
     whose structure can change in place (a sparse connection that is rewired
@@ -322,7 +366,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         grad_checkpoint: bool = False,
         save_grad_history: bool = False,
         grad_state_names: Sequence[str] | None = None,
-        cudagraph: bool = False,
+        cudagraph: bool | None = None,
         cudagraph_warmup: int = 3,
     ):
         super().__init__()
@@ -355,6 +399,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         captures.
         """
         self._cudagraph_runner.reset()
+        self.__dict__.pop("_training_graphs", None)
 
     def _detect_loop_args(self, *args: Any) -> tuple[int, tuple[int, ...]]:
         """Infer ``(T, loop_args)`` from the first positional argument.
@@ -380,6 +425,41 @@ class RecurrentNNAbstract(base.MemoryModule):
             )
         loop_args = tuple(i for i, s in enumerate(shapes) if s == T)
         return T, loop_args
+
+    def _cudagraph_enabled(self, args: Sequence[Any], kwargs: dict[str, Any]) -> bool:
+        """Resolve automatic CUDA-graph inference selection once per call."""
+        if self.cudagraph is not None:
+            return self.cudagraph
+        if torch.compiler.is_compiling() or self._cudagraph_incompatibilities():
+            return False
+        values = (*args, *kwargs.values())
+        tensors = [value for value in values if isinstance(value, Tensor)]
+        if not tensors or any(value.device.type != "cuda" for value in tensors):
+            return False
+        # The runner's static inputs are positional/keyword tensors, not nested
+        # containers. Leave unsupported input structures on the ordinary path.
+        if any(
+            not _is_static_input(value)
+            for value in values
+            if not isinstance(value, Tensor)
+        ):
+            return False
+        if torch.is_grad_enabled() and (
+            any(value.requires_grad for value in tensors)
+            or any(parameter.requires_grad for parameter in self.parameters())
+            or any(buffer.requires_grad for buffer in self.buffers())
+        ):
+            return False
+        if any(
+            value.device.type != "cuda"
+            for value in named_hidden_states(self).values()
+            if isinstance(value, Tensor)
+        ):
+            return False
+        return not any(
+            submodule.capture_incompatibility()
+            for _, submodule in self._cudagraph_runner._participants_of(self)[1]
+        )
 
     @abstractmethod
     def single_step_forward(
@@ -552,12 +632,13 @@ class RecurrentNNAbstract(base.MemoryModule):
             scoped_loop_args = loop_args
         if args[scoped_loop_args[0]].shape[0] == 0:
             raise ValueError("RecurrentNN requires at least one timestep")
+        use_cudagraph = self._cudagraph_enabled(args, kwargs)
         with _sparse_run_scope(
             self,
             args[scoped_loop_args[0]],
-            stable_addresses=self.cudagraph,
+            stable_addresses=use_cudagraph,
         ):
-            if self.cudagraph:
+            if use_cudagraph:
                 return self._cudagraph_multi_step(*args, loop_args=loop_args, **kwargs)
             return self._multi_step_forward_impl(*args, loop_args=loop_args, **kwargs)
 
@@ -745,6 +826,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         full_states = None
         time_offset = 0
         replay_length = None
+        entry = None
         from .kernels.operators import poisson_uniforms
         from .kernels.options import normalize_backend
         from .surrogate import PoissonRandomSpike, Truncated
@@ -786,13 +868,21 @@ class RecurrentNNAbstract(base.MemoryModule):
             if length < replay_length:
                 z, states = fn(*capture_args, **kwargs)
             else:
-                z, states = self._cudagraph_runner(
-                    self,
-                    fn,
+                continuation = entry is not None and entry.continuous
+                if not continuation:
+                    entry = self._cudagraph_runner._prepare(
+                        self,
+                        fn,
+                        capture_args,
+                        kwargs,
+                        incompatible=self._cudagraph_incompatibilities(),
+                    )
+                z, states = self._cudagraph_runner._replay_entry(
+                    entry,
                     capture_args,
                     kwargs,
                     clone_outputs=n_chunks == 1 and not self.cpu_offload,
-                    incompatible=self._cudagraph_incompatibilities(),
+                    continuation=continuation,
                 )
 
             if n_chunks == 1:
@@ -1013,7 +1103,21 @@ class RecurrentNN(RecurrentNNAbstract):
             validate_merge_module(self)
 
     def _apply(self, fn):
+        graphs = self.__dict__.get("_training_graphs")
+        before = (
+            tuple(
+                (t.device, t.dtype, t.data_ptr())
+                for t in (*self.parameters(), *self.buffers())
+            )
+            if graphs is not None
+            else None
+        )
         result = super()._apply(fn)
+        if before is not None and before != tuple(
+            (t.device, t.dtype, t.data_ptr())
+            for t in (*self.parameters(), *self.buffers())
+        ):
+            self.__dict__.pop("_training_graphs", None)
         if hasattr(self, "_backend"):
             self._refresh_merge_validation(self, None)
         return result
@@ -1172,13 +1276,23 @@ class RecurrentNN(RecurrentNNAbstract):
 
     def multi_step_forward(self, *args, loop_args=None, **kwargs):
         self._reject_native_conductance_recurrence()
+        use_cudagraph = self._cudagraph_enabled(args, kwargs)
+        # Native sequence operators expose their complete tapes and VJPs.
+        # Their training graphs preserve private tapes across outstanding
+        # chunks; the generic forward-only runner cannot do that.
+        if use_cudagraph and self.backend != "torch" and torch.is_grad_enabled():
+            values = (*args, *self.parameters(), *self.buffers())
+            if any(isinstance(t, Tensor) and t.requires_grad for t in values):
+                return self._graphed_training_forward(
+                    *args, loop_args=loop_args, **kwargs
+                )
         if self.backend == "torch":
             from .kernels.adapters import connection_scope
             from .kernels.options import normalize_backend
 
             with connection_scope(normalize_backend(self.backend)):
                 return super().multi_step_forward(*args, loop_args=loop_args, **kwargs)
-        if self.cudagraph:
+        if use_cudagraph:
             from .kernels.options import normalize_backend
 
             if normalize_backend(self.backend).merge_synapse and not getattr(
@@ -1187,13 +1301,33 @@ class RecurrentNN(RecurrentNNAbstract):
                 from .kernels.recurrent import prepare_merged_state
 
                 prepare_merged_state(self)
-        if self.cudagraph or self.save_grad_history or self.grad_state_names:
+        if use_cudagraph or self.save_grad_history or self.grad_state_names:
             from .kernels.adapters import connection_scope
             from .kernels.options import normalize_backend
 
             with connection_scope(normalize_backend(self.backend)):
                 return super().multi_step_forward(*args, loop_args=loop_args, **kwargs)
         from .kernels.recurrent import recurrent_sequence
+
+        return recurrent_sequence(self, *args, loop_args=loop_args, **kwargs)
+
+    @torch.compiler.disable
+    def _graphed_training_forward(self, *args, loop_args=None, **kwargs):
+        """Keep explicit graph preparation outside Dynamo/Graph Trees."""
+        from .kernels.options import normalize_backend
+        from .kernels.recurrent import recurrent_sequence
+        from .kernels.registry import _NATIVE_GPU_BACKENDS
+
+        if normalize_backend(self.backend).neuron not in _NATIVE_GPU_BACKENDS:
+            raise RuntimeError(
+                "CUDA Graph BPTT requires native Triton, CuPy or TileLang kernels; "
+                "use cudagraph=False for Torch/reference training"
+            )
+        if self.save_grad_history or self.grad_state_names:
+            raise RuntimeError(
+                "CUDA Graph BPTT does not support per-timestep gradient-history "
+                "hooks; use cudagraph=False for gradient-history recording"
+            )
 
         return recurrent_sequence(self, *args, loop_args=loop_args, **kwargs)
 

@@ -76,10 +76,16 @@ python -m examples.rsnn
 python -m examples.rsnn_izhikevich --neurons 256 --density .05 --steps 256 --mode train --compile
 ```
 
-`--mode both` runs inference and training. Inference capture is disabled for
-training; `--compile` uses Torch's `reduce-overhead` training graph machinery.
-Training keeps the existing functional BPTT, checkpointing, and CPU-offload
-behavior; chunked CUDA Graph replay is an inference-only feature. Each epoch starts
+`--mode both` runs inference and training. With native GPU backends,
+`--cudagraph` captures bounded forward and reverse chunks without requiring
+`torch.compile`. Each chunk retains its own autograd tape, so state gradients
+cross chunk boundaries. A shorter final piece runs eagerly. Use
+checkpointing (enabled by default for Izhikevich training) to bound private
+activations. `--cpu-offload` also moves saved tensors and traces to CPU;
+requested traces still require storage proportional to sequence length.
+`--no-cudagraph --compile` selects Inductor's `reduce-overhead` training path;
+with explicit graphs, `--compile` uses default mode for surrounding computation
+rather than nesting Graph Trees inside manual capture. Each epoch starts
 from fresh physical memories and fits `--target-rate-hz` plus a voltage penalty.
 This demonstrates gradients through neuron parameters and recurrent weights;
 it is not a scientific fitting task. Changing neuron count or density changes

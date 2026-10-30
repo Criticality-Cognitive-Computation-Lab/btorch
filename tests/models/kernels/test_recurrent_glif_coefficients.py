@@ -68,7 +68,7 @@ def _model(backend: str, tau_layout: str, device: str = "cuda") -> RecurrentNN:
         ExponentialPSC(4, 2.4, connection),
         backend=KernelOptions(neuron=backend),
         update_state_names=STATE_NAMES,
-    ).float()
+    ).to(device=device, dtype=torch.float32)
     neuron.init_state(batch_size=2, dtype=torch.float32, device=device)
     model.synapse.init_state(batch_size=2, dtype=torch.float32, device=device)
     lane = torch.arange(8, device=device, dtype=torch.float32).reshape(2, 4)

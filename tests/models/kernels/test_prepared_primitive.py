@@ -218,7 +218,7 @@ def test_prepared_native_plan_reuses_source_for_new_runtime_values(
 ):
     """Each renderer reuses a warmed plan for new values and outputs."""
     require_cuda_backend(backend)
-    engine._forward_plan.cache_clear()
+    engine._primitive_plan.cache_clear()
     engine._kernel_plan.cache_clear()
     engine._generate_source.cache_clear()
     engine._compile_cached.cache_clear()
@@ -242,11 +242,11 @@ def test_prepared_native_plan_reuses_source_for_new_runtime_values(
 
     with torch.inference_mode():
         first_result = run_multi_step(first, state, parameters, spec, backend=backend)
-        warmed = engine._forward_plan.cache_info()
+        warmed = engine._primitive_plan.cache_info()
         second_result = run_multi_step(
             second, state, parameters, second_spec, backend=backend
         )
-    repeated = engine._forward_plan.cache_info()
+    repeated = engine._primitive_plan.cache_info()
     first_expected = python_module_sequence(first, state, parameters, spec)
     second_expected = python_module_sequence(second, state, parameters, second_spec)
     for actual, expected in zip(
@@ -307,7 +307,7 @@ def test_gradient_producer_rebinds_shared_storage_without_changing_results():
     require_cuda_backend("tilelang")
     from btorch.sparse.runtime.activity import GradientList
 
-    engine._forward_plan.cache_clear()
+    engine._primitive_plan.cache_clear()
     steps, neurons = 2, 4
     tape_width = GradientList.size(neurons)
     shared = torch.zeros(
@@ -331,7 +331,7 @@ def test_gradient_producer_rebinds_shared_storage_without_changing_results():
         ("v",),
         gradient_activity=separate_tape,
     )
-    warmed = engine._forward_plan.cache_info()
+    warmed = engine._primitive_plan.cache_info()
     second = engine.forward(
         "tilelang",
         x,
@@ -341,7 +341,7 @@ def test_gradient_producer_rebinds_shared_storage_without_changing_results():
         ("v",),
         gradient_activity=shared_tape,
     )
-    assert engine._forward_plan.cache_info().misses == warmed.misses + 1
+    assert engine._primitive_plan.cache_info().misses == warmed.misses + 1
     expected = python_module_sequence(x, state, parameters, spec, ("v",))
     for actual in (first, second):
         for value, reference in zip(
@@ -380,3 +380,89 @@ def test_sequence_operator_functional_and_autograd_contracts():
             dt,
         ),
     )
+
+
+@pytest.mark.parametrize("backend", ("triton", "cupy", "tilelang"))
+def test_prepared_reverse_rebinds_tapes_and_strided_cotangents(backend, monkeypatch):
+    """Reuse reverse preparation without owning tensors or losing full VJPs."""
+    require_cuda_backend(backend)
+    engine._primitive_plan.cache_clear()
+    original_launch = engine._launch
+    reverse_preparations = 0
+
+    def count_preparation(*args, **kwargs):
+        nonlocal reverse_preparations
+        reverse_preparations += bool(kwargs.get("backward"))
+        return original_launch(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "_launch", count_preparation)
+    references = []
+    for index in range(4 if backend == "triton" else 3):
+        # New storage and dt must bind to the same executable. Later passes
+        # change cotangent or saved-history strides and need new reverse plans.
+        spec = NeuronSpec("lif", dt=0.25 + index * 0.1, hard_reset=True)
+        x = torch.linspace(0.05, 0.9, 24, device="cuda").reshape(4, 2, 3)
+        x = (x + index * 0.03).requires_grad_()
+        state = torch.full((2, 3), 0.1 * index, device="cuda", requires_grad=True)
+        parameters = tuple(
+            torch.tensor(value, device="cuda", requires_grad=True)
+            for value in (0.8, -0.1, 1.2, 3.0)
+        )
+        restored_histories = []
+
+        def pack(value, source=x):
+            return value, value is not source and value.shape == source.shape
+
+        def unpack(packed):
+            value, is_history = packed
+            if index == 3 and is_history:
+                restored = torch.empty((*value.shape, 2), device=value.device)[..., 0]
+                restored.copy_(value)
+                restored_histories.append(tuple(restored.stride()))
+                return restored
+            return value
+
+        # One renderer also exercises real saved-tensor restoration: offload
+        # hooks may restore a history in new storage with different strides.
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+            actual = run_multi_step(
+                x,
+                (state,),
+                parameters,
+                spec,
+                HistoryPlan(requested=("v",)),
+                backend=backend,
+            )
+        expected = _flat_sequence(
+            python_module_sequence(x, (state,), parameters, spec, ("v",))
+        )
+        cotangents = tuple(
+            torch.ones((*value.shape, 2), device="cuda")[..., 0]
+            if index == 2
+            else torch.ones_like(value)
+            for value in actual
+        )
+        roots = (x, state, *parameters)
+        gradients = torch.autograd.grad(actual, roots, cotangents)
+        golden = torch.autograd.grad(expected, roots, cotangents, allow_unused=True)
+        for value, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(value, reference, atol=5e-5, rtol=5e-5)
+        for value, reference, root in zip(gradients, golden, roots, strict=True):
+            torch.testing.assert_close(
+                value,
+                torch.zeros_like(root) if reference is None else reference,
+                atol=5e-5,
+                rtol=5e-5,
+            )
+        assert reverse_preparations == (1 if index < 2 else index)
+        if index == 3:
+            assert restored_histories
+        references.extend(
+            weakref.ref(value) for value in (*roots, *actual, *cotangents)
+        )
+        del roots, x, state, parameters, actual, expected, cotangents, gradients, golden
+        del pack, unpack
+    # Plans may retain executables and layouts, never a saved autograd tape.
+    del value, reference, root
+    gc.collect()
+    assert all(reference() is None for reference in references)

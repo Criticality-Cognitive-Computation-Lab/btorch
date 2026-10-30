@@ -779,15 +779,24 @@ class RendererRuntime:
         del span
         return value
 
-    def bind_current_stream(self, launch):
+    def bind_submission(self, launch):
         """Bind an invocation's repeated submissions to its active stream."""
-        return launch.submit
+        return launch.launch, launch.constants, None
 
     def bind_rows(self, value, span):
         """Prepare a sequence's argument views for a tensor-based ABI."""
         return tuple(self.argument(row, span) for row in value.unbind(0))
 
-    def prepare_launch(self, kernel, args, n, *, changing, enable_fp_fusion, writes=()):
+    def prepare_launch(
+        self,
+        kernel,
+        args,
+        n,
+        *,
+        changing,
+        enable_fp_fusion,
+        writes=(),
+    ):
         """Bind launch policy for an invocation with stable argument
         layouts."""
         del args, changing, writes
@@ -814,22 +823,17 @@ class TritonRuntime(RendererRuntime):
     supports_dynamic_steps = True
     supports_pointer_offsets = True
 
-    def bind_current_stream(self, prepared):
+    def bind_submission(self, prepared):
         import torch
 
         stream = torch.cuda.current_stream(prepared.owners[0].device)
-        launch, args, constants = (
-            prepared.launch,
-            prepared.arguments,
+        # Retain the stream separately; partial forwards directly to Triton's
+        # public grid callable, including its profiling hooks.
+        return (
+            functools.partial(prepared.launch, stream=stream.cuda_stream),
             prepared.constants,
+            stream,
         )
-
-        def submit():
-            # Use the public compiled grid callable, including profiler hooks.
-            # This binding lives only for the current trajectory invocation.
-            launch(*args, *constants, stream=stream.cuda_stream)
-
-        return submit
 
     def prepare_recipe(
         self, kernel, args, n, *, steps, enable_fp_fusion, debug, num_warps, writes=()
@@ -869,22 +873,45 @@ class TritonRuntime(RendererRuntime):
 
         return invoke
 
-    def prepare_launch(self, kernel, args, n, *, changing, enable_fp_fusion, writes=()):
-        # Row views can change alignment even when shape/strides are constant.
-        # Specialize dtype/layout once, but never assume the first row's pointer
-        # alignment for changing arguments. Static parameters retain alignment.
+    def prepare_launch(
+        self,
+        kernel,
+        args,
+        n,
+        *,
+        changing,
+        enable_fp_fusion,
+        writes=(),
+    ):
+        # Generated cells do not specialize pointer alignment. Cache executable
+        # metadata only; every invocation binds fresh addresses and owners.
+        from ....utils.kernel import PreparedLaunch
         from ....utils.triton import prepare_launch
 
-        return prepare_launch(
+        key = (
+            "bound",
             kernel,
-            args,
-            ((n + 127) // 128,),
-            (("BLOCK", 128),),
-            changing=changing,
-            writes=writes,
-            work=n,
-            enable_fp_fusion=enable_fp_fusion,
+            self._argument_contract(args),
+            n,
+            enable_fp_fusion,
+            tuple(writes),
         )
+        recipe = self._recipes.get(key)
+        if recipe is None:
+            prepared = prepare_launch(
+                kernel,
+                args,
+                ((n + 127) // 128,),
+                (("BLOCK", 128),),
+                changing=changing,
+                writes=writes,
+                work=n,
+                enable_fp_fusion=enable_fp_fusion,
+            )
+            self._remember_recipe(key, (prepared.launch, prepared.constants))
+            return prepared
+        launch, constants = recipe
+        return PreparedLaunch(launch, list(args), tuple(changing), constants)
 
     def compile(self, source, enable_fp_fusion, precise_division, stamp, target):
         del enable_fp_fusion, stamp, target
@@ -904,6 +931,18 @@ class CuPyRuntime(RendererRuntime):
     name = "cupy"
     supports_dynamic_steps = True
     supports_pointer_offsets = True
+
+    def bind_submission(self, prepared):
+        import cupy
+        import torch
+
+        owner = torch.cuda.current_stream(prepared.owners[0].device)
+        stream = cupy.cuda.Stream.from_external(owner)
+        return (
+            functools.partial(prepared.launch, stream=stream),
+            prepared.constants,
+            (owner, stream),
+        )
 
     def prepare_recipe(
         self, kernel, args, n, *, steps, enable_fp_fusion, debug, num_warps, writes=()
@@ -931,7 +970,16 @@ class CuPyRuntime(RendererRuntime):
 
         return invoke
 
-    def prepare_launch(self, kernel, args, n, *, changing, enable_fp_fusion, writes=()):
+    def prepare_launch(
+        self,
+        kernel,
+        args,
+        n,
+        *,
+        changing,
+        enable_fp_fusion,
+        writes=(),
+    ):
         del enable_fp_fusion
         import cupy
         import torch
@@ -942,15 +990,17 @@ class CuPyRuntime(RendererRuntime):
         device = args[0].device.index
         block = cupy_block(kernel, args, n, writes)
         grid = (-(-n // block),)
-        stream = cupy.cuda.Stream.from_external(torch.cuda.current_stream(device))
+        last_stream = cupy.cuda.Stream.from_external(torch.cuda.current_stream(device))
 
-        def launch(*pointers):
-            nonlocal stream
+        def launch(*pointers, stream=None):
+            nonlocal last_stream
             # Resolve the caller's stream at submission, including capture.
-            # The fused invocation already owns the device guard.
-            current = torch.cuda.current_stream(device)
-            if current.cuda_stream != stream.ptr:
-                stream = cupy.cuda.Stream.from_external(current)
+            # Recurrent bindings supply their invocation-owned stream directly.
+            if stream is None:
+                current = torch.cuda.current_stream(device)
+                if current.cuda_stream != last_stream.ptr:
+                    last_stream = cupy.cuda.Stream.from_external(current)
+                stream = last_stream
             kernel(grid, (block,), pointers, stream=stream)
 
         return PreparedLaunch(launch, list(args), tuple(changing), ())
@@ -1002,7 +1052,16 @@ class TileLangRuntime(RendererRuntime):
 
         return invoke
 
-    def prepare_launch(self, kernel, args, n, *, changing, enable_fp_fusion, writes=()):
+    def prepare_launch(
+        self,
+        kernel,
+        args,
+        n,
+        *,
+        changing,
+        enable_fp_fusion,
+        writes=(),
+    ):
         del changing, enable_fp_fusion
         from ....utils.autotune import outputs_are_disjoint, tilelang_kernel
 

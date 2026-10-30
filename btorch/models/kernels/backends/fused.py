@@ -7,7 +7,9 @@ cell launches.
 """
 
 import functools
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
+from threading import RLock
 
 import torch
 
@@ -16,6 +18,7 @@ from ..templates import RecordCotangent, get_template, model_template_revision
 from .engine import (
     _compile,
     _device_scope,
+    _dt_buffer,
     _layout,
     _load_prepared_parameters,
     _mode_name,
@@ -23,11 +26,94 @@ from .engine import (
     _parameter_index,
     _prepare,
     _prepare_parameters,
+    _sequence_layout,
     _Source,
     _tensor_storage,
 )
 from .fragments import get_fragments, scalar_layout
 from .renderers import get_runtime
+
+
+_FUSED_PLANS = OrderedDict()
+_FUSED_PLAN_LOCK = RLock()
+
+
+@dataclass(frozen=True)
+class _FusedPlan:
+    """Retain static paired-stage metadata, never invocation tensors."""
+
+    factory: object
+    state_names: tuple
+    parameter_names: tuple
+    state_shapes: dict
+
+    def bind_inputs(self, neuron_input, drive, states, parameters, specs, coefficients):
+        if (
+            len(states) != 2
+            or len(parameters) != 2
+            or len(specs) != 2
+            or len(coefficients) != 2
+        ):
+            raise ValueError("Paired preparation requires neuron and PSC groups")
+        buffers = {
+            "neuron_input": neuron_input,
+            "drive": drive,
+            "neuron_dt": _dt_buffer(specs[0].dt, neuron_input),
+            "psc_dt": _dt_buffer(specs[1].dt, neuron_input),
+        }
+        for prefix, names, parameter_names, values, params, computed in zip(
+            ("neuron_", "psc_"),
+            self.state_names,
+            self.parameter_names,
+            states,
+            parameters,
+            coefficients,
+        ):
+            if len(values) != len(names) or len(params) != len(parameter_names):
+                raise ValueError(
+                    "Paired state or parameter count disagrees with the plan"
+                )
+            for name, value in zip(names, values):
+                target = self.state_shapes[prefix + name + "_init"]
+                buffers[prefix + name + "_init"] = (
+                    value if value.shape == target else value.expand(target)
+                )
+            buffers.update(
+                (prefix + name, value)
+                for name, value in zip(parameter_names, _parameter_buffers(params))
+            )
+            buffers.update(
+                (prefix + name, value.resolve_neg())
+                for name, value in (computed or {}).items()
+            )
+        return buffers
+
+    def bind(
+        self,
+        neuron_input,
+        drive,
+        states,
+        parameters,
+        specs,
+        coefficients,
+        uniform,
+        spike_list,
+        gradient_activity,
+    ):
+        buffers = self.bind_inputs(
+            neuron_input, drive, states, parameters, specs, coefficients
+        )
+        if uniform is not None:
+            buffers["neuron_uniform"] = uniform
+        if spike_list is not None:
+            buffers.update(spike_list.bindings())
+        if gradient_activity is not None:
+            buffers["gradient_activity"] = gradient_activity
+        return self.factory(buffers=buffers)
+
+
+def _fused_layout(value):
+    return None if value is None else (*_sequence_layout(value), value.is_neg())
 
 
 def _prepare_psc_parameters(parameters, template, physical_target, logical_target):
@@ -363,6 +449,8 @@ class _PreparedFusedLaunch:
     arguments: list
     slots: dict
     owners: list
+    constants: tuple = ()
+    stream: object = None
 
 
 @dataclass
@@ -519,16 +607,19 @@ class _FusedStep:
             )
         if self.runtime.supports_pointer_offsets:
             args, owners = launch.arguments, launch.owners
-            submit = self.runtime.bind_current_stream(launch)
+            submit, constants, stream = self.runtime.bind_submission(launch)
         else:
             owners = args
             submit = functools.partial(launch, args)
+            constants, stream = (), None
 
         return _PreparedFusedLaunch(
             submit,
             args,
             {name: (index, size) for index, name, size in updates},
             owners,
+            constants,
+            stream,
         )
 
 
@@ -562,6 +653,57 @@ def prepare_fused_step(
     """
     if neuron_input.device.type != "cuda":
         raise ValueError("Fused GPU cells require CUDA tensors")
+    semantic_specs = (replace(neuron_spec, dt=1.0), replace(psc_spec, dt=1.0))
+    key = (
+        backend,
+        semantic_specs,
+        model_template_revision(neuron_spec.model),
+        model_template_revision(psc_spec.model),
+        (_fused_layout(neuron_input), _fused_layout(drive)),
+        tuple(
+            tuple(_fused_layout(value) for value in group)
+            for group in (
+                neuron_states,
+                psc_states,
+                neuron_parameters,
+                psc_parameters,
+            )
+        ),
+        (_fused_layout(uniform), _fused_layout(gradient_activity)),
+        tuple(
+            tuple((name, _fused_layout(value)) for name, value in sorted(items.items()))
+            if items
+            else ()
+            for items in (neuron_prepared_parameters, psc_prepared_parameters)
+        ),
+        ()
+        if spike_list is None
+        else tuple(
+            (name, _fused_layout(value))
+            for name, value in spike_list.bindings().items()
+        ),
+        tuple(neuron_history_names),
+        tuple(psc_history_names),
+        enable_fp_fusion,
+        precise_division,
+        precise_exp,
+    )
+    with _FUSED_PLAN_LOCK:
+        plan = _FUSED_PLANS.get(key)
+        if plan is not None:
+            _FUSED_PLANS.move_to_end(key)
+    if plan is not None:
+        return plan.bind(
+            neuron_input,
+            drive,
+            (neuron_states, psc_states),
+            (neuron_parameters, psc_parameters),
+            (neuron_spec, psc_spec),
+            (neuron_prepared_parameters, psc_prepared_parameters),
+            uniform,
+            spike_list,
+            gradient_activity,
+        )
     n = neuron_input.numel()
     _state_receptors = psc_states[0].numel() // n
     _drive_receptors = drive.numel() // n
@@ -661,8 +803,7 @@ def prepare_fused_step(
     source_factory = functools.partial(
         generate_fused_source,
         backend,
-        neuron_spec,
-        psc_spec,
+        *semantic_specs,
         n,
         _state_receptors,
         _drive_receptors,
@@ -683,19 +824,35 @@ def prepare_fused_step(
         backend, source, enable_fp_fusion, precise_division, device=neuron_input.device
     )
 
-    return _FusedStep(
+    factory = functools.partial(
+        _FusedStep,
         backend,
         kernel,
         n,
-        buffers,
-        declarations,
-        strided_names,
-        output_shapes,
-        enable_fp_fusion,
+        declarations=declarations,
+        strided_names=strided_names,
+        output_shapes=output_shapes,
+        enable_fp_fusion=enable_fp_fusion,
         storage=storage,
         source_factory=source_factory,
         precise_division=precise_division,
     )
+    plan = _FusedPlan(
+        factory,
+        (neuron.state_names, psc.state_names),
+        (neuron.parameter_names, psc.parameter_names),
+        {
+            prefix + name + "_init": tuple(buffers[prefix + name + "_init"].shape)
+            for prefix, template in (("neuron_", neuron), ("psc_", psc))
+            for name in template.state_names
+        },
+    )
+    with _FUSED_PLAN_LOCK:
+        _FUSED_PLANS[key] = plan
+        _FUSED_PLANS.move_to_end(key)
+        if len(_FUSED_PLANS) > 256:
+            _FUSED_PLANS.popitem(last=False)
+    return factory(buffers=buffers)
 
 
 def fused_step_forward(
@@ -1063,6 +1220,7 @@ class _FusedBackwardStep:
     psc_parameter_names: set[str]
     outputs: tuple = field(init=False)
     index: int = field(default=0, init=False)
+    launches: dict = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self):
         # Alternate destinations: incoming adjoints remain readable throughout
@@ -1105,16 +1263,40 @@ class _FusedBackwardStep:
         ):
             for name, state, gradient in zip(template.state_names, states, gradients):
                 key = prefix + name + "_init"
-                bindings[key] = state.expand(self.step.buffers[key].shape)
+                target = self.step.buffers[key].shape
+                bindings[key] = state if state.shape == target else state.expand(target)
                 if gradient is not None:
                     bindings[prefix + "grad_" + name] = gradient
             for name, gradient in records.items():
                 if gradient is not None:
                     bindings[prefix + "record_grad_" + name] = gradient
-        self.step.launch_into(bindings)
+        stream = torch.cuda.current_stream(self.step.buffers["neuron_input"].device)
+        signature = (
+            stream.cuda_stream,
+            tuple((name, _sequence_layout(value)) for name, value in bindings.items()),
+        )
+        prepared = self.launches.get(signature)
+        if prepared is None:
+            prepared = self.step.prepare_launch(bindings)
+            self.launches[signature] = prepared
+        args, owners = prepared.arguments, prepared.owners
+        with _device_scope(self.step.buffers["neuron_input"].device):
+            if self.step.runtime.supports_pointer_offsets:
+                for name, (index, _span) in prepared.slots.items():
+                    value = bindings[name]
+                    owners[index] = value
+                    args[index] = value.data_ptr()
+                prepared.launch(*args, *prepared.constants)
+            else:
+                for name, (index, span) in prepared.slots.items():
+                    args[index] = self.step.runtime.argument(bindings[name], span)
+                prepared.launch()
 
         def reduce(name, value):
-            return bindings[name].sum_to_size(value.shape).to(value.dtype)
+            result = bindings[name]
+            if result.shape != value.shape:
+                result = result.sum_to_size(value.shape)
+            return result if result.dtype == value.dtype else result.to(value.dtype)
 
         return (
             bindings["grad_neuron_input"]
@@ -1172,6 +1354,105 @@ def prepare_fused_backward(
     psc_prepared_parameters=None,
 ):
     """Prepare a paired reverse kernel and private gradient working sets."""
+    if neuron_input.device.type != "cuda":
+        raise ValueError("Fused GPU cells require CUDA tensors")
+    semantic_specs = (replace(neuron_spec, dt=1.0), replace(psc_spec, dt=1.0))
+    key = (
+        "backward",
+        backend,
+        semantic_specs,
+        tuple(model_template_revision(spec.model) for spec in semantic_specs),
+        tuple(
+            _fused_layout(value) for value in (neuron_input, drive, authoritative_spike)
+        ),
+        tuple(
+            tuple(_fused_layout(value) for value in group)
+            for group in (
+                neuron_states,
+                psc_states,
+                neuron_parameters,
+                psc_parameters,
+                (grad_spike,),
+                grad_neuron_states,
+                grad_psc_states,
+            )
+        ),
+        tuple(
+            tuple((name, _fused_layout(value)) for name, value in sorted(items.items()))
+            if items
+            else ()
+            for items in (
+                neuron_prepared_parameters,
+                psc_prepared_parameters,
+                grad_neuron_records,
+                grad_psc_records,
+            )
+        ),
+        None if needs_neuron_parameters is None else tuple(needs_neuron_parameters),
+        None if needs_psc_parameters is None else tuple(needs_psc_parameters),
+        enable_fp_fusion,
+        precise_division,
+        precise_exp,
+    )
+    neuron, psc = get_template(neuron_spec), get_template(psc_spec)
+    neuron_parameter_names = {
+        name
+        for name, needed in zip(
+            neuron.parameter_names,
+            needs_neuron_parameters or (True,) * len(neuron.parameter_names),
+        )
+        if needed
+    }
+    psc_parameter_names = {
+        name
+        for name, needed in zip(
+            psc.parameter_names,
+            needs_psc_parameters or (True,) * len(psc.parameter_names),
+        )
+        if needed
+    }
+    with _FUSED_PLAN_LOCK:
+        plan = _FUSED_PLANS.get(key)
+        if plan is not None:
+            _FUSED_PLANS.move_to_end(key)
+    if plan is not None:
+        buffers = plan.bind_inputs(
+            neuron_input,
+            drive,
+            (neuron_states, psc_states),
+            (neuron_parameters, psc_parameters),
+            (neuron_spec, psc_spec),
+            (neuron_prepared_parameters, psc_prepared_parameters),
+        )
+        if neuron_spec.surrogate == "poisson" and neuron_spec.poisson.spiking:
+            if authoritative_spike is None:
+                raise ValueError("Poisson fused reverse requires authoritative spikes")
+            buffers["neuron_spike"] = authoritative_spike
+        if grad_spike is not None:
+            buffers["grad_spike"] = grad_spike
+        for prefix, template, gradients, records in (
+            ("neuron_", neuron, grad_neuron_states, grad_neuron_records or {}),
+            ("psc_", psc, grad_psc_states, grad_psc_records or {}),
+        ):
+            buffers.update(
+                (prefix + "grad_" + name, value)
+                for name, value in zip(template.state_names, gradients)
+                if value is not None
+            )
+            buffers.update(
+                (prefix + "record_grad_" + name, value)
+                for name, value in records.items()
+                if value is not None
+            )
+        return _FusedBackwardStep(
+            plan.factory(buffers=buffers),
+            neuron,
+            psc,
+            tuple(neuron_parameters),
+            tuple(psc_parameters),
+            neuron_parameter_names,
+            psc_parameter_names,
+        )
     n = neuron_input.numel()
     _state_receptors = psc_states[0].numel() // n
     _drive_receptors = drive.numel() // n
@@ -1203,22 +1484,6 @@ def prepare_fused_backward(
         else neuron_input.shape,
     )
     psc_buffers.update(psc_parameter_buffers)
-    neuron_parameter_names = set(
-        name
-        for name, need in zip(
-            neuron.parameter_names,
-            needs_neuron_parameters or (True,) * len(neuron.parameter_names),
-        )
-        if need
-    )
-    psc_parameter_names = set(
-        name
-        for name, need in zip(
-            psc.parameter_names,
-            needs_psc_parameters or (True,) * len(psc.parameter_names),
-        )
-        if need
-    )
     buffers = {
         "neuron_input": neuron_input,
         "drive": drive,
@@ -1318,8 +1583,7 @@ def prepare_fused_backward(
     source_factory = functools.partial(
         _generate_fused_backward_source,
         backend,
-        neuron_spec,
-        psc_spec,
+        *semantic_specs,
         n,
         _state_receptors,
         _drive_receptors,
@@ -1345,19 +1609,35 @@ def prepare_fused_backward(
         backend, source, enable_fp_fusion, precise_division, device=neuron_input.device
     )
 
-    step = _FusedStep(
+    factory = functools.partial(
+        _FusedStep,
         backend,
         kernel,
         n,
-        buffers,
-        declarations,
-        strided_names,
-        output_shapes,
-        enable_fp_fusion,
+        declarations=declarations,
+        strided_names=strided_names,
+        output_shapes=output_shapes,
+        enable_fp_fusion=enable_fp_fusion,
         storage=storage,
         source_factory=source_factory,
         precise_division=precise_division,
     )
+    plan = _FusedPlan(
+        factory,
+        (neuron.state_names, psc.state_names),
+        (neuron.parameter_names, psc.parameter_names),
+        {
+            prefix + name + "_init": tuple(buffers[prefix + name + "_init"].shape)
+            for prefix, template in (("neuron_", neuron), ("psc_", psc))
+            for name in template.state_names
+        },
+    )
+    with _FUSED_PLAN_LOCK:
+        _FUSED_PLANS[key] = plan
+        _FUSED_PLANS.move_to_end(key)
+        if len(_FUSED_PLANS) > 256:
+            _FUSED_PLANS.popitem(last=False)
+    step = factory(buffers=buffers)
     return _FusedBackwardStep(
         step,
         neuron,

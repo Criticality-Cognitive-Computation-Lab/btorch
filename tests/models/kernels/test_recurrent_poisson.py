@@ -314,6 +314,9 @@ def test_recurrent_poisson_inference_has_no_backward_history(backend, monkeypatc
     from btorch.models.kernels import recurrent_operator
 
     actual = _build(ALIF, "dense", backend, records=())
+    # This case inspects a single eager inference trajectory. Graph warmup
+    # and replay, including their RNG behavior, have a separate contract below.
+    actual.cudagraph = False
     expected = copy.deepcopy(actual)
     expected.backend = "torch"
     drive = torch.linspace(0.22, 0.78, 40, device="cuda").reshape(5, 2, 4)
@@ -369,6 +372,7 @@ def test_recurrent_poisson_cudagraph_shapes_preserve_state_and_rng():
     """Match shape-specific split captures for stochastic durations."""
     require_cuda_backend("triton")
     eager = _build(ALIF, "dense", "triton")
+    eager.cudagraph = False
     captured = copy.deepcopy(eager)
     captured.cudagraph = True
     drive = torch.linspace(0.22, 0.78, 413 * 2 * 4, device="cuda").reshape(413, 2, 4)

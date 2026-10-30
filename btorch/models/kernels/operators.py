@@ -263,23 +263,36 @@ def _validate_parameter_shapes(parameters, spec, states, target_shape, *, label=
         if ndim
     )
     components = component_shapes[0] if component_shapes else ()
+    validate = (
+        _validated_parameter_shapes.__wrapped__
+        if torch.compiler.is_compiling()
+        else _validated_parameter_shapes
+    )
+    validate(
+        tuple((name, template.extra_dims(name)) for name in template.parameter_names),
+        tuple(tuple(value.shape) for value in parameters),
+        tuple(components),
+        tuple(target_shape),
+        label,
+    )
+
+
+@functools.lru_cache(maxsize=256)
+def _validated_parameter_shapes(names, shapes, components, target_shape, label):
+    """Validate immutable broadcast contracts without retaining tensors."""
     prefix = f"{label} " if label else ""
-    for name, value in zip(template.parameter_names, parameters):
-        target = (
-            (*target_shape, *components[-template.extra_dims(name) :])
-            if template.extra_dims(name)
-            else target_shape
-        )
+    for (name, ndim), shape in zip(names, shapes):
+        target = (*target_shape, *components[-ndim:]) if ndim else target_shape
         try:
-            broadcast = torch.broadcast_shapes(value.shape, target)
+            broadcast = torch.broadcast_shapes(shape, target)
         except RuntimeError as error:
             raise ValueError(
-                f"{prefix}parameter {name!r} shape {tuple(value.shape)} cannot "
+                f"{prefix}parameter {name!r} shape {shape} cannot "
                 f"broadcast to {tuple(target)}"
             ) from error
         if broadcast != target:
             raise ValueError(
-                f"{prefix}parameter {name!r} shape {tuple(value.shape)} cannot "
+                f"{prefix}parameter {name!r} shape {shape} cannot "
                 f"broadcast to {tuple(target)}"
             )
 

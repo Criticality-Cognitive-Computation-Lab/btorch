@@ -20,6 +20,89 @@ from btorch.models.kernels.torch_backend import forward_step
 from tests.models.kernels.helpers import GPU_BACKENDS, require_cuda_backend
 
 
+def test_fused_plan_rebinds_values_layouts_and_releases_invocation_storage():
+    """Reuse static preparation without retaining states, drives or dt."""
+    import gc
+    import weakref
+    from dataclasses import replace
+
+    from btorch.models.kernels.golden import python_module_sequence
+    from tests.models.kernels.cases import cell_inputs
+
+    require_cuda_backend("triton")
+    neuron_spec, _, neuron_states, neuron_parameters = cell_inputs("lif")
+    psc_spec, _, psc_states, psc_parameters = cell_inputs("alpha")
+    neuron_states, psc_states, neuron_parameters, psc_parameters = (
+        tuple(value.detach().cuda() for value in group)
+        for group in (neuron_states, psc_states, neuron_parameters, psc_parameters)
+    )
+    stream = torch.cuda.Stream()
+    with torch.inference_mode():
+        for index, dt in enumerate((0.25, 0.5, 0.75)):
+            # The second call reuses the exact layout with fresh buffers and
+            # parameters. The third changes the physical input stride without
+            # changing its shape. Both must match the original Python modules.
+            external = (
+                torch.randn(3, 2, device="cuda").T
+                if index == 2
+                else torch.randn(2, 3, device="cuda")
+            )
+            drive = torch.randn_like(external)
+            runtime_dt = torch.tensor(dt, device="cuda")
+            neuron_runtime = replace(neuron_spec, dt=runtime_dt)
+            psc_runtime = replace(psc_spec, dt=runtime_dt)
+            for parameter in (*neuron_parameters, *psc_parameters):
+                parameter.add_(0.01)
+            # Executables are shared across calls; their current-stream
+            # binding must remain invocation-local, including after a warm hit.
+            current = torch.cuda.current_stream()
+            target = stream if index == 1 else current
+            if target != current:
+                target.wait_stream(current)
+            with torch.cuda.stream(target):
+                external.add_(0.1)
+                actual = fused_step_forward(
+                    external,
+                    drive,
+                    neuron_states,
+                    psc_states,
+                    neuron_parameters,
+                    psc_parameters,
+                    neuron_runtime,
+                    psc_runtime,
+                )
+            if target != current:
+                current.wait_stream(target)
+            psc_reference = python_module_sequence(
+                drive.unsqueeze(0),
+                psc_states,
+                psc_parameters,
+                replace(psc_spec, dt=dt),
+            )
+            neuron_reference = python_module_sequence(
+                (external + psc_reference[0][0]).unsqueeze(0),
+                neuron_states,
+                neuron_parameters,
+                replace(neuron_spec, dt=dt),
+            )
+            for value, expected in zip(
+                (actual[0], *actual[1], *actual[2]),
+                (
+                    neuron_reference[0][0],
+                    *neuron_reference[1],
+                    *psc_reference[1],
+                ),
+                strict=True,
+            ):
+                torch.testing.assert_close(value, expected, atol=8e-5, rtol=8e-4)
+            references = tuple(
+                weakref.ref(value) for value in (external, drive, runtime_dt)
+            )
+            del external, drive, runtime_dt, neuron_runtime, psc_runtime
+            gc.collect()
+            assert all(reference() is None for reference in references)
+
+
 def _leaf(value):
     return value.detach().requires_grad_()
 
@@ -337,3 +420,89 @@ def test_recurrent_module_strided_parameters_match_torch_vjp(backend):
             atol=7e-4,
             rtol=7e-4,
         )
+
+
+@pytest.mark.parametrize("backend", GPU_BACKENDS)
+def test_fused_reverse_reuses_metadata_with_independent_tapes(backend):
+    """Fresh tensors, runtime dt and cotangent strides retain every state
+    VJP."""
+    import gc
+    import weakref
+    from dataclasses import replace
+
+    from btorch.models.kernels.golden import python_module_sequence
+    from tests.models.kernels.cases import cell_inputs
+
+    require_cuda_backend(backend)
+
+    def run(dt, strided):
+        neuron_spec, _, neuron_states, neuron_parameters = cell_inputs("lif")
+        psc_spec, _, psc_states, psc_parameters = cell_inputs("alpha")
+        neuron_states, psc_states, neuron_parameters, psc_parameters = (
+            tuple(value.detach().cuda().requires_grad_() for value in group)
+            for group in (neuron_states, psc_states, neuron_parameters, psc_parameters)
+        )
+        external = torch.full((2, 3), 0.6, device="cuda", requires_grad=True)
+        drive = torch.full((2, 3), 0.3, device="cuda", requires_grad=True)
+        runtime_dt = torch.tensor(dt, device="cuda")
+        psc_reference = python_module_sequence(
+            drive.unsqueeze(0), psc_states, psc_parameters, replace(psc_spec, dt=dt)
+        )
+        neuron_reference = python_module_sequence(
+            (external + psc_reference[0][0]).unsqueeze(0),
+            neuron_states,
+            neuron_parameters,
+            replace(neuron_spec, dt=dt),
+        )
+        expected = (neuron_reference[0][0], *neuron_reference[1], *psc_reference[1])
+        cotangents = tuple(
+            torch.randn((*value.shape, 2), device="cuda")[..., 0]
+            if strided
+            else torch.randn_like(value)
+            for value in expected
+        )
+        roots = (
+            external,
+            drive,
+            *neuron_states,
+            *psc_states,
+            *neuron_parameters,
+            *psc_parameters,
+        )
+        golden = torch.autograd.grad(expected, roots, cotangents, allow_unused=True)
+        reverse = fused_step_backward(
+            external,
+            drive,
+            neuron_states,
+            psc_states,
+            neuron_parameters,
+            psc_parameters,
+            replace(neuron_spec, dt=runtime_dt),
+            replace(psc_spec, dt=runtime_dt),
+            cotangents[0],
+            cotangents[1:2],
+            cotangents[2:],
+            backend=backend,
+        )
+        actual = (
+            reverse[0],
+            reverse[1],
+            *reverse[2],
+            *reverse[3],
+            *reverse[4],
+            *reverse[5],
+        )
+        for value, trusted, root in zip(actual, golden, roots, strict=True):
+            torch.testing.assert_close(
+                value,
+                torch.zeros_like(root) if trusted is None else trusted,
+                atol=8e-5,
+                rtol=8e-4,
+            )
+        return tuple(weakref.ref(value) for value in (*roots, runtime_dt))
+
+    # The second call hits the same semantic/layout plan with new operands and
+    # dt; the third requires a separate cotangent ABI. No plan may own a tape.
+    references = [run(0.25, False), run(0.5, False), run(0.75, True)]
+    gc.collect()
+    assert all(reference() is None for group in references for reference in group)
