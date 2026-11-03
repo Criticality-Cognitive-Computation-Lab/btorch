@@ -10,6 +10,7 @@ from btorch.models.connection import SparseConnection
 from btorch.models.functional import reset_net_state
 from btorch.models.linear import Linear
 from btorch.models.rnn import make_rnn
+from btorch.monitor import col
 from tests.utils.compile import compile_or_skip
 
 
@@ -88,7 +89,8 @@ def native_rnncell_forward(cell: nn.RNNCell, x_in: torch.Tensor) -> torch.Tensor
     return torch.stack(outputs, dim=0)
 
 
-def test_checkpointed_sparseconn_matches_eager_dense():
+@pytest.mark.parametrize("monitor", [False, True])
+def test_checkpointed_sparseconn_matches_eager_dense(monitor):
     """Checkpointed sparse recurrence matches native dense math and grads."""
     torch.manual_seed(42)
 
@@ -107,7 +109,15 @@ def test_checkpointed_sparseconn_matches_eager_dense():
 
     # Sparse recurrence uses gradient checkpointing; dense baseline uses
     # torch.nn.RNNCell for native dense math.
-    rnn_sparse = make_rnn(SparseConnRNNCell, grad_checkpoint=True, unroll=4)(
+    rnn_sparse = make_rnn(
+        SparseConnRNNCell,
+        grad_checkpoint=True,
+        unroll=2,
+        chunk_size=4,
+        update_state_names=(
+            {"mean": col("h").mean(), "trace": col("h")} if monitor else None
+        ),
+    )(
         input_size,
         hidden_size,
         W_x_dense,
@@ -134,6 +144,18 @@ def test_checkpointed_sparseconn_matches_eager_dense():
 
     loss_sparse = out_sparse.sum()
     loss_native = out_native.sum()
+    if monitor:
+        # The streaming carry crosses both unroll blocks and checkpoint chunks.
+        # The raw trace retains autograd; reductions are detached diagnostics.
+        # Trace backward must restore sparse bindings during recomputation and
+        # agree with the dense reference, without duplicating recorded steps.
+        mean = rnn_sparse.get_records()["mean"]
+        torch.testing.assert_close(mean, out_native.mean(0), atol=1e-6, rtol=0.0)
+        assert not mean.requires_grad
+        trace = rnn_sparse.get_records()["trace"]
+        torch.testing.assert_close(trace, out_native, atol=1e-6, rtol=0.0)
+        loss_sparse = loss_sparse + trace.square().mean()
+        loss_native = loss_native + out_native.square().mean()
 
     loss_sparse.backward()
     loss_native.backward()

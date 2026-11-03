@@ -5,8 +5,13 @@ import torch
 
 from btorch.models.functional import reset_net_state
 from btorch.models.rnn import make_rnn
+from btorch.monitor import grad
 from tests.models.rnn.rnn_utils import DTYPE, SimpleRNNCell, last_step_sum
 
+
+# grad("h") records per-step gradients of the hidden state (replaces the old
+# save_grad_history / grad_state_names params).
+_GRAD_H = {"h_grad": grad("h")}
 
 # Define parameter ranges for exhaustive testing
 PARAMS = {
@@ -14,7 +19,7 @@ PARAMS = {
     "chunk_size": [None, 4, 8],
     "grad_checkpoint": [True, False],
     "cpu_offload": [True, False],
-    "save_grad_history": [True, False],
+    "record_grad": [True, False],
 }
 
 
@@ -50,15 +55,15 @@ def test_rnn_exhaustive_ops(config):
     T, batch_size, input_size, hidden_size = 16, 2, 3, 4
     # Baseline: Simple unroll=1 (pure python loop equivalent mainly) or
     # unroll=T (pure compiled). Let's use unroll=1 as robust baseline.
-    rnn_base = make_rnn(
-        SimpleRNNCell, unroll=1, save_grad_history=True, grad_state_names=["h"]
-    )(input_size=input_size, hidden_size=hidden_size)
+    rnn_base = make_rnn(SimpleRNNCell, unroll=1, update_state_names=dict(_GRAD_H))(
+        input_size=input_size, hidden_size=hidden_size
+    )
 
-    # Test RNN
-    # Inject grad_state_names if saving history
+    # Test RNN: turn the record_grad flag into a grad("h") monitor.
     kwargs = config.copy()
-    if kwargs["save_grad_history"]:
-        kwargs["grad_state_names"] = ["h"]
+    record_grad = kwargs.pop("record_grad")
+    if record_grad:
+        kwargs["update_state_names"] = dict(_GRAD_H)
 
     rnn_test = make_rnn(SimpleRNNCell, **kwargs)(
         input_size=input_size, hidden_size=hidden_size
@@ -108,10 +113,10 @@ def test_rnn_exhaustive_ops(config):
         rnn_base.rnn_cell.W_x.grad, rnn_test.rnn_cell.W_x.grad, atol=1e-5
     ), f"W_x grad mismatch with config {config}"
 
-    # Check Grad History correctness
-    if config["save_grad_history"]:
-        hist_base = rnn_base.get_grad_history()["h"]
-        hist_test = rnn_test.get_grad_history()["h"]
+    # Check per-step gradient recording correctness
+    if config["record_grad"]:
+        hist_base = rnn_base.get_records()["h_grad"]
+        hist_test = rnn_test.get_records()["h_grad"]
 
         # Ensure all time steps are captured
         assert len(hist_test) == T
@@ -160,26 +165,3 @@ def test_rnn_edge_cases():
     x = torch.randn(T, batch_size, input_size)
     out, _ = rnn(x)
     assert out.shape == (T, batch_size, hidden_size)
-
-
-def test_get_grad_history_returns_copy():
-    """``get_grad_history`` hands out a copy, so callers cannot corrupt (or be
-    surprised by later changes to) the module's internal history."""
-    rnn = make_rnn(
-        SimpleRNNCell, unroll=1, save_grad_history=True, grad_state_names=["h"]
-    )(input_size=3, hidden_size=4)
-    x = torch.randn(5, 2, 3, dtype=DTYPE, requires_grad=True)
-    reset_net_state(rnn, batch_size=2)
-    out, _ = rnn(x)
-    last_step_sum(out).backward()
-
-    hist = rnn.get_grad_history()
-    assert len(hist["h"]) == 5
-    hist["h"].clear()
-    hist["extra"] = []
-    # The module's own history is untouched by mutating the returned dict.
-    assert len(rnn.get_grad_history()["h"]) == 5
-    assert "extra" not in rnn.get_grad_history()
-
-    rnn.clear_grad_history()
-    assert rnn.get_grad_history() == {}

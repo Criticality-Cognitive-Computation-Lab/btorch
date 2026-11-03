@@ -86,6 +86,7 @@ nav:
 - Guides:
   - guides/configuration.md
   - guides/sparse_connectivity.md
+  - guides/monitor_recording.md
 - Design notes:
   - design/sparse_connectivity.md
   - design/sparse_einsum_notes.md
