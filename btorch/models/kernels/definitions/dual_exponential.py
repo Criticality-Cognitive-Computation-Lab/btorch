@@ -23,22 +23,16 @@ def fragments(spec, modes=0, *, prepared_values=(), authoritative_output=False):
             decay_linear = decay_reciprocal * -1.0
             {chr(10).join(_exp_euler_forward("decay", "decay_linear", dt))}
             g_decay_decayed = g_decay_prev + decay_phi * decay_derivative
-            rise = exp(-{dt} / tau_rise)
-            decay = exp(-{dt} / tau_decay)
             g_rise_next = g_rise_decayed + x
             g_decay_next = g_decay_decayed + x
-            psc_next = a * (decay * g_decay_next - rise * g_rise_next)
+            psc_next = a * (g_decay_next - g_rise_next)
             output = psc_next
         """)
     b += _lines(f"""
             grad_s_psc = grad_s_psc + grad_output
-            grad_g_rise_next = grad_s_g_rise - grad_s_psc * a * rise
-            grad_g_decay_next = grad_s_g_decay + grad_s_psc * a * decay
-            grad_p_a = grad_s_psc * (decay * g_decay_next - rise * g_rise_next)
-            grad_rise = -grad_s_psc * a * g_rise_next
-            grad_tau_rise_readout = grad_rise * rise * {dt} / (tau_rise * tau_rise)
-            grad_decay = grad_s_psc * a * g_decay_next
-            grad_tau_decay_readout = grad_decay * decay * {dt} / (tau_decay * tau_decay)
+            grad_g_rise_next = grad_s_g_rise - grad_s_psc * a
+            grad_g_decay_next = grad_s_g_decay + grad_s_psc * a
+            grad_p_a = grad_s_psc * (g_decay_next - g_rise_next)
             grad_x = grad_g_rise_next + grad_g_decay_next
             grad_rise_derivative = grad_g_rise_next * rise_phi
             grad_rise_phi = grad_g_rise_next * rise_derivative
@@ -50,7 +44,7 @@ def fragments(spec, modes=0, *, prepared_values=(), authoritative_output=False):
             negative_grad_rise = -grad_rise_derivative
             grad_tau_rise_derivative = negative_grad_rise * rise_derivative_over_tau
             grad_tau_rise_state = grad_tau_rise_linear + grad_tau_rise_derivative
-            grad_p_tau_rise = grad_tau_rise_readout + grad_tau_rise_state
+            grad_p_tau_rise = grad_tau_rise_state
             grad_s_g_rise = grad_g_rise_next + (-grad_rise_derivative / tau_rise)
             grad_decay_derivative = grad_g_decay_next * decay_phi
             grad_decay_phi = grad_g_decay_next * decay_derivative
@@ -62,7 +56,7 @@ def fragments(spec, modes=0, *, prepared_values=(), authoritative_output=False):
             negative_grad_decay = -grad_decay_derivative
             grad_tau_decay_derivative = negative_grad_decay * decay_derivative_over_tau
             grad_tau_decay_state = grad_tau_decay_linear + grad_tau_decay_derivative
-            grad_p_tau_decay = grad_tau_decay_readout + grad_tau_decay_state
+            grad_p_tau_decay = grad_tau_decay_state
             grad_s_g_decay = grad_g_decay_next + (-grad_decay_derivative / tau_decay)
             grad_s_psc = 0.0
         """)

@@ -214,3 +214,35 @@ def test_precise_exp_dual_sequence_matches_actual_module_forward_and_vjp(backend
             torch.testing.assert_close(value, torch.zeros_like(root))
         else:
             torch.testing.assert_close(value, reference, atol=5e-5, rtol=5e-4, msg=name)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("backend", GPU_BACKENDS)
+def test_dual_impulse_starts_at_zero_without_lookahead(backend):
+    """Check native event timing against an independent analytic impulse.
+
+    Module/native agreement alone cannot detect a shared one-step advance.
+    Heterogeneous time constants also make swapping rise/decay parameters
+    observable rather than reducing this to a zero-output smoke test.
+    """
+    require_cuda_backend(backend)
+    spec = NeuronSpec("dual_exponential", dt=0.5)
+    tau_rise = torch.tensor([1.2, 1.7, 2.4], device="cuda")
+    tau_decay = torch.tensor([3.5, 5.0, 7.2], device="cuda")
+    amplitude = torch.tensor([0.4, 0.8, 1.3], device="cuda")
+    source = torch.zeros(16, 1, 3, device="cuda")
+    source[0] = 1.0
+    states = tuple(torch.zeros_like(source[0]) for _ in range(3))
+    actual = run_multi_step(
+        source,
+        states,
+        (tau_rise, tau_decay, amplitude),
+        spec,
+        HistoryPlan(),
+        backend=KernelOptions(neuron=backend),
+    )[0]
+    time = torch.arange(16, device="cuda")[:, None, None] * spec.dt
+    expected = amplitude * (torch.exp(-time / tau_decay) - torch.exp(-time / tau_rise))
+    assert torch.count_nonzero(actual[0]) == 0
+    assert bool((actual[1] > 0).all())
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)

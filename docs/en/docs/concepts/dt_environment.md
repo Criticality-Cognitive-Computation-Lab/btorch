@@ -49,10 +49,14 @@ def forward(model, x):
 
 ## Timing Convention
 
-All neurons and post-synaptic current (PSC) models share one convention:
+Neurons and post-synaptic current (PSC) models use these timing conventions:
 
-- an input (current, or a spike delivered to a PSC) at step `t` already affects
-  the returned `v` / spike / `psc` of step `t`;
+- input current at step `t` affects the returned neuron state at step `t`;
+- ExponentialPSC and alpha PSCs respond to a delivered spike immediately;
+- DualExponentialPSC injects equal increments into its rise and decay states.
+  Their difference is zero at injection, so its impulse response begins at
+  step `t + 1`: `k[s] = a * (exp(-s*dt/tau_decay) - exp(-s*dt/tau_rise))`.
+  Torch, convolution and native fused kernels share this convention;
 - a spike's reset and adaptation (`g_k`, `Iasc`, `u`, ...) are applied at the end
   of step `t` and first act at step `t + 1`;
 - `DelayedPSC(psc, max_delay_steps=d)` shifts the PSC response by exactly `d`

@@ -587,19 +587,23 @@ def _closed_form_impulse(psc_cls, T: int, tau: float, tau_rise: float = 2.0):
         A = tau_d / (tau_d - tau_r) * (tau_r / tau_d) ** (tau_r / (tau_r - tau_d))
         coef = (tau_d - tau_r) / tau_r / tau_d * A
         a_d, a_r = torch.exp(-1.0 / tau_d), torch.exp(-1.0 / tau_r)
-        return coef * (a_d ** (t + 1) - a_r ** (t + 1))
+        return coef * (a_d**t - a_r**t)
     raise ValueError(psc_cls)
 
 
 @pytest.mark.parametrize("psc_cls", PSC_CLASSES)
-def test_psc_spike_acts_in_delivery_step(psc_cls):
-    """A spike at step 0 changes psc at step 0 and matches the closed form."""
+def test_psc_impulse_matches_declared_timing(psc_cls):
+    """Dual exponential starts at zero; other PSCs respond immediately."""
     tau = 5.0
     with environ.context(dt=1.0):
         psc = _make_psc(psc_cls, n_neuron=1, tau_syn=tau, tau_decay=tau, tau_rise=2.0)
         psc.linear = _identity(1)
         out = _impulse_response(psc)
-    assert out[0].item() > 0.0, f"{psc_cls.__name__}: no response in delivery step"
+    if psc_cls is DualExponentialPSC:
+        assert out[0].item() == 0.0
+        assert out[1].item() > 0.0
+    else:
+        assert out[0].item() > 0.0
     expected = _closed_form_impulse(psc_cls, out.shape[0], tau)
     torch.testing.assert_close(out, expected, atol=1e-6, rtol=1e-5)
 
@@ -639,8 +643,8 @@ def test_delayed_psc_shifts_base_response_by_exactly_delay(psc_cls, delay):
 
 
 @pytest.mark.parametrize("psc_cls", PSC_CLASSES)
-def test_heter_synapse_psc_spike_acts_in_delivery_step(psc_cls):
-    """HeterSynapsePSC (no delay) inherits the same-step convention."""
+def test_heter_synapse_psc_inherits_base_timing(psc_cls):
+    """Receptor composition preserves each base PSC impulse timing."""
     import pandas as pd
 
     tau = 5.0
@@ -664,7 +668,11 @@ def test_heter_synapse_psc_spike_acts_in_delivery_step(psc_cls):
         z = torch.zeros(10, 1)
         z[0] = 1.0
         out = torch.stack([syn.single_step_forward(z[t]) for t in range(10)])[:, 0]
-    assert out[0].item() > 0.0
+    if psc_cls is DualExponentialPSC:
+        assert out[0].item() == 0.0
+        assert out[1].item() > 0.0
+    else:
+        assert out[0].item() > 0.0
     torch.testing.assert_close(
         out, _closed_form_impulse(psc_cls, 10, tau), atol=1e-6, rtol=1e-5
     )

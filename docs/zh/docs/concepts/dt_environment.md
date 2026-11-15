@@ -46,3 +46,11 @@ def forward(model, x):
 ```
 
 参阅 [`environ`][btorch.models.environ] 了解完整的环境 API。
+
+## PSC 送达时序
+
+`DualExponentialPSC` 在脉冲注入时向 rise 和 decay 状态加入相等的增量，
+因此两者之差在该时刻为零，脉冲响应从下一时间步开始。其响应为
+`k[s] = a * (exp(-s*dt/tau_decay) - exp(-s*dt/tau_rise))`。
+Torch、卷积及原生 fused 前向/反向算子采用相同时序。
+其他 PSC 的送达时序保持不变；`DelayedPSC` 仍在基础响应上增加指定的延迟。

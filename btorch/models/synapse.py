@@ -744,7 +744,11 @@ class DualExponentialPSC(BasePSC):
         step_mode: StepMode = "s",
         backend: Backend = "torch",
     ):
-        """The Double Exponential form of PSC, from Brainpy/BrainState."""
+        """The Double Exponential form of PSC, from Brainpy/BrainState.
+
+        Equal increments to the rise and decay memories cancel at injection.
+        The impulse starts at zero and first produces current one step later.
+        """
 
         super().__init__(
             n_neuron=n_neuron,
@@ -788,26 +792,21 @@ class DualExponentialPSC(BasePSC):
         wz = self._synaptic_input(z)
         self.g_rise = self.g_rise + wz
         self.g_decay = self.g_decay + wz
-        # The analytic response a*(e^{-t/tau_d} - e^{-t/tau_r}) is zero at the
-        # injection instant, so psc is read out one dt after the input
-        # (``g`` advanced by one decay step) to make the spike act in its
-        # delivery step; the stored ``g`` stay at the injection instant.
-        dt = environ.get("dt")
-        a_r = torch.exp(-dt / self.tau_rise)
-        a_d = torch.exp(-dt / self.tau_decay)
-        self.psc = self.a * (a_d * self.g_decay - a_r * self.g_rise)
+        # Equal increments cancel at the injection instant. Read the stored
+        # conductances without a look-ahead decay: the impulse starts at zero.
+        self.psc = self.a * (self.g_decay - self.g_rise)
 
     def get_kernel(self, dt: float | Tensor, kernel_len: int) -> Tensor:
         """Dual-exponential (alpha-shaped) kernel.
 
-        Kernel: k[t] = a * (a_d^(t+1) - a_r^(t+1)) for t >= 0 so a spike acts
-        in its delivery step, where a = self.a, a_d = exp(-dt/tau_decay),
+        Kernel: k[t] = a * (a_d^t - a_r^t) for t >= 0, with zero current
+        at the injection instant, where a = self.a, a_d = exp(-dt/tau_decay),
         a_r = exp(-dt/tau_rise).
         """
         a_r = torch.exp(-dt / self.tau_rise)
         a_d = torch.exp(-dt / self.tau_decay)
         t = torch.arange(kernel_len, dtype=self.a.dtype, device=self.a.device)
-        return self.a * (a_d ** (t + 1) - a_r ** (t + 1))
+        return self.a * (a_d**t - a_r**t)
 
 
 class BilinearMixingSynapse(MemoryModule):

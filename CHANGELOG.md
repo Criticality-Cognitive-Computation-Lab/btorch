@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** DualExponentialPSC reads its stored rise/decay conductances
+  without an extra look-ahead decay. Its impulse is zero at injection and
+  responds one timestep later than before. Torch, convolution and native fused
+  forward/reverse kernels use the same timing; other PSC models are unchanged.
+
 ### Added
 
 - Bounded preparation-time GPU autotuning through native Triton/TileLang
