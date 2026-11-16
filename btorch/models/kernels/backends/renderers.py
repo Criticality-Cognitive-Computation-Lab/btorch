@@ -890,7 +890,7 @@ class TileLangRenderer(SourceRenderer):
             def visit_Call(self, node):  # noqa: N802
                 node = self.generic_visit(node)
                 if (
-                    self_dtype == "float64"
+                    scalar_dtype == "float64"
                     and isinstance(node.func, ast.Attribute)
                     and node.func.attr == "call_pure_extern"
                     and len(node.args) >= 2
@@ -900,7 +900,6 @@ class TileLangRenderer(SourceRenderer):
                     node.args[:2] = [ast.Constant("float64"), ast.Constant("fma")]
                 return node
 
-        self_dtype = getattr(self, "scalar_dtype", "float32")
         tree = _ExpandFma().visit(tree)
         return ast.unparse(ast.fix_missing_locations(tree))
 

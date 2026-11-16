@@ -75,7 +75,8 @@ def native_step(backend):
     if backend == "triton":
         import triton
         import triton.language as tl
-        from triton.language.extra.cuda import libdevice
+
+        from btorch.models.kernels.backends.math_triton import exp
 
         @triton.jit
         def step(
@@ -94,11 +95,8 @@ def native_step(backend):
             INCLUDE_LTD: tl.constexpr,
         ):
             dtype: tl.constexpr = weight.dtype
-            compute_dtype: tl.constexpr = (
-                tl.float64 if dtype == tl.float64 else tl.float32
-            )
             ratio = (-dt / tau).to(dtype)
-            decay = libdevice.exp(ratio.to(compute_dtype)).to(dtype)
+            decay = exp(ratio, fast_math=False)
             pre = (pre_trace * decay).to(dtype)
             post = (post_trace * decay).to(dtype)
             plus = tl.full((), 0.0, dtype)
@@ -118,6 +116,8 @@ def native_step(backend):
         return step
     if backend == "tilelang":
         import tilelang.language as T
+
+        from btorch.models.kernels.backends.math_tilelang import exp
 
         # TileLang calls this function with scalar expressions while building
         # its kernel. No tracing or Python callback runs at simulation time.
@@ -141,14 +141,7 @@ def native_step(backend):
             ratio = T.Cast(
                 dtype, -T.Cast(compute_dtype, dt) / T.Cast(compute_dtype, tau)
             )
-            decay = T.Cast(
-                dtype,
-                T.call_pure_extern(
-                    compute_dtype,
-                    "exp" if dtype == "float64" else "expf",
-                    T.Cast(compute_dtype, ratio),
-                ),
-            )
+            decay = exp(ratio, fast_math=False)
             pre = T.Cast(dtype, pre_trace * decay)
             post = T.Cast(dtype, post_trace * decay)
             plus = (
