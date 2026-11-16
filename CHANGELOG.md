@@ -198,8 +198,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Unify native neuron/PSC math selection as `KernelOptions(fast_math=...)`;
-  share dtype-aware Triton/TileLang exponential helpers and cancellation-safe
-  fast `expm1` for exponential Euler. FMA contraction remains independent.
+  share dtype-aware Triton/TileLang exponential helpers and reuse libdevice
+  `expm1` for exponential Euler. FMA contraction remains independent.
 
 - Reduce recurrent CPU submission overhead by reusing trajectory device guards
   and validated sparse bindings across timesteps.

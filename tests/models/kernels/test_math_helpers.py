@@ -4,22 +4,7 @@ boundaries."""
 import pytest
 import torch
 
-from btorch.models.kernels.backends.math import expm1_series
 from tests.models.kernels.helpers import require_cuda_backend
-
-
-def test_fast_expm1_series_preserves_tiny_updates_and_interval_accuracy():
-    # Exponential Euler needs a nonzero update even when exp(x) rounds to one.
-    # A dense independent FP64 oracle also checks the approximation's endpoints.
-    x = torch.cat(
-        (
-            torch.linspace(-0.5, 0.5, 2049, dtype=torch.float64),
-            torch.tensor([-1e-30, 0.0, 1e-30], dtype=torch.float64),
-        )
-    )
-    actual = expm1_series(x)
-    torch.testing.assert_close(actual, torch.expm1(x), atol=9e-9, rtol=0)
-    torch.testing.assert_close(actual[-3:], x[-3:], atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
@@ -35,8 +20,8 @@ def test_native_exponentials_preserve_dtype_small_updates_and_special_values(
     backend, dtype
 ):
     require_cuda_backend(backend)
-    # Both modes share this single vector, covering the polynomial boundary,
-    # tiny signed increments, stiff decay, and IEEE special values. The four
+    # Both modes share this vector: tiny signed updates, stiff decay, moderate
+    # exponential growth, and IEEE special values. The four
     # backend/dtype cases qualify distinct ABIs without a Cartesian matrix.
     x = torch.tensor(
         [
@@ -74,7 +59,7 @@ def test_native_exponentials_preserve_dtype_small_updates_and_special_values(
                 index = tl.arange(0, 32)
                 value = tl.load(x_ptr + index, index < N, other=0)
                 tl.store(y_ptr + index, exp(value, FAST), index < N)
-                tl.store(y_ptr + N + index, expm1(value, FAST), index < N)
+                tl.store(y_ptr + N + index, expm1(value), index < N)
 
             kernel[(1,)](x, output, x.numel(), fast_math)
         else:
@@ -95,11 +80,11 @@ def test_native_exponentials_preserve_dtype_small_updates_and_special_values(
                         index = T.get_thread_binding()
                         if index < n:
                             y_ptr[index] = exp(x_ptr[index], fast_math)
-                            y_ptr[n + index] = expm1(x_ptr[index], fast_math)
+                            y_ptr[n + index] = expm1(x_ptr[index])
 
                 return kernel
 
-            build()(x, output)
+            build()(x, output.reshape(-1))
         assert output.dtype == dtype
         torch.testing.assert_close(
             output,

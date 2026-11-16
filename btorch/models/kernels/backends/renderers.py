@@ -99,7 +99,7 @@ class _MathTransformer(ast.NodeTransformer):
         node = self.generic_visit(node)
         if isinstance(node.func, ast.Name):
             replacement = self.calls.get(node.func.id)
-            if self.fast_math is not None and node.func.id in ("exp", "expm1"):
+            if self.fast_math is not None and node.func.id == "exp":
                 node.args.append(ast.Constant(int(self.fast_math)))
             if replacement is not None:
                 if replacement == "__tilelang_fma__":
@@ -521,7 +521,7 @@ class CuPyRenderer(SourceRenderer):
             'extern "C" __device__ float __nv_expm1f(float);\n'
             "__device__ __forceinline__ float _btorch_exp(float x, bool fast_math) "
             "{ return fast_math ? __expf(x) : __nv_expf(x); }\n"
-            "__device__ __forceinline__ float _btorch_expm1(float x, bool) "
+            "__device__ __forceinline__ float _btorch_expm1(float x) "
             "{ return __nv_expm1f(x); }\n"
             "__device__ __forceinline__ float where(bool condition, float x, float y) "
             "{ return condition ? x : y; }\n"

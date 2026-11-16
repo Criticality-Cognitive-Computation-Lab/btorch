@@ -174,8 +174,8 @@ def test_precise_exp_changes_source_policy_without_changing_default(backend, bac
     default, _ = engine.generate_source(*arguments, backward=backward)
     precise, _ = engine.generate_source(*arguments, backward=backward, precise_exp=True)
 
-    # The shared helpers receive the compile-time mode for both exp and
-    # expm1; expm1 is what the exponential-Euler forward update actually uses.
+    # exp receives the explicit compile-time policy; exponential Euler's
+    # expm1 always reuses libdevice, independently of that policy.
     for source, mode in ((default, 1), (precise, 0)):
         tree = ast.parse(source) if backend != "cupy" else None
         if tree is not None:
@@ -184,7 +184,7 @@ def test_precise_exp_changes_source_policy_without_changing_default(backend, bac
                 for node in ast.walk(tree)
                 if isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
-                and node.func.id in ("_btorch_exp", "_btorch_expm1")
+                and node.func.id == "_btorch_exp"
             ]
             assert calls
             assert all(

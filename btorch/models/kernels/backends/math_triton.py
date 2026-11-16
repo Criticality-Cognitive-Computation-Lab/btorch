@@ -4,19 +4,6 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from .math import EXPM1_COEFFICIENTS
-
-
-_COEFFICIENTS = tl.constexpr(EXPM1_COEFFICIENTS)
-
-
-@triton.jit
-def _expm1_series(x):
-    value = tl.full(x.shape, _COEFFICIENTS[0], tl.float32)
-    for index in tl.static_range(1, len(_COEFFICIENTS)):
-        value = value * x + _COEFFICIENTS[index]
-    return x * value
-
 
 @triton.jit
 def exp(x, fast_math: tl.constexpr = True):
@@ -33,16 +20,14 @@ def exp(x, fast_math: tl.constexpr = True):
 
 
 @triton.jit
-def expm1(x, fast_math: tl.constexpr = True):
-    """Evaluate exp(x) - 1 without subtractive cancellation near zero"""
+def expm1(x):
+    """Evaluate cancellation-safe exp(x) - 1 using libdevice in either math mode
+
+    Keep FP64 arithmetic intact and promote half/BF16 only for the
+    transcendental ABI, rounding back to the input storage dtype.
+    Triton's libdevice lowering can flush FP32 subnormals to zero; this
+    helper does not add a separate correction to that backend behavior.
+    """
     if x.dtype == tl.float64:
         return libdevice.expm1(x)
-    else:
-        value = x.to(tl.float32)
-        if fast_math:
-            small = tl.abs(value) <= 0.5
-            bounded = tl.where(small, value, 0.0)
-            result = tl.where(small, _expm1_series(bounded), exp(value) - 1.0)
-        else:
-            result = libdevice.expm1(value)
-        return result.to(x.dtype)
+    return libdevice.expm1(x.to(tl.float32)).to(x.dtype)

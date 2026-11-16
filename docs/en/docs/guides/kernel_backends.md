@@ -305,9 +305,11 @@ is controlled by this option rather than an unconditional fused operation.
 
 `KernelOptions(fast_math=False)` selects libdevice exponentials and accurately
 rounded division across built-in neuron/PSC kernels, including reverse replay.
-The default `True` uses approximate FP32 exponentials; exponential Euler uses a
-cancellation-safe `expm1` polynomial near zero rather than subtracting `exp(x)-1`.
-FP64 always retains libdevice transcendental accuracy. Half/BF16 storage is
+The default `True` uses approximate FP32 `exp`. Exponential Euler always uses
+libdevice `expm1`, avoiding cancellation without a separate approximation.
+FP64 always retains libdevice transcendental accuracy. Triton's libdevice
+lowering may flush FP32 subnormals to zero, including tiny BF16 inputs promoted
+to FP32; `fast_math=False` does not promise denormal preservation. Half/BF16 storage is
 preserved; only transcendental arithmetic is promoted where the GPU ABI requires
 it. The Torch reference retains PyTorch's native arithmetic.
 
@@ -322,7 +324,7 @@ options always take precedence. Changing either option invalidates the prepared
 kernel and CUDA Graph route.
 
 Native Triton/TileLang extensions can reuse `exp(x, fast_math=True)` and
-`expm1(x, fast_math=True)` from
+`expm1(x)` from
 `btorch.models.kernels.backends.math_triton` or `math_tilelang`.
 These helpers follow the explicit fast/precise approach in
 [SGLang PR #48942](https://github.com/sgl-project/sglang/pull/48942), independently
