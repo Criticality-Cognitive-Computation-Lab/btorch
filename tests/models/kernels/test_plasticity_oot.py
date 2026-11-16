@@ -345,7 +345,13 @@ def test_external_native_stdp_replacement_and_chunk_replay(
                 torch.testing.assert_close(
                     actual_records[key].cpu(),
                     target_records[key],
-                    atol=absolute,
+                    # A normwise storage-precision budget also covers values
+                    # near zero after cancellation. Lazy event decay and eager
+                    # per-step BF16 decay round at different points; preserving
+                    # BF16 arithmetic must not require extra runtime decay.
+                    atol=max(
+                        absolute, relative * target_records[key].abs().max().item()
+                    ),
                     rtol=relative,
                     msg=lambda message: f"{key}: {message}",
                 )

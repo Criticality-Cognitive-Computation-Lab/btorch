@@ -810,7 +810,7 @@ def register_plasticity_template(
     return template
 
 
-@torch.compiler.assume_constant_result
+@torch.compiler.disable
 def get_plasticity_template(
     model: str,
     state_domains: tuple[tuple[str, str], ...] = (),
@@ -825,6 +825,8 @@ def get_plasticity_template(
         ) from None
     # Model and declared domains are static metadata, just like neuron specs.
     # Resolve their AST outside Dynamo rather than tracing preparation work.
+    # Registry values contain OOT callables; treating them as synthetic graph
+    # constants gives Dynamo invalid guards after a graph break.
     return _specialize_domains(
         _specialize_signals(template, signal_domains), state_domains
     )

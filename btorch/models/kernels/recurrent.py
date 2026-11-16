@@ -18,6 +18,7 @@ from .operators import (
     encode_spec,
 )
 from .options import _event_connection_backend, normalize_backend, resolve_model_options
+from .plasticity import get_plasticity_template
 from .registry import _NATIVE_GPU_BACKENDS, resolve_cell_backend
 from .templates import get_template
 
@@ -211,8 +212,6 @@ def _prepare_connection(connection, options=None, *, online=False):
         ):
             connection_spec["max_degree"] = cache.max_source_degree
             if online:
-                from .plasticity import get_plasticity_template
-
                 rule = connection.plasticity
                 template = get_plasticity_template(
                     rule._kernel_model,
@@ -447,8 +446,6 @@ def recurrent_sequence(
     ):
         # Build lazy topology buffers before Dynamo guards the module's buffer
         # shapes during precision discovery. Preparation is outside the graph.
-        from .plasticity import get_plasticity_template
-
         if (
             get_plasticity_template(
                 cell.linear.plasticity._kernel_model,
@@ -520,8 +517,6 @@ def recurrent_sequence(
         cell.linear if isinstance(cell.linear, SparseConnection) else None
     )
     if online_connection is not None and online_connection.plasticity is not None:
-        from .plasticity import get_plasticity_template
-
         rule = online_connection.plasticity
         plasticity_template = get_plasticity_template(
             rule._kernel_model, tuple(rule.state_domains.items()), rule.signal_domains
@@ -733,8 +728,6 @@ def _execute(
     signal_bindings = []
     plasticity_model = None
     if online_binding is not None:
-        from .plasticity import get_plasticity_template
-
         connection, _ = online_binding
         rule = connection.plasticity
         plasticity_model = rule._kernel_model
