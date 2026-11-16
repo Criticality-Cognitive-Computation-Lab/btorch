@@ -157,9 +157,7 @@ def test_implicit_math_policy_matches_explicit_forward_and_reverse(
         torch.testing.assert_close(value, reference, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize(
-    "option", ("enable_fp_fusion", "precise_division", "precise_exp")
-)
+@pytest.mark.parametrize("option", ("enable_fp_fusion", "fast_math"))
 def test_math_policy_rejects_non_boolean_values(option):
     # A truthy integer would create ambiguous compile/capture identities.
     with pytest.raises(TypeError, match=f"{option} must be a bool"):
@@ -176,34 +174,25 @@ def test_precise_exp_changes_source_policy_without_changing_default(backend, bac
     default, _ = engine.generate_source(*arguments, backward=backward)
     precise, _ = engine.generate_source(*arguments, backward=backward, precise_exp=True)
 
-    if backend == "triton":
-        assert "tl.exp(" in default
-        assert "libdevice.exp(" not in default
-        assert "libdevice.exp(" in precise
-        assert "tl.exp(" not in precise
-    elif backend == "tilelang":
-        # Inspect the extern ABI structurally: quote style is not a numerical
-        # policy. The precise path must select CUDA expf rather than T.exp.
-        def expf_calls(source):
-            return [
+    # The shared helpers receive the compile-time mode for both exp and
+    # expm1; expm1 is what the exponential-Euler forward update actually uses.
+    for source, mode in ((default, 1), (precise, 0)):
+        tree = ast.parse(source) if backend != "cupy" else None
+        if tree is not None:
+            calls = [
                 node
-                for node in ast.walk(ast.parse(source))
+                for node in ast.walk(tree)
                 if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "call_pure_extern"
-                and len(node.args) >= 2
-                and isinstance(node.args[1], ast.Constant)
-                and node.args[1].value == "expf"
+                and isinstance(node.func, ast.Name)
+                and node.func.id in ("_btorch_exp", "_btorch_expm1")
             ]
-
-        assert "T.exp(" in default
-        assert not expf_calls(default)
-        assert expf_calls(precise)
-        assert "T.exp(" not in precise
-    else:
-        # CuPy's historical lowering is already the standard accurate expf.
-        assert "expf(" in default
-        assert "expf(" in precise
+            assert calls
+            assert all(
+                isinstance(node.args[-1], ast.Constant) and node.args[-1].value == mode
+                for node in calls
+            )
+        else:
+            assert f", {mode})" in source
 
 
 @pytest.mark.parametrize("backend", GPU_BACKENDS)

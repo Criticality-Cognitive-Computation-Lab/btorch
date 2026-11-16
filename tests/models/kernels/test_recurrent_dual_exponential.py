@@ -67,7 +67,7 @@ def _build(connection_kind, backend):
             neuron=backend,
             connection="triton",
             enable_fp_fusion=False,
-            precise_division=True,
+            fast_math=False,
         ),
         update_state_names=RECORDS,
     ).to(device="cuda", dtype=torch.float32)
@@ -217,8 +217,7 @@ def test_native_recorded_cudagraph_continuation_and_record_policy(backend):
             connection="triton",
             connection_method="pull",
             enable_fp_fusion=False,
-            precise_division=True,
-            precise_exp=True,
+            fast_math=False,
         )
         initialize(network, "cuda")
     # The expanded source and the strided neuron view are deliberately

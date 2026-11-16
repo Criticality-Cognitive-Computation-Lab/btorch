@@ -92,7 +92,7 @@ class ModelTemplate:
         reverse_parameter_warps: Declared reverse scheduling hints by parameter,
             used only when input VJPs are omitted by a compatible renderer.
         output_state: State equal to the output, allowing trajectory alias reuse.
-        default_precise_division: Accurate division for shorthand backends;
+        default_fast_math: Math policy for shorthand backends;
             explicit KernelOptions always take precedence.
         spike_gradient_input: Forward scalar register passed to the spike
             surrogate, if its output adjoint enters only through that
@@ -122,7 +122,7 @@ class ModelTemplate:
     replay_state: Callable | None = None
     reverse_parameter_warps: tuple[tuple[str, int], ...] = ()
     output_state: str | None = None
-    default_precise_division: bool = False
+    default_fast_math: bool = True
     _extra_dimensions: dict[str, int] = field(init=False, repr=False, compare=False)
     _history_sources: dict[str, str] = field(init=False, repr=False, compare=False)
 

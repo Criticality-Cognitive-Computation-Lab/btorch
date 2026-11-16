@@ -62,9 +62,7 @@ def _model(backend: str, *, steps: int = 128, neurons: int = 64):
     model = RecurrentNN(
         neuron,
         AlphaPSC(neurons, 3.0, connection, g_max=1.0),
-        backend=KernelOptions(
-            neuron=backend, enable_fp_fusion=False, precise_division=True
-        ),
+        backend=KernelOptions(neuron=backend, enable_fp_fusion=False, fast_math=False),
         update_state_names=RECORDS,
     ).to(device)
     init_net_state(model, batch_size=1, device=device, dtype=torch.float32)

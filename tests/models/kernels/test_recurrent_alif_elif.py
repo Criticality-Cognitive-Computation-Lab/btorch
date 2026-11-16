@@ -86,7 +86,7 @@ def _build(neuron_type, connection_kind, backend, *, records=RECORDS):
                 neuron=backend,
                 connection="triton",
                 enable_fp_fusion=False,
-                precise_division=True,
+                fast_math=False,
             )
         ),
         update_state_names=records,
@@ -177,8 +177,7 @@ def test_recurrent_whole_and_two_forward_bptt_match_actual_modules(
             neuron=backend,
             connection="triton",
             enable_fp_fusion=False,
-            precise_division=True,
-            precise_exp=fp_policy == "precise_exp",
+            fast_math=not (True or fp_policy == "precise_exp"),
         )
     whole.backend = options
     continued.backend = options

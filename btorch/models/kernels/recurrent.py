@@ -465,8 +465,8 @@ def _execute(
     _validate_compile_policy(
         options.neuron,
         options.enable_fp_fusion,
-        options.precise_division,
-        options.precise_exp,
+        (not options.fast_math),
+        (not options.fast_math),
     )
     if (x_syn_seq.shape != x_seq.shape and x_syn_seq.shape != (0,)) or (
         x_syn_seq.device != x_seq.device
@@ -585,8 +585,8 @@ def _execute(
         # Execution policy is deliberately outside both semantic NeuronSpec
         # encodings, but remains part of this captured recurrent call.
         "enable_fp_fusion": options.enable_fp_fusion,
-        "precise_division": options.precise_division,
-        "precise_exp": options.precise_exp,
+        "precise_division": (not options.fast_math),
+        "precise_exp": (not options.fast_math),
         "gradient_activity": activity_index if gradient_activity else None,
         "gradient_list": gradient_list,
     }

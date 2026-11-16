@@ -301,9 +301,7 @@ def test_outstanding_forwards_preserve_their_compilation_policies(monkeypatch):
         false_states,
         false_parameters,
         spec,
-        backend=KernelOptions(
-            neuron="torch", enable_fp_fusion=False, precise_division=True
-        ),
+        backend=KernelOptions(neuron="torch", enable_fp_fusion=False, fast_math=False),
     )
     true_result = run_multi_step(
         true_x,
@@ -360,7 +358,7 @@ def test_external_backend_rejects_nondefault_compile_policy_before_dispatch():
     spec, x_seq, states, parameters = _inputs("lif")
     for options in (
         KernelOptions(neuron="compile_policy_external", enable_fp_fusion=False),
-        KernelOptions(neuron="compile_policy_external", precise_division=True),
+        KernelOptions(neuron="compile_policy_external", fast_math=False),
     ):
         with pytest.raises(NotImplementedError, match="built-in cell backends"):
             run_multi_step(
@@ -619,9 +617,7 @@ def test_recurrent_compile_policy_fullgraph_and_capture_invalidation(backend):
     model = RecurrentNN(
         LIF(3, v_threshold=0.65, v_reset=0.0, c_m=1.1, tau=3.0),
         AlphaPSC(3, 2.0, torch.nn.Identity()),
-        backend=KernelOptions(
-            neuron=backend, enable_fp_fusion=False, precise_division=True
-        ),
+        backend=KernelOptions(neuron=backend, enable_fp_fusion=False, fast_math=False),
         update_state_names=("neuron.v",),
     ).cuda()
     model.neuron.init_state(batch_size=2, device="cuda", dtype=torch.float32)
@@ -653,9 +649,7 @@ def test_recurrent_compile_policy_fullgraph_and_capture_invalidation(backend):
     for layer in (model, reference):
         layer.neuron.reset(batch_size=2, device="cuda", dtype=torch.float32)
         layer.synapse.reset(batch_size=2, device="cuda", dtype=torch.float32)
-    model.backend = KernelOptions(
-        neuron=backend, enable_fp_fusion=True, precise_division=False
-    )
+    model.backend = KernelOptions(neuron=backend, enable_fp_fusion=True, fast_math=True)
     model.cudagraph = True
     drive = x.detach()
     with torch.no_grad(), environ.context(dt=1.0):
@@ -671,7 +665,7 @@ def test_recurrent_compile_policy_fullgraph_and_capture_invalidation(backend):
             )
         assert model._cudagraph_runner.n_captures == 1
         model.backend = KernelOptions(
-            neuron=backend, enable_fp_fusion=False, precise_division=True
+            neuron=backend, enable_fp_fusion=False, fast_math=False
         )
         actual, records = model(drive)
         expected, expected_records = reference(drive)

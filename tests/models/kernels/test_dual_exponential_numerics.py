@@ -58,9 +58,7 @@ def test_long_dual_exponential_sequence_matches_module_state_and_parameter_vjps(
     )
     options = KernelOptions(neuron=backend)
     if fp_policy == "strict":
-        options = KernelOptions(
-            neuron=backend, enable_fp_fusion=False, precise_division=True
-        )
+        options = KernelOptions(neuron=backend, enable_fp_fusion=False, fast_math=False)
     histories = template.history_names
 
     actual = run_multi_step(

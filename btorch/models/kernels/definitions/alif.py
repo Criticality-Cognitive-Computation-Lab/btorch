@@ -58,7 +58,7 @@ register_model_template(
         ("v", "g_k", "v_charged"),
         history_sources=(("v_charged", "v"),),
         fragments=fragments,
-        default_precise_division=True,
+        default_fast_math=False,
         module_factory=module_factory,
         record_attributes=(("v_charged", "v_pre_spike"),),
         spike_gradient_input="norm",

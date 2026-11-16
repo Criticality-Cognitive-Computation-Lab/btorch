@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
 ### Added
 
 - Support native recurrent BPTT with bounded forward/reverse CUDA Graph replay.
@@ -195,6 +196,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live buffers (e.g. a start state to restore each step).
 
 ### Changed
+
+- Unify native neuron/PSC math selection as `KernelOptions(fast_math=...)`;
+  share dtype-aware Triton/TileLang exponential helpers and cancellation-safe
+  fast `expm1` for exponential Euler. FMA contraction remains independent.
 
 - Reduce recurrent CPU submission overhead by reusing trajectory device guards
   and validated sparse bindings across timesteps.

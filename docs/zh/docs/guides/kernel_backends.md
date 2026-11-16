@@ -138,3 +138,27 @@ Checkpoint 在反向时重算私有激活；CPU offload 将保存的私有张量
 开启 offload 后，完整轨迹占用的 CPU 内存随序列长度增长，GPU 记录缓冲区
 则由 chunk 大小限制。模型权重和调用方的 GPU 输入仍驻留在 GPU。
 只选择需要的记录，或通过 `update_state_names=()` 省略状态轨迹。
+
+
+### 数学精度
+
+`KernelOptions(fast_math=False)` 为内置神经元、PSC 和反向重放选择 libdevice
+指数函数与精确舍入除法。默认 `True` 使用近似 FP32 指数；指数 Euler 在零附近
+使用避免相消的 `expm1` 多项式，而不是直接计算 `exp(x)-1`。FP64 始终使用
+libdevice。保留 half/BF16 存储类型，仅在超越函数的 GPU ABI 要求时提升计算精度。
+Torch 参考路径保留 PyTorch 原生运算。
+
+```python
+options = KernelOptions(neuron="triton", fast_math=False, enable_fp_fusion=False)
+```
+
+`enable_fp_fusion` 单独控制编译器乘加收缩。数学模式不保证长序列逐位一致，也不改变
+稀疏累加顺序。ALIF/ELIF 的后端字符串简写选择 `fast_math=False`，显式选项优先。
+修改这些选项会使准备好的内核和 CUDA Graph 缓存失效。
+
+自定义 Triton/TileLang 函数可复用
+`btorch.models.kernels.backends.math_triton` 或 `math_tilelang` 中的
+`exp(x, fast_math=True)`、`expm1(x, fast_math=True)`。设计遵循
+[SGLang PR #48942](https://github.com/sgl-project/sglang/pull/48942) 的显式快速/精确
+数学模式，不依赖全局编译器 fast-math 开关。CuPy 显式选择指数指令，两个模式的
+`expm1` 均使用 libdevice。

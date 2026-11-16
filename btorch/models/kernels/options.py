@@ -43,18 +43,12 @@ class KernelOptions:
             mode.
             Explicit fused operations that reproduce a Torch surrogate remain
             fused; this flag controls compiler-selected contraction.
-        precise_division: Request accurately rounded floating-point division in
-            built-in GPU cell kernels. The default preserves each backend's
-            historical division implementation. Plain backend strings select accurate
-            division for ALIF/ELIF; explicit options retain this boolean.
-            This option does not select a
-            general precise-math mode or control transcendental functions,
-            square roots, denormals or flush-to-zero behavior.
-        precise_exp: Request accurate floating-point ``exp`` evaluation in
-            built-in GPU cell kernels. The default preserves each backend's
-            historical exponential implementation, and shorthand backends do
-            not enable this option automatically. This option does not control
-            ``expm1``, division, compiler contraction, or other operations.
+        fast_math: Use approximate GPU exponentials and division when True.
+            False selects libdevice exponentials (including cancellation-safe
+            ``expm1``) and accurately rounded division. FP64 transcendentals
+            always use libdevice. This does not change storage dtype or select
+            compiler FMA contraction; control that with ``enable_fp_fusion``.
+            Torch reference modules retain PyTorch's native arithmetic.
     """
 
     neuron: NeuronBackend = "torch"
@@ -62,8 +56,7 @@ class KernelOptions:
     connection_method: PropagationMethod = "auto"
     merge_synapse: bool = False
     enable_fp_fusion: bool = True
-    precise_division: bool = False
-    precise_exp: bool = False
+    fast_math: bool = True
 
     def __post_init__(self) -> None:
         from .registry import cell_backend_names
@@ -77,10 +70,8 @@ class KernelOptions:
             raise TypeError("merge_synapse must be a bool")
         if not isinstance(self.enable_fp_fusion, bool):
             raise TypeError("enable_fp_fusion must be a bool")
-        if not isinstance(self.precise_division, bool):
-            raise TypeError("precise_division must be a bool")
-        if not isinstance(self.precise_exp, bool):
-            raise TypeError("precise_exp must be a bool")
+        if not isinstance(self.fast_math, bool):
+            raise TypeError("fast_math must be a bool")
 
 
 def normalize_backend(backend: str | KernelOptions) -> KernelOptions:
@@ -110,9 +101,9 @@ def resolve_model_options(backend: str | KernelOptions, *models: str) -> KernelO
         and options.neuron in _NATIVE_GPU_BACKENDS
         and any(
             has_generated_model(model)
-            and get_template(NeuronSpec(model)).default_precise_division
+            and not get_template(NeuronSpec(model)).default_fast_math
             for model in models
         )
     ):
-        return replace(options, precise_division=True)
+        return replace(options, fast_math=False)
     return options

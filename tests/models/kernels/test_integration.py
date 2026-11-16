@@ -594,7 +594,7 @@ def test_gpu_sparse_fullgraph_training_and_cudagraph_replay(backend):
             neuron=backend,
             connection="cusparse",
             enable_fp_fusion=False,
-            precise_division=True,
+            fast_math=False,
         )
         with torch.no_grad():
             captured, state = rnn(drive)
@@ -1167,7 +1167,7 @@ def test_cusparse_checkpoint_offload_preserves_full_recurrent_vjp():
         connection="cusparse",
         connection_method="pull",
         enable_fp_fusion=False,
-        precise_division=True,
+        fast_math=False,
     )
     model.chunk_size, model.grad_checkpoint, model.cpu_offload = 4, True, True
     reference = copy.deepcopy(model)

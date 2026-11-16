@@ -84,14 +84,23 @@ def _parse_statement(line: str) -> ast.AST:
 
 
 class _MathTransformer(ast.NodeTransformer):
-    def __init__(self, calls: dict[str, str], *, floor_division: bool = False):
+    def __init__(
+        self,
+        calls: dict[str, str],
+        *,
+        floor_division: bool = False,
+        fast_math: bool | None = None,
+    ):
         self.calls = calls
         self.floor_division = floor_division
+        self.fast_math = fast_math
 
     def visit_Call(self, node):  # noqa: N802 - ast API
         node = self.generic_visit(node)
         if isinstance(node.func, ast.Name):
             replacement = self.calls.get(node.func.id)
+            if self.fast_math is not None and node.func.id in ("exp", "expm1"):
+                node.args.append(ast.Constant(int(self.fast_math)))
             if replacement is not None:
                 if replacement == "__tilelang_fma__":
                     node.func = ast.parse("T.call_pure_extern", mode="eval").body
@@ -133,11 +142,12 @@ def transform_statement(
     calls: dict[str, str],
     *,
     floor_division: bool = False,
+    fast_math: bool | None = None,
 ) -> str:
     """Lower scalar math calls in one Python-like source statement."""
-    tree = _MathTransformer(calls, floor_division=floor_division).visit(
-        _parse_statement(line)
-    )
+    tree = _MathTransformer(
+        calls, floor_division=floor_division, fast_math=fast_math
+    ).visit(_parse_statement(line))
     return ast.unparse(ast.fix_missing_locations(tree))
 
 
@@ -215,12 +225,11 @@ class SourceRenderer:
         if stripped.startswith(("for ", "if ")):
             return stripped
         calls = dict(self.calls)
-        if self.precise_exp:
-            calls["exp"] = self.precise_exp_call
         return transform_statement(
             line,
             calls,
             floor_division=self.floor_division,
+            fast_math=not self.precise_exp,
         )
 
     def render(self, lines, pointers, has_spike_list, has_gradient_list, epilogue=()):
@@ -231,14 +240,13 @@ class TritonRenderer(SourceRenderer):
     name = "triton"
     calls = {
         "abs": "tl.abs",
-        "exp": "tl.exp",
-        "expm1": "libdevice.expm1",
+        "exp": "_btorch_exp",
+        "expm1": "_btorch_expm1",
         "fma": "tl.fma",
         "maximum": "tl.maximum",
         "minimum": "tl.minimum",
         "where": "tl.where",
     }
-    precise_exp_call = "libdevice.exp"
 
     def validate_dt(self, required_dt=None):
         lines = [
@@ -357,6 +365,8 @@ class TritonRenderer(SourceRenderer):
         imports = (
             "import triton\nimport triton.language as tl\n"
             "from triton.language.extra import libdevice\n"
+            "from btorch.models.kernels.backends.math_triton "
+            "import exp as _btorch_exp, expm1 as _btorch_expm1\n"
         )
         if has_gradient_list:
             imports += (
@@ -388,14 +398,13 @@ class CuPyRenderer(SourceRenderer):
     floor_division = True
     calls = {
         "abs": "fabsf",
-        "exp": "expf",
-        "expm1": "expm1f",
+        "exp": "_btorch_exp",
+        "expm1": "_btorch_expm1",
         "fma": "fmaf",
         "maximum": "fmaxf",
         "minimum": "fminf",
         "where": "where",
     }
-    precise_exp_call = "expf"
 
     def storage_index(self, layout, index):
         # Pointer offsets are integer arithmetic. Floating fmaxf/fminf would
@@ -508,6 +517,12 @@ class CuPyRenderer(SourceRenderer):
             args += ", int n_steps"
         return (
             "#include <cuda_fp16.h>\n#include <cuda_bf16.h>\n"
+            'extern "C" __device__ float __nv_expf(float);\n'
+            'extern "C" __device__ float __nv_expm1f(float);\n'
+            "__device__ __forceinline__ float _btorch_exp(float x, bool fast_math) "
+            "{ return fast_math ? __expf(x) : __nv_expf(x); }\n"
+            "__device__ __forceinline__ float _btorch_expm1(float x, bool) "
+            "{ return __nv_expm1f(x); }\n"
             "__device__ __forceinline__ float where(bool condition, float x, float y) "
             "{ return condition ? x : y; }\n"
             f'extern "C" __global__ void cell_kernel({args}) {{\n'
@@ -522,14 +537,13 @@ class TileLangRenderer(SourceRenderer):
     name = "tilelang"
     calls = {
         "abs": "T.abs",
-        "exp": "T.exp",
+        "exp": "_btorch_exp",
         "expm1": "_btorch_expm1",
         "fma": "__tilelang_fma__",
         "maximum": "T.max",
         "minimum": "T.min",
         "where": "T.if_then_else",
     }
-    precise_exp_call = "__tilelang_exp__"
 
     def emit_spike_list(self, value, n, layout):
         n_source, n_output, capacity = layout
@@ -574,27 +588,10 @@ class TileLangRenderer(SourceRenderer):
         if line.strip().startswith(("for ", "if ")):
             return line.strip()
         calls = dict(self.calls)
-        if self.precise_exp:
-            calls["exp"] = "__tilelang_exp__"
-        tree = _MathTransformer(calls).visit(_parse_statement(line))
+        tree = _MathTransformer(calls, fast_math=not self.precise_exp).visit(
+            _parse_statement(line)
+        )
 
-        # TileLang's pure extern call needs the same ABI as fma.
-        class _ExpandExp(ast.NodeTransformer):
-            def visit_Call(self, node):  # noqa: N802 - ast API
-                node = self.generic_visit(node)
-                if (
-                    isinstance(node.func, ast.Name)
-                    and node.func.id == "__tilelang_exp__"
-                ):
-                    node.func = ast.parse("T.call_pure_extern", mode="eval").body
-                    node.args = [
-                        ast.Constant("float32"),
-                        ast.Constant("expf"),
-                        *node.args,
-                    ]
-                return node
-
-        tree = _ExpandExp().visit(tree)
         return ast.unparse(ast.fix_missing_locations(tree))
 
     def cast_load(self, expression, dtype):
@@ -636,8 +633,8 @@ class TileLangRenderer(SourceRenderer):
                 if has_spike_list
                 else ""
             )
-            + "def _btorch_expm1(value):\n"
-            '    return T.call_pure_extern("float32", "expm1f", value)\n'
+            + "from btorch.models.kernels.backends.math_tilelang "
+            "import exp as _btorch_exp, expm1 as _btorch_expm1\n"
             + (
                 "@tilelang.jit\ndef build_kernel():\n"
                 if has_spike_list

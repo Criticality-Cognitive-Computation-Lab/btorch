@@ -129,9 +129,7 @@ def test_selective_reverse_outputs_match_actual_module(backend, model, scope):
         states,
         parameters,
         spec,
-        backend=KernelOptions(
-            neuron=backend, enable_fp_fusion=False, precise_division=True
-        ),
+        backend=KernelOptions(neuron=backend, enable_fp_fusion=False, fast_math=False),
     )
     expected_output, expected_final, _ = python_module_sequence(
         ref_x, ref_states, ref_parameters, spec

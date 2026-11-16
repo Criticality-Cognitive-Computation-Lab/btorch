@@ -345,9 +345,7 @@ def _glif_alpha_model(backend, requested):
     model = RecurrentNN(
         neuron,
         AlphaPSC(neurons, 2.4, connection),
-        backend=KernelOptions(
-            neuron=backend, enable_fp_fusion=False, precise_division=True
-        ),
+        backend=KernelOptions(neuron=backend, enable_fp_fusion=False, fast_math=False),
         update_state_names=requested,
     ).to(device="cuda", dtype=torch.float32)
     init_net_state(model, batch_size=batch, device="cuda", dtype=torch.float32)

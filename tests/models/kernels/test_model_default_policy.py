@@ -61,9 +61,8 @@ def _cuda_policy_network(neuron_type, backend, *, cudagraph=False):
 
 @pytest.mark.parametrize("backend", GPU_BACKENDS)
 @pytest.mark.parametrize("neuron_type", (ALIF, ELIF))
-@pytest.mark.parametrize("math_option", ("precise_division", "precise_exp"))
 def test_cuda_capture_recaptures_when_effective_math_policy_changes(
-    monkeypatch, backend, neuron_type, math_option
+    monkeypatch, backend, neuron_type
 ):
     """A policy switch must never replay a graph with stale math semantics.
 
@@ -99,12 +98,8 @@ def test_cuda_capture_recaptures_when_effective_math_policy_changes(
     # Both model shorthands promise accurate division. The eager twin uses an
     # independently specified policy, so a shared resolver bug cannot make two
     # identically wrong shorthand paths pass the exact native comparison.
-    base_options = KernelOptions(neuron=backend, precise_division=True)
-    policies = (
-        (backend, replace(base_options, precise_division=False), backend)
-        if math_option == "precise_division"
-        else (base_options, replace(base_options, precise_exp=True), base_options)
-    )
+    base_options = KernelOptions(neuron=backend, fast_math=False)
+    policies = (backend, replace(base_options, fast_math=True), backend)
 
     with torch.inference_mode(), environ.context(dt=0.7):
         for phase, policy in enumerate(policies, start=1):

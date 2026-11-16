@@ -104,7 +104,7 @@ def _build(neuron_type, connection_kind, backend, *, spiking=True, records=RECOR
                 neuron=backend,
                 connection="triton",
                 enable_fp_fusion=False,
-                precise_division=True,
+                fast_math=False,
             )
         ),
         update_state_names=records,
@@ -194,7 +194,7 @@ def test_recurrent_poisson_whole_chunk_rng_and_full_bptt(
         neuron=backend,
         connection="triton",
         enable_fp_fusion=False,
-        precise_division=True,
+        fast_math=False,
     )
     whole.backend = options
     chunked.backend = options

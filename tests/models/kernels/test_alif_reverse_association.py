@@ -101,9 +101,7 @@ def test_elif_voltage_cotangents_follow_the_module_accumulation_order():
         states,
         parameters,
         spec,
-        backend=KernelOptions(
-            neuron="triton", enable_fp_fusion=False, precise_division=True
-        ),
+        backend=KernelOptions(neuron="triton", enable_fp_fusion=False, fast_math=False),
     )
     (native_voltage,) = torch.autograd.grad(native[0], voltage)
     assert torch.equal(native_voltage, actual)

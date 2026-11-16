@@ -9,7 +9,7 @@ from btorch.models.rnn import RecurrentNN
 rnn = RecurrentNN(neuron, synapse, backend=KernelOptions(
     neuron="triton", connection="auto", connection_method="push",
     merge_synapse=False,
-    enable_fp_fusion=False, precise_division=True,
+    enable_fp_fusion=False, fast_math=False,
 ))
 ```
 
@@ -303,30 +303,31 @@ Surrogate functions use ordinary Torch operations without TorchScript.
 Native ATan backward follows the same square/add expression; its contraction
 is controlled by this option rather than an unconditional fused operation.
 
-`KernelOptions(precise_division=True)` separately requests accurately rounded
-floating-point division from built-in GPU cell backends. Its default is `False`,
-which preserves each backend's existing division implementation when an explicit
-options object is supplied. Plain backend strings use accurately rounded
-division for ALIF/ELIF; these new families need it to preserve scalar parameter
-VJPs in the validated configurations. Other families retain their historical
-string defaults. Explicit `KernelOptions` always take precedence. This is useful
-for long nonlinear recurrences where small division errors accumulate, but it can
-reduce throughput. It does not promise bitwise equality in general and does not
-control exponential or square-root approximations, denormal handling, or
-flush-to-zero behavior. Division precision and floating-point contraction are
-independent options and neither changes `NeuronSpec` or the model equations.
-
-`KernelOptions(precise_exp=True)` requests accurate exponential evaluation.
-It is opt-in and defaults to `False`; no model shorthand enables it. It affects
-exponentials independently of division precision and multiply-add contraction.
-Use it when the extra accuracy matters for the workload. For example:
+`KernelOptions(fast_math=False)` selects libdevice exponentials and accurately
+rounded division across built-in neuron/PSC kernels, including reverse replay.
+The default `True` uses approximate FP32 exponentials; exponential Euler uses a
+cancellation-safe `expm1` polynomial near zero rather than subtracting `exp(x)-1`.
+FP64 always retains libdevice transcendental accuracy. Half/BF16 storage is
+preserved; only transcendental arithmetic is promoted where the GPU ABI requires
+it. The Torch reference retains PyTorch's native arithmetic.
 
 ```python
-options = KernelOptions(neuron="triton", precise_exp=True)
+options = KernelOptions(neuron="triton", fast_math=False, enable_fp_fusion=False)
 ```
 
-The cell benchmark exposes the same choice through `--precise-exp` and records
-it with the measurements.
+`fast_math` does not select compiler FMA contraction, sparse accumulation order,
+or guarantee bitwise trajectory equality. `enable_fp_fusion` controls contraction
+independently. ALIF/ELIF backend shorthands select `fast_math=False`; explicit
+options always take precedence. Changing either option invalidates the prepared
+kernel and CUDA Graph route.
+
+Native Triton/TileLang extensions can reuse `exp(x, fast_math=True)` and
+`expm1(x, fast_math=True)` from
+`btorch.models.kernels.backends.math_triton` or `math_tilelang`.
+These helpers follow the explicit fast/precise approach in
+[SGLang PR #48942](https://github.com/sgl-project/sglang/pull/48942), independently
+of global compiler fast-math flags. CuPy uses explicit exponential intrinsics and
+retains libdevice `expm1` in both modes.
 
 GLIF3, AlphaPSC and DualExponentialPSC state kernels follow the Module's stable exponential-Euler update
 using `expm1`, including zero adaptation rates and the infinite time-constant

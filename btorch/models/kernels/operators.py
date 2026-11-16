@@ -803,8 +803,8 @@ def run_multi_step(
     _validate_compile_policy(
         backend,
         options.enable_fp_fusion,
-        options.precise_division,
-        options.precise_exp,
+        (not options.fast_math),
+        (not options.fast_math),
     )
     if x_seq.ndim < 2:
         raise ValueError("Cell input requires time-first FP32, FP16 or BF16 tensors")
@@ -936,9 +936,9 @@ def run_multi_step(
         if isinstance(spec.dt, Tensor)
         else torch.full((), spec.dt, dtype=torch.float32, device=x_seq.device),
         options.enable_fp_fusion,
-        options.precise_division,
+        (not options.fast_math),
         uniform_seq,
-        options.precise_exp,
+        (not options.fast_math),
     )
     n_states = len(states)
     record_map = dict(zip(names, result[1 + n_states :]))

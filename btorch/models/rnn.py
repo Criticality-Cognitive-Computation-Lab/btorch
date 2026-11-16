@@ -1162,8 +1162,8 @@ class RecurrentNN(RecurrentNNAbstract):
             options.connection,
             options.merge_synapse,
             options.enable_fp_fusion,
-            options.precise_division,
-            options.precise_exp,
+            (not options.fast_math),
+            (not options.fast_math),
             cell_backend_revision(options.neuron),
             options.connection_method,
         )
