@@ -2,7 +2,7 @@
 
 import pytest
 
-from btorch.models.kernels import register_cell_backend
+from btorch.models.kernels import register_backend
 from btorch.models.kernels.torch_backend import backward_sequence, forward_sequence
 
 
@@ -16,7 +16,7 @@ def reference_backend():
     mutate the registry.
     """
     name = "test_torch_sequence_reference"
-    register_cell_backend(
+    register_backend(
         name,
         forward=forward_sequence,
         backward=backward_sequence,

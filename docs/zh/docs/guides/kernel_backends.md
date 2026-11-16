@@ -87,8 +87,14 @@ python -m examples.rsnn_izhikevich --device cuda --neuron-backend triton --spars
 和用户请求的记录。`.train()`、`.eval()` 不参与分流。即使 RNN 参数冻结，可训练
 encoder 的梯度仍会穿过 RNN；`no_grad()`、`inference_mode()` 强制 inference。
 
-当前内置 kernel 支持 FP32、FP16、BF16 输入，cell 状态与累加使用 FP32，输出序列跟随输入 dtype。
-这是目前实现的限制，精度与类型提升策略尚未确定。
+Torch、Triton 和 TileLang 保留显式提供的 FP16/BF16 神经元和 PSC 状态精度；
+混合浮点操作数遵循 Torch 类型提升规则，准备阶段不将状态或参数强制转换为 FP32。
+缺少低精度数学接口的操作仅临时提升该次运算，并立即转回结果。
+时间方向的伴随梯度和参数归约可使用 FP32 累加，但不提升前向轨迹或 checkpoint 重放的精度。
+公共输出序列跟随输入 dtype。CuPy renderer 的标量局部变量目前仍使用 FP32。
+单模型时间循环按提升后的模型 dtype 绑定混合初始状态，确保循环寄存器类型稳定；
+统一的 FP16/BF16 模型仍保留原精度。CUDA Graph 复用还要求状态 shape、dtype 和 stride
+不变；仅修改状态值不会使捕获失效。
 时间在第一维，通常是 `[T,B,N]`；初始状态没有时间维。Adaptation 和 receptor 轴
 显式保留，整数拓扑、receptor 和 delay 不求梯度。
 

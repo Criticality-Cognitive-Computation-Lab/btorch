@@ -39,6 +39,7 @@ from .backend import (
     RouteSpec,
     registry,
 )
+from .planner import _prefer_dense
 
 
 registry.register("csr_matvec", "torch", kernels_torch.csr_matvec)
@@ -433,6 +434,8 @@ def _build_dense(kernels: dict[str, object]) -> RouteImplementation:
 
     Materialization belongs to preparation, once per trajectory, so optimizer
     updates are visible and no dense matrix is rebuilt inside the time loop.
+    Online learning binds a placement destination to update the same operand
+    from its existing canonical weight writer.
     Reverse keeps the shared sparse VJP: only existing edges own parameters.
     """
 
@@ -470,7 +473,16 @@ def _build_dense(kernels: dict[str, object]) -> RouteImplementation:
             torch.matmul(flat, matrix.transpose(-1, -2), out=flat_output)
             return output
 
-        return PreparedPropagation(forward)
+        def weight_destination():
+            # Keep placement storage invocation-local to online learning;
+            # static GEMM needs only the matrix and output destinations.
+            index = kernels_torch._row_indices(crow) * n_in + col
+            return matrix.view(-1), index
+
+        return PreparedPropagation(
+            forward,
+            prepare_weight_destination=weight_destination if not n_vb else None,
+        )
 
     def forward(crow, col, values, x, *unused):
         return prepare_forward(crow, col, values, x)(x)
@@ -1256,14 +1268,7 @@ def _register_route_specs() -> None:
                 key=RouteKey("propagate", "dense", "pull", reverse_backend),
                 kernel_bindings=bindings,
                 build=_build_dense,
-                supports=lambda context: (
-                    context is not None
-                    and context.method == "auto"
-                    and registry.override is None
-                    and context.shape is not None
-                    and max(context.shape) < 4000
-                    and context.dtype in kernels_torch._FLOAT_DTYPES
-                ),
+                supports=_prefer_dense,
             ),
             device=device,
             priority=31 if reverse_backend == "triton" else 30,

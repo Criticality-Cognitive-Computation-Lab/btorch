@@ -19,7 +19,24 @@ from .base import (
     OperatorConnection,
     StructuredConnection,
 )
-from .plasticity import PairSTDP
+from .plasticity import (
+    ExternalSignal,
+    InhibitorySTDP,
+    ModulatedSTDP,
+    ModulatedSTDPOptions,
+    NearestPairSTDP,
+    PairSTDP,
+    PlasticityEvents,
+    PlasticityLayout,
+    PlasticityRule,
+    PostState,
+    PowerPairSTDP,
+    PowerPairSTDPOptions,
+    TripletSTDP,
+    TripletSTDPOptions,
+    VoltageSTDP,
+    VoltageSTDPOptions,
+)
 from .projection import Projection
 from .rewire import HardDeepR, HardDeepROptions
 from .rule import (
@@ -35,6 +52,7 @@ from .rule import (
 )
 from .sparse import SparseConnection
 from .synapse import Synapse
+from .transmission import TransmissionRule, TsodyksMarkram
 from .weight import ConstantWeight, ConstrainedWeight, EdgeWeight, Weight
 
 
@@ -49,6 +67,7 @@ __all__ = [
     "ConstrainedWeight",
     "DistanceDependent",
     "EdgeWeight",
+    "ExternalSignal",
     "FixedIndegree",
     "FixedOutdegree",
     "FromEdges",
@@ -57,14 +76,30 @@ __all__ = [
     "HardDeepROptions",
     "HybridConnection",
     "ImplicitConnection",
+    "InhibitorySTDP",
+    "ModulatedSTDP",
+    "ModulatedSTDPOptions",
+    "NearestPairSTDP",
     "OneToOne",
     "OperatorConnection",
     "PairwiseBernoulli",
     "PairSTDP",
+    "PlasticityEvents",
+    "PlasticityLayout",
+    "PlasticityRule",
+    "PostState",
+    "PowerPairSTDP",
+    "PowerPairSTDPOptions",
     "Projection",
     "SparseConnection",
     "SparseLinear",
     "StructuredConnection",
     "Synapse",
+    "TripletSTDP",
+    "TripletSTDPOptions",
+    "TransmissionRule",
+    "TsodyksMarkram",
+    "VoltageSTDP",
+    "VoltageSTDPOptions",
     "Weight",
 ]

@@ -49,6 +49,37 @@ def _cell_records(model, refractory, revision):
     return get_template(NeuronSpec(model, refractory=refractory)).record_attributes
 
 
+def resolve_post_state(module, declaration) -> str:
+    """Resolve a learning signal to live state/record storage through
+    metadata."""
+    if declaration.stage == "state":
+        attribute = declaration.name
+    else:
+        from .contracts import NeuronSpec
+        from .templates import get_template
+
+        model, _, _ = _model_layout(module)
+        template = get_template(NeuronSpec(model))
+        records = dict(template.record_attributes)
+        candidates = [
+            records[record]
+            for record, state in template.history_sources
+            if state == declaration.name and record in records
+        ]
+        if len(candidates) != 1:
+            raise ValueError(
+                f"{type(module).__name__} must declare one charged record "
+                f"for {declaration.name!r}"
+            )
+        attribute = candidates[0]
+    if attribute not in module._memories_rv:
+        raise ValueError(
+            f"Enable {attribute!r} recording when constructing "
+            f"{type(module).__name__} before binding a plasticity signal"
+        )
+    return attribute
+
+
 def validate_module(module, options: KernelOptions) -> None:
     """Reject modules without an explicitly bound sequence implementation."""
     # Composite modules own their sequence composition (for example, a
@@ -189,11 +220,10 @@ def _cell_metadata(model, options, revision):
 
 
 def _cell_tensor(value: Tensor, device: torch.device) -> Tensor:
-    """Keep existing FP32 storage; convert only when the cell policy requires
-    it."""
-    if value.dtype == torch.float32 and value.device == device:
+    """Bind model storage on the input device without changing precision."""
+    if value.device == device:
         return value
-    return value.to(device=device, dtype=torch.float32)
+    return value.to(device=device)
 
 
 def _prepare_cell_from_layout(module, x_seq: Tensor, layout):
@@ -217,7 +247,7 @@ def _prepare_cell_from_layout(module, x_seq: Tensor, layout):
         extra = module._memories_rv[name].sizes[-ndim:] if ndim else ()
         shape = (*x_seq.shape[1:], *extra)
         if not isinstance(value, Tensor):
-            value = x_seq.new_full(shape, value, dtype=torch.float32)
+            value = x_seq.new_full(shape, value)
         else:
             value = _cell_tensor(value, device)
         states.append(value)

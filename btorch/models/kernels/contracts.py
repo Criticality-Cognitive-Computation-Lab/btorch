@@ -2,7 +2,18 @@
 
 from dataclasses import dataclass
 
+import torch
 from torch import Tensor
+
+
+def pointwise_dtype(reference: Tensor, *operands: Tensor) -> torch.dtype:
+    """Resolve floating model precision without widening low-precision
+    inputs."""
+    dtype = reference.dtype
+    for value in operands:
+        if value.is_floating_point():
+            dtype = torch.promote_types(dtype, value.dtype)
+    return dtype
 
 
 @dataclass(frozen=True)

@@ -10,6 +10,7 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 
+from .contracts import pointwise_dtype
 from .operators import decode_spec
 from .registry import _NATIVE_GPU_BACKENDS, cell_backend_revision, resolve_cell_backend
 from .templates import (
@@ -42,7 +43,9 @@ def _connection(source, parameters, topology, spec):
     from ...sparse.runtime.ops import propagate_bound
 
     crow, col, t_crow, t_col, t_perm = topology[:5]
-    task_values = topology[5] if len(topology) > 5 else None
+    task_values = (
+        topology[5] if len(topology) > 5 and not spec.get("plasticity") else None
+    )
     output = propagate_bound(
         spec["route"],
         crow,
@@ -114,7 +117,7 @@ def _prepare_connection_forward(source, parameters, topology, spec):
             t_col,
             t_perm,
             spec.get("max_density"),
-            topology[5] if len(topology) > 5 else None,
+            topology[5] if len(topology) > 5 and not spec.get("plasticity") else None,
         ),
     )
     if forward is None or len(parameters) == 1:
@@ -285,6 +288,47 @@ def _parts(states, parameters, spec):
     )
 
 
+def _connection_dtype(source_dtype, parameters, spec):
+    """Resolve the existing linear-cast or sparse-promotion contract."""
+    if spec["connection"] == "linear":
+        return parameters[0].dtype
+    return (
+        torch.promote_types(source_dtype, parameters[0].dtype)
+        if parameters
+        else source_dtype
+    )
+
+
+def _physical_dtypes(x_seq, x_syn_seq, states, parameters, spec):
+    """Resolve neuron and PSC storage from their actual connection operands.
+
+    Dense linear execution casts its source to the weight dtype; sparse
+    and identity propagation retain operand promotion. A delayed source
+    keeps the delay module's storage dtype. This metadata is shared by
+    real and fake trajectories, including the one-step case with no
+    next-neuron update.
+    """
+    neuron_states, psc_states, neuron_parameters, psc_parameters, connection = _parts(
+        states, parameters, spec
+    )
+    neuron_dtype = pointwise_dtype(
+        x_seq, *neuron_states, *neuron_parameters, psc_states[0]
+    )
+    psc_dtype = pointwise_dtype(psc_states[0], *psc_states, *psc_parameters)
+
+    def propagated_dtype(spike_dtype):
+        source_dtype = states[-1].dtype if spec["delay"] else spike_dtype
+        if x_syn_seq.numel():
+            source_dtype = torch.promote_types(source_dtype, x_syn_seq.dtype)
+        return _connection_dtype(source_dtype, connection, spec)
+
+    psc_dtype = torch.promote_types(psc_dtype, propagated_dtype(neuron_dtype))
+    if x_seq.shape[0] > 1:
+        neuron_dtype = torch.promote_types(neuron_dtype, psc_dtype)
+        psc_dtype = torch.promote_types(psc_dtype, propagated_dtype(neuron_dtype))
+    return neuron_dtype, psc_dtype
+
+
 def _spike_input(spikes, x_syn_seq, time_index):
     """Keep absent synaptic input absent instead of adding a zero sequence."""
     return spikes + x_syn_seq[time_index] if x_syn_seq.numel() else spikes
@@ -370,14 +414,19 @@ def _prepare_recurrent_step(
     charged_histories=(),
     gradient_activity=None,
     uniform_seq=None,
+    record_offsets=(1, 0),
+    input_offset=1,
+    extra_inputs=(),
 ):
     """Prepare state/record slots without materializing every temporal view.
 
-    A stage at t writes PSC(t) and neuron(t+1). Inputs use the preceding
-    stage's destinations. Only logical boundaries need Tensor state
-    views; Triton interior launches use stride-aware byte offsets into
-    owned storage. Other runtimes consume Tensor views through the same
-    slot schedule.
+    Paired stages write PSC(t) and neuron(t+1); HELION stages write both
+    states at t. Inputs use the preceding stage's destinations. The
+    first stage binds initial memories directly; this schedule owns
+    subsequent stages. Only logical boundaries need Tensor state views;
+    Triton interior launches use stride-aware byte offsets into owned
+    storage. Other runtimes consume Tensor views through the same slot
+    schedule.
     """
     owners = []
     slots = []
@@ -405,8 +454,8 @@ def _prepare_recurrent_step(
     state_views = []
     offset = 0
     for prefix, template, record_offset in (
-        ("neuron_", templates[0], 1),
-        ("psc_", templates[1], 0),
+        ("neuron_", templates[0], record_offsets[0]),
+        ("psc_", templates[1], record_offsets[1]),
     ):
         readers = []
         for index, name in enumerate(template.state_names):
@@ -432,7 +481,7 @@ def _prepare_recurrent_step(
         tensors = (
             workspace(final)
             if record is None
-            else sequence(final, record, 1, keepdim=True)
+            else sequence(final, record, input_offset, keepdim=True)
         )
         slots.append((final, tensors))
         charged_views.append(tensors)
@@ -443,7 +492,9 @@ def _prepare_recurrent_step(
         ("neuron_uniform", uniform_seq),
     ):
         if value is not None:
-            slots.append((name, sequence(name, value, 1)))
+            slots.append((name, sequence(name, value, input_offset)))
+    for name, value in extra_inputs:
+        slots.append((name, sequence(name, value, keepdim=True)))
 
     bindings = {name: tensors(1) for name, tensors in slots}
     bindings["drive"] = drive
@@ -532,6 +583,67 @@ def _prepare_recurrent_step(
         )
 
     return _PreparedRecurrentStep(run, materialize, tuple(owners))
+
+
+def _prepare_plasticity(
+    source,
+    spikes,
+    topology,
+    weight,
+    traces,
+    parameters,
+    model,
+    n_delay,
+    dt,
+    backend,
+    records=None,
+    signals=None,
+    state_domains=(),
+    signal_domains=(),
+    weight_destination=None,
+):
+    """Bind canonical rule storage once for the recurrent invocation."""
+    from .plasticity import get_plasticity_template, prepare_update
+
+    if len(topology) < 8:
+        raise RuntimeError("Online STDP topology is missing canonical edge indices")
+    pre_index, post_index, delay_index = topology[5:8]
+    template = get_plasticity_template(
+        model,
+        tuple(tuple(item) for item in state_domains),
+        tuple(tuple(item) for item in signal_domains),
+    )
+    return prepare_update(
+        backend,
+        model,
+        weight,
+        dict(zip(template.states, traces, strict=True)),
+        source.reshape(-1),
+        spikes.reshape(-1),
+        pre_index,
+        post_index,
+        delay_index if delay_index.numel() else None,
+        max(n_delay, 1),
+        dict(zip(template.parameters, parameters, strict=True)),
+        dt,
+        records=records,
+        signals=signals,
+        state_domains=state_domains,
+        signal_domains=signal_domains,
+        segments={
+            "segment_pre": topology[10],
+            "segment_delay": topology[11],
+            **(
+                {"segment_index": topology[14]}
+                if n_delay > 1
+                else {"source_segment_ptr": topology[9]}
+            ),
+        }
+        if "segment"
+        in (*dict(template.state_domains).values(), *dict(template.signals).values())
+        else None,
+        weight_destination=weight_destination,
+    )
 
 
 def _current(psc, spec):
@@ -708,6 +820,11 @@ def _trajectory(
     backend,
     dt,
     uniform_seq=None,
+    online_weight=None,
+    plasticity_states=None,
+    stdp_parameters=None,
+    destinations=None,
+    plasticity_signals=None,
 ):
     n_steps = x_seq.shape[0]
     if uniform_seq is not None and not uniform_seq.numel():
@@ -724,10 +841,41 @@ def _trajectory(
         synapse_parameters,
         connection_parameters,
     ) = _parts(initial_states, parameters, spec)
+    if spec.get("plasticity"):
+        if online_weight is None or plasticity_states is None:
+            raise RuntimeError("Online STDP requires mutable weight and traces")
+        execution_weight = (
+            online_weight.index_select(-1, topology[8])
+            if spec.get("online_permuted") and not spec.get("event_connection")
+            else online_weight
+        )
+        connection_parameters = [execution_weight, *connection_parameters]
     neuron_template = get_template(neuron_spec)
     synapse_template = get_template(synapse_spec)
+    neuron_dtype, psc_dtype = _physical_dtypes(
+        x_seq,
+        x_syn_seq,
+        initial_states,
+        [*neuron_parameters, *synapse_parameters, *connection_parameters],
+        spec,
+    )
     ring = initial_states[-1] if spec["delay"] else x_seq.new_empty(0)
+    history_destinations = (
+        dict(zip(history_names, destinations[1 + len(initial_states) :]))
+        if destinations is not None
+        else {}
+    )
     histories = {}
+    online_base = len(initial_states) + len(spec.get("charged_names", ()))
+    if spec.get("plasticity"):
+        for offset, value in enumerate((*plasticity_states, online_weight)):
+            index = online_base + offset
+            if index in history_names:
+                histories[index] = (
+                    history_destinations[index]
+                    if destinations is not None
+                    else value.new_empty((x_seq.shape[0], *value.shape))
+                )
     charged_names = tuple(spec.get("charged_names", ()))
     enable_fp_fusion = bool(spec.get("enable_fp_fusion", True))
     precise_division = bool(spec.get("precise_division", False))
@@ -735,10 +883,15 @@ def _trajectory(
     use_fused = backend in _NATIVE_GPU_BACKENDS and x_seq.device.type == "cuda"
     output_dtype = x_seq.dtype
     output_seq = (
-        torch.empty(x_seq.shape, device=x_seq.device, dtype=torch.float32)
+        x_seq.new_empty(
+            x_seq.shape,
+            dtype=neuron_dtype,
+        )
         if use_fused or spec.get("save_compute_spikes")
         else torch.empty_like(x_seq)
     )
+    if destinations is not None and destinations[0].dtype == output_seq.dtype:
+        output_seq = destinations[0]
     activity_index = spec.get("gradient_activity")
     gradient_activity = (
         torch.empty_like(output_seq) if activity_index is not None else None
@@ -765,8 +918,11 @@ def _trajectory(
     n_checkpoints = _checkpoint_count(n_steps, checkpoint_interval)
     checkpoints = (
         [
-            state.new_empty((n_checkpoints, *state.shape), dtype=torch.float32)
-            for state in (*neuron_states, *synapse_states)
+            state.new_empty(
+                (n_checkpoints, *state.shape),
+                dtype=neuron_dtype if index < len(neuron_states) else psc_dtype,
+            )
+            for index, state in enumerate((*neuron_states, *synapse_states))
         ]
         if checkpoint_interval
         else []
@@ -775,24 +931,61 @@ def _trajectory(
     step_launch = None
     step_outputs = None
     prepared_connection = None
+    event_connection = None
+    plasticity_update = None
     spike_list = None
     from .backends.renderers import get_runtime
 
-    if (
-        use_fused
-        and get_runtime(backend).supports_spike_list
-        and spec["connection"] == "sparse"
-        and not spec["delay"]
-        and not x_syn_seq.numel()
-    ):
+    if spec.get("event_connection"):
+        from .backends.helion_plasticity import prepare_event_connection
+        from .plasticity import get_plasticity_template
+
+        template = get_plasticity_template(spec["plasticity"])
+        event_connection = prepare_event_connection(
+            output_seq[0],
+            online_weight,
+            dict(zip(template.states, plasticity_states, strict=True)),
+            dict(zip(template.parameters, stdp_parameters, strict=True)),
+            topology,
+            dt,
+            x_seq.shape[0],
+            spec,
+            records={
+                name: histories[online_base + offset]
+                for offset, name in enumerate((*template.states, "weight"))
+                if online_base + offset in histories
+            },
+        )
+        prepared_connection = event_connection
+        spike_list = event_connection.spikes
+    elif use_fused and spec["connection"] == "sparse":
+        source = output_seq[0].flatten(-len(spec["neuron_shape"]))
+        if spec["delay"]:
+            source = source.new_empty(
+                (*source.shape[:-1], source.shape[-1] * spec["delay"]),
+                dtype=ring.dtype,
+            )
+        elif x_syn_seq.numel():
+            source = source.to(torch.promote_types(source.dtype, x_syn_seq.dtype))
         prepared_connection = _prepare_connection_forward(
-            output_seq[0].flatten(-len(spec["neuron_shape"])),
+            source,
             connection_parameters,
             topology,
             spec,
         )
-        if prepared_connection is not None:
+        if (
+            prepared_connection is not None
+            and get_runtime(backend).supports_spike_list
+            and not spec["delay"]
+            and not x_syn_seq.numel()
+        ):
             spike_list = prepared_connection.spikes
+    if spec.get("spike_selection") == "spike_list" and spike_list is None:
+        raise NotImplementedError(
+            "Explicit spike lists require a native paired neuron/PSC producer "
+            "and a connection that consumes its queue; use spike_selection='auto' "
+            "for ordinary sparse routing"
+        )
     if use_fused:
         from .backends.fused import prepare_fused_step
 
@@ -813,6 +1006,11 @@ def _trajectory(
             if gradient_activity is None
             else gradient_activity[0],
         )
+        # The first producer can precede promotion by the connection/PSC.
+        # Publish it into the already owned raster before binding propagation,
+        # so every step uses the same prepared dtype without an extra copy.
+        output_seq[0].copy_(spikes)
+        spikes = output_seq[0]
     if use_fused:
         # Templates determine state/record shapes. The trajectory owns these
         # destinations, so neither an earlier forward nor a saved input is
@@ -823,8 +1021,9 @@ def _trajectory(
             *([ring] if spec["delay"] else []),
             *neuron_charged,
         )
-        histories = {}
         for name in history_names:
+            if name in histories:
+                continue
             if name < 0:
                 continue
             if name == activity_index:
@@ -832,13 +1031,17 @@ def _trajectory(
                 continue
             sample = samples[name]
             dtype = (
-                torch.float32
+                psc_dtype
                 if len(neuron_states) <= name < len(neuron_states) + len(synapse_states)
-                else sample.dtype
+                else neuron_dtype
             )
             if spec["delay"] and name == len(initial_states) - 1:
                 dtype = ring.dtype
-            histories[name] = sample.new_empty((n_steps, *sample.shape), dtype=dtype)
+            histories[name] = (
+                history_destinations[name]
+                if destinations is not None
+                else sample.new_empty((n_steps, *sample.shape), dtype=dtype)
+            )
     prepared_source = (
         _prepare_source(
             spikes,
@@ -855,9 +1058,40 @@ def _trajectory(
         prepared_connection.prepare_sequence(
             output_seq.flatten(-len(spec["neuron_shape"]))
         )
-        if spike_list is not None and prepared_connection.prepare_sequence is not None
+        if spike_list is not None
+        and event_connection is None
+        and prepared_connection.prepare_sequence is not None
         else None
     )
+    signal_bindings = spec.get("plasticity_signals", ())
+    weight_destination = (
+        prepared_connection.prepare_weight_destination()
+        if spec.get("plasticity")
+        and prepared_connection is not None
+        and event_connection is None
+        and prepared_connection.prepare_weight_destination is not None
+        else None
+    )
+    if weight_destination is not None and spec.get("online_permuted"):
+        destination, index = weight_destination
+        # Restored canonical slots can differ from CSR order. Resolve their
+        # placement once; the common identity order needs no extra operation.
+        canonical_index = torch.empty_like(index)
+        canonical_index.scatter_(0, topology[8], index)
+        weight_destination = destination, canonical_index
+    live_neuron_signals = any(
+        kind in ("state", "charged") for _name, kind, _index in signal_bindings
+    )
+    plasticity_records = ()
+    if spec.get("plasticity") and event_connection is None:
+        from .plasticity import get_plasticity_template
+
+        trace_names = get_plasticity_template(spec["plasticity"]).states
+        plasticity_records = tuple(
+            (name, online_base + offset)
+            for offset, name in enumerate((*trace_names, "weight"))
+            if online_base + offset in histories
+        )
     for time_index in range(n_steps):
         if not use_fused:
             spikes, neuron_states, neuron_charged = _cell_forward(
@@ -875,6 +1109,10 @@ def _trajectory(
             )
         if consume_sequence is not None and time_index:
             drive = consume_sequence(time_index)
+            if spec.get("plasticity"):
+                # Learning still consumes the current event stream; the
+                # prepared propagator addresses the same sequence directly.
+                source, ring = prepared_source(spikes, ring, time_index)
         elif prepared_source is not None:
             source, ring = prepared_source(spikes, ring, time_index)
         else:
@@ -891,12 +1129,55 @@ def _trajectory(
             )
         if consume_sequence is None or not time_index:
             drive = (
-                prepared_connection.from_spikes(source)
+                event_connection.step(source, time_index)
+                if event_connection is not None
+                else prepared_connection.from_spikes(source)
                 if spike_list is not None
                 else prepared_connection(source)
                 if prepared_connection is not None
                 else _connection(source, connection_parameters, topology, spec)
             )
+        if spec.get("plasticity") and event_connection is None:
+            if stdp_parameters is None:
+                raise RuntimeError("Online STDP parameters are missing")
+            records = {
+                name: histories[index][time_index] for name, index in plasticity_records
+            }
+            signals = {
+                name: (
+                    neuron_states[index]
+                    if kind == "state"
+                    else neuron_charged[index]
+                    if kind == "charged"
+                    else plasticity_signals[index][time_index]
+                    if kind == "sequence"
+                    else plasticity_signals[index]
+                ).reshape(-1)
+                for name, kind, index in signal_bindings
+            }
+            arrivals = source.reshape(-1)
+            posts = spikes.reshape(-1)
+            if plasticity_update is None:
+                plasticity_update = _prepare_plasticity(
+                    arrivals,
+                    posts,
+                    topology,
+                    online_weight,
+                    plasticity_states,
+                    stdp_parameters,
+                    spec["plasticity"],
+                    spec["delay"],
+                    dt,
+                    backend,
+                    records=records,
+                    signals=signals,
+                    state_domains=spec.get("plasticity_domains", ()),
+                    signal_domains=spec.get("plasticity_signal_domains", ()),
+                    weight_destination=weight_destination,
+                )
+            plasticity_update(arrivals, posts, records=records, signals=signals)
+            if spec.get("online_permuted") and weight_destination is None:
+                torch.index_select(online_weight, -1, topology[8], out=execution_weight)
         if not spec.get("merge_receptors", 0) and drive.shape != drive_shape:
             drive = drive.reshape(drive_shape)
         current_spikes, current_neuron_states = spikes, neuron_states
@@ -914,12 +1195,14 @@ def _trajectory(
                     synapse_spec,
                     backend=backend,
                     neuron_history_names=charged_names,
+                    state_dtypes=(neuron_dtype, psc_dtype),
                     enable_fp_fusion=enable_fp_fusion,
                     precise_division=precise_division,
                     precise_exp=precise_exp,
                     neuron_prepared_parameters=prepared_parameters,
                     psc_prepared_parameters=synapse_prepared_parameters,
                     spike_list=spike_list,
+                    clear_drive=(event_connection is not None and spike_list is None),
                     gradient_activity=(
                         None
                         if gradient_activity is None
@@ -1002,13 +1285,19 @@ def _trajectory(
                         uniform_seq=uniform_seq,
                     )
                 step_launch.launch(time_index, drive)
-                if consume_sequence is None:
+                if consume_sequence is None or spec.get("plasticity"):
                     spikes = output_seq[time_index + 1]
-                if time_index + 2 == n_steps or (
-                    checkpoint_interval and (time_index + 1) % checkpoint_interval == 0
+                if (
+                    live_neuron_signals
+                    or time_index + 2 == n_steps
+                    or (
+                        checkpoint_interval
+                        and (time_index + 1) % checkpoint_interval == 0
+                    )
                 ):
-                    # Interior states stay in owned destinations. Only a
-                    # checkpoint or the trailing primitive stage needs views.
+                    # Live learning signals need the current producer views
+                    # every step. Other paths only need boundary/checkpoint
+                    # views; neither case copies data or launches a kernel.
                     neuron_states, synapse_states, neuron_charged = (
                         step_launch.state_views(time_index)
                     )
@@ -1045,7 +1334,7 @@ def _trajectory(
             # fused schedule without replaying a threshold decision.
             for target, value in zip(checkpoints, (*neuron_states, *synapse_states)):
                 target[checkpoint_index].copy_(value)
-        if not use_fused or time_index == 0:
+        if not use_fused:
             output_seq[time_index].copy_(current_spikes)
         history_values = None
         # Fused interior stages already store every requested record. Only
@@ -1058,7 +1347,9 @@ def _trajectory(
         for name in copy_names:
             if name < 0:
                 continue
-            if name == activity_index:
+            if name == activity_index or (
+                spec.get("plasticity") and name >= online_base
+            ):
                 continue
             # Native interior stages already wrote these records. Only
             # the leading neuron and trailing PSC need copies.
@@ -1086,7 +1377,11 @@ def _trajectory(
     # states are already independent tensor allocations for nonempty runs;
     # histories own one preallocated sequence allocation throughout forward.
     final = [*neuron_states, *synapse_states, *([ring] if spec["delay"] else [])]
-    if use_fused:
+    if event_connection is not None:
+        event_connection.finish()
+    if plasticity_update is not None:
+        plasticity_update.finish()
+    if use_fused and destinations is None:
         # Final outputs cannot alias a recorded trajectory under the functional
         # custom-op schema. Copy once at the trajectory boundary, never per step.
         final = [value.clone() for value in final]
@@ -1100,6 +1395,531 @@ def _trajectory(
         *checkpoints,
         *([output_seq] if spec.get("save_compute_spikes") else []),
     ]
+
+
+def _helion_trajectory(
+    x_seq,
+    x_syn_seq,
+    initial_states,
+    parameters,
+    topology,
+    encoded,
+    history_names,
+    backend,
+    dt,
+    online_weight=None,
+    plasticity_states=None,
+    stdp_parameters=None,
+    destinations=None,
+    plasticity_signals=None,
+):
+    """Run shared HELION model phases with static or online sparse
+    propagation."""
+    if backend not in ("triton", "tilelang"):
+        raise NotImplementedError(
+            "HELION recurrent execution requires the Triton or TileLang backend"
+        )
+    if x_syn_seq.numel():
+        raise NotImplementedError("HELION recurrent execution does not support x_syn")
+    spec = json.loads(encoded)
+    online = bool(spec.get("plasticity"))
+    spike_selection = spec.get("spike_selection", "auto")
+    use_spike_list = spike_selection == "spike_list"
+    if use_spike_list:
+        from .plasticity import get_plasticity_template
+
+        if int(spec.get("delay", 0)) > 1 or (not online and spec.get("delay", 0)):
+            raise NotImplementedError(
+                "Fused spike-list execution currently supports zero-delay "
+                "connections; delayed producer queues are not retained"
+            )
+        if online and get_plasticity_template(spec["plasticity"]).events is None:
+            raise NotImplementedError(
+                "Spike-list plasticity requires a rule with an exact event-only "
+                "silent-evolution contract; continuous learning still scans edges"
+            )
+    if not x_seq.shape[0]:
+        raise ValueError("HELION execution requires at least one timestep")
+    if online and x_seq.shape[0] > torch.iinfo(torch.int32).max:
+        raise ValueError("HELION plasticity exceeds its per-invocation trace clock")
+    delay = int(spec.get("delay", 0))
+    if delay < 0:
+        raise ValueError("HELION delay count must be non-negative")
+    if online and any(
+        value is None for value in (online_weight, plasticity_states, stdp_parameters)
+    ):
+        raise RuntimeError("HELION STDP requires canonical mutable weight and traces")
+    if spec.get("connection") != "sparse" or spec.get("method") != "push":
+        raise NotImplementedError(
+            "HELION recurrent execution requires a sparse push connection"
+        )
+    if len(topology) < 5 or len(parameters) < (
+        spec["neuron_parameters"] + spec["synapse_parameters"] + (not online)
+    ):
+        raise RuntimeError("HELION sparse topology or parameters are incomplete")
+
+    from .backends.fused import helion_csr_push, prepare_helion_step
+
+    spec["dt"] = dt
+    neuron_spec = decode_spec(spec["neuron"], dt)
+    synapse_spec = decode_spec(spec["synapse"], dt)
+    (
+        neuron_states,
+        synapse_states,
+        neuron_parameters,
+        synapse_parameters,
+        connection_parameters,
+    ) = _parts(initial_states, parameters, spec)
+    if len(connection_parameters) != (0 if online else 1):
+        raise NotImplementedError(
+            "HELION recurrent execution currently supports sparse weights without bias"
+        )
+    state_dtypes = _physical_dtypes(
+        x_seq,
+        x_syn_seq,
+        initial_states,
+        [*neuron_parameters, *synapse_parameters, online_weight]
+        if online
+        else parameters,
+        spec,
+    )
+    weight = online_weight if online else connection_parameters[0]
+    n = x_seq[0].numel()
+    state_receptors = synapse_states[0].numel() // n
+    if state_receptors < 1 or state_receptors * n != synapse_states[0].numel():
+        raise ValueError("HELION PSC state shape is not neuron-major")
+    t_crow, t_col, t_perm = topology[2:5]
+    expected_rows = n * delay if delay else n
+    if t_crow.numel() != expected_rows + 1:
+        raise ValueError("HELION source-major CSR row pointer disagrees with neurons")
+    max_degree = int(spec.get("max_degree", -1))
+    if max_degree < 0:
+        raise RuntimeError(
+            "HELION sparse topology is missing its maximum source degree"
+        )
+    propagation = (
+        ()
+        if online
+        else helion_csr_push(
+            backend,
+            max_degree,
+            n,
+            state_receptors,
+            delay or None,
+            n_delay=delay or 1,
+            spike_list=use_spike_list,
+        )
+    )
+
+    neuron_prepared = prepare_parameters(neuron_spec, neuron_parameters)
+    synapse_prepared = prepare_parameters(synapse_spec, synapse_parameters)
+    initial_history = initial_states[-1] if delay else None
+    if delay:
+        if initial_history.numel() != delay * n:
+            raise ValueError(
+                "HELION delay history must be delay-first with shape "
+                f"({delay}, {n}), got {tuple(initial_history.shape)}"
+            )
+    future = synapse_states[0].new_zeros(
+        (delay, n, state_receptors) if delay and not online else (n, state_receptors),
+        dtype=torch.promote_types(
+            (online_weight if online else connection_parameters[0]).dtype,
+            state_dtypes[0],
+        ),
+    )
+    spike_list = None
+    if use_spike_list:
+        from ...sparse.runtime.spike_list import SPIKE_BLOCK, SpikeList
+
+        groups = (n + SPIKE_BLOCK - 1) // SPIKE_BLOCK
+        capacity = groups * SPIKE_BLOCK
+        spike_list = SpikeList(
+            torch.empty(capacity, device=x_seq.device, dtype=torch.int32),
+            torch.empty(capacity, device=x_seq.device, dtype=torch.int64),
+            torch.empty(groups, device=x_seq.device, dtype=torch.int32),
+            t_crow[1:] - t_crow[:-1],
+            future,
+            n,
+        )
+    step_values = (
+        torch.arange(
+            x_seq.shape[0] + int(online), dtype=torch.int64, device=x_seq.device
+        )
+        if delay or online
+        else None
+    )
+    extra_buffers = {
+        "t_crow": t_crow,
+        "t_col": t_col,
+        "t_perm": t_perm,
+        "weight": weight,
+    }
+    if delay or online:
+        extra_buffers["helion_step"] = step_values[:1]
+    if backend == "triton":
+        # Graph replay reuses the monotonic counters across many chunks.
+        # Int64 avoids overflow after a few million timesteps on large grids.
+        extra_buffers.update(
+            grid_barrier=torch.zeros((1,), dtype=torch.int64, device=x_seq.device),
+            grid_epoch=torch.zeros((1,), dtype=torch.int64, device=x_seq.device),
+        )
+    delay_state_index = len(neuron_states) + len(synapse_states)
+    delay_records = (
+        initial_history.new_empty((x_seq.shape[0], *initial_history.shape))
+        if delay and delay_state_index in history_names
+        else None
+    )
+    if delay:
+        extra_buffers["delay_history"] = initial_history
+        if delay_records is not None:
+            extra_buffers["delay_history_record"] = delay_records
+    online_base = len(initial_states) + len(spec.get("charged_names", ()))
+    online_histories = {}
+    pre_propagation = ()
+    post_propagation = ()
+    local_dtypes = {}
+    signal_inputs = ()
+    event_plasticity = False
+    mutated_buffers = ()
+    output_seq = None
+    if online:
+        from .backends.helion_plasticity import (
+            event_topology_bindings,
+            prepare_continuous_phases,
+            prepare_stdp_phases,
+        )
+        from .plasticity import get_plasticity_template
+
+        domains = tuple(tuple(item) for item in spec.get("plasticity_domains", ()))
+        plasticity_template = get_plasticity_template(
+            spec["plasticity"],
+            domains,
+            tuple(tuple(item) for item in spec.get("plasticity_signal_domains", ())),
+        )
+        event_plasticity = plasticity_template.events is not None
+        shared_traces = event_plasticity and any(
+            domain != "edge" for _, domain in plasticity_template.state_domains
+        )
+        segment_domains = "segment" in (
+            *dict(plasticity_template.state_domains).values(),
+            *dict(plasticity_template.signals).values(),
+        )
+        required_topology = (
+            15
+            if segment_domains and delay > 1
+            else 14
+            if event_plasticity or segment_domains
+            else 10
+        )
+        if segment_domains and not event_plasticity:
+            required_topology += 1  # Canonical receptor IDs follow the segment maps.
+        if len(topology) != required_topology or len(stdp_parameters) != len(
+            plasticity_template.parameters
+        ):
+            raise RuntimeError("HELION STDP segment topology or parameters are missing")
+        traces = dict(zip(plasticity_template.states, plasticity_states, strict=True))
+        rule_parameters = dict(
+            zip(plasticity_template.parameters, stdp_parameters, strict=True)
+        )
+        output_seq = (
+            destinations[0] if destinations is not None else torch.empty_like(x_seq)
+        )
+        # Invocation-local clocks fit int32 and save one word per edge. This
+        # device fill is captured too, resetting clocks before every replay.
+        extra_buffers.update(
+            **traces,
+            stdp_step=step_values[:1],
+            stdp_dt=dt,
+            spike_history=output_seq,
+        )
+        extra_buffers.update(
+            ("stdp_" + name, value) for name, value in rule_parameters.items()
+        )
+        for offset, (name, value) in enumerate((*traces.items(), ("weight", weight))):
+            index = online_base + offset
+            if index in history_names:
+                history = (
+                    destinations[1 + len(initial_states) + history_names.index(index)]
+                    if destinations is not None
+                    else value.new_empty((x_seq.shape[0], *value.shape))
+                )
+                online_histories[index] = history
+                extra_buffers[name + "_history"] = history
+        learning_history_names = tuple(
+            name
+            for name in (*plasticity_template.states, "weight")
+            if name + "_history" in extra_buffers
+        )
+        if event_plasticity:
+            extra_buffers.update(
+                event_topology_bindings(
+                    topology, spike_list=use_spike_list, shared=shared_traces
+                )
+            )
+            if not shared_traces:
+                trace_tick = torch.zeros_like(weight, dtype=torch.int32)
+                extra_buffers["trace_tick"] = trace_tick
+            phases = prepare_stdp_phases(
+                backend,
+                spec["plasticity"],
+                n,
+                state_receptors,
+                max(delay, 1),
+                int(spec["n_segments"]),
+                weight.numel(),
+                tuple(value.numel() for value in stdp_parameters),
+                history_names=learning_history_names,
+                spike_selection="spike_list" if use_spike_list else "scan",
+                state_domains=domains if shared_traces else (),
+            )
+        else:
+            extra_buffers.update(edge_pre=topology[5], edge_post=topology[6])
+            if segment_domains:
+                extra_buffers.update(
+                    event_topology_bindings(topology[:-1], shared=True)
+                )
+            if topology[7].numel():
+                extra_buffers["edge_delay"] = topology[7]
+            if topology[-1].numel():
+                extra_buffers["edge_receptor"] = topology[-1]
+            signal_pointers = {}
+            for name, kind, index in spec.get("plasticity_signals", ()):
+                if kind == "charged":
+                    pointer = "neuron_" + spec["charged_names"][index] + "_seq"
+                elif kind == "state":
+                    pointer = (
+                        "neuron_"
+                        + get_template(neuron_spec).state_names[index]
+                        + "_final"
+                    )
+                else:
+                    pointer = "plasticity_signal_" + name
+                    value = plasticity_signals[index]
+                    extra_buffers[pointer] = value[0] if kind == "sequence" else value
+                    if kind == "sequence":
+                        signal_inputs += ((pointer, value),)
+                signal_pointers[name] = pointer
+            phases = prepare_continuous_phases(
+                backend,
+                spec["plasticity"],
+                n,
+                state_receptors,
+                max(delay, 1),
+                weight.numel(),
+                tuple(value.numel() for value in stdp_parameters),
+                signal_pointers,
+                history_names=learning_history_names,
+                has_delay=bool(topology[7].numel()),
+                has_receptor=bool(topology[-1].numel()),
+                n_segments=int(spec.get("n_segments", 0)),
+                state_domains=domains,
+                signal_domains=tuple(
+                    tuple(item) for item in spec.get("plasticity_signal_domains", ())
+                ),
+            )
+        pre_propagation = phases.pre_propagation
+        propagation = phases.propagation
+        post_propagation = phases.post_propagation
+        local_dtypes = phases.local_dtypes
+        mutated_buffers = phases.mutated_buffers
+    prepared = prepare_helion_step(
+        x_seq[0],
+        future,
+        tuple(neuron_states),
+        tuple(synapse_states),
+        tuple(neuron_parameters),
+        tuple(synapse_parameters),
+        neuron_spec,
+        synapse_spec,
+        propagation,
+        extra_buffers,
+        neuron_history_names=tuple(spec.get("charged_names", ())),
+        backend=backend,
+        state_dtypes=state_dtypes,
+        enable_fp_fusion=bool(spec.get("enable_fp_fusion", True)),
+        precise_division=bool(spec.get("precise_division", False)),
+        precise_exp=bool(spec.get("precise_exp", False)),
+        neuron_prepared_parameters=neuron_prepared,
+        psc_prepared_parameters=synapse_prepared,
+        grid_sync_before_psc=True,
+        spike_list=spike_list,
+        grid_sync_before_propagation=online or use_spike_list,
+        ring_capacity=delay if delay and not online else None,
+        **(
+            dict(
+                history_capacity=delay or None,
+                pre_propagation=pre_propagation,
+                post_propagation=post_propagation,
+                local_dtypes=local_dtypes,
+                mutated_buffers=mutated_buffers,
+                plasticity_model=spec["plasticity"],
+            )
+            if online
+            else {}
+        ),
+    )
+    prepared_first = prepared
+    if delay and not online:
+        first_propagation = helion_csr_push(
+            backend,
+            max_degree,
+            n,
+            state_receptors,
+            delay,
+            n_delay=delay,
+            preload_history=True,
+        )
+        prepared_first = prepare_helion_step(
+            x_seq[0],
+            future,
+            tuple(neuron_states),
+            tuple(synapse_states),
+            tuple(neuron_parameters),
+            tuple(synapse_parameters),
+            neuron_spec,
+            synapse_spec,
+            first_propagation,
+            extra_buffers,
+            neuron_history_names=tuple(spec.get("charged_names", ())),
+            backend=backend,
+            state_dtypes=state_dtypes,
+            enable_fp_fusion=bool(spec.get("enable_fp_fusion", True)),
+            precise_division=bool(spec.get("precise_division", False)),
+            precise_exp=bool(spec.get("precise_exp", False)),
+            neuron_prepared_parameters=neuron_prepared,
+            psc_prepared_parameters=synapse_prepared,
+            grid_sync_before_psc=True,
+            ring_capacity=delay,
+        )
+
+    template = get_template(neuron_spec)
+    psc_template = get_template(synapse_spec)
+    charged_names = tuple(spec.get("charged_names", ()))
+    samples = (*neuron_states, *synapse_states, *([initial_history] if delay else []))
+    working = (prepared.allocate_outputs(), prepared.allocate_outputs())
+    kernel_dtype = working[0]["spike"].dtype
+    histories = dict(online_histories)
+    for name in history_names:
+        if name < 0:
+            continue
+        if name in histories:
+            continue
+        if name == delay_state_index and delay_records is not None:
+            histories[name] = delay_records
+            continue
+        if name >= len(samples):
+            if name >= len(samples) + len(charged_names):
+                raise ValueError("HELION history index is out of range")
+            sample = samples[0]
+        else:
+            sample = samples[name]
+        if name < len(neuron_states) or name >= len(samples):
+            record_dtype = state_dtypes[0]
+        elif name < len(neuron_states) + len(synapse_states):
+            record_dtype = state_dtypes[1]
+        else:
+            record_dtype = sample.dtype
+        histories[name] = torch.empty(
+            (x_seq.shape[0], *sample.shape),
+            device=x_seq.device,
+            dtype=record_dtype,
+        )
+    if output_seq is None:
+        output_seq = torch.empty(x_seq.shape, device=x_seq.device, dtype=kernel_dtype)
+    # The leading step reads module memories. Every later step reuses the
+    # same owned state slots as the ordinary paired schedule, with both
+    # neuron and PSC histories indexed at the current HELION timestep.
+    outputs = dict(working[0])
+    outputs["spike"] = output_seq[0]
+    offset = 0
+    for prefix, template_, values in (
+        ("neuron_", template, neuron_states),
+        ("psc_", psc_template, synapse_states),
+    ):
+        for index, (name, value) in enumerate(zip(template_.state_names, values)):
+            outputs[prefix + name + "_init"] = value
+            history = histories.get(offset + index)
+            if history is not None:
+                outputs[prefix + name + "_final"] = history[0]
+        offset += len(values)
+    for index, name in enumerate(charged_names):
+        history = histories.get(len(samples) + index)
+        if history is not None:
+            outputs["neuron_" + name + "_seq"] = history[:1]
+    outputs["neuron_input"] = x_seq[0]
+    extra_inputs = signal_inputs
+    if delay or online:
+        outputs["helion_step"] = step_values[:1]
+        extra_inputs += (("helion_step", step_values),)
+    if online:
+        outputs["stdp_step"] = step_values[:1]
+        extra_inputs += (("stdp_step", step_values),)
+    prepared_first.launch_into(outputs)
+
+    if x_seq.shape[0] > 1:
+        step_launch = _prepare_recurrent_step(
+            prepared,
+            working,
+            x_seq,
+            output_seq,
+            histories,
+            (template, psc_template),
+            future,
+            charged_histories=tuple(
+                (name, histories.get(len(samples) + index))
+                for index, name in enumerate(charged_names)
+            ),
+            record_offsets=(0, 0),
+            input_offset=0,
+            extra_inputs=extra_inputs,
+        )
+        for time_index in range(1, x_seq.shape[0]):
+            step_launch.launch(time_index, future)
+        current_neuron, current_psc, current_charged = step_launch.state_views(
+            x_seq.shape[0] - 1
+        )
+    else:
+        current_neuron = tuple(
+            outputs["neuron_" + name + "_final"] for name in template.state_names
+        )
+        current_psc = tuple(
+            outputs["psc_" + name + "_final"] for name in psc_template.state_names
+        )
+        current_charged = tuple(
+            outputs["neuron_" + name + "_seq"][0] for name in charged_names
+        )
+    last_charged = dict(zip(charged_names, current_charged, strict=True))
+    final_states = [value.clone() for value in (*current_neuron, *current_psc)]
+    if event_plasticity and not shared_traces:
+        from .plasticity import materialize
+
+        materialize(
+            backend,
+            spec["plasticity"],
+            traces,
+            trace_tick,
+            rule_parameters,
+            dt,
+            step_values[-1:],
+        )
+    if delay:
+        final_history = torch.cat(
+            (output_seq.to(initial_history.dtype).flip(0), initial_history), dim=0
+        )[:delay]
+        final_states.append(final_history)
+        if delay_records is not None:
+            histories[delay_state_index] = delay_records
+    charged_values = [
+        histories[len(samples) + index][-1].clone()
+        if len(samples) + index in histories
+        else last_charged[name].clone()
+        for index, name in enumerate(charged_names)
+    ]
+    history_outputs = tuple(
+        histories[name] if name >= 0 else charged_values[-name - 1]
+        for name in history_names
+    )
+    return [output_seq.to(x_seq.dtype), *final_states, *history_outputs]
 
 
 def _forward_impl(
@@ -1116,8 +1936,10 @@ def _forward_impl(
 ) -> list[Tensor]:
     from .recurrent_graph import active_graphs
 
+    encoded_spec = json.loads(encoded)
+    is_helion = encoded_spec.get("recurrent") == "helion"
     graphs = active_graphs()
-    if graphs is not None:
+    if graphs is not None and not is_helion:
         return graphs.run(
             _trajectory,
             (
@@ -1135,6 +1957,18 @@ def _forward_impl(
             fixed=(3, 4),
         )
     with torch.cuda.device(x_seq.device) if x_seq.is_cuda else nullcontext():
+        if is_helion:
+            return _helion_trajectory(
+                x_seq,
+                x_syn_seq,
+                states,
+                parameters,
+                topology,
+                encoded,
+                history_names,
+                backend,
+                dt,
+            )
         return _trajectory(
             x_seq,
             x_syn_seq,
@@ -1157,6 +1991,86 @@ inference = torch.ops.btorch_cells.recurrent_inference.default
 training = torch.ops.btorch_cells.recurrent_training.default
 
 
+def _online_impl(
+    x_seq: Tensor,
+    x_syn_seq: Tensor,
+    states: list[Tensor],
+    parameters: list[Tensor],
+    topology: list[Tensor],
+    weight: Tensor,
+    plasticity_states: list[Tensor],
+    stdp_parameters: list[Tensor],
+    plasticity_signals: list[Tensor],
+    outputs: list[Tensor],
+    encoded: str,
+    history_names: list[int],
+    backend: str,
+    dt: Tensor,
+    uniform_seq: Tensor | None = None,
+) -> None:
+    metadata = _recurrent_metadata(encoded)
+    from .plasticity import plasticity_template_revision
+
+    if metadata["plasticity_revision"] != plasticity_template_revision(
+        metadata["plasticity"]
+    ):
+        raise RuntimeError(
+            "Plasticity registration changed; recreate the compiled callable or graph"
+        )
+    with torch.cuda.device(x_seq.device) if x_seq.is_cuda else nullcontext():
+        if json.loads(encoded).get("recurrent") == "helion":
+            result = _helion_trajectory(
+                x_seq,
+                x_syn_seq,
+                states,
+                parameters,
+                topology,
+                encoded,
+                history_names,
+                backend,
+                dt,
+                weight,
+                plasticity_states,
+                stdp_parameters,
+                outputs,
+                plasticity_signals,
+            )
+            for target, value in zip(outputs, result, strict=True):
+                if target is not value:
+                    target.copy_(value)
+            return
+        result = _trajectory(
+            x_seq,
+            x_syn_seq,
+            states,
+            parameters,
+            topology,
+            encoded,
+            history_names,
+            backend,
+            dt,
+            uniform_seq,
+            weight,
+            plasticity_states,
+            stdp_parameters,
+            outputs,
+            plasticity_signals,
+        )
+        for target, value in zip(outputs, result, strict=True):
+            if target is not value:
+                target.copy_(value)
+
+
+_library.define(
+    "recurrent_online"
+    + torch.library.infer_schema(
+        _online_impl, mutates_args=("weight", "plasticity_states", "outputs")
+    )
+)
+_library.impl("recurrent_online", _online_impl, "CompositeExplicitAutograd")
+online_inference = torch.ops.btorch_cells.recurrent_online.default
+
+
 def _fake(
     x_seq,
     x_syn_seq,
@@ -1174,14 +2088,20 @@ def _fake(
     template = get_template(decode_spec(spec["neuron"]))
     state_names = template.state_names
     native = backend in _NATIVE_GPU_BACKENDS and x_seq.device.type == "cuda"
-    if native:
-        state_outputs = [
-            state.new_empty(state.shape, dtype=torch.float32) for state in states
-        ]
-        if spec["delay"]:
-            state_outputs[-1] = torch.empty_like(states[-1])
-    else:
-        state_outputs = [torch.empty_like(state) for state in states]
+    neuron_dtype, psc_dtype = _physical_dtypes(
+        x_seq, x_syn_seq, states, parameters, spec
+    )
+    state_outputs = [
+        torch.empty_like(
+            state,
+            dtype=neuron_dtype
+            if index < spec["neuron_states"]
+            else psc_dtype
+            if index < spec["neuron_states"] + spec["synapse_states"]
+            else state.dtype,
+        )
+        for index, state in enumerate(states)
+    ]
     history_sources = [
         *state_outputs,
         *(
@@ -1223,7 +2143,7 @@ def _fake(
             if checkpoint_interval
         ),
         *(
-            [torch.empty(x_seq.shape, device=x_seq.device, dtype=torch.float32)]
+            [x_seq.new_empty(x_seq.shape, dtype=neuron_dtype)]
             if spec.get("save_compute_spikes")
             else []
         ),
@@ -1232,6 +2152,31 @@ def _fake(
 
 torch.library.register_fake("btorch_cells::recurrent_inference", _fake, lib=_library)
 torch.library.register_fake("btorch_cells::recurrent_training", _fake, lib=_library)
+
+
+def _fake_online(
+    x_seq,
+    x_syn_seq,
+    states,
+    parameters,
+    topology,
+    weight,
+    plasticity_states,
+    stdp_parameters,
+    plasticity_signals,
+    outputs,
+    encoded,
+    history_names,
+    backend,
+    dt,
+    uniform_seq=None,
+):
+    return None
+
+
+torch.library.register_fake(
+    "btorch_cells::recurrent_online", _fake_online, lib=_library
+)
 
 
 def _paired_checkpoint_state_reader(
@@ -1276,12 +2221,15 @@ def _paired_checkpoint_state_reader(
     psc_template = get_template(psc_spec)
     source_spikes = spikes_seq
     source_workspace = _prepare_source(source_spikes[0], x_syn_seq, None, spec, None)
+    sample_source = source_workspace(source_spikes[0], None, 0)[0]
     prepared_connection = _prepare_connection_forward(
-        source_workspace(source_spikes[0], None, 0)[0],
+        sample_source,
         connection_parameters,
         topology,
         spec,
     )
+    drive_dtype = _connection_dtype(sample_source.dtype, connection_parameters, spec)
+    state_dtypes = _physical_dtypes(x_seq, x_syn_seq, initial_states, parameters, spec)
     prepared_step = None
     working_outputs = None
     block_states = None
@@ -1329,11 +2277,19 @@ def _paired_checkpoint_state_reader(
             # consuming launch completes, without retaining the full replay.
             samples = (*neuron_states, *psc_states)
             block_states = tuple(
-                tuple(value.new_empty((interval, *value.shape)) for value in samples)
+                tuple(
+                    value.new_empty(
+                        (interval, *value.shape),
+                        dtype=state_dtypes[0] if index < ns else state_dtypes[1],
+                    )
+                    for index, value in enumerate(samples)
+                )
                 for _ in range(2)
             )
             block_drives = tuple(
-                psc_states[0].new_empty((interval, *psc_states[0].shape))
+                psc_states[0].new_empty(
+                    (interval, *psc_states[0].shape), dtype=drive_dtype
+                )
                 for _ in range(2)
             )
         slot = replay_count % 2
@@ -1367,6 +2323,7 @@ def _paired_checkpoint_state_reader(
                         neuron_spec,
                         psc_spec,
                         backend=backend,
+                        state_dtypes=state_dtypes,
                         enable_fp_fusion=enable_fp_fusion,
                         precise_division=precise_division,
                         precise_exp=precise_exp,
@@ -1488,7 +2445,13 @@ def _reverse_paired(
         torch.zeros_like(p) if need else None
         for p, need in zip(parameters, needs[2 + n_initial :])
     ]
-    grad_x = torch.empty(x_seq.shape, device=x_seq.device, dtype=torch.float32)
+    grad_x = torch.empty(
+        x_seq.shape,
+        device=x_seq.device,
+        dtype=torch.promote_types(
+            pointwise_dtype(x_seq, *initial_states, *parameters), torch.float32
+        ),
+    )
     grad_x_syn = torch.empty(
         x_syn_seq.shape, device=x_syn_seq.device, dtype=x_syn_seq.dtype
     )

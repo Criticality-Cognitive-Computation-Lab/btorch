@@ -83,7 +83,7 @@ GLIF 在 optimizer 更新后通过 `constrain_net(network)` 保持 Dale 符号�
 清除缓存图但不重置状态，改变 native 记录策略会自动使旧 capture 失效。
 
 神经元/PSC 与连接后端独立选择。`--method push` 显式请求 spike-list SpMSpV，
-`pull` 使用目标驱动遍历；auto 可在展开算子维度均小于 4000 时内部使用 dense matmul，
+`pull` 使用目标驱动遍历；auto 可在展开算子维度均小于 4096 时内部使用 dense matmul，
 外部仍保持稀疏接口。
 
 两个示例都有 SONATA 导入/导出：
@@ -160,3 +160,46 @@ python -m examples.rsnn_izhikevich --steps 256 --no-compare --import-sonata /tmp
 - `tests/visualisation/*.py` — 几乎每个绘图函数
 
 **提示：** 将测试代码改编为文档时，将 `fig_path` / `save_fig` 调用替换为标准 matplotlib 模式（例如 `plt.show()` 或返回图形对象）。
+
+## Izhikevich 在线 STDP
+
+`examples/rsnn_izhikevich_stdp.py` 是仅使用 btorch 公共模块的独立示例，
+不导入其他示例脚本。网络与 `rsnn_izhikevich.py` 相同：60,000 个神经元、
+33,072,348 条边、异质双指数受体，固定输入缩放 `0.6640625`（学习前约 5 Hz）。
+
+```bash
+python -m examples.rsnn_izhikevich_stdp
+python -m examples.rsnn_izhikevich_stdp --recurrent helion --spike-selection scan
+python -m examples.rsnn_izhikevich_stdp --recurrent helion --spike-selection spike_list
+python -m examples.rsnn_izhikevich_stdp --neuron-backend tilelang --recurrent helion
+```
+
+通过 `Synapse.plasticity` 绑定成对 STDP；仅兴奋性边学习，抑制性权重固定。
+学习幅度随初始权重缩放，逐边上下界保持符号，`trace_scope="neuron"` 按来源/延迟
+共享前迹线、按神经元共享后迹线。学习可能改变实际放电率，运行期间不重新校准输入。
+
+标准调度与 HELION 融合使用相同学习规则。`--spike-selection` 选择扫描或脉冲列表；
+`--no-plasticity` 提供匹配的静态网络，`--no-cudagraph` 使用普通提交。
+CPU Torch 参考用法：
+
+```bash
+python -m examples.rsnn_izhikevich_stdp --neurons 128 --density .05 --steps 256 \
+    --device cpu --neuron-backend torch --method pull --no-cudagraph --no-recordings
+```
+
+默认运行 5,000 步，CUDA Graph 块长为 200，并保留两种 `chunk_mode`。
+冷运行时间包含首次 JIT 和有界块的预热/捕获；重放前恢复相同权重并重置记忆。
+建网、CPU 校验/传输单独计时，写盘不计入模拟时间。保存 `v`、`u`、`spike`、
+`psc`、`epsc`、`ipsc`，不保存完整逐步边权或迹线历史；
+`--no-recordings` 跳过记录的 CPU 传输和写盘。
+
+`--dtype float64|float32|float16|bfloat16` 选择参数、记忆和输入的存储精度，
+初始化沿用该精度。`--compile` 可与默认分块 CUDA Graph 同时使用：
+在有界预热期间编译，Python 分块调度留在 Dynamo 外；
+`--no-cudagraph --compile` 则允许 Inductor 管理捕获。
+显式 `--method pull` 保留自动事件发现，除非同时指定 `--spike-selection`；
+不兼容的显式发现请求会报错。
+
+在线 STDP 使用 `torch.no_grad()`，不对在线权重更新执行 BPTT。
+需要检查点/CPU offload 的 BPTT 训练和 SONATA 回路 IO 时，使用原 Izhikevich 示例。
+自定义规则、事件顺序和后端支持见[可塑性指南](guides/plasticity.md)。

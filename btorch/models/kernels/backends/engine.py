@@ -6,6 +6,7 @@ reduce across broadcast batch axes afterwards; no time-by-edge
 intermediate is created.
 """
 
+import ast
 import functools
 import hashlib
 import math
@@ -18,7 +19,7 @@ from pathlib import Path
 import torch
 
 from ....sparse.runtime.activity import BLOCK_SIZE
-from ..contracts import surrogate_support
+from ..contracts import pointwise_dtype, surrogate_support
 from ..program import substitute_expression
 from ..templates import (
     RecordCotangent,
@@ -28,7 +29,13 @@ from ..templates import (
     model_template_revision,
 )
 from .fragments import get_fragments, scalar_layout
-from .renderers import get_renderer, get_runtime
+from .renderers import (
+    _BLOCK_EPILOGUE_MARKER,
+    _GRID_SYNC_MARKER,
+    _split_grid_phases,
+    get_renderer,
+    get_runtime,
+)
 
 
 @dataclass(frozen=True)
@@ -47,6 +54,65 @@ class _TensorStorage:
     span: int
     physical_index: bool = False
     dynamic_first: bool = False
+
+
+class _DoubleBufferedState:
+    """Own compact current/next snapshots for one prepared invocation."""
+
+    def __init__(self, states):
+        self.initial = dict(states)
+        self.next = {
+            name: torch.empty_strided(
+                value.shape, value.stride(), dtype=value.dtype, device=value.device
+            )
+            for name, value in states.items()
+        }
+        self.steps = 0
+
+    @property
+    def current(self):
+        """Look up the latest submitted snapshot without copying storage."""
+        return self.next if self.steps % 2 else self.initial
+
+    def buffers(self):
+        """Expose next-state destinations to the shared source renderer."""
+        return {"next_" + name: value for name, value in self.next.items()}
+
+    def bindings(self, runtime, declarations, *, pointers=False):
+        """Prepare both argument parities using identical storage layouts."""
+        slots = {name: (slot, size) for slot, (name, size) in enumerate(declarations)}
+        pairs = []
+        for name, value in self.initial.items():
+            if name not in slots:
+                continue
+            current_slot, current_size = slots[name]
+            next_slot, next_size = slots["next_" + name]
+            values = (
+                runtime.argument(value, current_size),
+                runtime.argument(self.next[name], next_size),
+            )
+            if pointers:
+                values = tuple(value.data_ptr() for value in values)
+            pairs.append((current_slot, next_slot, values))
+        return tuple(
+            tuple(
+                (slot, value)
+                for current_slot, next_slot, values in pairs
+                for slot, value in (
+                    (current_slot, values[parity]),
+                    (next_slot, values[1 - parity]),
+                )
+            )
+            for parity in range(2)
+        )
+
+    def finish(self):
+        """Commit an odd final snapshot to persistent storage once."""
+        if self.steps % 2:
+            for name, value in self.initial.items():
+                if value.numel():
+                    value.copy_(self.next[name])
+        self.steps = 0
 
 
 def _is_contiguous_shape(shape, stride, numel):
@@ -234,11 +300,18 @@ class _Source:
         precise_exp=False,
         storage=(),
         dynamic_steps=False,
+        *,
+        scalar_dtype="float32",
     ):
         self.backend, self.n, self.n_step, self.modes = backend, n, n_step, modes
         self.dynamic_steps = dynamic_steps
         self.precise_exp = precise_exp
+        self.scalar_dtype = scalar_dtype
+        self.local_dtypes = {}
         self.storage = dict(storage)
+        self.low_precision = scalar_dtype in ("float16", "bfloat16") or any(
+            layout.dtype in ("float16", "bfloat16") for layout in self.storage.values()
+        )
         self.renderer = get_renderer(
             backend, n, n_step, self.storage, precise_exp, dynamic_steps
         )
@@ -266,11 +339,29 @@ class _Source:
     def storage_index(self, pointer, index):
         return self.renderer.storage_index(self.storage.get(pointer), index)
 
-    def load(self, local, pointer, index):
+    def load(self, local, pointer, index, *, dtype=None):
+        if dtype is None:
+            layout = self.storage.get(pointer)
+            # Contiguous FP32 pointers deliberately omit storage metadata.
+            # An absent descriptor therefore means FP32, not the dtype of
+            # weights or traces used by the surrounding scalar program.
+            storage_dtype = layout.dtype if layout is not None else "float32"
+            if storage_dtype in (
+                "float16",
+                "bfloat16",
+                "float32",
+                "float64",
+            ):
+                dtype = storage_dtype
+        self.local_dtypes[local] = dtype or self.scalar_dtype
         lane_index = "index" in index
         index = self.storage_index(pointer, index)
         expr = self.renderer.load(
-            pointer, index, self.storage.get(pointer), lane_index=lane_index
+            pointer,
+            index,
+            self.storage.get(pointer),
+            lane_index=lane_index,
+            dtype=dtype or self.scalar_dtype,
         )
         self.lines.append(f"{local} = {expr}")
 
@@ -279,7 +370,115 @@ class _Source:
         self.lines.append(self.renderer.store(pointer, index, local))
 
     def statements(self, lines):
+        if self.low_precision:
+            lines = self.renderer.storage_statements(
+                lines, self.local_dtypes, self.scalar_dtype
+            )
         self.lines.extend(lines)
+
+    def indexed_statements(self, lines):
+        """Address injected logical pointer indices using the existing layouts.
+
+        Model fragments use :meth:`load` and :meth:`store`. Sparse fragments
+        also contain masked loads and atomics, so keep their operations intact
+        and translate only their indices. Dense storage takes the unchanged
+        source path; views need no packing or extra device work.
+        """
+        layouts = {}
+        for name, layout in self.storage.items():
+            trailing = 1
+            dense = True
+            for size, stride in reversed(tuple(zip(layout.shape, layout.stride))):
+                if size != 1 and stride != trailing:
+                    dense = False
+                if size is not None:
+                    trailing *= size
+            if not dense:
+                # Prepared parameter loads may already carry physical
+                # offsets, but this method explicitly accepts logical
+                # indices in injected fragments, including extra buffers.
+                layouts[name + "_ptr"] = replace(layout, physical_index=False)
+        if not layouts:
+            self.statements(lines)
+            return
+
+        renderer = self.renderer
+
+        def pointer_offset(expression):
+            if isinstance(expression, ast.Name) and expression.id in layouts:
+                return expression.id, None
+            if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Add):
+                for base, offset in (
+                    (expression.left, expression.right),
+                    (expression.right, expression.left),
+                ):
+                    found = pointer_offset(base)
+                    if found is not None:
+                        name, previous = found
+                        return name, (
+                            offset
+                            if previous is None
+                            else ast.BinOp(previous, ast.Add(), offset)
+                        )
+            return None
+
+        def storage_index(name, index):
+            logical = "0" if index is None else ast.unparse(index)
+            translated = ast.parse(
+                renderer.storage_index(layouts[name], logical), mode="eval"
+            ).body
+            if (
+                self.backend == "triton"
+                and index is not None
+                and isinstance(translated, ast.Constant)
+                and translated.value == 0
+            ):
+                # A broadcast view still has one logical pointer per lane.
+                # Retain its tensor shape so masked loads do not receive a
+                # scalar pointer with a vector mask. This arithmetic folds
+                # away without packing or a separate device operation.
+                return ast.BinOp(index, ast.Mult(), ast.Constant(0))
+            return translated
+
+        class IndexStorage(ast.NodeTransformer):
+            def visit_Call(self, node):  # noqa: N802 - ast API
+                node = self.generic_visit(node)
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "tl"
+                    and node.func.attr in ("load", "store", "atomic_add")
+                    and node.args
+                ):
+                    found = pointer_offset(node.args[0])
+                    if found is not None:
+                        name, index = found
+                        node.args[0] = ast.BinOp(
+                            ast.Name(name, ast.Load()),
+                            ast.Add(),
+                            storage_index(name, index),
+                        )
+                return node
+
+            def visit_Subscript(self, node):  # noqa: N802 - ast API
+                node = self.generic_visit(node)
+                if isinstance(node.value, ast.Name) and node.value.id in layouts:
+                    node.slice = storage_index(node.value.id, node.slice)
+                return node
+
+        tree = IndexStorage().visit(ast.parse("\n".join(lines)))
+        self.statements(ast.unparse(ast.fix_missing_locations(tree)).splitlines())
+
+    def grid_sync(self):
+        """Insert a backend-wide barrier between generated source phases."""
+        if self.backend not in ("triton", "tilelang"):
+            raise NotImplementedError(
+                f"Grid synchronization is unavailable for the {self.backend} renderer"
+            )
+        if self.epilogue:
+            self.lines.extend((_BLOCK_EPILOGUE_MARKER, *self.epilogue))
+            self.epilogue.clear()
+        self.lines.append(_GRID_SYNC_MARKER)
 
     def emit_spike_list(self, value, layout):
         """Append an optional sparse output sink after shared model math."""
@@ -322,12 +521,19 @@ class _Source:
         self.has_gradient_list |= emission.feature == "gradient_list"
 
     def render(self):
+        _phases, grid_barriers = _split_grid_phases(self.lines)
+        if grid_barriers and self.backend == "triton":
+            self.pointer("grid_barrier", 1)
+            self.pointer("grid_epoch", 1)
         return self.renderer.render(
             self.lines,
             tuple(self.pointers),
             self.has_spike_list,
             self.has_gradient_list,
             self.epilogue,
+            scalar_dtype=self.scalar_dtype,
+            local_dtypes=self.local_dtypes,
+            grid_barriers=grid_barriers,
         )
 
 
@@ -391,7 +597,21 @@ def _generate_source(
         precise_exp,
         storage,
         dynamic_steps,
+        scalar_dtype=dict(storage)["x_seq"].dtype
+        if "x_seq" in dict(storage)
+        else "float32",
     )
+    calculation_dtype = getattr(torch, source.scalar_dtype)
+    for name in (
+        "x_seq",
+        *(name + "_init" for name in template.state_names),
+        *template.parameter_names,
+    ):
+        layout = source.storage.get(name)
+        calculation_dtype = torch.promote_types(
+            calculation_dtype, getattr(torch, layout.dtype if layout else "float32")
+        )
+    calculation_dtype = str(calculation_dtype).removeprefix("torch.")
     checkpoint_block = f"(time {source.renderer.division} {checkpoint_interval or 1})"
     source.pointer("dt", 1)
     source.load("dt", "dt", "0")
@@ -439,7 +659,15 @@ def _generate_source(
             )
         for name in states:
             base, _ = _mode_name(name, modes)
-            source.load(name + "_prev", base + "_init", source.index(name))
+            # Triton loop-carried values need a stable type from entry.
+            # Widen only when mixed model operands require promotion; uniform
+            # FP16/BF16 models keep their state and arithmetic low precision.
+            source.load(
+                name + "_prev",
+                base + "_init",
+                source.index(name),
+                dtype=calculation_dtype,
+            )
         source.lines.append(f"for time in range({step_count}):")
         start = len(source.lines)
         source.load("x", "x_seq", source.index("x", "time"))
@@ -494,6 +722,11 @@ def _generate_source(
             base, _ = _mode_name(name, modes)
             source.store(base + "_final", source.index(name), name + "_prev")
     else:
+        accumulator_dtype = (
+            "float64"
+            if any(layout.dtype == "float64" for _, layout in storage)
+            else "float32"
+        )
         presence = _normalize_gradient_presence(
             template, history_names, gradient_presence
         )
@@ -535,6 +768,7 @@ def _generate_source(
             base, _ = _mode_name(name, modes)
             if base in needed_params:
                 source.lines.append(f"sum_grad_{name} = 0.0")
+                source.local_dtypes[f"sum_grad_{name}"] = accumulator_dtype
         final_presence = dict(zip(template.state_names, presence.final_states))
         for name in states:
             base, _ = _mode_name(name, modes)
@@ -543,12 +777,19 @@ def _generate_source(
                     "grad_s_" + name,
                     "grad_" + base + "_final",
                     source.index(name),
+                    dtype=accumulator_dtype,
                 )
             else:
                 source.lines.append("grad_s_" + name + " = 0.0")
+                source.local_dtypes["grad_s_" + name] = accumulator_dtype
         for name in states:
             base, _ = _mode_name(name, modes)
-            source.load("initial_" + name, base + "_init", source.index(name))
+            source.load(
+                "initial_" + name,
+                base + "_init",
+                source.index(name),
+                dtype=calculation_dtype,
+            )
         source.lines.append(f"for time in range({step_count} - 1, -1, -1):")
         start = len(source.lines)
         source.load("x", "x_seq", source.index("x", "time"))
@@ -1100,10 +1341,10 @@ def _dt_buffer(dt, reference):
     if isinstance(dt, torch.Tensor):
         if dt.numel() != 1:
             raise ValueError("Cell timestep must be scalar")
-        return dt.to(device=reference.device, dtype=torch.float32).reshape(1)
+        return dt.to(device=reference.device).reshape(1)
     # ``full`` fills device storage directly; unlike ``tensor([dt], device=...)``
     # it does not introduce a host-to-device copy during CUDA graph capture.
-    return torch.full((1,), dt, device=reference.device, dtype=torch.float32)
+    return torch.full((1,), dt, device=reference.device, dtype=reference.dtype)
 
 
 def _layout(value, target_shape):
@@ -1417,42 +1658,37 @@ def forward(
         else 0
     )
     n = math.prod(plan.shape)
-    # Empty sequences preserve initial state with the same FP32 policy.
+    dtype = pointwise_dtype(x_seq, *states, *parameters)
+    # Empty sequences preserve state without imposing a calculation dtype.
     if not n_step:
         checkpoint = (
-            (
-                x_seq.new_empty(
-                    (0, *target(residual.checkpoint_state)), dtype=torch.float32
-                ),
-            )
+            (x_seq.new_empty((0, *target(residual.checkpoint_state)), dtype=dtype),)
             if residual.checkpoint_state
             else ()
         )
         return (
-            torch.empty(x_seq.shape, device=x_seq.device, dtype=torch.float32),
+            torch.empty(x_seq.shape, device=x_seq.device, dtype=dtype),
             tuple(buffers[name + "_init"].clone() for name in template.state_names),
             tuple(
-                x_seq.new_empty((0, *target(name)), dtype=torch.float32)
+                x_seq.new_empty((0, *target(name)), dtype=dtype)
                 for name in history_names
             )
             + checkpoint,
         )
-    buffers["output_seq"] = torch.empty(
-        x_seq.shape, device=x_seq.device, dtype=torch.float32
-    )
+    buffers["output_seq"] = torch.empty(x_seq.shape, device=x_seq.device, dtype=dtype)
     for name in template.state_names:
         buffers[name + "_final"] = torch.empty(
-            target(name), device=x_seq.device, dtype=torch.float32
+            target(name), device=x_seq.device, dtype=dtype
         )
     for name in history_names:
         buffers[name + "_seq"] = torch.empty(
-            (n_step, *target(name)), device=x_seq.device, dtype=torch.float32
+            (n_step, *target(name)), device=x_seq.device, dtype=dtype
         )
     if residual.checkpoint_state is not None:
         buffers[residual.checkpoint_state + "_checkpoint"] = torch.empty(
             (checkpoint_count, *target(residual.checkpoint_state)),
             device=x_seq.device,
-            dtype=torch.float32,
+            dtype=dtype,
         )
     if plan.launch is None and n:
         if torch.cuda.is_current_stream_capturing():
@@ -1614,11 +1850,14 @@ def backward(
         bool(needs[0]), tuple(bool(value) for value in needs[1 : 1 + len(states)])
     )
     n_step, n = x_seq.shape[0], math.prod(plan.shape)
+    accumulator_dtype = torch.promote_types(
+        pointwise_dtype(x_seq, *states, *parameters), torch.float32
+    )
     if grad_output is not None:
         buffers["grad_output_seq"] = grad_output
     if gradient_targets.input:
         buffers["grad_x_seq"] = torch.empty(
-            x_seq.shape, device=x_seq.device, dtype=torch.float32
+            x_seq.shape, device=x_seq.device, dtype=accumulator_dtype
         )
     for name, history, grad in zip(history_names, histories, grad_histories):
         buffers[name + "_seq"] = history
@@ -1631,7 +1870,7 @@ def backward(
             buffers["grad_" + name + "_final"] = grad
         if gradient_targets.states[template.state_names.index(name)]:
             buffers["grad_" + name + "_init"] = torch.empty(
-                target(name), device=x_seq.device, dtype=torch.float32
+                target(name), device=x_seq.device, dtype=accumulator_dtype
             )
     if residual.save_output:
         if residual_output is None:
@@ -1650,7 +1889,7 @@ def backward(
     )
     for name in parameter_mask:
         buffers["grad_" + name] = torch.empty(
-            target(name), device=x_seq.device, dtype=torch.float32
+            target(name), device=x_seq.device, dtype=accumulator_dtype
         )
     outputs = {
         "grad_x_seq",

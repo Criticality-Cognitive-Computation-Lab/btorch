@@ -87,9 +87,11 @@ capture-safe; this runner does not implement that training schedule.
 import gc
 import weakref
 from collections.abc import Callable, Mapping, Sequence
+from functools import partial
 from typing import Any
 
 import torch
+from torch.utils._pytree import tree_flatten, tree_map
 
 from .functional import named_hidden_states, set_hidden_states
 
@@ -195,13 +197,9 @@ def _incompatibilities(checked: Sequence[tuple[str, torch.nn.Module]]) -> dict:
 def clone_graph_outputs(obj: Any) -> Any:
     """Copy replay results out of the graph's pool so they survive the next
     one."""
-    if torch.is_tensor(obj):
-        return obj.clone()
-    if isinstance(obj, dict):
-        return {k: clone_graph_outputs(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return type(obj)(clone_graph_outputs(v) for v in obj)
-    return obj
+    return tree_map(
+        lambda value: value.clone() if torch.is_tensor(value) else value, obj
+    )
 
 
 def _is_static_input(value: Any) -> bool:
@@ -304,6 +302,10 @@ class CudaGraphRunner:
     usually created before the module tree is complete) and their versions are
     read on every call. Call :meth:`reset` after adding or replacing submodules.
 
+    Cache validation and replay bookkeeping stay outside Dynamo. Capture
+    preparation leaves the bounded chunk callback compilable, so warmup can
+    settle its compilation before recording device work.
+
     Attributes:
         entries: Captured graphs by input signature.
         n_captures: Number of captures performed so far (never reset); a
@@ -327,6 +329,7 @@ class CudaGraphRunner:
             self._participants = cached
         return cached[1], cached[2]
 
+    @torch.compiler.disable
     def _versions(self, module: torch.nn.Module) -> tuple:
         """Current capture versions: a handful of python reads per call."""
         versioned = self._participants_of(module)[0]
@@ -336,15 +339,17 @@ class CudaGraphRunner:
         return current
 
     @staticmethod
+    @torch.compiler.disable
     def _key(args: Sequence, kwargs: Mapping[str, Any]) -> tuple:
         def describe(v):
             if torch.is_tensor(v):
                 return ("t", tuple(v.shape), v.dtype, v.device)
             return ("v", v)
 
+        leaves, structure = tree_flatten((tuple(args), dict(sorted(kwargs.items()))))
         return (
-            tuple(describe(a) for a in args),
-            tuple(sorted((k, describe(v)) for k, v in kwargs.items())),
+            structure,
+            tuple(describe(value) for value in leaves),
             # Identical FP32 inputs can capture different GEMMs under AMP.
             # Replaying a graph from another policy silently changes results.
             torch.get_autocast_dtype("cuda")
@@ -353,6 +358,7 @@ class CudaGraphRunner:
         )
 
     @staticmethod
+    @torch.compiler.disable
     def _check_supported(
         module: torch.nn.Module,
         args: Sequence,
@@ -364,9 +370,7 @@ class CudaGraphRunner:
             not torch.is_tensor(value) and not _is_static_input(value) for value in args
         ):
             raise TypeError(
-                "CUDA Graph inputs must be tensors or hashable static values; "
-                "nested tensor containers are not supported. Pass tensor inputs "
-                "as separate positional or keyword arguments."
+                "CUDA Graph input leaves must be tensors or hashable static values"
             )
         devices = {
             value.device
@@ -409,6 +413,7 @@ class CudaGraphRunner:
                 f"cudagraph=True is incompatible with submodule '{name}' ({why})."
             )
 
+    @partial(torch.compiler.disable, recursive=False)
     def _capture(
         self,
         module: torch.nn.Module,
@@ -427,10 +432,11 @@ class CudaGraphRunner:
         }
         amp_enabled = torch.is_autocast_enabled("cuda")
         amp_dtype = torch.get_autocast_dtype("cuda")
-        static_kwargs = {
-            name: value.detach().clone() if torch.is_tensor(value) else value
-            for name, value in kwargs.items()
-        }
+
+        def clone_input(value):
+            return value.detach().clone() if torch.is_tensor(value) else value
+
+        static_kwargs = tree_map(clone_input, kwargs)
         mutable = _capture_mutable_tensors(module)
         mutable_snapshot = {
             name: value.detach().clone() for name, value in mutable.items()
@@ -449,10 +455,7 @@ class CudaGraphRunner:
             ):
                 return fn(*inputs, **static_kwargs)
 
-        static_args = tuple(
-            value.detach().clone() if torch.is_tensor(value) else value
-            for value in args
-        )
+        static_args = tree_map(clone_input, tuple(args))
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
@@ -574,6 +577,7 @@ class CudaGraphRunner:
             self._versions(module),
         )
 
+    @partial(torch.compiler.disable, recursive=False)
     def _prepare(
         self,
         module: torch.nn.Module,
@@ -583,8 +587,10 @@ class CudaGraphRunner:
         incompatible: Mapping[str, str] | None = None,
     ) -> _Entry:
         """Validate one logical invocation and prepare its reusable entry."""
-        kwargs = kwargs or {}
-        self._check_supported(module, (*args, *kwargs.values()), incompatible)
+        args = tuple(args)
+        kwargs = dict(sorted((kwargs or {}).items()))
+        input_leaves, _ = tree_flatten((args, kwargs))
+        self._check_supported(module, input_leaves, incompatible)
         self._check_submodules(module)
 
         key = self._key(args, kwargs)
@@ -606,7 +612,7 @@ class CudaGraphRunner:
                 {torch.cuda.current_device()}
                 | {
                     value.device.index
-                    for value in (*args, *kwargs.values())
+                    for value in input_leaves
                     if torch.is_tensor(value)
                 }
             )
@@ -640,6 +646,7 @@ class CudaGraphRunner:
         entry = self._prepare(module, fn, args, kwargs, incompatible)
         return self._replay_entry(entry, args, kwargs, clone_outputs)
 
+    @torch.compiler.disable
     def _replay_entry(
         self,
         entry: _Entry,
@@ -656,12 +663,11 @@ class CudaGraphRunner:
         live memories, including in-place edits to inference tensors
         without version counters.
         """
-        for static, incoming in zip(entry.static_args, args):
+        static_leaves, _ = tree_flatten((entry.static_args, entry.static_kwargs))
+        input_leaves, _ = tree_flatten((tuple(args), dict(sorted(kwargs.items()))))
+        for static, incoming in zip(static_leaves, input_leaves, strict=True):
             if torch.is_tensor(static):
                 static.copy_(incoming)
-        for name, static in entry.static_kwargs.items():
-            if torch.is_tensor(static):
-                static.copy_(kwargs[name])
 
         if not (continuation and entry.feedback):
             incoming = (

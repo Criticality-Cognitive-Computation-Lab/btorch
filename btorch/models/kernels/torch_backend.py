@@ -3,7 +3,7 @@
 import torch
 from torch import Tensor
 
-from .contracts import NeuronSpec
+from .contracts import NeuronSpec, pointwise_dtype
 from .templates import get_reference_callbacks, get_template
 
 
@@ -109,20 +109,18 @@ def forward_sequence(
     history_names: tuple[str, ...],
 ):
     """Evaluate a complete sequence with only the requested history storage."""
-    x_float = x_seq.float()
-    states = tuple(value.float() for value in states)
-    parameters = tuple(value.float() for value in parameters)
+    dtype = pointwise_dtype(x_seq, *states, *parameters)
     template = get_template(spec)
     state_map = dict(zip(template.state_names, states))
-    output_seq = torch.empty_like(x_float)
+    output_seq = torch.empty_like(x_seq, dtype=dtype)
     histories = []
     for name in history_names:
         source = state_map[template.history_state_name(name)]
-        histories.append(source.new_empty((x_seq.shape[0], *source.shape)))
+        histories.append(source.new_empty((x_seq.shape[0], *source.shape), dtype=dtype))
     # Allocate each sequence once, rather than retaining every step followed
     # by a second full-sequence stack allocation. Slice writes still preserve
     # ordinary eager autograd, which is the independent parity reference.
-    for time, x in enumerate(x_float.unbind(0)):
+    for time, x in enumerate(x_seq.unbind(0)):
         output, states, records = forward_step(x, states, parameters, spec)
         output_seq[time] = output
         for name, values in zip(history_names, histories):
@@ -152,38 +150,39 @@ def backward_sequence(
     recomputation."""
     template = get_template(spec)
     history = dict(zip(history_names, histories))
-    state_grad = tuple(value.float() for value in grad_final_states)
+    accumulator_dtype = torch.promote_types(
+        pointwise_dtype(x_seq, *initial_states, *parameters), torch.float32
+    )
+    state_grad = tuple(value.to(accumulator_dtype) for value in grad_final_states)
     parameter_mask = (
         None
         if needs_input_grad is None
         else needs_input_grad[1 + len(initial_states) :]
     )
     parameter_grad = tuple(
-        torch.zeros_like(value, dtype=torch.float32)
+        torch.zeros_like(value, dtype=accumulator_dtype)
         if parameter_mask is None or parameter_mask[i]
         else None
         for i, value in enumerate(parameters)
     )
-    parameters_float = tuple(value.float() for value in parameters)
-    initial_float = tuple(value.float() for value in initial_states)
     needs_x = needs_input_grad is None or needs_input_grad[0]
     grad_x = torch.empty_like(x_seq) if needs_x else None
     for time in range(x_seq.shape[0] - 1, -1, -1):
         previous = (
-            initial_float
+            initial_states
             if time == 0
             else tuple(history[name][time - 1] for name in template.state_names)
         )
         grad_records = {
-            name: value[time].float()
+            name: value[time].to(accumulator_dtype)
             for name, value in zip(history_names, grad_histories)
         }
         gx, state_grad, gp = backward_step(
-            x_seq[time].float(),
+            x_seq[time],
             previous,
-            parameters_float,
+            parameters,
             spec,
-            grad_output[time].float(),
+            grad_output[time].to(accumulator_dtype),
             state_grad,
             grad_records,
             parameter_mask=parameter_mask,

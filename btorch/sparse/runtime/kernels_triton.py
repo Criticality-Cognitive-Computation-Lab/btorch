@@ -143,6 +143,7 @@ if triton is not None:
         WEIGHT_GRAD: tl.constexpr,
         LIST: tl.constexpr,
         SEGMENT: tl.constexpr,
+        VALUE_STRIDE: tl.constexpr,
     ):
         """One program per (``BR`` row segments, member, ``BS`` samples).
 
@@ -218,7 +219,7 @@ if triton is not None:
                 )
             longest = tl.max(length, axis=0)
 
-            v_base = val_ptr + member * val_stride
+            v_base = val_ptr + member.to(tl.int64) * val_stride
             x_base = x_ptr + member * x_stride
             lane = tl.arange(0, BK)
             compute_dtype: tl.constexpr = (
@@ -265,9 +266,17 @@ if triton is not None:
                             weight_mask
                             & (tl.sum(active.to(tl.int32), axis=0) > 0)[:, None]
                         )
-                    w = tl.load(v_base + slot, mask=weight_mask, other=0.0)
+                    w = tl.load(
+                        v_base + slot.to(tl.int64) * VALUE_STRIDE,
+                        mask=weight_mask,
+                        other=0.0,
+                    )
                 else:
-                    w = tl.load(v_base + idx, mask=mask, other=0.0)
+                    w = tl.load(
+                        v_base + idx.to(tl.int64) * VALUE_STRIDE,
+                        mask=mask,
+                        other=0.0,
+                    )
                 product_input = xv
                 if MASK:
                     product_input = tl.where(active[:, :, None], xv, 0.0)

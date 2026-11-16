@@ -14,6 +14,15 @@ from .backend import KernelCache
 SPIKE_BLOCK = BLOCK_SIZE
 
 
+def consumer_programs(n_edges: int, n_sources: int) -> int:
+    """Size persistent consumers from topology rather than measured
+    activity."""
+    return min(
+        32,
+        max(1, -(-n_edges * SPIKE_BLOCK // (n_sources * source_layout.EDGE_BLOCK))),
+    )
+
+
 @dataclass(frozen=True)
 class SpikeList:
     """Invocation-owned block-local lists and degree prefixes for fanout.
@@ -189,13 +198,7 @@ def prepare_spike_list(
         # consumers to hide dependent prefix/edge loads even when neighboring
         # producer blocks are silent. Persistent consumers cover arbitrary
         # degrees, including hubs; this is not a capacity bound.
-        min(
-            32,
-            max(
-                1,
-                (-(-values.numel() * SPIKE_BLOCK // (n_in * source_layout.EDGE_BLOCK))),
-            ),
-        ),
+        consumer_programs(values.numel(), n_in),
     )
     bind(execution, x)
     return execution

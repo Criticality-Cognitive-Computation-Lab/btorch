@@ -21,8 +21,10 @@ from ...sparse.runtime import (
     task_layout,
 )
 from ...sparse.runtime.method import PropagationMethod, resolve_method, validate_method
+from .. import environ
 from .base import Connection
 from .synapse import Synapse
+from .transmission import TransmissionRule
 from .weight import EdgeWeight, Weight
 
 
@@ -241,11 +243,12 @@ class SparseConnection(Connection):
         self.weight.bind(values, edge_map, adjacency)
         self.weight.to(device=row.device)
         self.plasticity = synapse.plasticity
+        self.transmission = synapse.transmission
         if self.plasticity is not None:
-            from .plasticity import PairSTDP
+            from .plasticity import PlasticityRule
 
-            if not isinstance(self.plasticity, PairSTDP):
-                raise TypeError("Synapse.plasticity must be PairSTDP or None")
+            if not isinstance(self.plasticity, PlasticityRule):
+                raise TypeError("Synapse.plasticity must be PlasticityRule or None")
             if type(self.weight) is not EdgeWeight or self.weight.dale:
                 raise NotImplementedError(
                     "STDP requires unconstrained per-edge EdgeWeight"
@@ -254,7 +257,10 @@ class SparseConnection(Connection):
                 raise NotImplementedError(
                     "STDP does not support batched connection weights"
                 )
-            self.plasticity.bind(edge_map, self.weight())
+        if self.transmission is not None and not isinstance(
+            self.transmission, TransmissionRule
+        ):
+            raise TypeError("Synapse.transmission must be TransmissionRule or None")
         self.orientation: Orientation = "post_pre"
         self.bias = None
         self.register_buffer(
@@ -282,6 +288,38 @@ class SparseConnection(Connection):
         self._route_token = 0
         self.cache = RepresentationCache()
         self._rebuild()
+        if self.plasticity is not None:
+            from .plasticity import PlasticityLayout
+
+            self._plasticity_uses_segments = "segment" in (
+                *self.plasticity.state_domains.values(),
+                *self.plasticity.parameter_domains.values(),
+                *(
+                    getattr(value, "domain", None)
+                    for value in self.plasticity.signals.values()
+                ),
+            )
+            n_segment = 0
+            if self._plasticity_uses_segments:
+                self.cache.prepare_delay_segments(self.n_pre, self.n_delay)
+                n_segment = self.cache.segment_pre.numel()
+            self.plasticity.bind(
+                edge_map,
+                self.weight(),
+                PlasticityLayout(self.indices.shape[1], self.n_post, n_segment),
+            )
+        if self.transmission is not None:
+            from .plasticity import PlasticityLayout
+
+            if self._member_shape:
+                raise NotImplementedError(
+                    "Transmission does not support batches of different patterns"
+                )
+            self.transmission.bind(
+                edge_map,
+                self.weight(),
+                PlasticityLayout(self.indices.shape[1], self.n_post),
+            )
 
         effective = self.weight()
         if bias is True:
@@ -569,6 +607,7 @@ class SparseConnection(Connection):
             n_receptor=n_receptor if n_receptor > 1 else None,
             dale=synapse.dale,
             plasticity=synapse.plasticity,
+            transmission=synapse.transmission,
         )
         operator = COO(
             torch.stack([coo.col // n_receptor, coo.row // n_delay]),
@@ -600,7 +639,12 @@ class SparseConnection(Connection):
         return self.indices[0]
 
     def update_plasticity(
-        self, arrivals: Tensor, post_spikes: Tensor, *, dt: float | Tensor
+        self,
+        arrivals: Tensor,
+        post_spikes: Tensor,
+        *,
+        dt: float | Tensor,
+        signals: dict[str, Tensor] | None = None,
     ) -> None:
         """Apply online learning after propagating this step with old weights.
 
@@ -612,10 +656,17 @@ class SparseConnection(Connection):
                 advances it a second time.
             post_spikes: Postsynaptic spikes, last dimension ``n_post``.
                 Receptors share postsynaptic activity, not necessarily traces.
-            dt: Positive simulation timestep in the STDP time units.
+            dt: Positive simulation timestep in the STDP time units, as a
+                number or one-element tensor. Singleton dimensions are
+                normalized to a scalar before the transition.
+            signals: Additional named live inputs for a custom rule. The
+                caller supplies values at the stage required by that rule.
         """
         if self.plasticity is None:
             return
+        from .plasticity import PlasticityEvents, _validate_weight_storage
+
+        _validate_weight_storage(self.weight.value, self.indices.shape[1])
         if torch.is_grad_enabled():
             raise RuntimeError(
                 "Online STDP requires no_grad or inference_mode; BPTT is unsupported"
@@ -643,7 +694,29 @@ class SparseConnection(Connection):
         delay = 0 if self.delay is None else self.delay
         arrival = arrivals.reshape(-1)[self.pre * self.n_delay + delay]
         post = post_spikes.reshape(-1)[self.post]
-        self.plasticity.single_step_forward(self.weight.value, arrival, post, dt)
+        segment_arrival = None
+        if self._plasticity_uses_segments:
+            self.cache.prepare_delay_segments(self.n_pre, self.n_delay)
+            segment_arrival = arrivals.reshape(-1)[
+                self.cache.segment_pre * self.n_delay + self.cache.segment_delay
+            ]
+        self.plasticity.update(
+            self.weight.value,
+            PlasticityEvents(
+                arrival,
+                post,
+                signals or {},
+                post_index=self.post,
+                segment_index=(
+                    self.cache.prepare_edge_segments(self.n_pre, self.n_delay)
+                    if self._plasticity_uses_segments
+                    else None
+                ),
+                segment_arrival=segment_arrival,
+                post_activity=post_spikes.reshape(-1),
+            ),
+            dt,
+        )
         # Derived permutations/task packs are snapshots, not canonical weight
         # owners. Refresh a live CSR view and discard any static packed values.
         if self._run_weight is not None and self._run_weight is not self.weight.value:
@@ -695,6 +768,14 @@ class SparseConnection(Connection):
         Returns:
             ``[*network_batch, ..., out_features]``.
         """
+        if self.transmission is not None and (
+            isinstance(x, Sparse)
+            or (isinstance(x, Tensor) and x.layout != torch.strided)
+        ):
+            raise NotImplementedError(
+                "Transmission currently requires dense eager binary arrivals; "
+                "external sparse events are unsupported"
+            )
         if isinstance(x, Sparse) or (
             isinstance(x, Tensor) and x.layout != torch.strided
         ):
@@ -706,6 +787,16 @@ class SparseConnection(Connection):
             raise ValueError(
                 f"Expected input with last dimension {n_in}, got {tuple(x.shape)}."
             )
+        if self.transmission is not None:
+            if x.numel() != n_in:
+                raise NotImplementedError(
+                    "Transmission currently supports one eager sample"
+                )
+            if torch.is_grad_enabled():
+                raise RuntimeError(
+                    "Transmission requires no_grad or inference_mode; "
+                    "BPTT is unsupported"
+                )
         n_batch = self._value_batch_dim + len(self._member_shape)
         if n_batch and (
             x.ndim - 1 < n_batch
@@ -738,6 +829,13 @@ class SparseConnection(Connection):
                 weight = self.weight()
                 if self._always_permute or not cache.identity_perm:
                     weight = weight.index_select(-1, cache.perm)
+            if self.transmission is not None:
+                delayed_index = self.delay if self.delay is not None else 0
+                arrivals = x.reshape(-1)[self.pre * self.n_delay + delayed_index]
+                efficacy = self.transmission.step(arrivals, environ.get("dt"))
+                if self._always_permute or not cache.identity_perm:
+                    efficacy = efficacy.index_select(0, cache.perm)
+                weight = weight * efficacy
             propagate = (
                 ops.propagate_bound
                 if torch.compiler.is_compiling()
@@ -830,9 +928,9 @@ class SparseConnection(Connection):
                 else:
                     weight = ordered
             object.__setattr__(self, "_run_weight", weight)
-            if self.plasticity is not None:
-                # Online weights remain live. Static task-value packs would
-                # become stale after the first plasticity update.
+            if self.plasticity is not None or self.transmission is not None:
+                # Online weights and transmission-scaled weights remain live.
+                # Static task-value packs would become stale after each update.
                 return
             if self._max_density is None or self._value_batch_dim or self._member_shape:
                 return
@@ -1003,6 +1101,11 @@ class SparseConnection(Connection):
         Returns:
             Dense ``[B, out_features]`` (or ``[out_features]``).
         """
+        if self.transmission is not None:
+            raise NotImplementedError(
+                "Transmission currently requires dense eager binary arrivals; "
+                "external sparse events are unsupported"
+            )
         if self._value_batch_dim or self._member_shape:
             raise NotImplementedError("Sparse event input for a network batch.")
         events = as_sparse(events)
@@ -1129,6 +1232,7 @@ class SparseConnection(Connection):
             registry.registry_generation,
             registry.override_snapshot(),
             torch.are_deterministic_algorithms_enabled(),
+            None if self.transmission is None else self.transmission.capture_version,
             tuple(
                 (str(t.device), t.dtype, t.data_ptr())
                 for t in (*self.weight.parameters(), *self.weight.buffers())
@@ -1184,9 +1288,10 @@ class SparseConnection(Connection):
             receptor: Optional ``[K]`` new receptor ids.
             delay: Optional ``[K]`` new delays.
         """
-        if self.plasticity is not None:
+        if self.plasticity is not None or self.transmission is not None:
             raise NotImplementedError(
-                "Reset/rebind STDP traces explicitly before structural rewiring"
+                "Reset/rebind synaptic rule memories explicitly before "
+                "structural rewiring"
             )
         slots, pre, post = (torch.as_tensor(t) for t in (slots, pre, post))
         receptor = None if receptor is None else torch.as_tensor(receptor)

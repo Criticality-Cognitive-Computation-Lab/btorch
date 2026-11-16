@@ -19,7 +19,9 @@ from btorch.models.synapse import ExponentialPSC
 from tests.models.kernels.helpers import GPU_BACKENDS, require_cuda_backend
 
 
-def _model(backend, device="cpu", requested=(), *, pre_spike_v=False):
+def _model(
+    backend, device="cpu", requested=(), *, pre_spike_v=False, dtype=torch.float32
+):
     linear = torch.nn.Linear(4, 4, bias=True)
     with torch.no_grad():
         linear.weight.copy_(
@@ -47,9 +49,9 @@ def _model(backend, device="cpu", requested=(), *, pre_spike_v=False):
         ExponentialPSC(4, 3.5, linear),
         backend=KernelOptions(neuron=backend),
         update_state_names=requested,
-    ).to(device=device, dtype=torch.float32)
-    model.neuron.init_state(batch_size=2, device=device, dtype=torch.float32)
-    model.synapse.init_state(batch_size=2, device=device, dtype=torch.float32)
+    ).to(device=device, dtype=dtype)
+    model.neuron.init_state(batch_size=2, device=device, dtype=dtype)
+    model.synapse.init_state(batch_size=2, device=device, dtype=dtype)
     with torch.no_grad():
         model.neuron.v.copy_(
             torch.tensor(
@@ -109,13 +111,30 @@ def _run_two(model, x1, x_syn1, x2, x_syn2):
     )
 
 
-def _assert_two_forward_vjp(backend, steps, device):
+def _assert_two_forward_vjp(
+    backend, steps, device, dtype=torch.float32, weight_dtype=None
+):
     torch.manual_seed(1601)
-    model = _model(backend, device)
+    model = _model(backend, device, dtype=dtype)
+    if weight_dtype is not None:
+        # Sparse connections support mixed source/value precision directly.
+        # Retain the fixture's bias and canonical values, using the existing
+        # sparse interface rather than a special mixed-dtype Linear wrapper.
+        linear = model.synapse.linear
+        post, pre = linear.weight.detach().nonzero(as_tuple=True)
+        model.synapse.linear = SparseConnection.from_edges(
+            pre,
+            post,
+            4,
+            4,
+            values=linear.weight.detach()[post, pre].to(weight_dtype),
+            bias=linear.bias.detach().to(weight_dtype),
+        )
     reference = copy.deepcopy(model)
     reference.backend = "torch"
     x1, x_syn1 = _inputs(steps, device)
     x2, x_syn2 = _inputs(3, device)
+    x1, x_syn1, x2, x_syn2 = (value.to(dtype) for value in (x1, x_syn1, x2, x_syn2))
     xr1 = x1.detach().clone().requires_grad_()
     xsr1 = x_syn1.detach().clone().requires_grad_()
     xr2 = x2.detach().clone().requires_grad_()
@@ -129,16 +148,24 @@ def _assert_two_forward_vjp(backend, steps, device):
 
     # Spike rasters are the recurrent connection source, so event equality is
     # stricter than the continuous-state tolerance used below.
-    torch.testing.assert_close(actual[0], expected[0], atol=0, rtol=0)
-    torch.testing.assert_close(actual[3], expected[3], atol=0, rtol=0)
+    torch.testing.assert_close(actual[0], expected[0].to(dtype), atol=0, rtol=0)
+    torch.testing.assert_close(actual[3], expected[3].to(dtype), atol=0, rtol=0)
     for value, target in zip(
         (*actual[1:3], *actual[4:]), (*expected[1:3], *expected[4:])
     ):
-        torch.testing.assert_close(value, target, atol=5e-6, rtol=5e-5)
+        torch.testing.assert_close(
+            value,
+            target,
+            atol=max(5e-6, 4 * torch.finfo(dtype).eps),
+            rtol=max(5e-5, 4 * torch.finfo(dtype).eps),
+        )
 
     generator = torch.Generator(device=device).manual_seed(1802 + steps)
     cotangents = tuple(
-        torch.randn(value.shape, generator=generator, device=device) for value in actual
+        torch.randn(value.shape, generator=generator, device=device)
+        if dtype == torch.float32
+        else torch.ones_like(value)
+        for value in actual
     )
     actual_gradients = torch.autograd.grad(
         actual, actual_inputs, cotangents, allow_unused=True
@@ -146,12 +173,21 @@ def _assert_two_forward_vjp(backend, steps, device):
     expected_gradients = torch.autograd.grad(
         expected, expected_inputs, cotangents, allow_unused=True
     )
-    for value, target, source in zip(
-        actual_gradients, expected_gradients, actual_inputs
+    for index, (value, target, source) in enumerate(
+        zip(actual_gradients, expected_gradients, actual_inputs)
     ):
         value = torch.zeros_like(source) if value is None else value
         target = torch.zeros_like(source) if target is None else target
-        torch.testing.assert_close(value, target, atol=7e-5, rtol=7e-4)
+        torch.testing.assert_close(
+            value,
+            target,
+            # Torch rounds adjoints at each low-precision timestep; the native
+            # temporal sums deliberately retain FP32. Allow rounding to grow
+            # with the unroll length, without promoting the forward oracle.
+            atol=max(7e-5, steps * torch.finfo(dtype).eps),
+            rtol=max(7e-4, steps * torch.finfo(dtype).eps),
+            msg=lambda message: f"gradient {index}: {message}",
+        )
 
 
 def _assert_values_and_vjp(
@@ -241,6 +277,14 @@ def test_checkpoint_fake_contract_uses_staggered_block_storage(
         "neuron": encode_spec(NeuronSpec("lif", dt=0.5, hard_reset=True)),
         "synapse": encode_spec(NeuronSpec("exponential", dt=0.5)),
         "charged_names": [],
+        # Include the physical partition metadata used by real trajectories:
+        # fake output allocation also resolves neuron/PSC storage precision.
+        "neuron_states": 1,
+        "synapse_states": 1,
+        "neuron_parameters": 0,
+        "synapse_parameters": 0,
+        "connection": "identity",
+        "delay": 0,
         "paired_checkpoint_interval": 16,
     }
     x = torch.empty(steps, 2, 4)
@@ -274,6 +318,28 @@ def test_checkpoint_fake_contract_uses_staggered_block_storage(
 def test_native_checkpointed_recurrence_matches_module_vjp(backend, steps):
     require_cuda_backend(backend)
     _assert_two_forward_vjp(backend, steps, "cuda")
+
+
+@pytest.mark.parametrize(
+    ("backend", "dtype", "weight_dtype"),
+    (
+        ("triton", torch.float16, None),
+        ("tilelang", torch.bfloat16, None),
+        ("triton", torch.float16, torch.float64),
+    ),
+)
+def test_low_precision_checkpoint_replay_keeps_forward_rounding(
+    backend, dtype, weight_dtype
+):
+    """Cross a replay boundary and continue with low-precision physical state.
+
+    Check input, initial-state and parameter VJPs against same-dtype
+    Torch modules. Wider adjoint sums are permitted; replaying the
+    forward model in FP32 would instead change the physical trajectory
+    being differentiated.
+    """
+    require_cuda_backend(backend)
+    _assert_two_forward_vjp(backend, 17, "cuda", dtype, weight_dtype)
 
 
 @pytest.mark.parametrize("backend", GPU_BACKENDS)

@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
+    from torch import Tensor
+
     from .planner import PlanningContext
     from .spike_list import SpikeList
 
@@ -75,12 +77,17 @@ class PreparedPropagation:
     buffer, then call ``from_spikes`` without packing the dense activity.
     ``prepare_sequence`` binds a trajectory's stable activity storage and
     returns an index-based consumer, avoiding per-step tensor rebinding.
+    ``prepare_weight_destination`` optionally binds a flattened execution
+    operand and its edge-to-slot indices for in-place online learning. Indices
+    follow the weight order supplied during preparation. Static propagation
+    does not call it or retain additional placement storage.
     """
 
     forward: Callable
     spikes: SpikeList | None = None
     from_spikes: Callable | None = None
     prepare_sequence: Callable | None = None
+    prepare_weight_destination: Callable[[], tuple[Tensor, Tensor]] | None = None
 
     def __call__(self, source):
         return self.forward(source)

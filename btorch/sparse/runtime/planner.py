@@ -33,6 +33,19 @@ class PlanningContext:
     shape: tuple[int, int] | None = None
 
 
+def _prefer_dense(context: PlanningContext | None) -> bool:
+    """Bound automatic dense execution by the expanded operator dimensions."""
+    return (
+        context is not None
+        and context.method == "auto"
+        and registry.override is None
+        and context.shape is not None
+        and max(context.shape) < 4096
+        and context.dtype
+        in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+    )
+
+
 @dataclass(frozen=True)
 class _Plan:
     """Internal execution plan of one connection."""
@@ -122,13 +135,8 @@ class Planner:
                     f"dtype={dtype}, batched_values={value_batched}, "
                     f"backend={registry.override or 'auto'!r}"
                 )
-        elif (
-            shape is not None
-            and max(shape) < 4000
-            and registry.override is None
-            and dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
-        ):
-            algorithm, reason = "pull", "fewer than 4000 neurons: dense matmul"
+        elif _prefer_dense(context):
+            algorithm, reason = "pull", "expanded dimensions below 4096: dense matmul"
         elif value_batched:
             algorithm, reason = "pull", "shared-pattern batch of values"
         elif density is None and not low_rate:

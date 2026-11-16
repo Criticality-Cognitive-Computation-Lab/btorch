@@ -1,37 +1,41 @@
-# 注册并验证生成的 cell kernel
+# 编写自定义 LIF kernel
 
-在仓库根目录运行完整示例：
+在安装了 Triton 的 CUDA 设备上运行：
 
 ```bash
-PYTHONPATH=. python examples/oot_cell_backend.py
-PYTHONPATH=. python examples/oot_cell_backend.py --backend triton --device cuda --source /tmp/lif_kernel.py --capture
+python -m examples.oot_cell_backend
 ```
 
-CPU 运行无需 GPU 可选依赖。Triton、TileLang、CuPy 路径使用共享模板生成的真实
-kernel。`--source` 在验证前输出可检查的源码；`--compile` 额外检查静态 fullgraph
-前向与反向。
+示例只展示一件事：替换 LIF 前向实现，同时保留常规 btorch Module 接口和已有的
+替代梯度反向实现。按调用顺序分为三部分：
 
-示例先取得内置实现，以外部包名称注册，再验证非零初始状态以及 voltage、
-charged-voltage 记录 loss。随后使用常规 `LIF(..., backend="tutorial_cell")` API，
-在 eval 模式下训练上游 scale。第二个 parity case 检查 AlphaPSC 的状态与记录梯度，
-随后 sparse RSNN 将两个已注册模型与现有 connection kernel 组合，并对最终状态添加 loss。
-需要保留模型语义、独立调整 kernel 调度的包也可
-从这里开始。
-
-## 定位导数错误
-
-Forward 正确不代表训练正确。尝试在外部包中将初始状态梯度错误地归零：
+1. `lif_kernel` 是手写 Triton kernel。每个 lane 在整个序列上更新一个神经元，
+   输出 spike、最终电压及请求的记录。
+2. `forward` 将 btorch 的张量回调适配到该 kernel。状态顺序为 `(v,)`，参数顺序为
+   `(v_threshold, v_reset, c_m, tau)`。广播参数和带 stride 的输入保留为视图，
+   返回张量不与输入共享存储。
+3. `register_example_backend` 将前向实现注册为 `tutorial_lif`，并复用 btorch
+   的 Triton LIF 反向实现。随后通过 `LIF(..., backend="tutorial_lif")` 选择它，
+   无需修改状态初始化或训练代码。
 
 ```python
-def broken_backward(*args, **kwargs):
-    grad_x, grad_states, grad_parameters = implementation.backward(*args, **kwargs)
-    grad_states = tuple(None if g is None else torch.zeros_like(g) for g in grad_states)
-    return grad_x, grad_states, grad_parameters
+from btorch.models.neurons import LIF
+from examples.oot_cell_backend import register_example_backend
+
+register_example_backend()
+neuron = LIF(129, tau=4.0, step_mode="m", backend="tutorial_lif", device="cuda")
 ```
 
-用不同名称注册这个错误实现，然后验证同一个 `ParityCase`。即使 spike 输出
-完全一致，`report.assert_close()` 仍会报告 `grad_v` 和首个失败坐标。
-仓库的 `tests/models/kernels/test_oot.py` 执行了这个回归场景。
+复用该反向实现的前提是自定义前向遵守相同的 LIF 方程和 reset 约定。改变方程时
+必须提供匹配的反向。示例明确不支持不应期和随机变体，输入为
+`(time, batch, neuron)`。
 
-发布外部包前检查 capability skip，并验证自己声称支持的形状、精度、surrogate、
-reset 选项和记录 loss。参见 [callback 与生成契约](../guides/oot_kernels.md)。
+`run_example` 先通过 `check_backend_parity` 对照已有 Torch 模型检查 spike、电压记录和
+梯度，包括编译和 CUDA Graph 重放，再使用常规 LIF Module，对输入缩放参数计算
+spike/电压 loss 的梯度。
+示例不再混合 RSNN、连接布局和源码生成流程。
+
+需要共享方程模板而非手写前向时，参见
+[kernel 生成](../design/kernel_generation.md)。回调顺序、能力声明、compile 和
+CUDA Graph 检查参见[扩展契约](../guides/oot_kernels.md)。在线学习使用独立示例
+`examples/oot_stdp.py`，见[可塑性指南](../guides/plasticity.md#out-of-tree-native-learning-templates)。

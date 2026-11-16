@@ -250,19 +250,27 @@ recurrent configurations retain physical-state histories. Unrequested pre-spike 
 kept only as differentiable final values; requesting their full records retains
 the corresponding trajectories.
 
-Current built-in kernels accept FP32, FP16 or BF16 inputs and use FP32 state and
-accumulation; output sequences follow input dtype. This is an implementation
-limitation, not a settled precision/promotion policy. Time is first, normally
+Torch, Triton and TileLang preserve explicitly supplied FP16/BF16 neuron and
+PSC state precision. Mixed floating operands follow Torch dtype promotion;
+model preparation does not convert memories or parameters to FP32. Operations
+without a low-precision math interface widen only that operation and round its
+result back. Temporal adjoints and parameter reductions may accumulate in FP32;
+this does not promote the forward trajectory or checkpoint replay. Output
+sequences follow input dtype. The CuPy renderer still uses FP32 scalar locals.
+Primitive temporal loops bind mixed initial states in the promoted model dtype
+so loop-carried registers keep a stable type. Uniform FP16/BF16 models remain
+in that dtype. CUDA Graph reuse also requires unchanged state shapes, dtypes
+and strides; changing state values alone does not invalidate a capture.
+Time is first, normally
 `[T,B,N]`; initial state has
 no time axis. Model adaptation and receptor axes remain explicit. Integer topology,
 receptors and delays receive no gradients.
 
 Native cell pointer bindings retain input and parameter storage dtype and
-strides, including sliced or transposed views with nonzero offsets. Register
-loads perform the calculation-precision conversion inside the kernel. They do
-not require an FP32 contiguous copy of each input. Low-precision training keeps
-the producer's existing spike buffer as a private residual, independently of
-the public raster's dtype.
+strides, including sliced or transposed views with nonzero offsets. They do
+not require an FP32 contiguous copy of each input. When model precision differs
+from the public raster, training keeps the producer's existing spike buffer as
+a private residual.
 
 Use standard Torch AMP without converting the model or its memories:
 

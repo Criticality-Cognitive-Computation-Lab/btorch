@@ -17,6 +17,8 @@ import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
 
+import torch
+
 from ....sparse.runtime.activity import BLOCK_SIZE
 
 
@@ -29,7 +31,23 @@ _MATH_NAMES = {
     "minimum",
     "where",
 }
-_FLOAT_DTYPES = {"float16", "bfloat16", "float64"}
+_FLOAT_DTYPES = {"float16", "bfloat16", "float32", "float64"}
+_LOW_PRECISION_DTYPES = {"float16", "bfloat16"}
+_GRID_SYNC_MARKER = "__BTORCH_GRID_SYNC__"
+_TILE_ALL_LANES_MARKER = "__BTORCH_TILE_ALL_LANES__"
+_BLOCK_EPILOGUE_MARKER = "__BTORCH_BLOCK_EPILOGUE__"
+
+
+def _split_grid_phases(lines):
+    phases = [[]]
+    barriers = 0
+    for line in lines:
+        if line == _GRID_SYNC_MARKER:
+            barriers += 1
+            phases.append([])
+        else:
+            phases[-1].append(line)
+    return phases, barriers
 
 
 @dataclass(frozen=True)
@@ -44,14 +62,40 @@ class RendererEmission:
 class _TritonPreciseDivision(ast.NodeTransformer):
     """Lower only floating division for Triton's precise-division mode."""
 
+    @staticmethod
+    def _constant(expression):
+        return not any(
+            isinstance(node, (ast.Name, ast.Call, ast.Attribute, ast.Subscript))
+            for node in ast.walk(expression)
+        )
+
     def visit_BinOp(self, node):  # noqa: N802 - ast API
         node = self.generic_visit(node)
         if not isinstance(node.op, ast.Div):
             return node
+        left_constant = self._constant(node.left)
+        right_constant = self._constant(node.right)
+        if left_constant and right_constant:
+            return node
+        if left_constant != right_constant:
+            # Libdevice requires equal operand types. Match a literal's type
+            # to the tensor rather than allowing Triton to default it to FP32.
+            literal, tensor = (
+                (node.left, node.right) if left_constant else (node.right, node.left)
+            )
+            literal = ast.Call(
+                func=ast.Attribute(ast.Name("tl", ast.Load()), "cast", ast.Load()),
+                args=[literal, ast.Attribute(tensor, "dtype", ast.Load())],
+                keywords=[],
+            )
+            if left_constant:
+                node.left = literal
+            else:
+                node.right = literal
         return ast.copy_location(
             ast.Call(
                 func=ast.Attribute(
-                    value=ast.Name(id="tl", ctx=ast.Load()),
+                    value=ast.Name(id="libdevice", ctx=ast.Load()),
                     attr="div_rn",
                     ctx=ast.Load(),
                 ),
@@ -81,6 +125,154 @@ def _retain_source(kernel, filename):
 def _parse_statement(line: str) -> ast.AST:
     """Parse one scalar assignment or expression without textual rewriting."""
     return ast.parse(line.strip(), mode="exec").body[0]
+
+
+class _StoragePrecision(ast.NodeTransformer):
+    """Keep pointwise arithmetic in its operand dtype.
+
+    Division and libdevice transcendentals lack low-precision
+    interfaces. Promote only those operations and round their results
+    immediately, as Torch's pointwise operations do. Mixed tensor dtypes
+    follow Torch promotion.
+    """
+
+    def __init__(self, renderer, dtypes, default_dtype):
+        self.renderer, self.dtypes, self.default_dtype = renderer, dtypes, default_dtype
+
+    @staticmethod
+    def _dtype(node):
+        return getattr(node, "_value_dtype", None)
+
+    def _promote(self, nodes):
+        types = [self._dtype(node) for node in nodes if self._dtype(node) is not None]
+        if not types:
+            return None
+        result = getattr(torch, types[0])
+        for dtype in types[1:]:
+            result = torch.promote_types(result, getattr(torch, dtype))
+        return str(result).removeprefix("torch.")
+
+    def _cast(self, node, dtype):
+        if (
+            self.renderer.name == "tilelang"
+            and dtype in _LOW_PRECISION_DTYPES
+            and self._dtype(node) in ("int64", "uint64")
+        ):
+            # TileLang's CUDA scalar wrappers have no unambiguous int64
+            # constructor. Convert the integer operand, without widening the
+            # surrounding floating-point operation or its stored state.
+            node = self._cast(node, "float32")
+        result = ast.parse(
+            self.renderer.cast_load(ast.unparse(node), dtype), mode="eval"
+        ).body
+        result._value_dtype = dtype
+        return result
+
+    def visit_Name(self, node):  # noqa: N802
+        node._value_dtype = self.dtypes.get(node.id)
+        return node
+
+    def _pointer_dtype(self, node):
+        pointers = [
+            item.id.removesuffix("_ptr")
+            for item in ast.walk(node)
+            if isinstance(item, ast.Name) and item.id.endswith("_ptr")
+        ]
+        if len(pointers) != 1:
+            return None
+        layout = self.renderer.storage.get(pointers[0])
+        return layout.dtype if layout is not None else "float32"
+
+    def visit_Subscript(self, node):  # noqa: N802
+        node = self.generic_visit(node)
+        node._value_dtype = self._pointer_dtype(node.value)
+        return node
+
+    def visit_UnaryOp(self, node):  # noqa: N802
+        node = self.generic_visit(node)
+        node._value_dtype = self._dtype(node.operand)
+        return node
+
+    def visit_BinOp(self, node):  # noqa: N802
+        node = self.generic_visit(node)
+        dtype = self._promote((node.left, node.right))
+        node._value_dtype = dtype
+        if dtype in _LOW_PRECISION_DTYPES and isinstance(node.op, (ast.Div, ast.Pow)):
+            node.left, node.right = (
+                self._cast(node.left, "float32"),
+                self._cast(node.right, "float32"),
+            )
+            return self._cast(node, dtype)
+        if dtype in _FLOAT_DTYPES:
+            for name in ("left", "right"):
+                operand = getattr(node, name)
+                if (
+                    self._dtype(operand) is not None
+                    and self._dtype(operand) != "bool"
+                    and self._dtype(operand) != dtype
+                ) or (
+                    dtype in _LOW_PRECISION_DTYPES
+                    and self._dtype(operand) is None
+                    and _TritonPreciseDivision._constant(operand)
+                ):
+                    setattr(node, name, self._cast(operand, dtype))
+        return node
+
+    def visit_Call(self, node):  # noqa: N802
+        node = self.generic_visit(node)
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "tl"
+            and node.func.attr == "load"
+        ):
+            node._value_dtype = self._pointer_dtype(node.args[0])
+            return node
+        if not isinstance(node.func, ast.Name) or node.func.id not in (
+            *_MATH_NAMES,
+            "pow",
+        ):
+            return node
+        dtype = self._promote(node.args[1:] if node.func.id == "where" else node.args)
+        if dtype is None and node.func.id == "where":
+            # A spike is a floating tensor in the threshold operand's dtype.
+            # Untyped 0/1 branches must not silently make it FP32.
+            dtype = getattr(node.args[0], "_comparison_dtype", self.default_dtype)
+        node._value_dtype = dtype
+        needs_math_abi = node.func.id in ("exp", "expm1", "pow") or (
+            node.func.id == "fma" and self.renderer.name == "tilelang"
+        )
+        if dtype in _LOW_PRECISION_DTYPES and needs_math_abi:
+            node.args = [self._cast(argument, "float32") for argument in node.args]
+            return self._cast(node, dtype)
+        if dtype in _FLOAT_DTYPES:
+            start = 1 if node.func.id == "where" else 0
+            for index in range(start, len(node.args)):
+                argument = node.args[index]
+                if (
+                    self._dtype(argument) in _FLOAT_DTYPES
+                    and self._dtype(argument) != dtype
+                ) or (
+                    dtype in _LOW_PRECISION_DTYPES
+                    and self._dtype(argument) is None
+                    and _TritonPreciseDivision._constant(argument)
+                ):
+                    node.args[index] = self._cast(argument, dtype)
+        return node
+
+    def visit_Compare(self, node):  # noqa: N802
+        node = self.generic_visit(node)
+        node._comparison_dtype = self._promote((node.left, *node.comparators))
+        node._value_dtype = "bool"
+        return node
+
+    def visit_Assign(self, node):  # noqa: N802
+        node = self.generic_visit(node)
+        if isinstance(node.targets[0], ast.Name):
+            self.dtypes[node.targets[0].id] = self._dtype(
+                node.value
+            ) or self.dtypes.get(node.targets[0].id, self.default_dtype)
+        return node
 
 
 class _MathTransformer(ast.NodeTransformer):
@@ -157,8 +349,28 @@ def local_statement(line: str, names: set[str]) -> str:
     return ast.unparse(ast.fix_missing_locations(tree))
 
 
+def local_expression(expression: str, names: set[str]) -> str:
+    """Render local-array references inside a standalone expression."""
+    tree = _LocalArrayTransformer(names).visit(ast.parse(expression, mode="eval"))
+    return ast.unparse(ast.fix_missing_locations(tree.body))
+
+
 class SourceRenderer:
     """Backend-independent renderer interface used by ``_Source``."""
+
+    def storage_statements(self, lines, dtypes, default_dtype):
+        """Resolve pointwise precision once while preparing scalar
+        templates."""
+        transform = _StoragePrecision(self, dtypes, default_dtype)
+        result = []
+        for line in lines:
+            if line.strip().endswith(":"):
+                result.append(line)
+                continue
+            indentation = line[: len(line) - len(line.lstrip())]
+            tree = transform.visit(_parse_statement(line))
+            result.append(indentation + ast.unparse(ast.fix_missing_locations(tree)))
+        return tuple(result)
 
     name = ""
     calls: dict[str, str] = {}
@@ -194,10 +406,13 @@ class SourceRenderer:
     def division(self):
         return "/" if self.floor_division else "//"
 
-    def load(self, pointer, index, layout, *, lane_index):
+    def load(self, pointer, index, layout, *, lane_index, dtype="float32"):
         expression = f"{pointer}_ptr[{index}]"
-        if layout is not None and layout.dtype in _FLOAT_DTYPES:
-            expression = self.cast_load(expression, layout.dtype)
+        if (
+            dtype in _FLOAT_DTYPES
+            and (layout.dtype if layout is not None else "float32") != dtype
+        ):
+            expression = self.cast_load(expression, dtype)
         return expression
 
     def cast_load(self, expression, dtype):
@@ -222,7 +437,7 @@ class SourceRenderer:
 
     def _math(self, line):
         stripped = line.strip()
-        if stripped.startswith(("for ", "if ")):
+        if stripped.startswith(("for ", "if ", "while ")):
             return stripped
         calls = dict(self.calls)
         return transform_statement(
@@ -232,7 +447,18 @@ class SourceRenderer:
             fast_math=not self.precise_exp,
         )
 
-    def render(self, lines, pointers, has_spike_list, has_gradient_list, epilogue=()):
+    def render(
+        self,
+        lines,
+        pointers,
+        has_spike_list,
+        has_gradient_list,
+        epilogue=(),
+        *,
+        scalar_dtype="float32",
+        local_dtypes=None,
+        grid_barriers=0,
+    ):
         raise NotImplementedError
 
 
@@ -245,6 +471,7 @@ class TritonRenderer(SourceRenderer):
         "fma": "tl.fma",
         "maximum": "tl.maximum",
         "minimum": "tl.minimum",
+        "pow": "libdevice.pow",
         "where": "tl.where",
     }
 
@@ -260,22 +487,27 @@ class TritonRenderer(SourceRenderer):
             )
         return tuple(lines)
 
-    def load(self, pointer, index, layout, *, lane_index):
+    def load(self, pointer, index, layout, *, lane_index, dtype="float32"):
+        value_type = layout.dtype if layout is not None else dtype
+        other = "0" if value_type.startswith(("int", "uint", "bool")) else "0.0"
         expression = (
             f"tl.load({pointer}_ptr)"
             if index == "0"
-            else f"tl.load({pointer}_ptr + {index}, mask=mask, other=0.0)"
+            else f"tl.load({pointer}_ptr + {index}, mask=mask, other={other})"
             if "index" in index
             else f"tl.load({pointer}_ptr + {index})"
         )
-        if layout is not None and layout.dtype in _FLOAT_DTYPES:
-            expression = self.cast_load(expression, layout.dtype)
+        if (
+            dtype in _FLOAT_DTYPES
+            and (layout.dtype if layout is not None else "float32") != dtype
+        ):
+            expression = self.cast_load(expression, dtype)
         if lane_index and "index" not in index:
             expression = f"tl.broadcast_to({expression}, (BLOCK,))"
         return expression
 
     def cast_load(self, expression, dtype):
-        return f"({expression}).to(tl.float32)"
+        return f"tl.cast({expression}, tl.{dtype})"
 
     def store(self, pointer, index, local):
         return f"tl.store({pointer}_ptr + {index}, {local}, mask=mask)"
@@ -330,35 +562,62 @@ class TritonRenderer(SourceRenderer):
             scalar, width, prefix, time, n, n_step, layout
         )
 
-    def render(self, lines, pointers, has_spike_list, has_gradient_list, epilogue=()):
+    def render(
+        self,
+        lines,
+        pointers,
+        has_spike_list,
+        has_gradient_list,
+        epilogue=(),
+        *,
+        scalar_dtype="float32",
+        local_dtypes=None,
+        grid_barriers=0,
+    ):
+        local_dtypes = local_dtypes or {}
+        phases, marker_count = _split_grid_phases(lines)
+        if marker_count != grid_barriers:
+            raise ValueError(
+                "Grid synchronization marker count disagrees with renderer state"
+            )
         rendered = []
-        for raw in lines:
-            indentation = raw[: len(raw) - len(raw.lstrip())]
-            line = raw.strip()
-            if line in ("END", "END_IF", "END_REPLAY"):
-                continue
-            if self.dynamic_steps and line.startswith("for time in range("):
-                reverse = "-1, -1" in line
-                if reverse:
-                    rendered.append(
-                        indentation + "for reverse_time in tl.range(0, n_steps):"
-                    )
-                    rendered.append(
-                        indentation + "    time = n_steps - 1 - reverse_time"
-                    )
+        for phase_index, phase in enumerate(phases):
+            for raw in phase:
+                indentation = raw[: len(raw) - len(raw.lstrip())]
+                line = raw.strip()
+                if line in ("END", "END_IF", "END_REPLAY"):
+                    continue
+                if self.dynamic_steps and line.startswith("for time in range("):
+                    reverse = "-1, -1" in line
+                    if reverse:
+                        rendered.append(
+                            indentation + "for reverse_time in tl.range(0, n_steps):"
+                        )
+                        rendered.append(
+                            indentation + "    time = n_steps - 1 - reverse_time"
+                        )
+                    else:
+                        rendered.append(
+                            indentation + "for time in tl.range(0, n_steps):"
+                        )
+                    continue
+                if line.rstrip().endswith(" = 0.0"):
+                    statement = _parse_statement(line)
+                    if isinstance(statement, ast.Assign):
+                        dtype = local_dtypes.get(statement.targets[0].id, scalar_dtype)
+                        line = (
+                            f"{ast.unparse(statement.targets[0])} = "
+                            f"tl.full((BLOCK,), 0.0, tl.{dtype})"
+                        )
                 else:
-                    rendered.append(indentation + "for time in tl.range(0, n_steps):")
-                continue
-            if line.rstrip().endswith(" = 0.0"):
-                statement = _parse_statement(line)
-                if isinstance(statement, ast.Assign):
-                    line = (
-                        f"{ast.unparse(statement.targets[0])} = "
-                        "tl.full((BLOCK,), 0.0, tl.float32)"
-                    )
-            else:
-                line = self._math(line)
-            rendered.append(indentation + line)
+                    line = self._math(line)
+                rendered.append(indentation + line)
+            if phase_index < marker_count:
+                rendered.append(
+                    "_grid_sync(grid_barrier_ptr, grid_epoch_ptr, grid_epoch, "
+                    f"PHASE_INDEX={phase_index + 1}, N_PHASES={marker_count}, "
+                    f"N_CTAS={(self.n + 127) // 128}, BLOCK=BLOCK)"
+                )
         args = ", ".join(name + "_ptr" for name, _ in pointers)
         if self.dynamic_steps:
             args += ", n_steps"
@@ -368,6 +627,11 @@ class TritonRenderer(SourceRenderer):
             "from btorch.models.kernels.backends.math_triton "
             "import exp as _btorch_exp, expm1 as _btorch_expm1\n"
         )
+        if marker_count:
+            imports += (
+                "from btorch.models.kernels.backends.synchronization "
+                "import _grid_sync\n"
+            )
         if has_gradient_list:
             imports += (
                 "from btorch.sparse.runtime.kernels_triton_spikelist "
@@ -388,6 +652,7 @@ class TritonRenderer(SourceRenderer):
             + f"def cell_kernel({args}, BLOCK: tl.constexpr):\n"
             + "    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n"
             + f"    mask = index < {self.n}\n"
+            + ("    grid_epoch = tl.load(grid_epoch_ptr)\n" if marker_count else "")
             + "\n".join("    " + line for line in rendered)
             + "\n"
         )
@@ -437,7 +702,23 @@ class CuPyRenderer(SourceRenderer):
     def cast_load(self, expression, dtype):
         return f"float({expression})"
 
-    def render(self, lines, pointers, has_spike_list, has_gradient_list, epilogue=()):
+    def render(
+        self,
+        lines,
+        pointers,
+        has_spike_list,
+        has_gradient_list,
+        epilogue=(),
+        *,
+        scalar_dtype="float32",
+        local_dtypes=None,
+        grid_barriers=0,
+    ):
+        del scalar_dtype, local_dtypes
+        if grid_barriers:
+            raise NotImplementedError(
+                "Grid synchronization is unavailable for the CuPy renderer"
+            )
         declared = {"index", "time", "replay"}
         rendered = []
         for raw in lines:
@@ -542,6 +823,7 @@ class TileLangRenderer(SourceRenderer):
         "fma": "__tilelang_fma__",
         "maximum": "T.max",
         "minimum": "T.min",
+        "pow": "T.pow",
         "where": "T.if_then_else",
     }
 
@@ -562,10 +844,11 @@ class TileLangRenderer(SourceRenderer):
                 "_emit_spike_list(spike_selected, spike_degree_ptr, "
                 "spike_indices_ptr, spike_cumulative_ptr, spike_counts_ptr, "
                 f"block, {n_source}, {BLOCK_SIZE})",
-                f"for lane in T.Parallel({BLOCK_SIZE}):",
-                f"    if block * {BLOCK_SIZE} + lane < {n}:",
+                f"for spike_clear_lane in T.Parallel({BLOCK_SIZE}):",
+                f"    if block * {BLOCK_SIZE} + spike_clear_lane < {n}:",
                 *(
-                    f"        spike_accumulation_ptr[(block * {BLOCK_SIZE} + lane) * "
+                    f"        spike_accumulation_ptr[(block * {BLOCK_SIZE} + "
+                    f"spike_clear_lane) * "
                     f"{receptors} + {receptor}] = 0.0"
                     for receptor in range(receptors)
                 ),
@@ -573,8 +856,15 @@ class TileLangRenderer(SourceRenderer):
         )
 
     def validate_dt(self, required_dt=None):
+        layout = self.storage.get("dt")
+        finite_operand = (
+            "T.Cast('float32', dt)"
+            if layout is not None and layout.dtype == "bfloat16"
+            else "dt"
+        )
         lines = [
-            "T.device_assert(index != 0 or (T.isfinite(dt) and dt > 0.0), "
+            "T.device_assert(index != 0 or "
+            f"(T.isfinite({finite_operand}) and dt > 0.0), "
             '"dt must be finite and positive")'
         ]
         if required_dt is not None:
@@ -584,41 +874,132 @@ class TileLangRenderer(SourceRenderer):
             )
         return tuple(lines)
 
-    def _math(self, line):
-        if line.strip().startswith(("for ", "if ")):
+    def _math(self, line, scalar_dtype="float32"):
+        if line.strip() == "else:" or line.strip().startswith(
+            ("for ", "if ", "elif ", "while ")
+        ):
             return line.strip()
         calls = dict(self.calls)
         tree = _MathTransformer(calls, fast_math=not self.precise_exp).visit(
             _parse_statement(line)
         )
 
+        # FP64 explicit FMA keeps the matching CUDA ABI; exponentials are
+        # handled by the shared dtype-aware helpers imported below.
+        class _ExpandFma(ast.NodeTransformer):
+            def visit_Call(self, node):  # noqa: N802
+                node = self.generic_visit(node)
+                if (
+                    self_dtype == "float64"
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "call_pure_extern"
+                    and len(node.args) >= 2
+                    and isinstance(node.args[1], ast.Constant)
+                    and node.args[1].value == "fmaf"
+                ):
+                    node.args[:2] = [ast.Constant("float64"), ast.Constant("fma")]
+                return node
+
+        self_dtype = getattr(self, "scalar_dtype", "float32")
+        tree = _ExpandFma().visit(tree)
         return ast.unparse(ast.fix_missing_locations(tree))
 
     def cast_load(self, expression, dtype):
-        return f'T.Cast("float32", {expression})'
+        return f'T.Cast("{dtype}", {expression})'
 
-    def render(self, lines, pointers, has_spike_list, has_gradient_list, epilogue=()):
+    def render(
+        self,
+        lines,
+        pointers,
+        has_spike_list,
+        has_gradient_list,
+        epilogue=(),
+        *,
+        scalar_dtype="float32",
+        local_dtypes=None,
+        grid_barriers=0,
+    ):
+        local_dtypes = local_dtypes or {}
+        phases, marker_count = _split_grid_phases(lines)
+        if marker_count != grid_barriers:
+            raise ValueError(
+                "Grid synchronization marker count disagrees with renderer state"
+            )
+        assignments = tuple(
+            statement
+            for line in lines
+            if " = " in line and not line.strip().startswith("for ")
+            for statement in (_parse_statement(line.strip()),)
+            if isinstance(statement, ast.Assign)
+            and isinstance(statement.targets[0], (ast.Name, ast.Tuple))
+        )
+        shared = {
+            statement.targets[0].id: ast.unparse(statement)
+            for statement in assignments
+            if isinstance(statement.targets[0], ast.Name)
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Attribute)
+            and isinstance(statement.value.func.value, ast.Name)
+            and statement.value.func.value.id == "T"
+            and statement.value.func.attr == "alloc_shared"
+        }
         locals_ = sorted(
             {
-                statement.targets[0].id
-                for line in lines
-                if " = " in line and not line.strip().startswith("for ")
-                for statement in (_parse_statement(line.strip()),)
-                if isinstance(statement, ast.Assign)
-                and isinstance(statement.targets[0], ast.Name)
+                node.id
+                for statement in assignments
+                for node in ast.walk(statement.targets[0])
+                if isinstance(node, ast.Name)
             }
+            - shared.keys()
         )
-        rendered = []
-        for raw in lines:
-            indentation = raw[: len(raw) - len(raw.lstrip())]
-            line = raw.strip()
-            if line in ("END", "END_IF", "END_REPLAY"):
-                continue
-            line = line.replace("range(", "T.serial(")
-            line = self._math(line)
-            if not line.startswith(("for ", "if ")):
-                line = local_statement(line, set(locals_))
-            rendered.append(indentation + line)
+        fixed_threads = (
+            has_spike_list or bool(grid_barriers) or _TILE_ALL_LANES_MARKER in lines
+        )
+        local_names = set(locals_)
+        rendered_phases = []
+        for phase_index, phase in enumerate(phases):
+            # A producer may publish its block-wide queue before a grid
+            # barrier, rather than at kernel exit. These statements already
+            # use physical lanes and must stay outside the neuron mask.
+            block_epilogue = []
+            if _BLOCK_EPILOGUE_MARKER in phase:
+                boundary = phase.index(_BLOCK_EPILOGUE_MARKER)
+                block_epilogue = phase[boundary + 1 :]
+                phase = phase[:boundary]
+            phase_rendered = []
+            all_lanes = False
+            for raw in phase:
+                if raw == _TILE_ALL_LANES_MARKER:
+                    all_lanes = True
+                    continue
+                indentation = raw[: len(raw) - len(raw.lstrip())]
+                line = raw.strip()
+                if " = T.alloc_shared(" in line:
+                    continue
+                if line in ("END", "END_IF", "END_REPLAY"):
+                    continue
+                line = line.replace("range(", "T.serial(")
+                line = self._math(line, scalar_dtype)
+                if line.startswith("for "):
+                    target, iterable = line[4:].split(" in ", 1)
+                    target = target.strip()
+                    iterable = local_expression(
+                        iterable.rstrip(":"), local_names - {target}
+                    )
+                    line = f"for {target} in {iterable}:"
+                elif line.startswith("if "):
+                    condition = local_expression(line[3:].rstrip(":"), local_names)
+                    line = f"if {condition}:"
+                elif line.startswith("elif "):
+                    condition = local_expression(line[5:].rstrip(":"), local_names)
+                    line = f"elif {condition}:"
+                elif line.startswith("while "):
+                    condition = local_expression(line[6:].rstrip(":"), local_names)
+                    line = f"while {condition}:"
+                elif line != "else:":
+                    line = local_statement(line, local_names)
+                phase_rendered.append(indentation + line)
+            rendered_phases.append((phase_rendered, all_lanes, block_epilogue))
         args = ", ".join(
             f'{name}_ptr: T.Tensor(({size},), "'
             f'{self.storage[name].dtype if name in self.storage else "float32"}")'
@@ -626,7 +1007,7 @@ class TileLangRenderer(SourceRenderer):
         )
         return (
             "import tilelang\nimport tilelang.language as T\n"
-            + f"TUNABLE_THREADS = {not has_spike_list!r}\n"
+            + f"TUNABLE_THREADS = {not fixed_threads!r}\n"
             + (
                 "from btorch.sparse.runtime.tilelang_csr import emit_spike_list "
                 "as _emit_spike_list\n"
@@ -637,19 +1018,21 @@ class TileLangRenderer(SourceRenderer):
             "import exp as _btorch_exp, expm1 as _btorch_expm1\n"
             + (
                 "@tilelang.jit\ndef build_kernel():\n"
-                if has_spike_list
+                if fixed_threads
                 else "@tilelang.jit\ndef build_kernel(threads=128):\n"
             )
             + f"    @T.prim_func\n    def cell_kernel({args}):\n"
             + (
                 f"        with T.Kernel({-(-self.n // BLOCK_SIZE)}, "
                 f"threads={BLOCK_SIZE}) as block:\n"
-                if has_spike_list
+                if fixed_threads
                 else f"        with T.Kernel(T.ceildiv({self.n}, threads), "
                 "threads=threads) as block:\n"
             )
+            + "".join("            " + line + "\n" for line in shared.values())
             + "".join(
-                f'            {name} = T.alloc_local((1,), "float32")\n'
+                f"            {name} = T.alloc_local((1,), "
+                f'"{local_dtypes.get(name, scalar_dtype)}")\n'
                 for name in locals_
             )
             + (
@@ -664,12 +1047,23 @@ class TileLangRenderer(SourceRenderer):
             )
             + (
                 f"            index = block * {BLOCK_SIZE} + T.get_thread_binding()\n"
-                if has_spike_list
+                if fixed_threads
                 else "            index = block * threads + T.get_thread_binding()\n"
             )
-            + f"            if index < {self.n}:\n"
-            + "\n".join("                " + line for line in rendered)
-            + "\n"
+            + "".join(
+                (
+                    ("\n".join("            " + line for line in phase) + "\n")
+                    if all_lanes
+                    else (
+                        f"            if index < {self.n}:\n"
+                        + "\n".join("                " + line for line in phase)
+                        + "\n"
+                    )
+                )
+                + "".join("            " + line + "\n" for line in block_epilogue)
+                + ("            T.sync_grid()\n" if i < marker_count else "")
+                for i, (phase, all_lanes, block_epilogue) in enumerate(rendered_phases)
+            )
             + "\n".join("            " + line for line in epilogue)
             + "\n    return cell_kernel\n"
         )
@@ -793,10 +1187,14 @@ class RendererRuntime:
         changing,
         enable_fp_fusion,
         writes=(),
+        read_writes=(),
+        launch_cooperative_grid=False,
     ):
         """Bind launch policy for an invocation with stable argument
         layouts."""
-        del args, changing, writes
+        if launch_cooperative_grid:
+            raise NotImplementedError("This renderer has no cooperative launch binding")
+        del args, changing, writes, read_writes
         return functools.partial(
             self.launch_prepared,
             kernel,
@@ -879,6 +1277,8 @@ class TritonRuntime(RendererRuntime):
         changing,
         enable_fp_fusion,
         writes=(),
+        read_writes=(),
+        launch_cooperative_grid=False,
     ):
         # Generated cells do not specialize pointer alignment. Cache executable
         # metadata only; every invocation binds fresh addresses and owners.
@@ -892,7 +1292,9 @@ class TritonRuntime(RendererRuntime):
             n,
             enable_fp_fusion,
             tuple(writes),
+            launch_cooperative_grid,
         )
+        del read_writes  # Triton already restores every writable trial buffer.
         recipe = self._recipes.get(key)
         if recipe is None:
             prepared = prepare_launch(
@@ -902,8 +1304,9 @@ class TritonRuntime(RendererRuntime):
                 (("BLOCK", 128),),
                 changing=changing,
                 writes=writes,
-                work=n,
+                work=0 if launch_cooperative_grid else n,
                 enable_fp_fusion=enable_fp_fusion,
+                launch_cooperative_grid=launch_cooperative_grid,
             )
             self._remember_recipe(key, (prepared.launch, prepared.constants))
             return prepared
@@ -976,8 +1379,12 @@ class CuPyRuntime(RendererRuntime):
         changing,
         enable_fp_fusion,
         writes=(),
+        read_writes=(),
+        launch_cooperative_grid=False,
     ):
-        del enable_fp_fusion
+        if launch_cooperative_grid:
+            raise NotImplementedError("CuPy does not support cooperative grid launch")
+        del enable_fp_fusion, read_writes
         import cupy
         import torch
 
@@ -1058,15 +1465,17 @@ class TileLangRuntime(RendererRuntime):
         changing,
         enable_fp_fusion,
         writes=(),
+        read_writes=(),
+        launch_cooperative_grid=False,
     ):
-        del changing, enable_fp_fusion
+        del changing, enable_fp_fusion, launch_cooperative_grid
         from ....utils.autotune import outputs_are_disjoint, tilelang_kernel
 
         factory = self.factories.get(kernel)
         if factory is not None:
-            # Generated forward/reverse destinations are final stores, with
-            # register-local accumulators. Aliasing a state input is the only
-            # additional dependency between repeated generated executions.
+            # Separate destinations can overwrite trial outputs. An in-place
+            # input may occur at only one argument slot, so explicit read/write
+            # metadata is needed in addition to checking storage aliases.
             kernel = tilelang_kernel(
                 factory,
                 (),
@@ -1074,7 +1483,7 @@ class TileLangRuntime(RendererRuntime):
                 writes,
                 4,
                 work=n,
-                overwrite=outputs_are_disjoint(args, writes),
+                overwrite=not read_writes and outputs_are_disjoint(args, writes),
             )
         return lambda arguments: kernel(*arguments)
 

@@ -1,12 +1,14 @@
 """Prepare stateful recurrent modules for a whole tensor sequence operator."""
 
 import json
+from contextlib import nullcontext
+from functools import lru_cache
 
 import torch
 from torch import nn
 
 from ..connection.sparse import SparseConnection
-from ..synapse import HeterSynapsePSC
+from ..synapse import DelayedPSC, HeterSynapsePSC
 from .adapters import connection_scope, prepare_cell
 from .contracts import surrogate_support
 from .operators import (
@@ -15,7 +17,7 @@ from .operators import (
     _validate_poisson_fp32,
     encode_spec,
 )
-from .options import normalize_backend, resolve_model_options
+from .options import _event_connection_backend, normalize_backend, resolve_model_options
 from .registry import _NATIVE_GPU_BACKENDS, resolve_cell_backend
 from .templates import get_template
 
@@ -54,7 +56,17 @@ def _reject_stochastic_input_composition(module):
 
 @torch.compiler.assume_constant_result
 def _encode_recurrent_spec(spec):
-    return json.dumps(spec, sort_keys=True)
+    return _encoded_recurrent_items(
+        tuple(
+            (name, tuple(value) if isinstance(value, list) else value)
+            for name, value in sorted(spec.items())
+        )
+    )
+
+
+@lru_cache(maxsize=256)
+def _encoded_recurrent_items(items):
+    return json.dumps(dict(items), sort_keys=True)
 
 
 @torch.compiler.assume_constant_result
@@ -62,6 +74,23 @@ def _compiled_sparse_route(connection, options, method):
     """Bind static RSNN execution choices before tracing tensor operations."""
     with connection_scope(options):
         return connection._compiled_method_route(method)
+
+
+@torch.compiler.assume_constant_result
+def _delay_segments(connection):
+    """Prepare topology-derived segment metadata outside compiled stepping."""
+    return connection.cache.prepare_delay_segments(
+        connection.n_pre, max(connection.n_delay, 1)
+    )
+
+
+@torch.compiler.assume_constant_result
+def _edge_segments(connection):
+    """Prepare the canonical inverse for heterogeneous delayed segment
+    reads."""
+    return connection.cache.prepare_edge_segments(
+        connection.n_pre, max(connection.n_delay, 1)
+    )
 
 
 def _prepare_connection(connection, options=None, *, online=False):
@@ -89,6 +118,21 @@ def _prepare_connection(connection, options=None, *, online=False):
             if options is not None and options.connection_method != "auto"
             else connection.method
         )
+        if (
+            options is not None
+            and options.spike_selection != "auto"
+            and method == "auto"
+        ):
+            method = "push"
+        if (
+            options is not None
+            and options.spike_selection != "auto"
+            and method != "push"
+        ):
+            raise NotImplementedError(
+                "Explicit spike discovery requires a sparse push connection; use "
+                "spike_selection='auto' for the ordinary pull path"
+            )
         explicit_route = (
             _compiled_sparse_route(connection, options, method)
             if options is not None
@@ -149,8 +193,63 @@ def _prepare_connection(connection, options=None, *, online=False):
             if explicit_route is not None
             else (None if use_fallback else connection._max_density),
         }
-        if options is not None and options.recurrent == "helion":
+        event_backend = _event_connection_backend(options) if online else None
+        event_connection = event_backend is not None
+        if event_connection:
+            connection_spec["event_connection"] = event_backend
+        shared_traces = online and any(
+            domain != "edge" for domain in connection.plasticity.state_domains.values()
+        )
+        segment_signals = online and any(
+            domain == "segment" for _, domain in connection.plasticity.signal_domains
+        )
+        if options is not None and (
+            options.recurrent == "helion"
+            or event_connection
+            or shared_traces
+            or segment_signals
+        ):
             connection_spec["max_degree"] = cache.max_source_degree
+            if online:
+                from .plasticity import get_plasticity_template
+
+                rule = connection.plasticity
+                template = get_plasticity_template(
+                    rule._kernel_model,
+                    tuple(rule.state_domains.items()),
+                    rule.signal_domains,
+                )
+                if (
+                    template.events is not None
+                    or "segment" in rule.state_domains.values()
+                    or segment_signals
+                ):
+                    if event_connection and template.events is None:
+                        raise NotImplementedError(
+                            "Two-kernel sparse learning requires exact "
+                            "event-only silent evolution"
+                        )
+                    segments = _delay_segments(connection)
+                    # Event traversal shares existing canonical edge maps;
+                    # continuous traversal needs no segment representation.
+                    topology += segments[:-1]
+                    connection_spec["n_segments"] = segments[1].numel()
+                    if (shared_traces or segment_signals) and connection.n_delay > 1:
+                        topology += (_edge_segments(connection),)
+                else:
+                    if event_connection:
+                        raise NotImplementedError(
+                            "Two-kernel sparse learning requires a rule with "
+                            "exact event-only silent evolution"
+                        )
+                if template.events is None:
+                    # Continuous canonical-edge traversal needs receptor IDs
+                    # even when compact traces also request segment metadata.
+                    topology += (
+                        connection.receptor
+                        if connection.receptor is not None
+                        else connection.indices[0].new_empty(0),
+                    )
         return (
             connection_spec,
             (
@@ -243,17 +342,53 @@ def recurrent_sequence(
     module,
     x_seq,
     x_syn=None,
-    *,
+    *signal_inputs,
     loop_args=None,
     _chunk=False,
     uniform_seq=None,
+    plasticity_signals=None,
     **kwargs,
 ):
     """Execute a complete recurrent trajectory with explicit tensor inputs."""
     from ..rnn import _sparse_run_scope
 
-    if kwargs or loop_args not in (None, (0,), (0, 1)):
-        raise ValueError("Cell recurrent sequences accept time-major x and x_syn only")
+    signal_names = getattr(module, "_stdp_sequence_names", ())
+    if (
+        kwargs
+        or len(signal_inputs) != len(signal_names)
+        or (
+            loop_args is not None
+            and (
+                not set(loop_args) <= {0, 1, *range(2, 2 + len(signal_inputs))}
+                or not {0, *range(2, 2 + len(signal_inputs))} <= set(loop_args)
+            )
+        )
+    ):
+        raise ValueError(
+            "Recurrent sequences accept time-major x, x_syn and declared "
+            "plasticity signals"
+        )
+    if (
+        not _chunk
+        and module.cudagraph is True
+        and torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
+    ):
+        from .recurrent_graph import RecurrentGraphs
+
+        steps = x_seq.shape[0]
+        if module.chunk_size is not None and steps > module.chunk_size:
+            sections = (steps + module.chunk_size - 1) // module.chunk_size
+            steps = (
+                module.chunk_size
+                if module.chunk_mode == "split"
+                else (steps + sections - 1) // sections
+            )
+        graphs = getattr(module, "_training_graphs", None)
+        if graphs is None or graphs.steps != steps:
+            module._training_graphs = RecurrentGraphs(
+                steps, module._cudagraph_runner.warmup
+            )
     chunked = module.chunk_size is not None and x_seq.shape[0] > module.chunk_size
     if not _chunk and (chunked or module.grad_checkpoint or module.cpu_offload):
         # Bind sparse execution before checkpoint snapshots are taken. Preparing
@@ -265,7 +400,18 @@ def recurrent_sequence(
             _sparse_run_scope(module, x_seq),
         ):
             return module._multi_step_forward_impl(
-                x_seq, *(() if x_syn is None else (x_syn,)), loop_args=loop_args
+                x_seq,
+                *(
+                    (x_syn, *signal_inputs)
+                    if signal_inputs or x_syn is not None
+                    else ()
+                ),
+                loop_args=loop_args,
+                **(
+                    {"plasticity_signals": plasticity_signals}
+                    if plasticity_signals is not None
+                    else {}
+                ),
             )
     _reject_stochastic_input_composition(module)
     if module.neuron_inp_module is not None:
@@ -277,6 +423,49 @@ def recurrent_sequence(
     cell = synapse.base_psc if isinstance(synapse, HeterSynapsePSC) else synapse
     if not x_seq.shape[0]:
         return x_seq.clone(), {}
+    if (
+        isinstance(cell.linear, SparseConnection)
+        and cell.linear.transmission is not None
+    ):
+        raise NotImplementedError(
+            "Transmission rules currently support eager connection "
+            "steps only; optimized recurrent execution is not implemented"
+        )
+    options = normalize_backend(backend)
+    if (
+        isinstance(cell.linear, SparseConnection)
+        and cell.linear.plasticity is not None
+        and (
+            options.recurrent == "helion"
+            or options.spike_selection != "auto"
+            or "segment" in cell.linear.plasticity.state_domains.values()
+            or any(
+                domain == "segment"
+                for _, domain in cell.linear.plasticity.signal_domains
+            )
+        )
+    ):
+        # Build lazy topology buffers before Dynamo guards the module's buffer
+        # shapes during precision discovery. Preparation is outside the graph.
+        from .plasticity import get_plasticity_template
+
+        if (
+            get_plasticity_template(
+                cell.linear.plasticity._kernel_model,
+                tuple(cell.linear.plasticity.state_domains.items()),
+                cell.linear.plasticity.signal_domains,
+            ).traces
+            is not None
+        ):
+            _delay_segments(cell.linear)
+            if (
+                "segment" in cell.linear.plasticity.state_domains.values()
+                or any(
+                    domain == "segment"
+                    for _, domain in cell.linear.plasticity.signal_domains
+                )
+            ) and cell.linear.n_delay > 1:
+                _edge_segments(cell.linear)
     neuron_spec, neuron_names, neuron_states, neuron_parameters = prepare_cell(
         neuron, x_seq
     )
@@ -284,6 +473,11 @@ def recurrent_sequence(
         cell, cell.psc.unsqueeze(0)
     )
     options = resolve_model_options(backend, neuron_spec.model, synapse_spec.model)
+    if options.recurrent == "helion" and isinstance(synapse, DelayedPSC):
+        raise NotImplementedError(
+            "HELION recurrent execution does not support the uniform DelayedPSC "
+            "wrapper; use per-edge delay-expanded sparse connections"
+        )
     if options.recurrent == "helion" and options.merge_synapse:
         raise NotImplementedError(
             "HELION recurrent execution does not support merge_synapse"
@@ -326,9 +520,17 @@ def recurrent_sequence(
         cell.linear if isinstance(cell.linear, SparseConnection) else None
     )
     if online_connection is not None and online_connection.plasticity is not None:
+        from .plasticity import get_plasticity_template
+
+        rule = online_connection.plasticity
+        plasticity_template = get_plasticity_template(
+            rule._kernel_model, tuple(rule.state_domains.items()), rule.signal_domains
+        )
         online_names = (
-            "synapse.linear.plasticity.pre_trace",
-            "synapse.linear.plasticity.post_trace",
+            *(
+                "synapse.linear.plasticity." + name
+                for name in plasticity_template.states
+            ),
             "synapse.linear.weight.value",
         )
     else:
@@ -337,7 +539,7 @@ def recurrent_sequence(
     requested = (
         list(module.update_state_names)
         if module.update_state_names is not None
-        else [*all_record_names, *online_names[:2]]
+        else [*all_record_names, *online_names[:-1]]
     )
     # Sum receptor PSC records from the exact same per-receptor history used by
     # backward; retain the individual dynamics for get_psc and continuation.
@@ -418,6 +620,10 @@ def recurrent_sequence(
             cell,
             uniform_seq,
             online_binding,
+            {
+                **(plasticity_signals or {}),
+                **dict(zip(signal_names, signal_inputs, strict=True)),
+            },
         )
     with connection_scope(options), _sparse_run_scope(module, x_seq):
         connection_spec, connection_parameters, topology = _prepare_connection(
@@ -445,6 +651,10 @@ def recurrent_sequence(
             cell,
             uniform_seq,
             online_binding,
+            {
+                **(plasticity_signals or {}),
+                **dict(zip(signal_names, signal_inputs, strict=True)),
+            },
         )
 
 
@@ -470,9 +680,11 @@ def _execute(
     cell,
     uniform_seq=None,
     online_binding=None,
+    plasticity_signals=None,
 ):
     from .operators import poisson_uniforms
     from .recurrent_operator import (
+        _physical_dtypes,
         inference,
         online_inference,
         training,
@@ -517,24 +729,54 @@ def _execute(
     online_weight = None
     online_traces = ()
     online_parameters = ()
+    online_signals = []
+    signal_bindings = []
+    plasticity_model = None
     if online_binding is not None:
+        from .plasticity import get_plasticity_template
+
         connection, _ = online_binding
+        rule = connection.plasticity
+        plasticity_model = rule._kernel_model
+        plasticity_template = get_plasticity_template(
+            plasticity_model, tuple(rule.state_domains.items()), rule.signal_domains
+        )
         online_weight = connection.weight()
-        online_traces = (
-            connection.plasticity.pre_trace,
-            connection.plasticity.post_trace,
+        online_traces = tuple(
+            getattr(rule, name) for name in plasticity_template.states
         )
         online_parameters = tuple(
-            getattr(connection.plasticity, name)
-            for name in (
-                "a_plus",
-                "a_minus",
-                "tau_plus",
-                "tau_minus",
-                "w_min",
-                "w_max",
-            )
+            getattr(rule, name) for name in plasticity_template.parameters
         )
+        from ..connection.plasticity import ExternalSignal
+
+        external = plasticity_signals or {}
+        attributes = dict(get_template(neuron_spec).record_attributes)
+        live_attributes = dict(module._stdp_signal_bindings)
+        for name, _domain in plasticity_template.signals:
+            source = rule.signals[name]
+            if isinstance(source, ExternalSignal):
+                signal_bindings.append(
+                    (
+                        name,
+                        "sequence" if source.time_first else "constant",
+                        len(online_signals),
+                    )
+                )
+                online_signals.append(external[name])
+            else:
+                attribute = live_attributes[name]
+                if source.stage == "state":
+                    signal_bindings.append(
+                        (name, "state", neuron_names.index(attribute))
+                    )
+                else:
+                    record = next(
+                        key for key in charged_names if attributes[key] == attribute
+                    )
+                    signal_bindings.append(
+                        (name, "charged", charged_names.index(record))
+                    )
         # The canonical weight is a mutable custom-op argument. The first
         # execution parameter remains the live ordered CSR view when needed.
         connection_parameters = connection_parameters[1:]
@@ -632,20 +874,57 @@ def _execute(
         "precise_division": (not options.fast_math),
         "precise_exp": (not options.fast_math),
         "recurrent": options.recurrent,
+        "spike_selection": options.spike_selection,
         "gradient_activity": activity_index if gradient_activity else None,
         "gradient_list": gradient_list,
     }
     if online_binding is not None:
-        recurrent_spec["online_stdp"] = True
+        from .plasticity import plasticity_template_revision
+
+        recurrent_spec["plasticity"] = plasticity_model
+        recurrent_spec["plasticity_revision"] = plasticity_template_revision(
+            plasticity_model
+        )
+        recurrent_spec["plasticity_domains"] = tuple(rule.state_domains.items())
+        recurrent_spec["plasticity_signal_domains"] = rule.signal_domains
+        recurrent_spec["plasticity_signals"] = signal_bindings
+    if options.spike_selection == "spike_list" and (
+        connection_spec["connection"] != "sparse"
+        or connection_spec.get("method") != "push"
+    ):
+        raise NotImplementedError(
+            "spike_selection='spike_list' requires a sparse push connection"
+        )
+    if (
+        options.recurrent == "standard"
+        and options.spike_selection == "scan"
+        and (not connection_spec.get("event_connection"))
+    ):
+        raise NotImplementedError(
+            "Standard scan discovery currently requires event-only online STDP; "
+            "use recurrent='helion' for static scan execution"
+        )
+    if (
+        options.recurrent == "standard"
+        and options.spike_selection == "spike_list"
+        and (n_delay or x_syn_seq.numel())
+    ):
+        raise NotImplementedError(
+            "Explicit neuron-produced lists currently require zero delay and no "
+            "x_syn input; use spike_selection='auto' for route-side packing"
+        )
+    if connection_spec.get("event_connection") and (
+        n_delay or x_syn_seq.numel() or options.merge_synapse
+    ):
+        raise NotImplementedError(
+            "Two-kernel sparse event learning currently requires zero delay, "
+            "no x_syn input and unmerged receptor states"
+        )
     if options.recurrent == "helion":
         if options.neuron not in ("triton", "tilelang"):
             raise NotImplementedError(
                 "HELION recurrent execution requires the Triton or TileLang "
                 "neuron backend"
-            )
-        if n_delay:
-            raise NotImplementedError(
-                "HELION recurrent execution currently supports no-delay networks only"
             )
         if x_syn_seq.numel():
             raise NotImplementedError(
@@ -659,15 +938,16 @@ def _execute(
             raise NotImplementedError(
                 "HELION recurrent execution requires connection_method='push'"
             )
-        if online_binding is not None:
-            raise NotImplementedError(
-                "HELION recurrent execution currently does not support online STDP"
-            )
-    if (
-        needs_backward
-        and x_seq.dtype != torch.float32
-        and (options.neuron in _NATIVE_GPU_BACKENDS or states[0].dtype == torch.float32)
-    ):
+    neuron_dtype, psc_dtype = _physical_dtypes(
+        x_seq,
+        x_syn_seq,
+        states,
+        [*neuron_parameters, *synapse_parameters, online_weight, *connection_parameters]
+        if online_binding is not None
+        else parameters,
+        recurrent_spec,
+    )
+    if needs_backward and x_seq.dtype != neuron_dtype:
         # The public raster follows input dtype, while reverse must consume
         # the producer's existing calculation-precision output without recasts.
         recurrent_spec["save_compute_spikes"] = True
@@ -705,6 +985,32 @@ def _execute(
             )
     else:
         uniform_seq = x_seq.new_empty(0, dtype=torch.float32)
+    graphs = getattr(module, "_training_graphs", None)
+    capture = (
+        online_binding is None
+        and needs_backward
+        and module.cudagraph is True
+        and graphs is not None
+        and x_seq.is_cuda
+        and options.neuron in _NATIVE_GPU_BACKENDS
+        and x_seq.shape[0] == graphs.steps
+        and not torch.compiler.is_compiling()
+        and not torch.cuda.is_current_stream_capturing()
+    )
+    if capture:
+        from ..cudagraph import capture_versions
+        from .registry import cell_backend_revision
+        from .templates import model_template_revision
+
+        version = (
+            capture_versions(module),
+            cell_backend_revision(options.neuron),
+            model_template_revision(neuron_spec.model),
+            model_template_revision(synapse_spec.model),
+        )
+        if graphs.version != version:
+            graphs.stages.clear()
+            graphs.version = version
     arguments = (
         x_seq,
         x_syn_seq,
@@ -714,7 +1020,7 @@ def _execute(
         encoded,
         history_indices,
         options.neuron,
-        torch.as_tensor(neuron_spec.dt, dtype=torch.float32, device=x_seq.device),
+        torch.as_tensor(neuron_spec.dt, device=x_seq.device),
     )
     if online_binding is not None:
         arguments = (
@@ -724,68 +1030,88 @@ def _execute(
             parameters,
             list(topology),
             online_weight,
-            *online_traces,
+            list(online_traces),
             list(online_parameters),
+            online_signals,
             encoded,
             history_indices,
             options.neuron,
             torch.as_tensor(
                 neuron_spec.dt,
-                dtype=torch.float64
-                if online_weight.dtype == torch.float64
-                else torch.float32,
                 device=x_seq.device,
             ),
         )
     uniform_args = (uniform_seq,) if poisson is not None and poisson.spiking else ()
-    if online_binding is not None:
-        history_sources = [
-            *states,
-            *(
-                getattr(
-                    module.neuron,
-                    "v_pre_spike" if name == "v_charged" else "u_pre_spike",
-                )
-                for name in charged_names
-            ),
-            *online_traces,
-            online_weight,
-        ]
-        result = [
-            torch.empty_like(x_seq),
-            *(torch.empty_like(value) for value in states),
-            *(
-                history_sources[index].new_empty(
-                    (x_seq.shape[0], *history_sources[index].shape)
-                )
-                if index >= 0
-                else torch.empty_like(history_sources[len(states) - index - 1])
-                for index in history_indices
-            ),
-        ]
-        # Mutable operators with Tensor[] returns cannot be automatically
-        # functionalized by Torch. Preallocated destinations keep the mutation
-        # explicit and let compile preserve its normal functionalization path.
-        operator(*arguments[:9], result, *arguments[9:], *uniform_args)
-    else:
-        result = operator(*arguments, *uniform_args)
+    with graphs.activate() if capture else nullcontext():
+        if online_binding is not None:
+            history_sources = [
+                *states,
+                *(
+                    getattr(
+                        module.neuron,
+                        dict(get_template(neuron_spec).record_attributes)[name],
+                    )
+                    for name in charged_names
+                ),
+                *online_traces,
+                online_weight,
+            ]
+            state_output_dtypes = (
+                *(neuron_dtype for _ in neuron_names),
+                *(psc_dtype for _ in synapse_names),
+                *(
+                    value.dtype
+                    for value in states[len(neuron_names) + len(synapse_names) :]
+                ),
+            )
+            history_dtypes = (
+                *state_output_dtypes,
+                *(neuron_dtype for _ in charged_names),
+                *(value.dtype for value in online_traces),
+                online_weight.dtype,
+            )
+            result = [
+                torch.empty_like(x_seq),
+                *(
+                    torch.empty_like(value, dtype=dtype)
+                    for value, dtype in zip(states, state_output_dtypes)
+                ),
+                *(
+                    history_sources[index].new_empty(
+                        (x_seq.shape[0], *history_sources[index].shape),
+                        dtype=history_dtypes[index],
+                    )
+                    if index >= 0
+                    else torch.empty_like(
+                        history_sources[len(states) - index - 1], dtype=neuron_dtype
+                    )
+                    for index in history_indices
+                ),
+            ]
+            # Mutable operators with Tensor[] returns cannot be automatically
+            # functionalized by Torch. Preallocated destinations keep the mutation
+            # explicit and let compile preserve its normal functionalization path.
+            operator(*arguments[:9], result, *arguments[9:], *uniform_args)
+        else:
+            result = operator(*arguments, *uniform_args)
+    persistent_state = online_binding is not None or options.recurrent == "helion"
     ns = len(neuron_names)
     for name, value in zip(neuron_names, result[1 : 1 + ns]):
-        if online_binding is not None:
-            # Online state survives compiler CUDA Graph tree iterations. Keep
-            # its original storage rather than retaining a graph-pool output.
+        if persistent_state and getattr(module.neuron, name).dtype == value.dtype:
+            # Preserve physical memory across compiler CUDA Graph tree iterations;
+            # a graph-pool output may be overwritten by the next invocation.
             getattr(module.neuron, name).copy_(value)
         else:
             setattr(module.neuron, name, value)
     for name, value in zip(synapse_names, result[1 + ns : 1 + ns + len(synapse_names)]):
-        if online_binding is not None:
+        if persistent_state and getattr(cell, name).dtype == value.dtype:
             getattr(cell, name).copy_(value)
         else:
             setattr(cell, name, value)
     if n_delay:
         delay = module.synapse.delayed_spike
         history = result[len(states)].movedim(0, -len(delay.n_neuron) - 1)
-        if online_binding is not None:
+        if persistent_state and delay.history.dtype == history.dtype:
             delay.history.copy_(history)
         else:
             delay.history = history
@@ -799,13 +1125,17 @@ def _execute(
             if index in histories
             else histories[-offset - 1]
         )
-        if online_binding is not None:
+        if persistent_state and getattr(module.neuron, attribute).dtype == value.dtype:
             getattr(module.neuron, attribute).copy_(value)
         else:
             setattr(module.neuron, attribute, value)
     records = {}
     for name, index in zip(requested, indices):
         value = histories[index]
+        if n_delay and name == "synapse.delayed_spike.history":
+            # Operators carry delay first; public records retain the memory's
+            # batch-first layout, just like eager MemoryModule recordings.
+            value = value.movedim(1, -len(module.synapse.delayed_spike.n_neuron) - 1)
         if (
             cell is not module.synapse
             and not options.merge_synapse
@@ -822,7 +1152,7 @@ def _execute(
         psc = cell.psc.reshape(
             *cell.psc.shape[:-1], *module.neuron.n_neuron, module.synapse.n_receptor
         ).sum(-1)
-        if online_binding is not None:
+        if persistent_state and module.synapse.psc.dtype == psc.dtype:
             module.synapse.psc.copy_(psc)
         else:
             module.synapse.psc = psc

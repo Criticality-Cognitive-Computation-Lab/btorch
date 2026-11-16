@@ -42,7 +42,7 @@ def emit_spike_list(selected, degree, indices, cumulative, counts, group, n_in, 
 @tilelang.jit
 def matvec(shapes, dtypes, scalars, tiles, grid, threads):
     n_seg, n_rows, n_sample, n_sample_block, n_tmp, val_stride, x_stride = scalars
-    BR, BK, BS, HUB, PERM, MASK, WEIGHT_GRAD, LIST, SEGMENT = tiles
+    BR, BK, BS, HUB, PERM, MASK, WEIGHT_GRAD, LIST, SEGMENT, VALUE_STRIDE = tiles
     compute = "float64" if dtypes[6] == "float64" else "float32"
     value_compute = "float64" if dtypes[11] == "float64" else "float32"
 
@@ -166,7 +166,10 @@ def matvec(shapes, dtypes, scalars, tiles, grid, threads):
                         )
                         weight = T.if_then_else(
                             edge_live and (not MASK or not PERM or any_active[r] > 0),
-                            values[member * val_stride + slot],
+                            values[
+                                member * val_stride
+                                + T.Cast("int64", slot) * VALUE_STRIDE
+                            ],
                             0,
                         )
                         product_input = T.if_then_else(

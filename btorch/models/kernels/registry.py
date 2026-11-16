@@ -54,7 +54,7 @@ def cell_backend_revision(name: str) -> int:
     raise ValueError(f"Unknown cell backend {name!r}")
 
 
-def register_cell_backend(
+def register_backend(
     name: str,
     *,
     forward: Callable,

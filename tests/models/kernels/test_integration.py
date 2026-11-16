@@ -787,10 +787,10 @@ def test_recurrent_model_pairs_all_float_and_initial_state_gradients(
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_low_precision_encoder_rnn_readout_preserves_fp32_states(dtype):
-    # Parameters and external activations use low precision, but the recurrent
-    # state and connection accumulation follow the same FP32 policy as the
-    # reference. Casts remain differentiable back to the original leaf dtype.
+def test_low_precision_encoder_rnn_readout_preserves_state_dtype(dtype):
+    # Explicitly converting a model to low precision also converts its state.
+    # Compare the ordinary same-dtype modules, rather than hiding recurrent
+    # rounding by promoting the reference network to FP32.
     rnn = RecurrentNN(
         LIF(3, trainable_param={"tau"}),
         AlphaPSC(3, 2.0, nn.Linear(3, 3, bias=False)),
@@ -800,18 +800,18 @@ def test_low_precision_encoder_rnn_readout_preserves_fp32_states(dtype):
     rnn.to(dtype=dtype)
     rnn.neuron.init_state(batch_size=2, dtype=dtype)
     rnn.synapse.init_state(batch_size=2, dtype=dtype)
-    reference = copy.deepcopy(rnn).float()
+    reference = copy.deepcopy(rnn)
     reference.backend = "torch"
     encoder, readout = nn.Linear(4, 3).to(dtype=dtype), nn.Linear(3, 2).to(dtype=dtype)
     encoder_reference, readout_reference = (
-        copy.deepcopy(encoder).float(),
-        copy.deepcopy(readout).float(),
+        copy.deepcopy(encoder),
+        copy.deepcopy(readout),
     )
     x = torch.randn(5, 2, 4, dtype=dtype, requires_grad=True)
-    xr = x.detach().float().requires_grad_()
+    xr = x.detach().clone().requires_grad_()
     with environ.context(dt=1.0):
         actual, states = rnn(encoder(x))
-        expected, reference_states = reference(encoder_reference(xr).to(dtype).float())
+        expected, reference_states = reference(encoder_reference(xr))
         loss = (
             readout(actual).float().square().sum() + states["neuron.v"].square().sum()
         )
@@ -821,21 +821,21 @@ def test_low_precision_encoder_rnn_readout_preserves_fp32_states(dtype):
         )
         loss.backward()
         reference_loss.backward()
-    torch.testing.assert_close(actual.float(), expected)
+    torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(
         states["neuron.v"], reference_states["neuron.v"], atol=3e-2, rtol=3e-2
     )
-    assert rnn.neuron.v.dtype == torch.float32
-    assert rnn.synapse.psc.dtype == torch.float32
-    torch.testing.assert_close(x.grad.float(), xr.grad, atol=3e-2, rtol=3e-2)
+    assert rnn.neuron.v.dtype == dtype
+    assert rnn.synapse.psc.dtype == dtype
+    torch.testing.assert_close(x.grad, xr.grad, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(
-        rnn.synapse.linear.weight.grad.float(),
+        rnn.synapse.linear.weight.grad,
         reference.synapse.linear.weight.grad,
         atol=3e-2,
         rtol=3e-2,
     )
     torch.testing.assert_close(
-        encoder.weight.grad.float(), encoder_reference.weight.grad, atol=3e-2, rtol=3e-2
+        encoder.weight.grad, encoder_reference.weight.grad, atol=3e-2, rtol=3e-2
     )
 
 
@@ -917,7 +917,7 @@ def test_external_backend_default_single_step_uses_registered_dynamics():
     # derivative disagree with the independently stepped reference.
     from btorch.models.kernels import (
         NeuronSpec,
-        register_cell_backend,
+        register_backend,
         resolve_cell_backend,
     )
 
@@ -955,9 +955,7 @@ def test_external_backend_default_single_step_uses_registered_dynamics():
         )
         return 2 * gx if gx is not None else None, gs, gp
 
-    register_cell_backend(
-        "integration_double_drive", forward=forward, backward=backward
-    )
+    register_backend("integration_double_drive", forward=forward, backward=backward)
     node = LIF(2, backend="integration_double_drive", v_threshold=0.8)
     node.float()
     node.init_state(batch_size=1, dtype=torch.float32)
@@ -1032,14 +1030,14 @@ def test_replaced_external_backend_invalidates_recurrent_capture():
     # inspect voltage so zero spikes cannot hide a stale implementation.
     from btorch.models.kernels import (
         NeuronSpec,
-        register_cell_backend,
+        register_backend,
         resolve_cell_backend,
     )
 
     forward_sequence = resolve_cell_backend("torch", NeuronSpec("lif"), "cpu").forward
 
     name = "integration_capture_replacement"
-    register_cell_backend(name, forward=forward_sequence, replace=True)
+    register_backend(name, forward=forward_sequence, replace=True)
     model = RecurrentNN(
         LIF(3),
         AlphaPSC(3, 2.0, nn.Identity()),
@@ -1064,7 +1062,7 @@ def test_replaced_external_backend_invalidates_recurrent_capture():
         def doubled_drive(x_seq, states, parameters, spec, history_names):
             return forward_sequence(x_seq * 2, states, parameters, spec, history_names)
 
-        register_cell_backend(name, forward=doubled_drive, replace=True)
+        register_backend(name, forward=doubled_drive, replace=True)
         actual, records = model(x)
         expected, expected_records = reference(x)
         torch.testing.assert_close(actual, expected)
@@ -1082,7 +1080,7 @@ def test_recurrent_refuses_replaced_backend_before_backward(compiled):
     # when AOTAutograd has compiled the backward custom operator already.
     from btorch.models.kernels import (
         NeuronSpec,
-        register_cell_backend,
+        register_backend,
         resolve_cell_backend,
     )
 
@@ -1091,7 +1089,7 @@ def test_recurrent_refuses_replaced_backend_before_backward(compiled):
     backward_sequence = torch_backend.backward
 
     name = "integration_pending_replacement"
-    register_cell_backend(
+    register_backend(
         name, forward=forward_sequence, backward=backward_sequence, replace=True
     )
     model = RecurrentNN(
@@ -1113,7 +1111,7 @@ def test_recurrent_refuses_replaced_backend_before_backward(compiled):
     x = torch.full((4, 2, 3), 0.1, dtype=torch.float32, requires_grad=True)
     with environ.context(dt=1.0):
         pending = operation(x)
-        register_cell_backend(
+        register_backend(
             name, forward=forward_sequence, backward=backward_sequence, replace=True
         )
         with pytest.raises(RuntimeError, match="registration changed"):

@@ -125,7 +125,7 @@ def _example(spec, dtype=torch.float32):
 
 def _trusted(x, states, parameters, spec, names):
     outputs, records = [], {name: [] for name in names}
-    for value in x.float().unbind(0):
+    for value in x.unbind(0):
         output, states, step_records = forward_step(value, states, parameters, spec)
         outputs.append(output)
         for name in names:
@@ -340,6 +340,126 @@ def test_low_precision_long_sequence_reports_first_spike_divergence(backend, dty
     torch.testing.assert_close(
         reverse[0], trusted_gradient, atol=2e-5, rtol=2 * torch.finfo(dtype).eps
     )
+
+
+@pytest.mark.parametrize(
+    ("backend", "dtype", "model"),
+    (
+        ("triton", torch.float16, "lif"),
+        ("tilelang", torch.bfloat16, "lif"),
+        ("triton", torch.bfloat16, "dual_exponential"),
+        ("tilelang", torch.float16, "alpha"),
+    ),
+)
+def test_native_cell_preserves_low_precision_state_and_recomputation(
+    backend, dtype, model
+):
+    """Keep neuron/PSC state arithmetic low precision across a training tape.
+
+    The mixed-input test above intentionally uses FP32 states. Here
+    every physical operand uses storage precision; compare the same-
+    dtype eager recurrence, including history needed by reverse
+    recomputation. The state adjoint may accumulate in FP32, but that
+    must not change forward rounding.
+    """
+    require_cuda_backend(backend)
+    spec = NeuronSpec(model, dt=0.5)
+    x, states, parameters = _example(spec, dtype)
+    states = tuple(value.detach().to(dtype).requires_grad_() for value in states)
+    parameters = tuple(
+        value.detach().to(dtype).requires_grad_() for value in parameters
+    )
+    names = get_template(spec).history_names
+    expected = _trusted(x, states, parameters, spec, names)
+    actual = forward(
+        backend,
+        x,
+        states,
+        parameters,
+        spec,
+        names,
+        enable_fp_fusion=False,
+        precise_division=True,
+        precise_exp=True,
+    )
+    tolerance = {"atol": 2 * torch.finfo(dtype).eps, "rtol": 2 * torch.finfo(dtype).eps}
+    for result, reference in zip(
+        (actual[0], *actual[1], *actual[2]),
+        (expected[0], *expected[1], *expected[2]),
+        strict=True,
+    ):
+        torch.testing.assert_close(result, reference, **tolerance)
+    cotangent = torch.ones_like(expected[0])
+    gradient = torch.autograd.grad(expected[0], x, cotangent)[0]
+    reverse = backward(
+        backend,
+        x,
+        states,
+        parameters,
+        spec,
+        names,
+        actual[2],
+        cotangent,
+        tuple(None for _ in states),
+        tuple(None for _ in names),
+        needs_input_grad=(True, *(False for _ in (*states, *parameters))),
+        enable_fp_fusion=False,
+        precise_division=True,
+        precise_exp=True,
+    )
+    torch.testing.assert_close(reverse[0], gradient, check_dtype=False, **tolerance)
+
+
+@pytest.mark.parametrize(
+    ("backend", "dtype"), (("triton", torch.float16), ("tilelang", torch.bfloat16))
+)
+def test_fused_mixed_drive_promotes_neuron_without_widening_psc(backend, dtype):
+    """An FP32 external drive promotes its neuron, while a low PSC stays low.
+
+    This distinguishes per-model promotion from allocating every fused
+    output like the input or the original state. Neither choice
+    implements both physical models' dtype contracts in this mixed
+    invocation.
+    """
+    from btorch.models.kernels.backends.fused import fused_step_forward
+
+    require_cuda_backend(backend)
+    neuron_spec, psc_spec = NeuronSpec("lif", dt=0.5), NeuronSpec("alpha", dt=0.5)
+    x, neuron_states, neuron_parameters = _example(neuron_spec)
+    _, psc_states, psc_parameters = _example(psc_spec)
+    neuron_states, psc_states, neuron_parameters, psc_parameters = (
+        tuple(value.to(dtype) for value in group)
+        for group in (neuron_states, psc_states, neuron_parameters, psc_parameters)
+    )
+    drive = x[0].to(dtype)
+    current, wanted_psc, _ = forward_step(drive, psc_states, psc_parameters, psc_spec)
+    spikes, wanted_neuron, _ = forward_step(
+        x[1] + current, neuron_states, neuron_parameters, neuron_spec
+    )
+    actual = fused_step_forward(
+        x[1],
+        drive,
+        neuron_states,
+        psc_states,
+        neuron_parameters,
+        psc_parameters,
+        neuron_spec,
+        psc_spec,
+        backend=backend,
+        enable_fp_fusion=False,
+        precise_division=True,
+        precise_exp=True,
+    )
+    torch.testing.assert_close(actual[0], spikes)
+    for result, reference in zip(
+        (*actual[1], *actual[2]), (*wanted_neuron, *wanted_psc), strict=True
+    ):
+        torch.testing.assert_close(
+            result,
+            reference,
+            atol=4 * torch.finfo(dtype).eps,
+            rtol=4 * torch.finfo(dtype).eps,
+        )
 
 
 @pytest.mark.parametrize("backend", GPU_BACKENDS)

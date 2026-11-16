@@ -45,13 +45,14 @@ if triton is not None:
         """
         lane = tl.arange(0, BLOCK)
         leader = lane == 0
+        zero = tl.full((), 0, barrier_ptr.dtype.element_ty)
         _grid_fence(lane, BLOCK)
         # Every warp must finish publishing its stores before the leader
         # advertises this CTA's arrival to the other CTAs.
         tl.debug_barrier()
         tl.atomic_add(
             barrier_ptr + lane * 0,
-            tl.full((BLOCK,), 1, tl.int32),
+            tl.full((BLOCK,), 1, barrier_ptr.dtype.element_ty),
             mask=leader,
             sem="acq_rel",
             scope="gpu",
@@ -59,16 +60,16 @@ if triton is not None:
         target = (epoch_value * N_PHASES + PHASE_INDEX) * N_CTAS
         seen = tl.atomic_cas(
             barrier_ptr,
-            0,
-            0,
+            zero,
+            zero,
             sem="acquire",
             scope="gpu",
         )
         while seen < target:
             seen = tl.atomic_cas(
                 barrier_ptr,
-                0,
-                0,
+                zero,
+                zero,
                 sem="acquire",
                 scope="gpu",
             )
@@ -78,7 +79,7 @@ if triton is not None:
             if tl.program_id(0) == 0:
                 tl.atomic_add(
                     epoch_ptr + lane * 0,
-                    tl.full((BLOCK,), 1, tl.int32),
+                    tl.full((BLOCK,), 1, epoch_ptr.dtype.element_ty),
                     mask=leader,
                     sem="release",
                     scope="gpu",

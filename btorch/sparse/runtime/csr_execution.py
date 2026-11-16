@@ -138,12 +138,20 @@ def _prepare_matvec(
 
     ``x_minor`` is the sample-minor layout of ``x`` if the caller already has
     it (the backward shares one transposed gradient between its kernels).
+    Weights retain their storage and strides so online updates remain visible.
     """
     input_layout = tensor_layout(x)
 
     def reference(input, mask, activity):
         _check_input(input, input_layout)
-        return kernels_torch.csr_matvec(crow, col, values, input)
+        ordered = values if perm is None else values.index_select(-1, perm)
+        product = kernels_torch.csr_matvec(crow, col, ordered, input)
+        if input_mask is not None:
+            active = input_mask if mask is None else mask
+            if isinstance(active, GradientList):
+                active = active.mask
+            product = torch.where(active.reshape_as(product) != 0, product, 0)
+        return product
 
     n_vb = values.ndim - 1
     pattern = None
@@ -189,8 +197,6 @@ def _prepare_matvec(
     else:
         supported = False
     if not supported:
-        if perm is not None:
-            values = values.index_select(-1, perm)
         return _PreparedMatvec(reference)
     out_shape = (*batch, *sample, n_out)
     output_dtype = torch.promote_types(values.dtype, x.dtype)
@@ -217,10 +223,13 @@ def _prepare_matvec(
     hub = layout.segmented and (not listed)
     n_sample_block = 1 if listed else -(-n_sample // samples)
     if n_member * (n_sample if hub else n_sample_block) > csr._MAX_GRID_Y:
-        if perm is not None:
-            values = values.index_select(-1, perm)
         return _PreparedMatvec(reference)
-    values = values.contiguous()
+    try:
+        value_rows = values.view(-1, values.shape[-1])
+    except RuntimeError:
+        # Nonflattenable member axes use the reference on each call, so
+        # preparation never snapshots mutable weights into private storage.
+        return _PreparedMatvec(reference)
     prepare_input = csr._prepare_sample_minor(x, n_sample) if x_minor is None else None
     out = torch.empty(out_shape, dtype=output_dtype, device=x.device)
     accumulate_values = (
@@ -287,7 +296,7 @@ def _prepare_matvec(
                 n_sample,
                 n_sample_block,
                 layout.n_seg if listed else layout.n_tmp,
-                0 if v_member == 1 else values.shape[-1],
+                0 if v_member == 1 else value_rows.stride(0),
                 0 if x_member == 1 else n_sample * n_in,
                 source if input_mask is None else mask,
                 layout.row_segment_start
@@ -300,7 +309,18 @@ def _prepare_matvec(
                 indices,
                 counts,
             ),
-            ("BR", "BK", "BS", "HUB", "PERM", "MASK", "WEIGHT_GRAD", "LIST", "SEGMENT"),
+            (
+                "BR",
+                "BK",
+                "BS",
+                "HUB",
+                "PERM",
+                "MASK",
+                "WEIGHT_GRAD",
+                "LIST",
+                "SEGMENT",
+                "VALUE_STRIDE",
+            ),
             (
                 rows,
                 entries,
@@ -311,6 +331,7 @@ def _prepare_matvec(
                 accumulate_values,
                 listed,
                 csr._SEGMENT,
+                value_rows.stride(-1),
             ),
             warps,
         )

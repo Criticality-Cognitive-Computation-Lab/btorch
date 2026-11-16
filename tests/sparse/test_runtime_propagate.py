@@ -421,7 +421,7 @@ KINDS = {"pull": None, "push": Hints(expected_density=0.001)}
 @pytest.fixture
 def sparse_reference_backend():
     # Keep the sparse operator ABI under test even for a small fixture: auto
-    # intentionally selects dense multiplication below 4000 dimensions.
+    # intentionally selects dense multiplication below 4096 dimensions.
     with use_backend("torch"):
         yield
 
@@ -658,6 +658,41 @@ def test_sparse_arrays_still_take_the_sparse_path():
     torch.testing.assert_close(sparse.matvec(A, x), x @ dense.T, **TOL)
     torch.testing.assert_close(sparse.rmatvec(A, y), y @ dense, **TOL)
     torch.testing.assert_close(sparse.matmul(A, B), dense @ B, **TOL)
+
+
+@pytest.mark.parametrize(
+    ("neurons", "delays", "representation"),
+    (
+        (4095, 1, "dense"),
+        (4096, 1, "post_pre_csr"),
+        (2048, 2, "post_pre_csr"),
+    ),
+)
+def test_auto_dense_cutoff_preserves_products_and_expanded_delay_dimensions(
+    neurons, delays, representation
+):
+    """Keep the cutoff strict and count delay-expanded input dimensions."""
+    # A tall input and only two edges make the real 4096 boundary inexpensive
+    # to exercise numerically. Low-rate hints must not override the dense
+    # preference below the cutoff; delay expansion must still bound memory.
+    connection = SparseConnection.from_edges(
+        torch.tensor([0, neurons - 1]),
+        torch.tensor([1, 0]),
+        neurons,
+        3,
+        Synapse(
+            weight=EdgeWeight(torch.tensor([0.5, -0.25], dtype=torch.float64)),
+            delay=torch.tensor([0, delays - 1]) if delays > 1 else None,
+            n_delay=delays if delays > 1 else None,
+        ),
+        hints=Hints(firing_rate_hz=1),
+    )
+    source = torch.arange(neurons * delays, dtype=torch.float64)
+    expected = source.new_zeros(3)
+    expected[1] = source[0] * 0.5
+    expected[0] = source[-1] * -0.25
+    torch.testing.assert_close(connection(source), expected)
+    assert connection._plan.route.key.representation == representation
 
 
 @pytest.mark.parametrize(

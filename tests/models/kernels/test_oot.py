@@ -10,7 +10,7 @@ from btorch.models import environ
 from btorch.models.kernels import (
     HistoryPlan,
     NeuronSpec,
-    register_cell_backend,
+    register_backend,
     run_multi_step,
 )
 from btorch.models.kernels.testing import (
@@ -50,7 +50,7 @@ def test_public_parity_captures_training_gradients(backend):
 # A separately packaged implementation registers callbacks through the public
 # API. Reusing the supplied reference callbacks is useful for developing its
 # integration before replacing numerical execution with generated GPU code.
-register_cell_backend(
+register_backend(
     "oot_example_lif",
     forward=forward_sequence,
     backward=backward_sequence,
@@ -163,7 +163,7 @@ def test_public_parity_catches_wrong_training_gradients(fault, gradient_name):
             (zero_gradients(gp) if fault == "parameter" else gp),
         )
 
-    register_cell_backend(
+    register_backend(
         "oot_broken_state",
         forward=forward_sequence,
         backward=wrong_backward,
@@ -179,7 +179,7 @@ def test_simulation_only_extension_fails_before_training_execution():
     # A user intentionally provides forward only for inference. It should work
     # under inference_mode and reject a trainable encoder at sequence entry,
     # instead of succeeding in forward then crashing much later in backward.
-    register_cell_backend(
+    register_backend(
         "oot_inference",
         forward=forward_sequence,
         supports=lambda spec, device: spec.model == "lif",
@@ -243,7 +243,7 @@ def test_external_callback_cannot_mutate_the_callers_initial_state():
             states[0].add_(0.1)
         return result
 
-    register_cell_backend(
+    register_backend(
         "oot_mutating",
         forward=mutating_forward,
         backward=backward_sequence,
@@ -288,7 +288,7 @@ def test_parity_checks_noncontiguous_input_and_record_losses():
             records = tuple(torch.zeros_like(value) for value in records)
         return output, final, records
 
-    register_cell_backend(
+    register_backend(
         "oot_bad_strides",
         forward=faulty_forward,
         backward=backward_sequence,
@@ -319,7 +319,7 @@ def test_parity_checks_chunk_state_gradient_and_two_live_graphs():
             gp,
         )
 
-    register_cell_backend(
+    register_backend(
         "oot_bad_continuation",
         forward=forward_sequence,
         backward=faulty_backward,
@@ -373,7 +373,7 @@ def test_parity_checks_declared_charged_records_explicitly():
         )
         return output, final, records
 
-    register_cell_backend(
+    register_backend(
         "oot_bad_charged_record",
         forward=faulty_forward,
         backward=backward_sequence,

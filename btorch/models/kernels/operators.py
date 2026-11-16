@@ -8,7 +8,7 @@ from dataclasses import replace
 import torch
 from torch import Tensor
 
-from .contracts import HistoryPlan, NeuronSpec, PoissonOptions
+from .contracts import HistoryPlan, NeuronSpec, PoissonOptions, pointwise_dtype
 from .options import KernelOptions, resolve_model_options
 from .registry import _NATIVE_GPU_BACKENDS, cell_backend_revision
 from .templates import (
@@ -41,7 +41,7 @@ def _environment_dt_impl(x_seq: Tensor, model: str) -> Tensor:
     required_dt = get_template(NeuronSpec(model)).required_dt
     if required_dt is not None and dt != required_dt:
         raise ValueError(f"{model} requires dt == {required_dt:g}")
-    return torch.full((), dt, device=x_seq.device, dtype=torch.float32)
+    return torch.full((), dt, device=x_seq.device, dtype=x_seq.dtype)
 
 
 # Register through the public dispatcher API. Unlike CustomOpDef, this does
@@ -56,7 +56,7 @@ environment_dt = torch.ops.btorch_cells.environment_dt.default
 
 @torch.library.register_fake("btorch_cells::environment_dt", lib=_library)
 def _fake_environment_dt(x_seq, model):
-    return x_seq.new_empty((), dtype=torch.float32)
+    return x_seq.new_empty(())
 
 
 def _setup_environment_dt(ctx, inputs, output):
@@ -478,16 +478,18 @@ def _fake_forward(
     precise_exp=False,
 ):
     template = get_template(decode_spec(encoded))
+    dtype = pointwise_dtype(x_seq, *states, *parameters)
     state_map = dict(zip(template.state_names, states))
     records = []
     for name in history_names.split("|") if history_names else ():
         source = state_map[template.history_state_name(name)]
-        records.append(
-            source.new_empty((x_seq.shape[0], *source.shape), dtype=torch.float32)
-        )
+        records.append(source.new_empty((x_seq.shape[0], *source.shape), dtype=dtype))
     return [
-        torch.empty_like(x_seq, dtype=torch.float32),
-        *(torch.empty_like(value, dtype=torch.float32) for value in states),
+        torch.empty_like(x_seq, dtype=dtype),
+        *(
+            torch.empty_like(value, dtype=dtype if x_seq.shape[0] else value.dtype)
+            for value in states
+        ),
         *records,
     ]
 
@@ -527,7 +529,9 @@ def _fake_training(
         template = get_template(decode_spec(encoded))
         state = states[template.state_names.index(residual.checkpoint_state)]
         checkpoints = max((x_seq.shape[0] - 1) // residual.checkpoint_interval, 0)
-        result.append(state.new_empty((checkpoints, *state.shape), dtype=torch.float32))
+        result.append(
+            state.new_empty((checkpoints, *state.shape), dtype=result[1].dtype)
+        )
     return result
 
 
@@ -932,9 +936,9 @@ def run_multi_step(
     result = operator(
         *arguments,
         backend,
-        spec.dt.to(device=x_seq.device, dtype=torch.float32)
+        spec.dt.to(device=x_seq.device)
         if isinstance(spec.dt, Tensor)
-        else torch.full((), spec.dt, dtype=torch.float32, device=x_seq.device),
+        else torch.full((), spec.dt, dtype=x_seq.dtype, device=x_seq.device),
         options.enable_fp_fusion,
         (not options.fast_math),
         uniform_seq,

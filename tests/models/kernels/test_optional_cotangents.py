@@ -238,7 +238,7 @@ def test_empty_sequence_final_state_gradients():
 
 
 def test_external_backend_receives_dense_cotangents():
-    from btorch.models.kernels import register_cell_backend
+    from btorch.models.kernels import register_backend
     from btorch.models.kernels.torch_backend import (
         backward_sequence,
         forward_sequence,
@@ -254,7 +254,7 @@ def test_external_backend_receives_dense_cotangents():
         )
         return backward_sequence(*args, **kwargs)
 
-    register_cell_backend(
+    register_backend(
         "optional_cotangent_external",
         forward=forward_sequence,
         backward=backward,
@@ -337,7 +337,7 @@ def test_outstanding_forwards_preserve_their_compilation_policies(monkeypatch):
 
 
 def test_external_backend_rejects_nondefault_compile_policy_before_dispatch():
-    from btorch.models.kernels import register_cell_backend
+    from btorch.models.kernels import register_backend
     from btorch.models.kernels.torch_backend import (
         backward_sequence,
         forward_sequence,
@@ -349,7 +349,7 @@ def test_external_backend_rejects_nondefault_compile_policy_before_dispatch():
         called.append("forward")
         return forward_sequence(*args, **kwargs)
 
-    register_cell_backend(
+    register_backend(
         "compile_policy_external",
         forward=forward,
         backward=backward_sequence,

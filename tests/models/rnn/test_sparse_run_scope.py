@@ -28,7 +28,7 @@ def sparse_reference_backend():
 @pytest.fixture
 def triton_task_backend():
     # Task preparation is the contract here. Explicit backend selection keeps
-    # these tiny physical fixtures off the auto dense-matmul route (<4000).
+    # these tiny physical fixtures off the auto dense-matmul route (<4096).
     pytest.importorskip("triton")
     with use_backend("triton"):
         yield

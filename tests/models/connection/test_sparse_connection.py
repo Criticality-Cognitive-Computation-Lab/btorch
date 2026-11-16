@@ -432,20 +432,25 @@ def test_explain_reports_algorithm_and_backend():
 
 
 @pytest.mark.parametrize("density", [0.0, 0.01, 1.0])
-def test_hints_change_the_plan_not_the_result(density):
-    """Hints are advisory: an expected input density switches the planned
-    algorithm (visible in ``explain``), results and gradients stay equal."""
+def test_hints_preserve_small_auto_dense_results_and_gradients(density):
+    """Keep small expanded matrices dense despite advisory activity hints.
+
+    The sparse interface still preserves outputs and gradients for
+    silent, sparse and dense input. Explicit methods have separate
+    routing coverage; an auto hint cannot override the expanded-
+    dimension cutoff.
+    """
     plain = SparseConnection(SOURCES["torch_coo"]())
     hinted = SparseConnection(
         SOURCES["torch_coo"](), hints=Hints(expected_density=0.01)
     )
-    assert hinted.hints.expected_density == 0.01
 
     def algorithm(conn):
         (line,) = [ln for ln in conn.explain().splitlines() if "algorithm" in ln]
         return line
 
-    assert algorithm(plain) != algorithm(hinted)
+    assert plain._plan.route.key.representation == "dense"
+    assert algorithm(plain) == algorithm(hinted)
     gen = torch.Generator().manual_seed(1)
     x = torch.rand(8, 20, N_PRE, generator=gen)
     x = (x * (torch.rand(8, 20, N_PRE, generator=gen) < density)).requires_grad_()
@@ -455,7 +460,7 @@ def test_hints_change_the_plan_not_the_result(density):
     grads = [torch.autograd.grad(o.sum(), x)[0] for o in outs]
     torch.testing.assert_close(grads[0], grads[1])
     torch.testing.assert_close(grads[1], A_DENSE.sum(0).expand_as(x))
-    # Hints can be changed later; the plan follows.
+    # Changing the advisory rate retains the small-matrix dense policy.
     plain.set_hints(Hints(expected_density=0.01))
     assert algorithm(plain) == algorithm(hinted)
     torch.testing.assert_close(plain(x), outs[0])

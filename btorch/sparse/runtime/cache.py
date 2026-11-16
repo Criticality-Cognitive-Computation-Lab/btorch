@@ -37,11 +37,21 @@ class RepresentationCache(nn.Module):
     t_perm: Tensor
 
     _NAMES = ("crow", "col", "perm", "t_crow", "t_col", "t_perm")
+    _SEGMENT_NAMES = (
+        "segment_src_ptr",
+        "segment_pre",
+        "segment_delay",
+        "segment_ptr",
+        "segment_edge_id",
+    )
 
     def __init__(self) -> None:
         super().__init__()
-        for name in self._NAMES:
+        for name in (*self._NAMES, *self._SEGMENT_NAMES):
             self.register_buffer(name, torch.empty(0, dtype=torch.long), False)
+        self.register_buffer("edge_segment", torch.empty(0, dtype=torch.long), False)
+        self._segment_signature = None
+        self._edge_segment_signature = None
         self.topology_version = -1
         self.identity_perm = True
         self.shape = (0, 0)
@@ -90,6 +100,75 @@ class RepresentationCache(nn.Module):
         self.identity_perm = identity
         self.shape = (n_out, n_in)
         self.topology_version = version
+        self._segment_signature = None
+        self._edge_segment_signature = None
+
+    @torch.no_grad()
+    def prepare_delay_segments(self, n_source: int, n_delay: int) -> tuple[Tensor, ...]:
+        """Prepare nonempty source/delay segments with canonical edge identity.
+
+        Reuse the outgoing CSR edge order and destination storage. Incoming
+        traversal continues to use ``crow``, ``col`` and ``perm``; it does not
+        need a second copy of canonical weights or receptor metadata.
+        Preparation may synchronize to discover segment count and runs only
+        when the topology or delay layout changes, never within a timestep.
+
+        Returns:
+            Source-to-segment pointers, segment sources, segment delays,
+            segment-to-edge pointers, canonical outgoing edge IDs and the
+            existing outgoing destinations.
+        """
+        if n_source < 0 or n_delay < 1 or n_source * n_delay != self.shape[1]:
+            raise ValueError("Source/delay layout disagrees with the cached topology")
+        signature = (self.topology_version, n_source, n_delay, self.t_crow.device)
+        if self._segment_signature != signature:
+            nonempty = torch.nonzero(
+                self.t_crow[1:] != self.t_crow[:-1], as_tuple=True
+            )[0]
+            source = nonempty // n_delay
+            values = (
+                self._pointer(source, n_source),
+                source,
+                nonempty % n_delay,
+                torch.cat((self.t_crow.index_select(0, nonempty), self.t_crow[-1:])),
+                self.perm.index_select(0, self.t_perm),
+            )
+            for name, value in zip(self._SEGMENT_NAMES, values, strict=True):
+                current = getattr(self, name)
+                if current.shape == value.shape and current.device == value.device:
+                    current.copy_(value)
+                else:
+                    setattr(self, name, value)
+            self._segment_signature = signature
+        return (*[getattr(self, name) for name in self._SEGMENT_NAMES], self.t_col)
+
+    @torch.no_grad()
+    def prepare_edge_segments(self, n_source: int, n_delay: int) -> Tensor:
+        """Map canonical edges to the existing source/delay segments once.
+
+        Only rules requesting segment-domain memories or signals need
+        this inverse map. Ordinary edge-local STDP allocates no per-edge
+        map.
+        """
+        _, source, _, pointer, edge_id, _ = self.prepare_delay_segments(
+            n_source, n_delay
+        )
+        if self._edge_segment_signature != self._segment_signature:
+            segment = torch.repeat_interleave(
+                torch.arange(source.numel(), device=source.device),
+                pointer[1:] - pointer[:-1],
+            )
+            result = torch.empty_like(edge_id)
+            result.scatter_(0, edge_id, segment)
+            if (
+                self.edge_segment.shape == result.shape
+                and self.edge_segment.device == result.device
+            ):
+                self.edge_segment.copy_(result)
+            else:
+                self.edge_segment = result
+            self._edge_segment_signature = self._segment_signature
+        return self.edge_segment
 
     def crow_rows(self) -> Tensor:
         """``[E]`` output index of every CSR entry (expanded ``crow``)."""

@@ -4,9 +4,9 @@
 btorch 继续管理有状态 Module API、autograd 分流和完整序列的算子边界。
 
 ```python
-from btorch.models.kernels import register_cell_backend
+from btorch.models.kernels import register_backend
 
-register_cell_backend(
+register_backend(
     "lab_cell",
     forward=forward,
     backward=backward,
@@ -36,7 +36,8 @@ def backward(x_seq, initial_states, parameters, spec, history_names, histories,
     return grad_x, grad_initial_states, grad_parameters
 ```
 
-Forward 返回 FP32 输出、状态、记录；序列 wrapper 将公共输出转为输入 dtype。
+Forward 按模型操作数提升后的 dtype 返回输出、状态和记录；序列 wrapper 将公共输出转为输入 dtype。
+反向重算前向模型时应保留输入张量精度。
 返回结果必须符合 custom operator 的非 alias 契约。`history_names` 是用户记录和
 反向需求的并集，不应另行保存全部 residual；wrapper 复用 PSC 输出和对应历史的
 存储。Backward 同时包含输出、最终状态与记录的梯度。初始状态冻结时仍需传播
@@ -99,3 +100,17 @@ CUDA replay。开启梯度检查时，capture 还会将重放的前向、反向�
 参见 [可运行的 OOT 教程](../tutorials/oot_kernels.md)。Sparse 扩展继续使用
 [已有 sparse registry](sparse_connectivity.md)；cell 注册不会重定义拓扑、delay
 布局或 sparse 算法。
+
+## 可塑性内核
+
+`register_backend` 注册神经元/PSC 序列执行，学习方程使用独立的
+`register_plasticity_template`。声明一次 `PlasticityTemplate`，即可复用
+Triton、TileLang 渲染器及普通、事件和 HELION 调度。
+可执行声明见[自定义可塑性](plasticity.md)。`PlasticityRule` 管理记忆，
+连接继续拥有规范权重。在线 STDP 使用 `no_grad`，拒绝对可变权重更新做 BPTT，
+因此无需注册反向回调。
+
+运行 `python examples/oot_stdp.py` 查看独立的、有记忆状态的规则及其 eager 参考。
+使用 `--backend triton --device cuda --capture`，或
+`--backend tilelang --device cuda --recurrent helion --capture`，验证同一声明的
+原生执行。添加 `--compile` 可检查编译执行。

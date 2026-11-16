@@ -5,7 +5,7 @@ from .options import KernelOptions
 from .registry import (
     CellBackendEntry,
     cell_backend_names,
-    register_cell_backend,
+    register_backend,
     resolve_cell_backend,
 )
 from .templates import (
@@ -32,8 +32,14 @@ __all__ = [
     "PoissonOptions",
     "cell_backend_names",
     "get_template",
-    "register_cell_backend",
+    "register_backend",
     "register_model_template",
+    "PlasticityTemplate",
+    "PlasticityStage",
+    "PlasticityTrace",
+    "register_plasticity_template",
+    "plasticity_template_names",
+    "plasticity_template_revision",
     "run_multi_step",
     "resolve_cell_backend",
     "generate_cell_source",
@@ -68,6 +74,20 @@ def __getattr__(name):
         "describe_response",
     }
     testing_names = {"ModelParityCase", "ModelParityOptions", "check_model_parity"}
+    plasticity_names = {
+        "PlasticityTemplate",
+        "PlasticityStage",
+        "PlasticityTrace",
+        "register_plasticity_template",
+        "plasticity_template_names",
+        "plasticity_template_revision",
+    }
+    if name in plasticity_names:
+        from importlib import import_module
+
+        value = getattr(import_module(".plasticity", package=__name__), name)
+        globals()[name] = value
+        return value
     if name in native_names | testing_names | response_names:
         from importlib import import_module
 

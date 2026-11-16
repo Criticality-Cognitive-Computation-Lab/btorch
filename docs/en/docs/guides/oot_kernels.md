@@ -5,9 +5,9 @@ fork. Registration selects numerical execution; btorch continues to own the
 stateful Module API, autograd dispatch and complete-sequence operator boundary.
 
 ```python
-from btorch.models.kernels import register_cell_backend
+from btorch.models.kernels import register_backend
 
-register_cell_backend(
+register_backend(
     "lab_cell",
     forward=forward,
     backward=backward,
@@ -40,8 +40,9 @@ def backward(x_seq, initial_states, parameters, spec, history_names, histories,
     return grad_x, grad_initial_states, grad_parameters
 ```
 
-Forward returns FP32 output/state/history; the sequence wrapper casts public
-output to input dtype. Every result must obey the non-aliasing custom-operator
+Forward returns output/state/history in the promoted model dtype; the sequence
+wrapper casts public output to input dtype. Preserve supplied tensor precision
+when recomputing the forward model in backward. Every result must obey the non-aliasing custom-operator
 contract. `history_names` is the union required by the caller and backward, not
 an invitation to allocate every residual. The wrapper shares PSC output storage
 with its corresponding history. Backward includes cotangents from outputs,
@@ -114,3 +115,19 @@ See [the executable OOT tutorial](../tutorials/oot_kernels.md). Sparse extension
 continue to use the existing sparse registry described in
 [the sparse guide](sparse_connectivity.md); cell registration does not redefine
 connection topology, delay layout or sparse algorithms.
+
+## Plasticity kernels
+
+`register_backend` registers neuron/PSC sequence execution. Register native
+learning functions with `register_plasticity_template`. A `PlasticityTemplate`
+binds Triton/TileLang helpers to the existing ordinary/event/HELION schedules;
+there is no equation-string DSL or symbolic tracing. See the executable declaration in
+[custom plasticity](plasticity.md#out-of-tree-native-learning-templates).
+The rule's `PlasticityRule` memories and the connection's canonical weights
+retain their ownership. There is no backward callback for online STDP, which
+runs under `no_grad` and rejects BPTT through mutable updates.
+
+Run `python examples/oot_stdp.py` for a standalone memory-backed rule and
+its eager reference. Select `--backend triton --device cuda --capture` or
+`--backend tilelang --device cuda --recurrent helion --capture` to validate
+native execution with the same declaration. Add `--compile` to check compilation.

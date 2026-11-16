@@ -187,7 +187,7 @@ def test_dispatch_tracks_actual_inputs_and_retains_only_needed_history(
 ):
     from contextlib import nullcontext
 
-    from btorch.models.kernels import register_cell_backend
+    from btorch.models.kernels import register_backend
     from btorch.models.kernels.operators import run_multi_step
     from btorch.models.kernels.torch_backend import backward_sequence, forward_sequence
 
@@ -197,7 +197,7 @@ def test_dispatch_tracks_actual_inputs_and_retains_only_needed_history(
         requested_names.append(history_names)
         return forward_sequence(x, initial, parameters, spec, history_names)
 
-    register_cell_backend(
+    register_backend(
         "reference_dispatch", forward=forward, backward=backward_sequence, replace=True
     )
     spec, x, states, parameters = cell_inputs("alpha")
@@ -542,7 +542,7 @@ def test_parameter_only_training_preserves_temporal_state_adjoint():
     ],
 )
 def test_replacement_rejects_outstanding_backward(registration, compiler):
-    from btorch.models.kernels import register_cell_backend, run_multi_step
+    from btorch.models.kernels import register_backend, run_multi_step
     from btorch.models.kernels.templates import ModelTemplate, register_model_template
     from btorch.models.kernels.torch_backend import backward_sequence, forward_sequence
 
@@ -552,7 +552,7 @@ def test_replacement_rejects_outstanding_backward(registration, compiler):
     # compiled backward, even when the replacement keeps the same tensor ABI.
     suffix = f"{registration}_{compiler or 'eager'}"
     backend = f"replacement_{suffix}"
-    register_cell_backend(
+    register_backend(
         backend, forward=forward_sequence, backward=backward_sequence, replace=True
     )
     if registration == "model":
@@ -596,7 +596,7 @@ def test_replacement_rejects_outstanding_backward(registration, compiler):
     x = torch.ones(4, 2, 3, dtype=torch.float32, requires_grad=True)
     output = runner(x)
     if registration == "backend":
-        register_cell_backend(
+        register_backend(
             backend, forward=forward_sequence, backward=backward_sequence, replace=True
         )
     else:
@@ -726,7 +726,7 @@ def test_external_model_rejects_ambiguous_state_and_record_layouts(extra_dims, s
 def test_external_template_without_reference_vjp_can_use_backend_vjp():
     from btorch.models.kernels import (
         ModelTemplate,
-        register_cell_backend,
+        register_backend,
         register_model_template,
         run_multi_step,
     )
@@ -763,7 +763,7 @@ def test_external_template_without_reference_vjp_can_use_backend_vjp():
 
     template = ModelTemplate("lab_backend_integrator", ("q",), (), ("q",))
     register_model_template(template, forward_step=step, replace=True)
-    register_cell_backend(
+    register_backend(
         "lab_integrator_vjp",
         forward=forward_sequence,
         backward=reverse,

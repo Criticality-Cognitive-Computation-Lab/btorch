@@ -1012,11 +1012,14 @@ The numerical sparse-array products (`A @ x`, `sparse.matvec`) remain independen
 reference operations; these execution options apply to the connection runtime.
 
 With automatic method and backend selection, connections with both operator
-dimensions below **4,000** use dense matmul internally. The public interface,
+dimensions below **4,096** use dense matmul internally. The public interface,
 sparse topology and edge-weight parameters remain sparse; missing edges never
 become trainable parameters. Native recurrent execution materializes the dense
 operand once per trajectory and reuses it and its output storage across steps.
 Each new trajectory reads current weights, including after optimizer updates.
+During native online STDP, the weight-update kernel also writes the prepared
+dense operand in place. Only existing canonical edges are updated; no dense
+matrix rebuild or extra propagation-weight copy is needed per timestep.
 Expanded receptor/delay/member dimensions count toward the limit to bound the
 dense operand's memory. Explicit `method="push"`, `method="pull"` or a backend
 override bypasses this automatic choice.

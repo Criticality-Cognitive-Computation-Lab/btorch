@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Register out-of-tree native Triton/TileLang plasticity functions
+  and supported event/HELION schedules, with revision-aware capture invalidation
+  and a standalone `examples/oot_stdp.py` memory-backed learning example.
+
+- Name pair-trace ownership `trace_scope="connection"` or `"neuron"`;
+  keep it independent of PSC merging and document custom learning-rule contracts.
+
 - Support native recurrent BPTT with bounded forward/reverse CUDA Graph replay.
   Preserve independent chunk tapes, cross-chunk state adjoints, checkpointing
   and CPU offload without requiring torch.compile. Reuse offloaded CPU trace
@@ -31,6 +38,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metadata across chunks. Bind current tensors and runtime timesteps on each
   call; reuse Triton executables and public CuPy stream bindings. Remove
   redundant output allocation and prepared-consumer submission wrappers.
+- Add eager Tsodyks–Markram release through `Synapse.transmission`, with
+  persistent facilitation/depression state independent of STDP weight updates.
+- Add modulated STDP with eager, separate and fused Triton/TileLang execution,
+  persistent edge eligibility, declared external teaching signals and explicit
+  within-bin reward ordering. Share trace equations without treating continuous
+  eligibility as event-only learning.
+
+- Preserve half/bfloat16 pointwise arithmetic in native plasticity; limit
+  promotion to individual math operations requiring a wider backend interface.
+  Preserve explicit neuron/PSC state precision through Torch, Triton and
+  TileLang recurrent execution and checkpoint replay; keep wider gradient
+  accumulation separate from forward model precision.
+
+- Add inhibitory homeostatic STDP with eager and native Triton/TileLang
+  implementations, explicit signed-weight polarity,
+  shared or edge-local traces and strict-past arrival timing.
+
+- Combine independent shared STDP trace and weight updates in one learning
+  kernel using compact old/next trace snapshots on Triton and TileLang.
 
 - Prepare recurrent pointer schedules and spike-list sequence consumers once
   per invocation, binding the current stream through public backend APIs.
@@ -81,8 +107,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `ceil(T / chunk_size)` sections. A shorter final piece runs eagerly.
   Examples expose both options and report firing-rate calibration separately
   from simulation timing.
+- Add online `Synapse.plasticity` with pair, power-pair, nearest-pair, triplet
+  and voltage-dependent STDP. Rules retain state across chunks and support
+  heterogeneous parameters, delays, receptors and recording. Pair STDP also
+  supports shared segment/post traces in eager, separate native and HELION
+  execution.
+- Support custom `PlasticityRule(MemoryModule)` rules with declared state domains
+  and live neuron or external signals. Online learning is separate from BPTT.
+- Add Triton/TileLang plasticity kernels and experimental cooperative
+  `KernelOptions(recurrent="helion")` inference using shared neuron/PSC templates,
+  with supported CUDA Graph and compiled execution. Zero-delay event learning
+  supports scan or neuron-produced spike lists with either a fused timestep
+  or separate PSC/neuron and propagation/plasticity kernels.
 - `btorch.analysis.compute_input_scale` calibrates external drive using the
-  actual recurrent model while restoring its memories and recording policy.
+  actual recurrent model while restoring its memories, online-plastic weights
+  and recording policy between trials and after calibration.
 - The Izhikevich example defaults to 60k neurons, 33,072,348 edges, ~5 Hz and
   CUDA Graph inference, records v/u/spikes/total PSC/EPSC/IPSC, and compares
   matched push/pull/eager execution without extra CLI settings.
@@ -200,6 +239,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unify native neuron/PSC math selection as `KernelOptions(fast_math=...)`;
   share dtype-aware Triton/TileLang exponential helpers and reuse libdevice
   `expm1` for exponential Euler. FMA contraction remains independent.
+- Replace the registration-only OOT tutorial with a handwritten Triton LIF
+  forward, the tensor adapter, and reuse of btorch's matching backward kernel.
+
+- Rename the public cell backend registration function to `register_backend`.
+
+- Keep CUDA Graph cache validation and replay bookkeeping outside Dynamo while
+  allowing bounded chunk callbacks to compile during warmup.
+
+- Declare custom synaptic-rule memories with `register_memory` in the constructor;
+  resolve topology dimensions when binding, without an additional initialization hook.
+- Add an online-STDP Izhikevich example reusing the 60K-neuron heterogeneous circuit,
+  with chunk CUDA Graph replay, selectable storage precision and independent
+  recurrent/discovery selection. Explicit pull retains automatic discovery.
+
+
+- Use internal dense propagation below 4096 expanded dimensions in automatic
+  sparse execution. Native online plasticity updates the prepared dense operand
+  within its existing weight kernel, retaining canonical sparse parameters.
 
 - Reduce recurrent CPU submission overhead by reusing trajectory device guards
   and validated sparse bindings across timesteps.
@@ -502,6 +559,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Validate external plasticity functions against the connection renderer when
+  propagation and learning share a kernel, permitting mixed neuron/connection
+  backends in the standard event schedule.
+
+- Normalize one-element timestep tensors before online learning and release
+  updates so singleton dimensions cannot broadcast canonical edge state.
 - Recurrent CPU offload includes private backward residuals as well as public
   traces, while keeping model-owned weights/topology resident. Graph inference
   copies chunks directly into full-sequence recording destinations. Charged

@@ -10,6 +10,7 @@ from .registry import _NATIVE_GPU_BACKENDS
 NeuronBackend = str
 ConnectionBackend = Literal["auto", "triton", "tilelang", "cusparse", "torch"]
 RecurrentStrategy = Literal["standard", "helion"]
+SpikeSelection = Literal["auto", "scan", "spike_list"]
 
 
 @dataclass(frozen=True)
@@ -23,8 +24,10 @@ class KernelOptions:
             ``torch`` selects
             the general PyTorch reference, and ``auto`` preserves routing.
         connection_method: Explicit sparse execution method. ``auto`` inherits
-            connection settings and hints; ``push`` requests spike-list SpMSpV,
-            and ``pull`` requests destination-driven execution. Unsupported
+            connection settings and hints; ``push`` requests source-driven
+            execution (spike-list SpMSpV in standard recurrence), and ``pull``
+            requests destination-driven execution. HELION activity discovery
+            is controlled by ``spike_selection``. Unsupported
             explicit requests raise instead of falling back. CUDA push is not
             bitwise reproducible, including under CUDA Graph replay: rounding
             differences can change later recurrent spikes and gradients. Use
@@ -36,6 +39,19 @@ class KernelOptions:
             spike bins out of 60 million. These are observations, not bounds.
         recurrent: Recurrent schedule. ``helion`` selects the experimental
             cooperative fused inference path; unsupported configurations raise.
+            Its single kernel uses the neuron renderer for propagation as well;
+            connection must be ``auto`` or match neuron.
+        spike_selection: Activity discovery for recurrent propagation.
+            ``auto`` retains the schedule's default: lists for standard
+            push execution, scanning for HELION. ``scan`` discovers
+            active rows from dense spikes, while ``spike_list`` consumes
+            the existing neuron-produced block-local queue. For zero-delay
+            event-only STDP, either explicit choice combines propagation
+            and learning in one kernel; ``standard`` retains a separate
+            PSC/neuron kernel and ``helion`` fuses the timestep.
+            Static list execution also requires zero delay; static scan
+            requires HELION. Explicit choices require native neuron templates
+            and push propagation. Unsupported combinations raise before stepping.
         merge_synapse: Combine compatible linear receptor states explicitly.
             Independent trainable parameters cannot be merged by value.
         enable_fp_fusion: Permit the GPU compiler to contract compatible
@@ -58,6 +74,7 @@ class KernelOptions:
     connection: ConnectionBackend = "auto"
     recurrent: RecurrentStrategy = "standard"
     connection_method: PropagationMethod = "auto"
+    spike_selection: SpikeSelection = "auto"
     merge_synapse: bool = False
     enable_fp_fusion: bool = True
     fast_math: bool = True
@@ -71,13 +88,54 @@ class KernelOptions:
             raise ValueError(f"Unknown connection backend: {self.connection!r}")
         if self.recurrent not in ("standard", "helion"):
             raise ValueError(f"Unknown recurrent backend: {self.recurrent!r}")
+        if self.spike_selection not in ("auto", "scan", "spike_list"):
+            raise ValueError(f"Unknown spike selection: {self.spike_selection!r}")
+        if self.spike_selection != "auto" and self.neuron not in ("triton", "tilelang"):
+            raise NotImplementedError(
+                "Explicit spike discovery requires Triton or TileLang "
+                "neuron/PSC templates"
+            )
+        if self.recurrent == "helion" and self.connection not in ("auto", self.neuron):
+            raise ValueError(
+                "HELION uses one backend for its fused neuron/propagation/PSC kernel; "
+                "connection must be 'auto' or match neuron. Use recurrent='standard' "
+                "for independent neuron and sparse backends."
+            )
         validate_method(self.connection_method)
+        if self.spike_selection != "auto" and self.connection_method == "pull":
+            raise ValueError(
+                "Explicit spike discovery requires source-driven propagation; use "
+                "connection_method='push' or spike_selection='auto'"
+            )
         if not isinstance(self.merge_synapse, bool):
             raise TypeError("merge_synapse must be a bool")
         if not isinstance(self.enable_fp_fusion, bool):
             raise TypeError("enable_fp_fusion must be a bool")
         if not isinstance(self.fast_math, bool):
             raise TypeError("fast_math must be a bool")
+
+
+def _event_connection_backend(options: KernelOptions | None) -> str | None:
+    """Resolve the shared propagation/learning renderer for explicit
+    discovery."""
+    if (
+        options is None
+        or options.recurrent != "standard"
+        or options.spike_selection == "auto"
+    ):
+        return None
+    if options.neuron not in ("triton", "tilelang"):
+        raise NotImplementedError(
+            "Two-kernel event recurrence requires Triton or TileLang "
+            "neuron/PSC templates"
+        )
+    backend = options.neuron if options.connection == "auto" else options.connection
+    if backend not in ("triton", "tilelang"):
+        raise NotImplementedError(
+            "Sparse propagation/plasticity fusion requires a Triton "
+            "or TileLang connection backend"
+        )
+    return backend
 
 
 def normalize_backend(backend: str | KernelOptions) -> KernelOptions:

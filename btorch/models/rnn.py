@@ -1,3 +1,4 @@
+import weakref
 from abc import abstractmethod
 from collections.abc import Callable, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
@@ -12,7 +13,7 @@ from torch.utils.checkpoint import checkpoint
 
 from . import base, environ, synapse
 from .base import StepMode
-from .cudagraph import CudaGraphRunner
+from .cudagraph import CudaGraphRunner, _is_static_input
 from .functional import filter_hidden_states, named_hidden_states, set_hidden_states
 from .gradients import BPTT
 
@@ -20,6 +21,23 @@ from .gradients import BPTT
 _sparse_scope_states: ContextVar[dict[int, tuple[int, tuple[int, torch.dtype]]]] = (
     ContextVar("btorch_sparse_run_scopes", default={})
 )
+_offload_snapshots: ContextVar[dict | None] = ContextVar(
+    "btorch_offload_snapshots", default=None
+)
+
+
+class _OffloadedTrace(torch.autograd.Function):
+    """Reuse an already offloaded value while retaining its transfer
+    adjoint."""
+
+    @staticmethod
+    def forward(ctx, value, snapshot):
+        ctx.device = value.device
+        return snapshot
+
+    @staticmethod
+    def backward(ctx, gradient):
+        return gradient.to(ctx.device), None
 
 
 def _restore_autograd_multithreading() -> None:
@@ -92,6 +110,12 @@ def _chunk_to_cpu(z, states: dict):
 
     def to_cpu(x):
         if isinstance(x, Tensor):
+            snapshots = _offload_snapshots.get()
+            entry = None if snapshots is None else snapshots.get(id(x))
+            if entry is not None:
+                owner, version, snapshot = entry
+                if owner() is x and x._version == version:
+                    return _OffloadedTrace.apply(x, snapshot)
             return x.cpu()
         # One transfer per chunk/record, preserving the existing list-of-steps
         # contract and its autograd edges without a copy launch per timestep.
@@ -143,6 +167,7 @@ def _offload_saved_tensors(
         yield
         return
     resident = {_tensor_storage_key(tensor) for tensor in persistent}
+    snapshots = {}
 
     def pack(tensor: Tensor):
         key = _tensor_storage_key(tensor)
@@ -165,7 +190,13 @@ def _offload_saved_tensors(
             # Hooks bypass SavedVariable's normal version check. Keep a detached
             # resident view and restore that check explicitly on unpack.
             return "resident", tensor.device, tensor.detach(), version
-        return "cpu", tensor.device, tensor.detach().cpu(), None
+        entry = snapshots.get(id(tensor))
+        if entry is None or entry[0]() is not tensor or entry[1] != version:
+            snapshot = tensor.detach().cpu()
+            snapshots[id(tensor)] = weakref.ref(tensor), version, snapshot
+        else:
+            snapshot = entry[2]
+        return "cpu", tensor.device, snapshot, snapshot._version
 
     def unpack(value):
         kind, device, tensor, version = value
@@ -173,8 +204,12 @@ def _offload_saved_tensors(
             raise RuntimeError("a saved recurrent tensor was modified in-place")
         return tensor if kind == "resident" else tensor.to(device)
 
-    with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
-        yield
+    token = _offload_snapshots.set(snapshots)
+    try:
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+            yield
+    finally:
+        _offload_snapshots.reset(token)
 
 
 def _sparse_run_arguments(loop_tensor: Tensor) -> tuple[int, torch.dtype]:
@@ -288,20 +323,21 @@ class RecurrentNNAbstract(base.MemoryModule):
 
     CUDA-graph acceleration comes in two flavours, one per use case:
 
-    * Inference: ``cudagraph=True`` captures the loop's device work and replays
-      it (see ``cudagraph.py``). It is the fastest option and composes with
+    * Inference: ``cudagraph=None`` automatically captures compatible CUDA
+      inference; ``cudagraph=True`` explicitly requires capture, while
+      ``cudagraph=False`` opts out. The runner captures the loop's device work
+      and replays it (see ``cudagraph.py``). It is the fastest option and composes with
       ``torch.compile`` and ``cpu_offload``, but is inference-only. Warm-up,
       capture and replay use pieces of at most ``chunk_size`` steps (default
       200). ``chunk_mode="split"`` uses torch.split; ``"chunk"`` uses
       torch.chunk with ceil(T / chunk_size) sections. A shorter final piece
       runs eagerly rather than creating a graph used only once per sequence.
-      ``None`` explicitly opts out of outer chunking.
-    * Training: wrap the module in ``torch.compile(model, mode="reduce-overhead")``
-      instead. Its CUDAGraph Trees capture forward and backward separately, so it
-      is correct through ``backward()`` and composes with ``grad_checkpoint`` and
-      ``cpu_offload`` -- call ``torch.compiler.cudagraph_mark_step_begin()`` once
-      per iteration. ``cudagraph=True`` refuses grad-recording calls and points
-      here.
+      ``chunk_size=None`` explicitly opts out of outer chunking.
+    * Native training: ``cudagraph=True`` captures the functional forward and
+      reverse of a bounded chunk separately. Autograd owns private chunk tapes
+      and carries state adjoints across chunks; checkpointing and CPU offload
+      remain outside capture. Alternatively, use ``cudagraph=False`` with
+      ``torch.compile(model, mode="reduce-overhead")`` for eligible regions.
 
     A captured graph is tied to the structure it was recorded for. Submodules
     whose structure can change in place (a sparse connection that is rewired
@@ -322,7 +358,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         grad_checkpoint: bool = False,
         save_grad_history: bool = False,
         grad_state_names: Sequence[str] | None = None,
-        cudagraph: bool = False,
+        cudagraph: bool | None = None,
         cudagraph_warmup: int = 3,
     ):
         super().__init__()
@@ -355,6 +391,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         captures.
         """
         self._cudagraph_runner.reset()
+        self.__dict__.pop("_training_graphs", None)
 
     def _detect_loop_args(self, *args: Any) -> tuple[int, tuple[int, ...]]:
         """Infer ``(T, loop_args)`` from the first positional argument.
@@ -380,6 +417,39 @@ class RecurrentNNAbstract(base.MemoryModule):
             )
         loop_args = tuple(i for i, s in enumerate(shapes) if s == T)
         return T, loop_args
+
+    def _cudagraph_enabled(self, args: Sequence[Any], kwargs: dict[str, Any]) -> bool:
+        """Resolve automatic CUDA-graph inference selection once per call."""
+        if self.cudagraph is not None:
+            return self.cudagraph
+        if torch.compiler.is_compiling() or self._cudagraph_incompatibilities():
+            return False
+        values = (*args, *kwargs.values())
+        tensors = [value for value in values if isinstance(value, Tensor)]
+        if not tensors or any(value.device.type != "cuda" for value in tensors):
+            return False
+        if any(
+            not _is_static_input(value)
+            for value in values
+            if not isinstance(value, Tensor)
+        ):
+            return False
+        if torch.is_grad_enabled() and (
+            any(value.requires_grad for value in tensors)
+            or any(parameter.requires_grad for parameter in self.parameters())
+            or any(buffer.requires_grad for buffer in self.buffers())
+        ):
+            return False
+        if any(
+            value.device.type != "cuda"
+            for value in named_hidden_states(self).values()
+            if isinstance(value, Tensor)
+        ):
+            return False
+        return not any(
+            submodule.capture_incompatibility()
+            for _, submodule in self._cudagraph_runner._participants_of(self)[1]
+        )
 
     @abstractmethod
     def single_step_forward(
@@ -552,12 +622,13 @@ class RecurrentNNAbstract(base.MemoryModule):
             scoped_loop_args = loop_args
         if args[scoped_loop_args[0]].shape[0] == 0:
             raise ValueError("RecurrentNN requires at least one timestep")
+        use_cudagraph = self._cudagraph_enabled(args, kwargs)
         with _sparse_run_scope(
             self,
             args[scoped_loop_args[0]],
-            stable_addresses=self.cudagraph,
+            stable_addresses=use_cudagraph,
         ):
-            if self.cudagraph:
+            if use_cudagraph:
                 return self._cudagraph_multi_step(*args, loop_args=loop_args, **kwargs)
             return self._multi_step_forward_impl(*args, loop_args=loop_args, **kwargs)
 
@@ -744,6 +815,7 @@ class RecurrentNNAbstract(base.MemoryModule):
         full_states = None
         time_offset = 0
         replay_length = None
+        entry = None
         from .kernels.operators import poisson_uniforms
         from .kernels.options import normalize_backend
         from .surrogate import PoissonRandomSpike, Truncated
@@ -785,13 +857,21 @@ class RecurrentNNAbstract(base.MemoryModule):
             if length < replay_length:
                 z, states = fn(*capture_args, **kwargs)
             else:
-                z, states = self._cudagraph_runner(
-                    self,
-                    fn,
+                continuation = entry is not None and entry.continuous
+                if not continuation:
+                    entry = self._cudagraph_runner._prepare(
+                        self,
+                        fn,
+                        capture_args,
+                        kwargs,
+                        incompatible=self._cudagraph_incompatibilities(),
+                    )
+                z, states = self._cudagraph_runner._replay_entry(
+                    entry,
                     capture_args,
                     kwargs,
                     clone_outputs=n_chunks == 1 and not self.cpu_offload,
-                    incompatible=self._cudagraph_incompatibilities(),
+                    continuation=continuation,
                 )
 
             if n_chunks == 1:
@@ -991,6 +1071,8 @@ class RecurrentNN(RecurrentNNAbstract):
         self.gradient = gradient
         self._stdp_bindings = self._find_stdp_bindings()
         self._stdp_run_active = False
+        self._stdp_signal_bindings = ()
+        self._stdp_sequence_names = ()
         self.register_load_state_dict_post_hook(self._refresh_merge_validation)
 
     def _find_stdp_bindings(self) -> tuple[tuple[nn.Module, synapse.BasePSC], ...]:
@@ -1015,9 +1097,15 @@ class RecurrentNN(RecurrentNNAbstract):
                 seen.add(id(connection))
         return tuple(bindings)
 
-    def _begin_stdp_run(self, sample: Tensor | None = None) -> None:
+    def _begin_stdp_run(
+        self,
+        sample: Tensor | None = None,
+        signals: dict[str, Tensor] | None = None,
+    ) -> None:
         """Validate the eager online-STDP execution contract."""
         if not self._stdp_bindings:
+            if signals:
+                raise ValueError("plasticity_signals require an active plasticity rule")
             return
         if len(self._stdp_bindings) != 1:
             raise NotImplementedError(
@@ -1041,7 +1129,9 @@ class RecurrentNN(RecurrentNNAbstract):
             )
         from .kernels.options import normalize_backend
 
-        if normalize_backend(self.backend).neuron == "cupy":
+        options = normalize_backend(self.backend)
+        backend = options.neuron
+        if backend == "cupy":
             raise NotImplementedError(
                 "Online STDP is not implemented for the CuPy recurrent backend; "
                 "use the eager Torch, Triton, or TileLang path."
@@ -1054,20 +1144,177 @@ class RecurrentNN(RecurrentNNAbstract):
             raise RuntimeError(
                 "Online STDP requires no_grad or inference_mode; BPTT is unsupported."
             )
-        if sample is not None:
-            for connection, _ in self._stdp_bindings:
-                if sample.numel() != connection.n_post:
+        from .connection.plasticity import (
+            ExternalSignal,
+            PostState,
+            _validate_weight_storage,
+        )
+        from .kernels.adapters import resolve_post_state
+        from .kernels.options import _event_connection_backend
+        from .kernels.plasticity import (
+            _validate_native_backend,
+            get_plasticity_template,
+        )
+
+        plasticity_backend = _event_connection_backend(options) or backend
+
+        for connection, _ in self._stdp_bindings:
+            if backend != "torch":
+                model = connection.plasticity._kernel_model
+                if model is None:
                     raise NotImplementedError(
-                        "Online STDP currently supports one recurrent sample; "
-                        f"expected {connection.n_post} neurons, got "
-                        f"input shape {tuple(sample.shape)}."
+                        f"{type(connection.plasticity).__name__} has no native "
+                        f"plasticity template for {backend}; select neuron='torch'"
                     )
+                rule = connection.plasticity
+                template = get_plasticity_template(
+                    model, tuple(rule.state_domains.items()), rule.signal_domains
+                )
+                _validate_native_backend(model, plasticity_backend)
+                coefficients = {*template.parameters, *dict(template.reset_parameters)}
+                if (
+                    set(dict(rule.named_buffers(recurse=False)))
+                    - set(rule.state_domains)
+                    != coefficients
+                ):
+                    raise NotImplementedError(
+                        f"The native {model!r} template requires its declared "
+                        "runtime and reset-only coefficients"
+                    )
+                if set(rule.signals) != dict(template.signals).keys():
+                    raise NotImplementedError(
+                        f"The native {model!r} template has no live signal inputs "
+                        "matching this rule; "
+                        "select neuron='torch'"
+                    )
+                if dict(rule.state_domains) != dict(template.state_domains):
+                    raise NotImplementedError(
+                        f"The native {model!r} template requires its declared "
+                        f"state domains {dict(template.state_domains)}"
+                    )
+                expected_domains = {
+                    **dict.fromkeys(template.parameters, "edge"),
+                    **dict(template.parameter_domains),
+                    **dict(template.reset_parameters),
+                }
+                incompatible = {
+                    name: rule.parameter_domains.get(name, "edge")
+                    for name, domain in expected_domains.items()
+                    if rule.parameter_domains.get(name, "edge")
+                    not in (domain, "scalar")
+                }
+                if incompatible:
+                    raise NotImplementedError(
+                        f"The native {model!r} template requires its declared "
+                        f"scalar/post/canonical-edge coefficients; got {incompatible}"
+                    )
+                if any(
+                    isinstance(rule.signals[name], ExternalSignal)
+                    and rule.signals[name].domain != domain
+                    for name, domain in template.signals
+                ):
+                    raise NotImplementedError(
+                        f"The native {model!r} template requires signal domains "
+                        f"{dict(template.signals)}"
+                    )
+                if options.recurrent == "helion" and template.events is None:
+                    from .kernels.backends.helion_plasticity import continuous_stages
+
+                    continuous_stages(template)
+            # Validate at run entry, including a replaced Parameter, rather
+            # than adding a host check to each native recurrent timestep.
+            _validate_weight_storage(
+                connection.weight.value, connection.indices.shape[1]
+            )
+            connection.plasticity._validate_state()
+            rule = connection.plasticity
+            external_names = {
+                name
+                for name, source in rule.signals.items()
+                if isinstance(source, ExternalSignal)
+            }
+            if set(signals or {}) - external_names:
+                raise ValueError(
+                    "Only declared external plasticity signals may be supplied"
+                )
+            self._stdp_signal_bindings = tuple(
+                (name, resolve_post_state(self.neuron, source))
+                for name, source in rule.signals.items()
+                if isinstance(source, PostState)
+            )
+            values = dict(signals or {})
+            values.update(
+                (name, getattr(self.neuron, attribute).reshape(-1))
+                for name, attribute in self._stdp_signal_bindings
+            )
+            rule.validate_signals(values, connection.weight.value.device)
+            if sample is not None and sample.numel() != connection.n_post:
+                raise NotImplementedError(
+                    "Online STDP currently supports one recurrent sample; "
+                    f"expected {connection.n_post} neurons, got "
+                    f"input shape {tuple(sample.shape)}."
+                )
         self._stdp_run_active = True
 
     def _end_stdp_run(self) -> None:
         self._stdp_run_active = False
+        self._stdp_signal_bindings = ()
+        self._stdp_sequence_names = ()
 
-    def _apply_stdp(self, presynaptic: Tensor, postsynaptic: Tensor) -> None:
+    def _prepare_plasticity_sequences(self, args, loop_args, kwargs):
+        """Bind time-first signals to the existing chunk/unroll input slots."""
+        from .connection.plasticity import ExternalSignal
+
+        values = kwargs.get("plasticity_signals") or {}
+        if not self._stdp_bindings:
+            return args, loop_args, kwargs, values
+        rule = self._stdp_bindings[0][0].plasticity
+        names = tuple(
+            name
+            for name, source in rule.signals.items()
+            if isinstance(source, ExternalSignal) and source.time_first
+        )
+        if not names:
+            return args, loop_args, kwargs, values
+        if "x_syn" in kwargs:
+            if len(args) > 1:
+                raise TypeError("Supply x_syn once, positionally or by keyword")
+            kwargs = dict(kwargs)
+            args = (*args, kwargs.pop("x_syn"))
+        if loop_args is None:
+            _, loop_args = self._detect_loop_args(*args)
+        steps = args[0].shape[0]
+        constants = dict(values)
+        initial = dict(values)
+        sequences = []
+        for name in names:
+            value = constants.pop(name, None)
+            shape = rule._layout.shape(rule.signals[name].domain)
+            if not isinstance(value, Tensor) or value.shape != (steps, *shape):
+                raise ValueError(
+                    f"Time-first plasticity signal {name!r} must have "
+                    f"shape {(steps, *shape)}"
+                )
+            sequences.append(value)
+            initial[name] = value[0] if steps else value.new_empty(shape)
+        # Reserve the ordinary x_syn slot even when the caller omits it.
+        # All additional inputs then use the shared chunking/capture machinery.
+        base_args = (*args, None) if len(args) == 1 else args
+        start = len(base_args)
+        self._stdp_sequence_names = names
+        return (
+            (*base_args, *sequences),
+            (*loop_args, *range(start, start + len(sequences))),
+            {**kwargs, "plasticity_signals": constants},
+            initial,
+        )
+
+    def _apply_stdp(
+        self,
+        presynaptic: Tensor,
+        postsynaptic: Tensor,
+        signals: dict[str, Tensor] | None = None,
+    ) -> None:
         """Apply bound eager STDP rules after PSC propagation."""
         if not self._stdp_bindings:
             return
@@ -1079,7 +1326,12 @@ class RecurrentNN(RecurrentNNAbstract):
                 if delayed is None
                 else delayed.get_flattened(psc.n_delay)
             )
-            connection.update_plasticity(arrivals, postsynaptic, dt=dt)
+            values = dict(signals or {})
+            values.update(
+                (name, getattr(self.neuron, attribute).reshape(-1))
+                for name, attribute in self._stdp_signal_bindings
+            )
+            connection.update_plasticity(arrivals, postsynaptic, dt=dt, signals=values)
 
     @property
     def gradient(self) -> BPTT:
@@ -1102,7 +1354,21 @@ class RecurrentNN(RecurrentNNAbstract):
             validate_merge_module(self)
 
     def _apply(self, fn):
+        graphs = self.__dict__.get("_training_graphs")
+        before = (
+            tuple(
+                (tensor.device, tensor.dtype, tensor.data_ptr())
+                for tensor in (*self.parameters(), *self.buffers())
+            )
+            if graphs is not None
+            else None
+        )
         result = super()._apply(fn)
+        if before is not None and before != tuple(
+            (tensor.device, tensor.dtype, tensor.data_ptr())
+            for tensor in (*self.parameters(), *self.buffers())
+        ):
+            self.__dict__.pop("_training_graphs", None)
         if hasattr(self, "_backend"):
             self._refresh_merge_validation(self, None)
         return result
@@ -1151,6 +1417,8 @@ class RecurrentNN(RecurrentNNAbstract):
             (not options.fast_math),
             cell_backend_revision(options.neuron),
             options.connection_method,
+            options.recurrent,
+            options.spike_selection,
         )
 
         parameters = tuple(
@@ -1161,9 +1429,28 @@ class RecurrentNN(RecurrentNNAbstract):
         for module_name, module in self.named_modules():
             memories = getattr(module, "_memories_rv", {})
             for name, value in module.named_buffers(recurse=False):
-                if name in memories:
-                    continue
                 qualified_name = f"{module_name}.{name}" if module_name else name
+                if name in memories:
+                    # Replay feeds memories by value, so their addresses and
+                    # revisions may change. Their storage ABI must still agree
+                    # with the captured input: mixed operands can promote a
+                    # memory on its first logical invocation.
+                    stride = (
+                        tuple(value.stride()) if value.layout == torch.strided else ()
+                    )
+                    buffers.append(
+                        (
+                            qualified_name,
+                            (
+                                "memory",
+                                value.device,
+                                value.dtype,
+                                tuple(value.shape),
+                                stride,
+                            ),
+                        )
+                    )
+                    continue
                 buffers.append((qualified_name, self._capture_tensor_token(value)))
 
         dt = environ.all().get("dt")
@@ -1267,11 +1554,29 @@ class RecurrentNN(RecurrentNNAbstract):
 
     def multi_step_forward(self, *args, loop_args=None, **kwargs):
         self._reject_native_conductance_recurrence()
-        sample = None
-        if args and torch.is_tensor(args[0]) and args[0].ndim and args[0].shape[0]:
-            sample = args[0][0]
-        self._begin_stdp_run(sample)
         try:
+            signals = kwargs.get("plasticity_signals")
+            if self._stdp_bindings:
+                args, loop_args, kwargs, signals = self._prepare_plasticity_sequences(
+                    args, loop_args, kwargs
+                )
+            sample = None
+            if args and torch.is_tensor(args[0]) and args[0].ndim and args[0].shape[0]:
+                sample = args[0][0]
+            self._begin_stdp_run(sample, signals)
+            use_cudagraph = self._cudagraph_enabled(args, kwargs)
+            if (
+                use_cudagraph
+                and not self._uses_eager_recurrent_loop()
+                and torch.is_grad_enabled()
+                and any(
+                    isinstance(value, Tensor) and value.requires_grad
+                    for value in (*args, *self.parameters(), *self.buffers())
+                )
+            ):
+                return self._graphed_training_forward(
+                    *args, loop_args=loop_args, **kwargs
+                )
             if self._uses_eager_recurrent_loop():
                 from .kernels.adapters import connection_scope
                 from .kernels.options import normalize_backend
@@ -1280,7 +1585,7 @@ class RecurrentNN(RecurrentNNAbstract):
                     return super().multi_step_forward(
                         *args, loop_args=loop_args, **kwargs
                     )
-            if self.cudagraph:
+            if use_cudagraph:
                 from .kernels.options import normalize_backend
 
                 if normalize_backend(self.backend).merge_synapse and not getattr(
@@ -1289,7 +1594,7 @@ class RecurrentNN(RecurrentNNAbstract):
                     from .kernels.recurrent import prepare_merged_state
 
                     prepare_merged_state(self)
-            if self.cudagraph or self.save_grad_history or self.grad_state_names:
+            if use_cudagraph or self.save_grad_history or self.grad_state_names:
                 from .kernels.adapters import connection_scope
                 from .kernels.options import normalize_backend
 
@@ -1302,6 +1607,25 @@ class RecurrentNN(RecurrentNNAbstract):
             return recurrent_sequence(self, *args, loop_args=loop_args, **kwargs)
         finally:
             self._end_stdp_run()
+
+    @torch.compiler.disable
+    def _graphed_training_forward(self, *args, loop_args=None, **kwargs):
+        """Prepare native recurrent BPTT outside Dynamo and graph capture."""
+        from .kernels.options import normalize_backend
+        from .kernels.recurrent import recurrent_sequence
+        from .kernels.registry import _NATIVE_GPU_BACKENDS
+
+        if normalize_backend(self.backend).neuron not in _NATIVE_GPU_BACKENDS:
+            raise RuntimeError(
+                "CUDA Graph BPTT requires a native Triton, CuPy or TileLang "
+                "backend; use cudagraph=False for Torch/reference training"
+            )
+        if self.save_grad_history or self.grad_state_names:
+            raise RuntimeError(
+                "CUDA Graph BPTT does not support per-timestep gradient-history "
+                "hooks; use cudagraph=False for gradient-history recording"
+            )
+        return recurrent_sequence(self, *args, loop_args=loop_args, **kwargs)
 
     @partial(torch.compiler.disable, recursive=False)
     def _stacked_chunk_forward(
@@ -1333,13 +1657,26 @@ class RecurrentNN(RecurrentNNAbstract):
         )
 
     def single_step_forward(
-        self, x: Tensor, x_syn: Tensor | None = None
+        self,
+        x: Tensor,
+        x_syn: Tensor | None = None,
+        *signal_inputs: Tensor,
+        plasticity_signals: dict[str, Tensor] | None = None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         self._reject_native_conductance_recurrence()
+        if len(signal_inputs) != len(self._stdp_sequence_names):
+            raise ValueError(
+                "Plasticity signal slots disagree with the prepared sequence"
+            )
+        if signal_inputs:
+            plasticity_signals = {
+                **(plasticity_signals or {}),
+                **dict(zip(self._stdp_sequence_names, signal_inputs, strict=True)),
+            }
         standalone = bool(self._stdp_bindings and not self._stdp_run_active)
-        if standalone:
-            self._begin_stdp_run(x)
         try:
+            if standalone:
+                self._begin_stdp_run(x, plasticity_signals)
             if self.neuron_inp_module is not None:
                 x = self.neuron_inp_module(x)
             if self.syn_inp_module is not None:
@@ -1351,7 +1688,7 @@ class RecurrentNN(RecurrentNNAbstract):
             with connection_scope(normalize_backend(self.backend)):
                 synaptic_event = z if x_syn is None else z + x_syn
                 _ = base._single_step_call(self.synapse, synaptic_event)
-            self._apply_stdp(synaptic_event, z)
+            self._apply_stdp(synaptic_event, z, plasticity_signals)
             states = filter_hidden_states(
                 self, self.update_state_names, allow_buffer=self.allow_buffer
             )

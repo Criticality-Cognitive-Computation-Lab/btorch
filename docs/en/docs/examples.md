@@ -103,7 +103,7 @@ neuron's rate, stationary activity, or the rate after optimizer updates.
 
 Neuron/PSC and connection backends are independent. `--method push` explicitly
 requests spike-list SpMSpV; `pull` selects destination-driven execution. Auto
-can use dense multiplication below 4000 expanded operator dimensions while
+can use dense multiplication below 4096 expanded operator dimensions while
 retaining the sparse public interface. For continuous inference, initialize
 once and retain physical memories across chunks. `clear_cudagraph()` releases
 cached captures without resetting those memories; changing recording policy
@@ -186,3 +186,54 @@ Many `tests/` files contain concise, validated usage patterns that are ideal for
 The [heterogeneous multi-receptor E/I tutorial](tutorials/heterogeneous_ei_rsnn.md)
 builds a complete recurrent network with semantic receptor-labelled edges,
 receptor-specific PSC kinetics, Dale's law, training, and channel inspection.
+
+## Online STDP with Izhikevich
+
+`examples/rsnn_izhikevich_stdp.py` is a standalone example using public btorch
+modules. It builds the same 60,000-neuron/33,072,348-edge circuit and heterogeneous
+dual-exponential receptors as `rsnn_izhikevich.py`, with the fixed input scale
+`0.6640625` (about 5 Hz before learning). It does not import other example scripts.
+
+```bash
+python -m examples.rsnn_izhikevich_stdp
+python -m examples.rsnn_izhikevich_stdp --recurrent helion --spike-selection scan
+python -m examples.rsnn_izhikevich_stdp --recurrent helion --spike-selection spike_list
+python -m examples.rsnn_izhikevich_stdp --neuron-backend tilelang --recurrent helion
+```
+
+Pair STDP is attached through `Synapse.plasticity`. Only excitatory edges learn;
+inhibitory weights are fixed. Learning amplitudes scale with initial weight,
+per-edge bounds preserve signs, and `trace_scope="neuron"` shares pre traces by
+source/delay and post traces by neuron. Learning can change the resulting rate;
+the script does not recalibrate the drive during simulation.
+
+The standard schedule and HELION fusion share the same rule. `--spike-selection`
+chooses scan or spike-list discovery; `--no-plasticity` provides a matched static
+run and `--no-cudagraph` ordinary submission. The Torch reference is available on
+CPU, for example:
+
+```bash
+python -m examples.rsnn_izhikevich_stdp --neurons 128 --density .05 --steps 256 \
+    --device cpu --neuron-backend torch --method pull --no-cudagraph --no-recordings
+```
+
+The default is 5,000 steps with 200-step CUDA Graph chunks, preserving both
+`chunk_mode` options. Cold simulation time includes first-use JIT and bounded
+chunk warmup/capture; replay starts from the same weights and reset memories.
+Construction and CPU validation/transfers are reported separately, and disk
+writes are outside timing. The archive contains `v`, `u`, `spike`, `psc`, `epsc`
+and `ipsc`; no full edge-weight or trace histories are recorded. Use
+`--no-recordings` to skip CPU transfer and disk output.
+
+Use `--dtype float64|float32|float16|bfloat16` to select parameter, memory and
+input storage precision. Initialization follows that dtype. `--compile` also
+works with the default chunk CUDA Graphs: compilation happens during bounded
+warmup, and the Python chunk scheduler stays outside Dynamo. With
+`--no-cudagraph --compile`, Inductor can manage capture instead. Explicit
+`--method pull` keeps automatic discovery unless `--spike-selection` is also
+supplied; an incompatible explicit discovery request raises.
+
+Online STDP runs under `torch.no_grad()`; it does not implement BPTT through the
+weight updates. Use the original Izhikevich example for checkpointed/offloaded
+BPTT training and SONATA circuit IO. See [plasticity](guides/plasticity.md) for
+custom rules, ordering and backend support.

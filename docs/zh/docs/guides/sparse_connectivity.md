@@ -11,6 +11,7 @@
 - `conn.to_sparse()` 默认返回构建连接时所用的方向；`conn.pre` / `conn.post` 给出每条边的源与目标；`conn.set_edges_(slots, *, pre, post)` 的索引参数仅限关键字。
 - 传入 `Synapse(weight=...)` 的 `Weight` 模块就是 `conn.weight`；优化器请使用 `conn.parameters()` 或 `conn.weight.value`。
 - `torch.compile(mode="reduce-overhead")` 不得与重连（rewiring）或加载不同连接模式的检查点同时使用。
+- 自动方法和后端选择下，展开后的两个算子维度均严格小于 **4096** 时，内部使用 dense matmul；受体、延迟和成员展开维度计入阈值。接口、连接拓扑及可训练权重仍保持稀疏。原生在线 STDP 在现有权重更新内核中同时更新预分配的 dense 操作数，没有每步矩阵重建或额外权重复制。显式方法或后端选择覆盖此策略。
 
 最小示例：
 
