@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add fresh-process Izhikevich inference, BPTT and STDP benchmarks reusing
+  the examples, with cold/warm timing and explicit Torch/native CUDA Graph
+  comparisons at 4096 and 60,000 neurons.
+
 - Register out-of-tree native Triton/TileLang plasticity functions
   and supported event/HELION schedules, with revision-aware capture invalidation
   and a standalone `examples/oot_stdp.py` memory-backed learning example.

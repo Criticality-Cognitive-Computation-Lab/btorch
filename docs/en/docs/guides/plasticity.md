@@ -628,3 +628,15 @@ Choose `--recurrent standard|helion` and `--spike-selection scan|spike_list`
 independently. The example records neuron/receptor histories while keeping
 learning histories disabled. See the [example guide](../examples.md#online-stdp-with-izhikevich)
 for timing boundaries, the Torch reference and static controls.
+
+## Reproduce cold and warm comparisons
+
+Run `python -m benchmarks.rsnn_izhikevich.run --modes inference stdp` from the
+repository root. It reuses the Izhikevich example at 4096 and 60,000 neurons
+and measures Torch native with and without CUDA Graph alongside Triton/TileLang
+push and HELION. Each case starts in a fresh process; disk caches are allowed.
+Cold time includes bounded chunk JIT/warmup/capture. Construction, reset,
+validation and writes are separate. Individual results and matched geometric
+means retain slowdowns and failures. See
+[the benchmark instructions](https://github.com/Criticality-Cognitive-Computation-Lab/btorch/blob/stdp/benchmarks/rsnn_izhikevich/README.md)
+for training, timing scope and unsupported combinations.

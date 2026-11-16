@@ -47,6 +47,10 @@
 6 万神经元、33,072,348 条边、约 5 Hz 示例，并对比 push/pull 和 eager/CUDA Graph，
 无需额外参数。见[示例指南](docs/zh/docs/examples.md)。
 
+冷启动/热启动的推理、BPTT 和 STDP 对比（包括 Torch native 有/无 CUDA Graph）
+可运行 `python -m benchmarks.rsnn_izhikevich.run`，详见
+[benchmark 说明](benchmarks/rsnn_izhikevich/README.md)。
+
 ## Cell 后端与外部 kernel
 
 使用 `KernelOptions(cell="triton", connection="auto")` 独立选择 cell dynamics

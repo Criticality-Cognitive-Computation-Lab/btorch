@@ -49,6 +49,11 @@ Run `python -m examples.rsnn_izhikevich` on CUDA for the recorded 60k-neuron,
 33,072,348-edge, ~5 Hz example. It compares push/pull and eager/CUDA Graph
 execution with no extra parameters; see [the examples guide](docs/en/docs/examples.md).
 
+For fresh-process cold/warm inference, BPTT and STDP comparisons (including
+Torch native with/without CUDA Graph), run
+`python -m benchmarks.rsnn_izhikevich.run`; see the
+[benchmark instructions](benchmarks/rsnn_izhikevich/README.md).
+
 ## Cell backends and external kernels
 
 Surrogate functions use ordinary PyTorch autograd and `torch.compile`, without

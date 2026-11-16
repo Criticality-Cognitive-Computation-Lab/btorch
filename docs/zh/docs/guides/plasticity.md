@@ -518,3 +518,13 @@ CUDA Graph。旧版本在线算子会在状态修改前拒绝执行。子类必�
 分别通过 `--recurrent standard|helion` 和 `--spike-selection scan|spike_list`
 选择调度与事件发现方式。示例记录神经元/受体历史，不分配逐步学习历史。
 计时范围、Torch 参考及静态对照见[示例指南](../examples.md)。
+
+## 复现冷启动与热启动对比
+
+在仓库根目录运行 `python -m benchmarks.rsnn_izhikevich.run --modes inference stdp`。
+脚本复用 Izhikevich 示例，测试 4096 和 60,000 个神经元，包含 Torch native
+有、无 CUDA Graph，以及 Triton/TileLang 的 push 和 HELION。每个组合启动独立
+进程，允许使用磁盘编译缓存。冷时间包含有限长度分块的 JIT、预热、捕获和实际运行；
+建网、重置、校验及写盘另计。结果保留各项测量、匹配组合的几何平均加速比、减速和失败。
+训练、计时范围及不支持的组合见
+[benchmark 说明](https://github.com/Criticality-Cognitive-Computation-Lab/btorch/blob/stdp/benchmarks/rsnn_izhikevich/README.md)。
