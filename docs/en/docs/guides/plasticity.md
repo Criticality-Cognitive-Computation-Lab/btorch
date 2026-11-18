@@ -99,7 +99,7 @@ The eager reference and native online path support one sample and unconstrained
 `EdgeWeight` with independently writable edge slots. Nonoverlapping strided
 views are supported; broadcast weights that alias multiple edges are rejected.
 Shared-weight minibatch reductions, structural rewiring, nested `DelayedPSC`,
-apical/conductance recurrence and CuPy plasticity are not supported.
+apical recurrence and CuPy plasticity are not supported.
 Unsupported combinations raise
 explicit errors rather than silently ignoring learning.
 
@@ -640,3 +640,29 @@ validation and writes are separate. Individual results and matched geometric
 means retain slowdowns and failures. See
 [the benchmark instructions](https://github.com/Criticality-Cognitive-Computation-Lab/btorch/blob/stdp/benchmarks/rsnn_izhikevich/README.md)
 for training, timing scope and unsupported combinations.
+
+
+## Positive conductance weights and pair learning
+
+`ConductanceRecurrentNN` supports online learning with `ConductancePSC` or
+`HeterConductancePSC` under eager Torch cell scheduling. Current is evaluated
+from preceding conductance and post-reset voltage; neuron emission and
+propagation with old weights precede the learning update. Receptor channels
+keep their own conductance, and current is summed only after `g * (E - v)`.
+The outer heterogeneous `psc` is current; `base_psc.psc` is conductance.
+
+Conductance E and I weights can both be positive. Select excitatory edges by
+source/receptor metadata, not by `weight > 0` as in a signed current example.
+Use positive E bounds, and freeze I with equal bounds at its initial positive
+weight (the walkthrough also sets I amplitudes to zero). Pass these arrays in
+input-edge order; connection binding remaps them to canonical order without
+changing receptors. PairSTDP does not infer inhibitory sign from a receptor.
+
+Run `python -m examples.rsnn_izhikevich_conductance_stdp` for the small
+CPU walkthrough; `--no-plasticity` gives its matched static control. Child
+neuron and synapse backends remain literal `"torch"`; the RNN selects
+`KernelOptions(neuron="torch", connection=..., connection_method=...)`.
+Independent sparse push, including Triton on CUDA, does not select fused
+cell lowering, native plasticity kernels or HELION. This example installs no
+STP. See [the conductance example](../examples.md#ei-conductance-with-optional-stdp)
+for the exact synthetic circuit, state checks and bounded recording policy.

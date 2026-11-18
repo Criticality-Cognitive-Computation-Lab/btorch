@@ -1117,10 +1117,12 @@ class RecurrentNN(RecurrentNNAbstract):
                 "Online STDP is not supported for ApicalRecurrentNN; use one "
                 "recurrent synapse with an explicit eager STDP schedule."
             )
-        if type(self.synapse) is synapse.ConductancePSC:
+        if type(self.synapse) in (
+            synapse.ConductancePSC,
+            synapse.HeterConductancePSC,
+        ) and not isinstance(self, ConductanceRecurrentNN):
             raise NotImplementedError(
-                "Online STDP is not supported for conductance recurrence until "
-                "the voltage-aware eager schedule is integrated."
+                "Online conductance STDP requires ConductanceRecurrentNN"
             )
         if isinstance(self.synapse, synapse.DelayedPSC):
             raise NotImplementedError(
@@ -1529,7 +1531,11 @@ class RecurrentNN(RecurrentNNAbstract):
         )
 
     def _reject_native_conductance_recurrence(self) -> None:
-        """Reject COBA until recurrence supplies the observed voltage."""
+        """Reject unsupported recurrences without observed-voltage coupling."""
+        if type(self.synapse) is synapse.HeterConductancePSC:
+            raise NotImplementedError(
+                "HeterConductancePSC requires ConductanceRecurrentNN"
+            )
         from .kernels.options import normalize_backend
 
         recurrent_synapses = (self.synapse, getattr(self, "synapse_apical", None))
@@ -1725,16 +1731,17 @@ class ConductanceRecurrentNN(RecurrentNN):
     The neuron advances, fires, and resets before its emitted spikes update the
     conductance. A recurrent spike emitted at step :math:`t` can therefore
     affect membrane current beginning at step :math:`t+1`. This initial public
-    schedule is deliberately Torch-only and requires the exact
-    :class:`~btorch.models.synapse.ConductancePSC` class.
+    schedule uses Torch cells with independent sparse connection routing.
+    Both :class:`~btorch.models.synapse.ConductancePSC` and
+    :class:`~btorch.models.synapse.HeterConductancePSC` are supported.
+    Online learning runs after propagation, using the same arrival histories.
 
     Constructor arguments are inherited from :class:`RecurrentNN`.
 
     Raises:
-        TypeError: If ``synapse`` is not an exact ``ConductancePSC`` or the
-            neuron has no membrane state ``v``.
-        NotImplementedError: If any backend-bearing module in the network is
-            not plain ``"torch"``.
+        TypeError: If the synapse type is unsupported or the neuron lacks ``v``.
+        NotImplementedError: If cell modules request native cell execution,
+            receptor merging or a fused recurrent schedule.
 
     Examples:
         Run a voltage-aware recurrent sequence while recording its physical
@@ -1750,47 +1757,123 @@ class ConductanceRecurrentNN(RecurrentNN):
     """
 
     def _reject_native_conductance_recurrence(self) -> None:
-        """Validate the explicit Torch COBA schedule before state advances."""
-        if type(self.synapse) is not synapse.ConductancePSC:
+        """Validate voltage-aware scheduling before any state advances."""
+        from .kernels.options import normalize_backend
+
+        if type(self.synapse) not in (
+            synapse.ConductancePSC,
+            synapse.HeterConductancePSC,
+        ):
             raise TypeError(
-                "ConductanceRecurrentNN requires an exact ConductancePSC synapse"
+                "ConductanceRecurrentNN requires an explicit ConductancePSC "
+                "or HeterConductancePSC synapse"
             )
         if not hasattr(self.neuron, "v"):
             raise TypeError(
                 "ConductanceRecurrentNN requires a neuron with membrane state 'v'"
             )
-        unsupported = []
-        for name, module in self.named_modules():
-            if not hasattr(module, "backend"):
-                continue
-            if module.backend != "torch":
-                unsupported.append(name or "network")
+        options = normalize_backend(self.backend)
+        if (
+            options.neuron != "torch"
+            or options.recurrent != "standard"
+            or options.merge_synapse
+            or options.spike_selection != "auto"
+        ):
+            raise NotImplementedError(
+                "ConductanceRecurrentNN requires Torch cells and standard "
+                "recurrence without receptor merging or explicit spike selection"
+            )
+        unsupported = [
+            name
+            for name, module in self.named_modules()
+            if module is not self
+            and hasattr(module, "backend")
+            and module.backend != "torch"
+        ]
         if unsupported:
             raise NotImplementedError(
-                "ConductanceRecurrentNN currently requires plain backend='torch' "
-                "for every backend-bearing module; unsupported: "
-                + ", ".join(unsupported)
+                "ConductanceRecurrentNN requires plain backend='torch' on "
+                "child cell modules; unsupported: " + ", ".join(unsupported)
             )
 
     def single_step_forward(
-        self, x: Tensor, x_syn: Tensor | None = None
+        self,
+        x: Tensor,
+        x_syn: Tensor | None = None,
+        *signal_inputs: Tensor,
+        plasticity_signals: dict[str, Tensor] | None = None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        """Advance one previous-post-reset-voltage conductance step."""
+        """Advance cells, propagate with old weights, then apply online STDP."""
         self._reject_native_conductance_recurrence()
-        if self.neuron_inp_module is not None:
-            x = self.neuron_inp_module(x)
-        if self.syn_inp_module is not None:
-            x_syn = self.syn_inp_module(x_syn)
+        if len(signal_inputs) != len(self._stdp_sequence_names):
+            raise ValueError(
+                "Plasticity signal slots disagree with the prepared sequence"
+            )
+        if signal_inputs:
+            plasticity_signals = {
+                **(plasticity_signals or {}),
+                **dict(zip(self._stdp_sequence_names, signal_inputs, strict=True)),
+            }
+        standalone = bool(self._stdp_bindings and not self._stdp_run_active)
+        try:
+            if standalone:
+                self._begin_stdp_run(x, plasticity_signals)
+            if self.neuron_inp_module is not None:
+                x = self.neuron_inp_module(x)
+            if self.syn_inp_module is not None:
+                x_syn = self.syn_inp_module(x_syn)
+            from .kernels.adapters import connection_scope
+            from .kernels.options import normalize_backend
 
-        voltage_observed = self.neuron.v
-        current = self.synapse.current_charge(voltage_observed)
-        z = base._single_step_call(self.neuron, x + current)
-        event = z if x_syn is None else z + x_syn
-        _ = base._single_step_call(self.synapse, event, voltage_observed)
-        states = filter_hidden_states(
-            self, self.update_state_names, allow_buffer=self.allow_buffer
-        )
-        return z, states
+            # Prepare a standalone sparse route before neuron/PSC mutation;
+            # a sequence's outer scope is reused by the nested scope.
+            scope = (
+                nullcontext()
+                if torch.compiler.is_compiling()
+                else _sparse_run_scope(self, x.unsqueeze(0))
+            )
+            # Multi-step entry already owns the connection scope outside the
+            # compiled region. A generator context around a failing neuron
+            # would obscure its original Dynamo error with a context error.
+            connection_context = (
+                nullcontext()
+                if torch.compiler.is_compiling()
+                else connection_scope(normalize_backend(self.backend))
+            )
+            with connection_context, scope:
+                voltage_observed = self.neuron.v
+                for name, value in (("drive", x), ("synaptic event", x_syn)):
+                    if value is not None and (
+                        not base.is_broadcastable(value.shape, voltage_observed.shape)
+                        or value.device != voltage_observed.device
+                    ):
+                        raise ValueError(
+                            f"{name} must broadcast to the existing neuron state "
+                            "on the same device"
+                        )
+                current = self.synapse.current_charge(voltage_observed)
+                z = base._single_step_call(self.neuron, x + current)
+                event = z if x_syn is None else z + x_syn
+                _ = base._single_step_call(self.synapse, event, voltage_observed)
+                self._apply_stdp(event, z, plasticity_signals)
+            states = filter_hidden_states(
+                self, self.update_state_names, allow_buffer=self.allow_buffer
+            )
+            if self._stdp_bindings:
+                states = {
+                    name: value.clone() if ".plasticity." in name else value
+                    for name, value in states.items()
+                }
+                if self.update_state_names is not None:
+                    weight_name = "synapse.linear.weight.value"
+                    if weight_name in self.update_state_names:
+                        states[weight_name] = self._stdp_bindings[0][
+                            0
+                        ].weight.value.clone()
+            return z, states
+        finally:
+            if standalone:
+                self._end_stdp_run()
 
 
 class ApicalRecurrentNN(RecurrentNN):

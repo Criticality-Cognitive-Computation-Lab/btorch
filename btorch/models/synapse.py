@@ -1321,6 +1321,219 @@ class HeterSynapsePSC(BasePSC):
         return self._reshape_sum_receptor(psc_flat, leading_with_time)
 
 
+class HeterConductancePSC(HeterSynapsePSC):
+    """Combine receptor conductances after voltage-dependent current conversion.
+
+    Each receptor retains its own conductance in ``base_psc.psc``. The outer
+    ``psc`` is the last evaluated total current, not a conductance memory.
+    Recurrence must call ``current_charge(v)`` with the observed voltage anew.
+
+    Args:
+        n_neuron: Target neuron shape.
+        n_receptor: Number of receptor slots per target.
+        receptor_type_index: Optional receptor-name table, as in HeterSynapsePSC.
+        linear: Connection routing to ``post * n_receptor + receptor``.
+        tau_syn: Positive scalar, receptor vector, flat slot vector or tensor
+            with shape ``(*n_neuron, n_receptor)``.
+        reversal_potential: Reversal voltages with the same layouts as tau_syn.
+        step_mode: Single-step or multi-step execution.
+        backend: Torch cell scheduling with an independent connection backend.
+        **kwargs: Delay options accepted by HeterSynapsePSC.
+
+    Notes:
+        Conductance-to-current conversion is performed by ConductancePSC.
+        STP is independent and is not installed by this composite.
+    """
+
+    def __init__(
+        self,
+        n_neuron: int | Sequence[int],
+        n_receptor: int,
+        receptor_type_index: pd.DataFrame | None,
+        linear: nn.Module,
+        *,
+        tau_syn: TensorLike,
+        reversal_potential: TensorLike,
+        step_mode: StepMode = "s",
+        backend: Backend = "torch",
+        **kwargs,
+    ):
+        shape, size = normalize_n_neuron(n_neuron)
+        if n_receptor < 1:
+            raise ValueError("n_receptor must be positive")
+
+        def slots(value, name):
+            value = torch.as_tensor(value)
+            if value.ndim == 0:
+                result = value
+            elif value.shape == (n_receptor,):
+                result = value.repeat(size)
+            elif value.shape in ((size * n_receptor,), (*shape, n_receptor)):
+                result = value.reshape(-1)
+            else:
+                raise ValueError(f"Invalid {name} receptor layout: {value.shape}")
+            if not torch.isfinite(result).all():
+                raise ValueError(f"{name} must be finite")
+            if name == "tau_syn" and not (result > 0).all():
+                raise ValueError("tau_syn must be positive")
+            return result
+
+        super().__init__(
+            n_neuron,
+            n_receptor,
+            receptor_type_index,
+            linear,
+            base_psc=ConductancePSC,
+            step_mode=step_mode,
+            backend="torch",
+            tau_syn=slots(tau_syn, "tau_syn"),
+            reversal_potential=slots(reversal_potential, "reversal_potential"),
+            **kwargs,
+        )
+        self.backend = backend
+        self._check_cell_backend()
+
+    def _check_cell_backend(self):
+        from .kernels.options import normalize_backend
+
+        options = normalize_backend(self.backend)
+        if options.neuron != "torch" or options.merge_synapse:
+            raise NotImplementedError(
+                "HeterConductancePSC requires Torch cell scheduling without merging"
+            )
+
+    def _validate_voltage(self, v, leading):
+        if v is None:
+            raise ValueError("HeterConductancePSC requires postsynaptic voltage")
+        if not isinstance(v, Tensor):
+            raise TypeError("voltage must be a Tensor")
+        target = (*leading, *self.n_neuron)
+        if not is_broadcastable(v.shape, target):
+            raise ValueError(f"voltage shape {v.shape} cannot broadcast to {target}")
+        if v.device != self.base_psc.psc.device:
+            raise ValueError("voltage and conductance must share a device")
+        return v.expand(target)
+
+    def _validate_source(self, source, leading):
+        if source.device != self.base_psc.psc.device:
+            raise ValueError("source and conductance must share a device")
+        if (
+            isinstance(self.linear, nn.Linear)
+            and source.dtype != self.linear.weight.dtype
+            and not torch.is_autocast_enabled(source.device.type)
+        ):
+            raise ValueError("source and dense connection must share a dtype")
+        if tuple(leading) != tuple(self.base_psc.psc.shape[:-1]):
+            raise ValueError("source batch dimensions must match conductance state")
+        expected = (
+            self._n_source
+            if self.delayed_spike is not None
+            else getattr(self.linear, "in_features", None)
+        )
+        if expected is not None and source.shape[-1] != expected:
+            raise ValueError("source neuron axis does not match the connection")
+
+    def get_conductance(self, receptor_type=None):
+        """Read conductance slots; no voltage conversion or state update."""
+        return super().get_psc(receptor_type, validate_nan=False)
+
+    def get_current(self, v: Tensor, receptor_type=None):
+        """Read receptor currents at v, retaining the flat slots when unselected."""
+        leading = self.base_psc.psc.shape[:-1]
+        voltage = self._validate_voltage(v, leading)
+        v_slots = voltage.reshape(*leading, self.size).repeat_interleave(
+            self.n_receptor, dim=-1
+        )
+        current = self.base_psc.current_charge(v_slots)
+        return super().get_psc(receptor_type, psc=current, validate_nan=False)
+
+    def get_psc(self, receptor_type=None, psc=None, validate_nan=True, *, v=None):
+        """Read receptor currents; live queries require explicit voltage."""
+        if psc is not None:
+            return super().get_psc(receptor_type, psc, validate_nan)
+        result = self.get_current(v, receptor_type)
+        if validate_nan and torch.isnan(result).any():
+            raise ValueError("NaN values detected in PSC tensor")
+        return result
+
+    def current_charge(self, v: Tensor | None = None):
+        """Sum currents, rather than conductances, over receptor slots."""
+        current = self.get_current(v)
+        return self._reshape_sum_receptor(current, current.shape[:-1])
+
+    def single_step_forward(self, z: Tensor, v: Tensor | None = None):
+        self._check_cell_backend()
+        z_flat, leading, has_receptor_axis = self._flatten_input(z)
+        self._validate_source(z_flat, leading)
+        voltage = self._validate_voltage(v, leading)
+        if self.delayed_spike is not None:
+            self._validate_delayed_input(has_receptor_axis, z.shape)
+        from contextlib import nullcontext
+
+        from .kernels.adapters import connection_scope
+        from .kernels.options import normalize_backend
+        from .rnn import _sparse_run_scope
+
+        scope = (
+            nullcontext()
+            if torch.compiler.is_compiling()
+            else _sparse_run_scope(self, z_flat.unsqueeze(0))
+        )
+        with (
+            connection_scope(normalize_backend(self.backend)),
+            scope,
+        ):
+            if self.delayed_spike is not None:
+                z_flat = self._delay_expand(z_flat)
+            self.base_psc.single_step_forward(z_flat)
+        self.psc = self.current_charge(voltage)
+        return self.psc
+
+    def multi_step_forward(self, z_seq: Tensor, kernel_len=64, *, v_seq=None):
+        """Advance live conductance/delay state for each supplied voltage step.
+
+        v_seq has leading length T or 1. kernel_len is accepted for interface
+        compatibility but never selects a stateless convolution.
+        """
+        self._check_cell_backend()
+        if v_seq is None or v_seq.ndim == 0:
+            raise ValueError("v_seq must have a leading time dimension")
+        source, leading, has_receptor_axis = self._flatten_input(z_seq)
+        self._validate_source(source, leading[1:])
+        steps = z_seq.shape[0]
+        if v_seq.shape[0] not in (1, steps):
+            raise ValueError("v_seq time length must be 1 or match z_seq")
+        target = (*leading[1:], *self.n_neuron)
+        if not is_broadcastable(v_seq.shape[1:], target):
+            raise ValueError("v_seq cannot broadcast to the target neuron shape")
+        if v_seq.device != self.base_psc.psc.device:
+            raise ValueError("voltage and conductance must share a device")
+        if self.delayed_spike is not None:
+            self._validate_delayed_input(has_receptor_axis, z_seq.shape)
+        if not steps:
+            # Reuse the physical expression for dtype promotion and zero VJPs
+            # to live g, E and voltage; an allocated empty tensor drops them.
+            padding = len(target) - (v_seq.ndim - 1)
+            voltage = v_seq.reshape(
+                v_seq.shape[0], *((1,) * padding), *v_seq.shape[1:]
+            ).expand(0, *target)
+            slots = voltage.reshape(0, *leading[1:], self.size).repeat_interleave(
+                self.n_receptor, -1
+            )
+            current = self.base_psc.current_charge(slots)
+            return (
+                current.reshape(0, *target, self.n_receptor).sum(-1) + z_seq.sum() * 0
+            )
+        return torch.stack(
+            [
+                self.single_step_forward(
+                    z_seq[t], v_seq[0 if v_seq.shape[0] == 1 else t]
+                )
+                for t in range(steps)
+            ]
+        )
+
+
 class GapJunction(nn.Module):
     """Electrical synapse (gap junction) for direct coupling between neurons.
 

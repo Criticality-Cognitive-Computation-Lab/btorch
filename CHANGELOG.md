@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `HeterConductancePSC` for voltage-aware multi-receptor conductances and
+  extend `ConductanceRecurrentNN` to eager Torch cells with independent sparse
+  push/pull propagation and online learning after propagation. Add a small CPU
+  Izhikevich E/I example with positive conductance weights, excitatory-only
+  PairSTDP, a static control and optional JSON summaries. No STP or fused
+  conductance cell lowering is introduced; existing defaults are unchanged.
+
 - Add fresh-process Izhikevich inference, BPTT and STDP benchmarks reusing
   the examples, with cold/warm timing and explicit Torch/native CUDA Graph
   comparisons at 4096 and 60,000 neurons.

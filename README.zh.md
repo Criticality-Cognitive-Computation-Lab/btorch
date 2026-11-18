@@ -51,6 +51,18 @@
 可运行 `python -m benchmarks.rsnn_izhikevich.run`，详见
 [benchmark 说明](benchmarks/rsnn_izhikevich/README.md)。
 
+小规模 CPU 电导回路与可选兴奋性 STDP：
+
+```bash
+python -m examples.rsnn_izhikevich_conductance_stdp
+python -m examples.rsnn_izhikevich_conductance_stdp --no-plasticity
+```
+
+该确定性合成环形回路组合原生 `Izhikevich`、E/I `HeterConductancePSC`
+和 `ConductanceRecurrentNN`，使用正电导权重、eager Torch 细胞和独立选择的
+稀疏传播；不配置 STP，不自动记录历史。参见
+[电导示例说明](docs/zh/docs/examples.md#ei-电导与可选-stdp)。已有示例默认设置不变。
+
 ## Cell 后端与外部 kernel
 
 使用 `KernelOptions(cell="triton", connection="auto")` 独立选择 cell dynamics

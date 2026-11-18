@@ -237,3 +237,61 @@ Online STDP runs under `torch.no_grad()`; it does not implement BPTT through the
 weight updates. Use the original Izhikevich example for checkpointed/offloaded
 BPTT training and SONATA circuit IO. See [plasticity](guides/plasticity.md) for
 custom rules, ordering and backend support.
+
+
+## E/I conductance with optional STDP
+
+`examples/rsnn_izhikevich_conductance_stdp.py` builds a deterministic synthetic
+ring: each source targets the next two neurons, every fifth source is inhibitory,
+and all other sources are excitatory. This is an API demonstration, not a
+reproduction of hippocampal connectivity. Defaults are 32 neurons, 400 steps,
+`dt=0.2 ms`, CPU float32, pull propagation and enabled pair STDP.
+
+```bash
+python -m examples.rsnn_izhikevich_conductance_stdp
+python -m examples.rsnn_izhikevich_conductance_stdp --no-plasticity
+python -m examples.rsnn_izhikevich_conductance_stdp --neurons 64 --steps 800 \
+    --dt 0.2 --device cpu --method pull --sparse-backend torch --output /tmp/conductance.json
+```
+
+Native `Izhikevich` neurons receive heterogeneous deterministic DC input.
+`HeterConductancePSC` retains two conductance slots per neuron with
+`tau_syn=[5, 10] ms` and reversal potentials `[0, -80] mV`. All edge weights
+are positive nS increments: inhibition comes from `g_I * (E_I - v)`, not a
+negative weight. `base_psc.psc` stores conductance; the outer `psc` stores the
+last evaluated total current. Query live receptor currents with explicit
+voltage (`synapse.get_current(v, receptor_type=0)`), or inspect conductance
+with `synapse.get_conductance(0)`.
+
+`ConductanceRecurrentNN` evaluates current from preceding conductance and
+post-reset voltage, advances the neuron, propagates emitted spikes with old
+weights, then applies STDP. New weights affect the next propagation. E edges
+have positive bounds; I edges have zero amplitudes and equal bounds at their
+initial positive values. Receptors remain unchanged. `--no-plasticity` omits
+the rule while constructing the same circuit, initial states and drive; later
+spikes may differ when learning is enabled. This example has no STP.
+
+Both child cell modules retain literal `backend="torch"`. The RNN uses
+`KernelOptions(neuron="torch", connection=..., connection_method=...)`.
+`--method pull|push` and `--sparse-backend auto|torch|triton` select sparse
+propagation independently. For example, on an allocated CUDA device,
+`--device cuda --method push --sparse-backend triton` requests Triton sparse
+push while cells and learning remain eager Torch. Unsupported explicit routes
+raise; CPU Torch supports pull, not push. This does not enable native fused
+conductance cells or HELION. CUDA
+atomic push need not be bitwise reproducible.
+
+The `dt` context covers construction, initialization and simulation. Simulation
+continues in blocks of at most 32 steps with `update_state_names=()`; only
+spike counts and final summaries are retained, with no automatic recordings.
+The printed JSON includes canonical weight owner/tensor identity checks,
+state-name and receptor preservation, E/I edge change counts, finite-state
+checks and `connection.explain()` under the execution's sparse routing scope.
+Short runs may have no spike pairs and therefore no learned changes.
+
+`simulation_seconds` measures one actual eager run, including first-use
+routing, block inputs and spike counting, with CUDA synchronization when
+needed. Construction/reset, final validation/transfers and disk writes are
+excluded. It is not a warm benchmark or a speedup comparison. `--output PATH`
+saves this JSON only; by default nothing is written. For large CUDA runs,
+follow your site's GPU allocation rules.

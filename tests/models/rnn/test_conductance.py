@@ -401,7 +401,9 @@ def test_invalid_conductance_schedule_rejects_before_callbacks_or_state(invalid,
         neuron,
         psc,
         neuron_inp_module=callback,
-        backend=KernelOptions() if invalid == "network_backend" else "torch",
+        backend=KernelOptions(neuron="triton")
+        if invalid == "network_backend"
+        else "torch",
     )
     if invalid == "neuron_backend":
         neuron.backend = KernelOptions()
