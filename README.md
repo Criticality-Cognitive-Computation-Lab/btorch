@@ -266,3 +266,8 @@ npx skills add https://github.com/Criticality-Cognitive-Computation-Lab/btorch/t
 <!-- prettier-ignore-end -->
 
 <!-- ALL-CONTRIBUTORS-LIST:END -->
+
+For fixed-weight CUDA conductance inference, `FusedConductanceRecurrentNN`
+extends the reference RNN with fused FP32 Izhikevich/conductance cells, the
+existing Triton push, chunk CUDA Graph replay and bounded GPU recording. See
+[the fused conductance guide](docs/en/docs/guides/kernel_backends.md#fixed-weight-fused-conductance-inference).

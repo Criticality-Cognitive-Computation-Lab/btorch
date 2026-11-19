@@ -2054,3 +2054,158 @@ class SomaApicalRecurrentNN(ApicalRecurrentNN):
             **kwargs,
         )
         self.synapse_soma = synapse_soma
+
+
+class FusedConductanceRecurrentNN(ConductanceRecurrentNN):
+    r"""Run fixed-weight Izhikevich conductance inference with fused Triton cells
+
+    Inherit the physical state and voltage-aware event schedule of
+    :class:`ConductanceRecurrentNN`. A local kernel evaluates receptor currents,
+    advances/resets the neuron, decays conductances and emits the existing
+    sparse runtime's spike list. The existing Triton push kernel propagates
+    those events; a final local kernel adds their conductance increments.
+    Thus an event first affects membrane current in the following frame.
+
+    ``run_chunk`` returns GPU-owned recording buffers. Clone or transfer them
+    before the next call with the same layout overwrites them. CUDA Graph
+    preparation restores all physical states after warmup and capture.
+    Changes of parameters, weights, topology or state storage require a new
+    prepared chunk and are detected before replay.
+
+    Args:
+        neuron: FP32 Izhikevich neuron with hard reset and one network batch.
+        synapse: HeterConductancePSC with a fixed SparseConnection, one to
+            eight receptor slots and no additional delay, STP or plasticity.
+        cudagraph: Capture fixed-length chunks, by default True. Graphs are
+            prepared lazily in a valid CUDA execution environment.
+        **kwargs: Reference RNN options. Full state-history requests and
+            gradient recording are unsupported; use the explicit probe and
+            current recordings in ``run_chunk`` instead.
+
+    Notes:
+        This inference path keeps the Torch discretization and accurately
+        rounded division; it does not enable fast math or FMA contraction.
+        CUDA push atomic sums retain their documented nondeterminism.
+        CPU ``forward`` uses the inherited reference, while ``run_chunk``
+        requires CUDA and disabled gradients. Neuron and synapse module
+        backends stay Torch so the original reference path remains callable.
+    """
+
+    def __init__(self, neuron, synapse, *, cudagraph=True, **kwargs):
+        from .connection import SparseConnection
+        from .kernels.options import KernelOptions
+        from .neurons import Izhikevich
+
+        if not isinstance(neuron, Izhikevich) or not neuron.hard_reset:
+            raise TypeError(
+                "Fused conductance inference requires hard-reset Izhikevich"
+            )
+        from .synapse import HeterConductancePSC
+
+        if not isinstance(synapse, HeterConductancePSC):
+            raise TypeError("Fused conductance inference requires HeterConductancePSC")
+        connection = synapse.linear
+        if not isinstance(connection, SparseConnection):
+            raise TypeError("Fused conductance inference requires SparseConnection")
+        if connection.plasticity is not None or connection.transmission is not None:
+            raise NotImplementedError(
+                "Fused inference requires fixed weights without STP"
+            )
+        if (
+            connection.bias is not None
+            or connection.batch_shape
+            or connection.n_delay != 1
+        ):
+            raise NotImplementedError(
+                "Fused inference requires unbatched bias-free zero-delay edges"
+            )
+        if synapse.delayed_spike is not None or not 1 <= synapse.n_receptor <= 8:
+            raise NotImplementedError(
+                "Fused inference supports one to eight undelayed receptors"
+            )
+        kwargs.setdefault("update_state_names", ())
+        if kwargs["update_state_names"] not in ((), []):
+            raise NotImplementedError(
+                "Use run_chunk probe recordings instead of full state histories"
+            )
+        kwargs.setdefault(
+            "backend",
+            KernelOptions(connection="triton", connection_method="push")
+            if connection.weight.value.device.type == "cuda"
+            else KernelOptions(connection="torch", connection_method="pull"),
+        )
+        super().__init__(neuron, synapse, cudagraph=False, **kwargs)
+        self.fused_cudagraph = bool(cudagraph)
+        self._fused_chunks = {}
+
+    @classmethod
+    def from_reference(cls, reference, *, cudagraph=True):
+        """Share the reference's physical modules without resetting their state"""
+        if not isinstance(reference, ConductanceRecurrentNN):
+            raise TypeError("Expected ConductanceRecurrentNN")
+        return cls(reference.neuron, reference.synapse, cudagraph=cudagraph)
+
+    def clear_fused_cache(self):
+        """Release graphs and derived sparse bindings, retaining physical state"""
+        self._fused_chunks.clear()
+
+    def run_chunk(
+        self,
+        inputs,
+        *,
+        hold_steps=1,
+        probe_ids=None,
+        group_index=None,
+        current_stride=0,
+        cudagraph=None,
+        check=True,
+    ):
+        """Advance a fixed chunk and return borrowed GPU recordings
+
+        Args:
+            inputs: Contiguous FP32 CUDA tensor [frames, 1, neurons] or
+                [frames, neurons]. Each frame is held for ``hold_steps``.
+            hold_steps: Positive number of neuron frames per input frame.
+            probe_ids: Optional unique global neuron IDs to record before and
+                after each step. Omission records no voltage/current probes.
+            group_index: Optional per-neuron integer group labels starting at
+                zero, used for fine-step population spike/current summaries.
+            current_stride: Record full-cell signed currents every this many
+                steps, starting at the first step. Zero disables this record.
+                Slot zero is EPSC; the remaining slots form signed IPSC.
+            cudagraph: Override the constructor's graph choice for this call.
+            check: Raise on an invalid physical state observed within the chunk.
+
+        Returns:
+            Dictionary of dense/packed spikes, selected probe trajectories,
+            optional full-cell E/I currents, group spike/current sums, an error
+            flag and preparation/execution metadata. Buffers alias later calls
+            with the same layout; clone or offload them before reuse.
+        """
+        from .kernels.fused_conductance import run_chunk
+
+        return run_chunk(
+            self,
+            inputs,
+            hold_steps=hold_steps,
+            probe_ids=probe_ids,
+            group_index=group_index,
+            current_stride=current_stride,
+            cudagraph=self.fused_cudagraph if cudagraph is None else cudagraph,
+            check=check,
+        )
+
+    def single_step_forward(self, x, x_syn=None, *args, **kwargs):
+        if x.device.type != "cuda":
+            return super().single_step_forward(x, x_syn, *args, **kwargs)
+        if x_syn is not None or args or kwargs:
+            raise NotImplementedError("Fused inference accepts external current only")
+        result = self.run_chunk(x.unsqueeze(0), cudagraph=False)
+        return result["spikes"][0], {}
+
+    def multi_step_forward(self, x_seq, *args, **kwargs):
+        if x_seq.device.type != "cuda":
+            return super().multi_step_forward(x_seq, *args, **kwargs)
+        if args or kwargs:
+            raise NotImplementedError("Use run_chunk for fused recording options")
+        return self.run_chunk(x_seq)["spikes"], {}

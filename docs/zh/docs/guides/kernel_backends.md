@@ -170,3 +170,37 @@ options = KernelOptions(neuron="triton", fast_math=False, enable_fp_fusion=False
 [SGLang PR #48942](https://github.com/sgl-project/sglang/pull/48942) 的显式快速/精确
 数学模式，不依赖全局编译器 fast-math 开关。CuPy 显式选择指数指令，两个模式的
 `expm1` 均使用 libdevice。
+
+### 固定权重电导融合推理
+
+`FusedConductanceRecurrentNN`继承`ConductanceRecurrentNN`，新增FP32 CUDA
+Izhikevich电导推理路径。它保留原时序：先用旧电导/当前膜电位求电流，再更新、发放和
+重置神经元，复用Triton源CSR push传播，最后完成电导更新；各受体及τ不合并。
+原参考类、学习和自动微分行为保持。
+
+```python
+from btorch.models import environ
+from btorch.models.rnn import FusedConductanceRecurrentNN
+
+fast = FusedConductanceRecurrentNN.from_reference(reference, cudagraph=True)
+with torch.no_grad(), environ.context(dt=0.2):
+    record = fast.run_chunk(
+        current_frames,       # FP32 CUDA [frames,1,neurons]
+        hold_steps=5,         # 每个1ms输入保持五个0.2ms步
+        probe_ids=probe_ids,
+        group_index=groups,
+        current_stride=5,     # 每1ms记录全细胞有符号E/I；0关闭
+    )
+    packed = record["packed_spikes"].cpu()  # 下次调用前归档
+```
+
+Graph准备在预热/捕获后恢复物理状态；真正的科学步由随后执行推进。参数、权重、
+拓扑或状态存储改变会使缓存重建；`clear_fused_cache()`仅释放派生缓存而不重置状态。
+返回的GPU记录缓冲由后续同布局调用覆盖，保留历史时须clone或转CPU。可记录细步spike、
+步前V/g/电流、步后探针状态、群体和及全细胞E/I；0号受体为EPSC，其余有符号和为IPSC。
+GPU在每步累计异常标志，块末检查不会漏掉块内瞬时异常。外部输入RNG和实验时钟由调用者管理。
+
+首版仅支持batch1、hard-reset Izhikevich、一至八受体、FP32、无bias/额外延迟/STP/可塑性
+的固定权重推理；普通CPU forward仍走参考。融合接口用显式探针，不提供完整自动微分历史。
+内核关闭FMA收缩并使用准确除法，但push原子累积仍不保证长轨迹逐位重复。
+性能须同时说明块长、活动率、输入/记录和存储成本，单列Graph准备与重放耗时。

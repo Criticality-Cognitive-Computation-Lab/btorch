@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `FusedConductanceRecurrentNN`, derived from the reference conductance
+  RNN, for fixed-weight FP32 Izhikevich inference using fused local cells,
+  existing Triton spike-list push, chunk CUDA Graphs and explicit bounded
+  GPU recordings. Preserve the reference physics/event schedule and old
+  class; restore capture state and invalidate changed execution bindings.
+
 - Add `HeterConductancePSC` for voltage-aware multi-receptor conductances and
   extend `ConductanceRecurrentNN` to eager Torch cells with independent sparse
   push/pull propagation and online learning after propagation. Add a small CPU
