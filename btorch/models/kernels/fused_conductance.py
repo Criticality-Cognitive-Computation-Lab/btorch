@@ -210,6 +210,7 @@ class _Chunk:
             external_pa=empty(t, p),
             group_spikes=empty(t, ng, dtype=torch.int32),
             group_current_sum_pa=empty(t, ng, r),
+            cell_current_sum_pa=empty(n, r, dtype=torch.float64),
             epsc_pa=empty(t // stride if stride else 0, n),
             ipsc_pa=empty(t // stride if stride else 0, n),
             errors=torch.zeros((), device=inputs.device, dtype=torch.int32),
@@ -311,6 +312,7 @@ class _Chunk:
         o["errors"].zero_()
         o["group_spikes"].zero_()
         o["group_current_sum_pa"].zero_()
+        o["cell_current_sum_pa"].zero_()
         for step in range(self.steps):
             cell[self.grid](
                 m.neuron.v,
@@ -339,6 +341,7 @@ class _Chunk:
                 o["ipsc_pa"],
                 o["group_spikes"],
                 o["group_current_sum_pa"],
+                o["cell_current_sum_pa"],
                 o["errors"],
                 queue.degree,
                 queue.indices,
@@ -449,6 +452,7 @@ def _kernels():
         FI,
         GC,
         GI,
+        CELL_CURRENT_SUM,
         ERROR,
         DEGREE,
         ACTIVE,
@@ -478,6 +482,12 @@ def _kernels():
             g = tl.load(G + i * R + r, valid, 0)
             rev = tl.load(REV + i * R + r, valid, 0)
             cur = g * (rev - v)
+            previous_sum = tl.load(CELL_CURRENT_SUM + i * R + r, valid, 0.0)
+            tl.store(
+                CELL_CURRENT_SUM + i * R + r,
+                previous_sum + cur.to(tl.float64),
+                valid,
+            )
             total = total + cur
             if r == 0:
                 exc = cur

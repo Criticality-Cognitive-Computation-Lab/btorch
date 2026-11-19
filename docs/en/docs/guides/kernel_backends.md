@@ -572,3 +572,5 @@ contraction and uses accurate division, while retaining CUDA push atomic
 nondeterminism. No speed is promised independently of chunk size, activity,
 input generation, recording and storage costs. CUDA Graph setup and replay
 should be timed separately from loading and IO.
+
+`cell_current_sum_pa` contains FP64 per-cell/per-receptor current sums over every fine step of the current chunk. These recording sums reset on each call, including Graph replay; dividing by the number of cell steps preserves fine-step mean-current/ECI statistics without full current-history transfers.

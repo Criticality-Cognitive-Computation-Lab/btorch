@@ -271,3 +271,5 @@ For fixed-weight CUDA conductance inference, `FusedConductanceRecurrentNN`
 extends the reference RNN with fused FP32 Izhikevich/conductance cells, the
 existing Triton push, chunk CUDA Graph replay and bounded GPU recording. See
 [the fused conductance guide](docs/en/docs/guides/kernel_backends.md#fixed-weight-fused-conductance-inference).
+
+Fused chunk recordings also expose FP64 per-cell/per-receptor current sums over every cell step, independently of the full-current sampling stride. These sums reset on each call and allow fine-step mean-current/ECI statistics without transferring full current histories.

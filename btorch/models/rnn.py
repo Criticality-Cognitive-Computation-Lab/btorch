@@ -2178,8 +2178,9 @@ class FusedConductanceRecurrentNN(ConductanceRecurrentNN):
 
         Returns:
             Dictionary of dense/packed spikes, selected probe trajectories,
-            optional full-cell E/I currents, group spike/current sums, an error
-            flag and preparation/execution metadata. Buffers alias later calls
+            optional full-cell E/I currents, group spike/current sums, FP64
+            ``cell_current_sum_pa[neurons, receptors]`` over every fine step,
+            an error flag and preparation/execution metadata. Buffers alias later calls
             with the same layout; clone or offload them before reuse.
         """
         from .kernels.fused_conductance import run_chunk

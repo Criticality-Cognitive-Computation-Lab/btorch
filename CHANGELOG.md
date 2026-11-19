@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Record per-cell, per-receptor fine-step current sums in FP64 in fused
+  conductance chunks, without transferring full current histories. Reset
+  these recording sums for every call, including CUDA Graph replay.
+
 - Add `FusedConductanceRecurrentNN`, derived from the reference conductance
   RNN, for fixed-weight FP32 Izhikevich inference using fused local cells,
   existing Triton spike-list push, chunk CUDA Graphs and explicit bounded

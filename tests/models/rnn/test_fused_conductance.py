@@ -263,3 +263,27 @@ def test_layout_eviction_keeps_the_physical_trajectory():
                 native.neuron.v, reference.neuron.v, atol=3e-5, rtol=2e-6
             )
             assert len(native._fused_chunks) <= 4
+
+
+@GPU
+@pytest.mark.parametrize("graph", [False, True])
+def test_fine_step_current_sums_reset_on_every_chunk(graph):
+    # Retained fine-step histories independently expose a missed reset or an
+    # accumulation at the coarse input/recording rate instead of every cell step.
+    with torch.no_grad(), environ.context(dt=0.2):
+        native = FusedConductanceRecurrentNN.from_reference(
+            model("cuda", n=131), cudagraph=graph
+        )
+        probes = torch.arange(131, device="cuda")
+        for amplitude in [500.0, 0.0, 700.0]:
+            result = native.run_chunk(
+                torch.full((15, 1, 131), amplitude, device="cuda"),
+                hold_steps=5,
+                probe_ids=probes,
+                current_stride=5,
+            )
+            expected = result["pre_current_pa"].double().sum(0)
+            assert result["cell_current_sum_pa"].dtype == torch.float64
+            torch.testing.assert_close(
+                result["cell_current_sum_pa"], expected, rtol=2e-13, atol=1e-10
+            )
