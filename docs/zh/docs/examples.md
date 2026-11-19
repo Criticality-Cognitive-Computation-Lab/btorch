@@ -203,3 +203,50 @@ python -m examples.rsnn_izhikevich_stdp --neurons 128 --density .05 --steps 256 
 在线 STDP 使用 `torch.no_grad()`，不对在线权重更新执行 BPTT。
 需要检查点/CPU offload 的 BPTT 训练和 SONATA 回路 IO 时，使用原 Izhikevich 示例。
 自定义规则、事件顺序和后端支持见[可塑性指南](guides/plasticity.md)。
+
+
+## E/I 电导与可选 STDP
+
+`examples/rsnn_izhikevich_conductance_stdp.py` 创建确定性的合成环形回路：
+每个源连接后续两个神经元，每第五个源为抑制性，其余为兴奋性。
+这是接口示例，不是海马真实连接拓扑复现。默认 32 个神经元、400 步、
+`dt=0.2 ms`、CPU float32、pull 传播，并启用 PairSTDP。
+
+```bash
+python -m examples.rsnn_izhikevich_conductance_stdp
+python -m examples.rsnn_izhikevich_conductance_stdp --no-plasticity
+python -m examples.rsnn_izhikevich_conductance_stdp --neurons 64 --steps 800 \
+    --dt 0.2 --device cpu --method pull --sparse-backend torch --output /tmp/conductance.json
+```
+
+原生 `Izhikevich` 接收异质确定性 DC 输入。`HeterConductancePSC` 为每个神经元
+保存两个电导槽，时间常数 `[5, 10] ms`，反转电位 `[0, -80] mV`。
+所有边权均为正电导增量（nS），抑制来自 `g_I * (E_I - v)`。
+`base_psc.psc` 保存电导，外层 `psc` 保存上次计算的总电流；用
+`synapse.get_current(v, receptor_type=0)` 显式提供电压查询受体电流，
+用 `synapse.get_conductance(0)` 查询电导。
+
+`ConductanceRecurrentNN` 以先前电导和复位后电压计算电流，推进神经元，
+用旧权重传播发放，最后更新 STDP；新权重用于下一次传播。E 边上下界为正，
+I 边学习幅度为零、上下界都等于其初始正权重，受体不变。
+`--no-plasticity` 不挂学习规则，回路、初态和输入与学习版相同；
+学习后的发放可以不同。本例没有 STP。
+
+两个细胞模块均保持字面值 `backend="torch"`。RNN 使用
+`KernelOptions(neuron="torch", connection=..., connection_method=...)`。
+`--method pull|push` 和 `--sparse-backend auto|torch|triton` 独立控制稀疏传播。
+例如在已分配的 CUDA 设备上，`--device cuda --method push --sparse-backend triton`
+选择 Triton 稀疏 push，细胞与学习仍为 eager Torch；不支持的显式路由会报错。
+CPU Torch 支持 pull、不支持 push。这不启用原生融合电导细胞或 HELION，
+CUDA 原子 push 不保证逐位重现。
+
+`dt` 上下文覆盖构建、初始化和全部仿真。每块至多 32 步，连续运行且不重置；
+`update_state_names=()` 关闭历史，只累积发放计数和最终摘要，不自动录制。
+JSON 报告规范权重持有者/张量身份、状态名称与受体保持情况、E/I 权重变化边数、
+最终状态有限性，以及在相同稀疏执行作用域内得到的 `connection.explain()`。
+短仿真可能没有有效 spike 配对，因此不一定产生权重变化。
+
+`simulation_seconds` 是一次真实 eager 运行的计时，包含首次路由、分块输入和
+发放计数，CUDA 时在边界同步；不含构建/重置、最终验证/传输及写盘。
+它不是预热后基准，也不报告加速比。默认只打印摘要，`--output PATH`
+仅保存 JSON。CUDA 运行应遵守所在机器的 GPU 资源分配要求。

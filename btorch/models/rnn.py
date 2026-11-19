@@ -1117,10 +1117,12 @@ class RecurrentNN(RecurrentNNAbstract):
                 "Online STDP is not supported for ApicalRecurrentNN; use one "
                 "recurrent synapse with an explicit eager STDP schedule."
             )
-        if type(self.synapse) is synapse.ConductancePSC:
+        if type(self.synapse) in (
+            synapse.ConductancePSC,
+            synapse.HeterConductancePSC,
+        ) and not isinstance(self, ConductanceRecurrentNN):
             raise NotImplementedError(
-                "Online STDP is not supported for conductance recurrence until "
-                "the voltage-aware eager schedule is integrated."
+                "Online conductance STDP requires ConductanceRecurrentNN"
             )
         if isinstance(self.synapse, synapse.DelayedPSC):
             raise NotImplementedError(
@@ -1529,7 +1531,11 @@ class RecurrentNN(RecurrentNNAbstract):
         )
 
     def _reject_native_conductance_recurrence(self) -> None:
-        """Reject COBA until recurrence supplies the observed voltage."""
+        """Reject unsupported recurrences without observed-voltage coupling."""
+        if type(self.synapse) is synapse.HeterConductancePSC:
+            raise NotImplementedError(
+                "HeterConductancePSC requires ConductanceRecurrentNN"
+            )
         from .kernels.options import normalize_backend
 
         recurrent_synapses = (self.synapse, getattr(self, "synapse_apical", None))
@@ -1725,16 +1731,17 @@ class ConductanceRecurrentNN(RecurrentNN):
     The neuron advances, fires, and resets before its emitted spikes update the
     conductance. A recurrent spike emitted at step :math:`t` can therefore
     affect membrane current beginning at step :math:`t+1`. This initial public
-    schedule is deliberately Torch-only and requires the exact
-    :class:`~btorch.models.synapse.ConductancePSC` class.
+    schedule uses Torch cells with independent sparse connection routing.
+    Both :class:`~btorch.models.synapse.ConductancePSC` and
+    :class:`~btorch.models.synapse.HeterConductancePSC` are supported.
+    Online learning runs after propagation, using the same arrival histories.
 
     Constructor arguments are inherited from :class:`RecurrentNN`.
 
     Raises:
-        TypeError: If ``synapse`` is not an exact ``ConductancePSC`` or the
-            neuron has no membrane state ``v``.
-        NotImplementedError: If any backend-bearing module in the network is
-            not plain ``"torch"``.
+        TypeError: If the synapse type is unsupported or the neuron lacks ``v``.
+        NotImplementedError: If cell modules request native cell execution,
+            receptor merging or a fused recurrent schedule.
 
     Examples:
         Run a voltage-aware recurrent sequence while recording its physical
@@ -1750,47 +1757,123 @@ class ConductanceRecurrentNN(RecurrentNN):
     """
 
     def _reject_native_conductance_recurrence(self) -> None:
-        """Validate the explicit Torch COBA schedule before state advances."""
-        if type(self.synapse) is not synapse.ConductancePSC:
+        """Validate voltage-aware scheduling before any state advances."""
+        from .kernels.options import normalize_backend
+
+        if type(self.synapse) not in (
+            synapse.ConductancePSC,
+            synapse.HeterConductancePSC,
+        ):
             raise TypeError(
-                "ConductanceRecurrentNN requires an exact ConductancePSC synapse"
+                "ConductanceRecurrentNN requires an explicit ConductancePSC "
+                "or HeterConductancePSC synapse"
             )
         if not hasattr(self.neuron, "v"):
             raise TypeError(
                 "ConductanceRecurrentNN requires a neuron with membrane state 'v'"
             )
-        unsupported = []
-        for name, module in self.named_modules():
-            if not hasattr(module, "backend"):
-                continue
-            if module.backend != "torch":
-                unsupported.append(name or "network")
+        options = normalize_backend(self.backend)
+        if (
+            options.neuron != "torch"
+            or options.recurrent != "standard"
+            or options.merge_synapse
+            or options.spike_selection != "auto"
+        ):
+            raise NotImplementedError(
+                "ConductanceRecurrentNN requires Torch cells and standard "
+                "recurrence without receptor merging or explicit spike selection"
+            )
+        unsupported = [
+            name
+            for name, module in self.named_modules()
+            if module is not self
+            and hasattr(module, "backend")
+            and module.backend != "torch"
+        ]
         if unsupported:
             raise NotImplementedError(
-                "ConductanceRecurrentNN currently requires plain backend='torch' "
-                "for every backend-bearing module; unsupported: "
-                + ", ".join(unsupported)
+                "ConductanceRecurrentNN requires plain backend='torch' on "
+                "child cell modules; unsupported: " + ", ".join(unsupported)
             )
 
     def single_step_forward(
-        self, x: Tensor, x_syn: Tensor | None = None
+        self,
+        x: Tensor,
+        x_syn: Tensor | None = None,
+        *signal_inputs: Tensor,
+        plasticity_signals: dict[str, Tensor] | None = None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        """Advance one previous-post-reset-voltage conductance step."""
+        """Advance cells, propagate with old weights, then apply online STDP."""
         self._reject_native_conductance_recurrence()
-        if self.neuron_inp_module is not None:
-            x = self.neuron_inp_module(x)
-        if self.syn_inp_module is not None:
-            x_syn = self.syn_inp_module(x_syn)
+        if len(signal_inputs) != len(self._stdp_sequence_names):
+            raise ValueError(
+                "Plasticity signal slots disagree with the prepared sequence"
+            )
+        if signal_inputs:
+            plasticity_signals = {
+                **(plasticity_signals or {}),
+                **dict(zip(self._stdp_sequence_names, signal_inputs, strict=True)),
+            }
+        standalone = bool(self._stdp_bindings and not self._stdp_run_active)
+        try:
+            if standalone:
+                self._begin_stdp_run(x, plasticity_signals)
+            if self.neuron_inp_module is not None:
+                x = self.neuron_inp_module(x)
+            if self.syn_inp_module is not None:
+                x_syn = self.syn_inp_module(x_syn)
+            from .kernels.adapters import connection_scope
+            from .kernels.options import normalize_backend
 
-        voltage_observed = self.neuron.v
-        current = self.synapse.current_charge(voltage_observed)
-        z = base._single_step_call(self.neuron, x + current)
-        event = z if x_syn is None else z + x_syn
-        _ = base._single_step_call(self.synapse, event, voltage_observed)
-        states = filter_hidden_states(
-            self, self.update_state_names, allow_buffer=self.allow_buffer
-        )
-        return z, states
+            # Prepare a standalone sparse route before neuron/PSC mutation;
+            # a sequence's outer scope is reused by the nested scope.
+            scope = (
+                nullcontext()
+                if torch.compiler.is_compiling()
+                else _sparse_run_scope(self, x.unsqueeze(0))
+            )
+            # Multi-step entry already owns the connection scope outside the
+            # compiled region. A generator context around a failing neuron
+            # would obscure its original Dynamo error with a context error.
+            connection_context = (
+                nullcontext()
+                if torch.compiler.is_compiling()
+                else connection_scope(normalize_backend(self.backend))
+            )
+            with connection_context, scope:
+                voltage_observed = self.neuron.v
+                for name, value in (("drive", x), ("synaptic event", x_syn)):
+                    if value is not None and (
+                        not base.is_broadcastable(value.shape, voltage_observed.shape)
+                        or value.device != voltage_observed.device
+                    ):
+                        raise ValueError(
+                            f"{name} must broadcast to the existing neuron state "
+                            "on the same device"
+                        )
+                current = self.synapse.current_charge(voltage_observed)
+                z = base._single_step_call(self.neuron, x + current)
+                event = z if x_syn is None else z + x_syn
+                _ = base._single_step_call(self.synapse, event, voltage_observed)
+                self._apply_stdp(event, z, plasticity_signals)
+            states = filter_hidden_states(
+                self, self.update_state_names, allow_buffer=self.allow_buffer
+            )
+            if self._stdp_bindings:
+                states = {
+                    name: value.clone() if ".plasticity." in name else value
+                    for name, value in states.items()
+                }
+                if self.update_state_names is not None:
+                    weight_name = "synapse.linear.weight.value"
+                    if weight_name in self.update_state_names:
+                        states[weight_name] = self._stdp_bindings[0][
+                            0
+                        ].weight.value.clone()
+            return z, states
+        finally:
+            if standalone:
+                self._end_stdp_run()
 
 
 class ApicalRecurrentNN(RecurrentNN):
@@ -1971,3 +2054,159 @@ class SomaApicalRecurrentNN(ApicalRecurrentNN):
             **kwargs,
         )
         self.synapse_soma = synapse_soma
+
+
+class FusedConductanceRecurrentNN(ConductanceRecurrentNN):
+    r"""Run fixed-weight Izhikevich conductance inference with fused Triton cells
+
+    Inherit the physical state and voltage-aware event schedule of
+    :class:`ConductanceRecurrentNN`. A local kernel evaluates receptor currents,
+    advances/resets the neuron, decays conductances and emits the existing
+    sparse runtime's spike list. The existing Triton push kernel propagates
+    those events; a final local kernel adds their conductance increments.
+    Thus an event first affects membrane current in the following frame.
+
+    ``run_chunk`` returns GPU-owned recording buffers. Clone or transfer them
+    before the next call with the same layout overwrites them. CUDA Graph
+    preparation restores all physical states after warmup and capture.
+    Changes of parameters, weights, topology or state storage require a new
+    prepared chunk and are detected before replay.
+
+    Args:
+        neuron: FP32 Izhikevich neuron with hard reset and one network batch.
+        synapse: HeterConductancePSC with a fixed SparseConnection, one to
+            eight receptor slots and no additional delay, STP or plasticity.
+        cudagraph: Capture fixed-length chunks, by default True. Graphs are
+            prepared lazily in a valid CUDA execution environment.
+        **kwargs: Reference RNN options. Full state-history requests and
+            gradient recording are unsupported; use the explicit probe and
+            current recordings in ``run_chunk`` instead.
+
+    Notes:
+        This inference path keeps the Torch discretization and accurately
+        rounded division; it does not enable fast math or FMA contraction.
+        CUDA push atomic sums retain their documented nondeterminism.
+        CPU ``forward`` uses the inherited reference, while ``run_chunk``
+        requires CUDA and disabled gradients. Neuron and synapse module
+        backends stay Torch so the original reference path remains callable.
+    """
+
+    def __init__(self, neuron, synapse, *, cudagraph=True, **kwargs):
+        from .connection import SparseConnection
+        from .kernels.options import KernelOptions
+        from .neurons import Izhikevich
+
+        if not isinstance(neuron, Izhikevich) or not neuron.hard_reset:
+            raise TypeError(
+                "Fused conductance inference requires hard-reset Izhikevich"
+            )
+        from .synapse import HeterConductancePSC
+
+        if not isinstance(synapse, HeterConductancePSC):
+            raise TypeError("Fused conductance inference requires HeterConductancePSC")
+        connection = synapse.linear
+        if not isinstance(connection, SparseConnection):
+            raise TypeError("Fused conductance inference requires SparseConnection")
+        if connection.plasticity is not None or connection.transmission is not None:
+            raise NotImplementedError(
+                "Fused inference requires fixed weights without STP"
+            )
+        if (
+            connection.bias is not None
+            or connection.batch_shape
+            or connection.n_delay != 1
+        ):
+            raise NotImplementedError(
+                "Fused inference requires unbatched bias-free zero-delay edges"
+            )
+        if synapse.delayed_spike is not None or not 1 <= synapse.n_receptor <= 8:
+            raise NotImplementedError(
+                "Fused inference supports one to eight undelayed receptors"
+            )
+        kwargs.setdefault("update_state_names", ())
+        if kwargs["update_state_names"] not in ((), []):
+            raise NotImplementedError(
+                "Use run_chunk probe recordings instead of full state histories"
+            )
+        kwargs.setdefault(
+            "backend",
+            KernelOptions(connection="triton", connection_method="push")
+            if connection.weight.value.device.type == "cuda"
+            else KernelOptions(connection="torch", connection_method="pull"),
+        )
+        super().__init__(neuron, synapse, cudagraph=False, **kwargs)
+        self.fused_cudagraph = bool(cudagraph)
+        self._fused_chunks = {}
+
+    @classmethod
+    def from_reference(cls, reference, *, cudagraph=True):
+        """Share the reference's physical modules without resetting their state"""
+        if not isinstance(reference, ConductanceRecurrentNN):
+            raise TypeError("Expected ConductanceRecurrentNN")
+        return cls(reference.neuron, reference.synapse, cudagraph=cudagraph)
+
+    def clear_fused_cache(self):
+        """Release graphs and derived sparse bindings, retaining physical state"""
+        self._fused_chunks.clear()
+
+    def run_chunk(
+        self,
+        inputs,
+        *,
+        hold_steps=1,
+        probe_ids=None,
+        group_index=None,
+        current_stride=0,
+        cudagraph=None,
+        check=True,
+    ):
+        """Advance a fixed chunk and return borrowed GPU recordings
+
+        Args:
+            inputs: Contiguous FP32 CUDA tensor [frames, 1, neurons] or
+                [frames, neurons]. Each frame is held for ``hold_steps``.
+            hold_steps: Positive number of neuron frames per input frame.
+            probe_ids: Optional unique global neuron IDs to record before and
+                after each step. Omission records no voltage/current probes.
+            group_index: Optional per-neuron integer group labels starting at
+                zero, used for fine-step population spike/current summaries.
+            current_stride: Record full-cell signed currents every this many
+                steps, starting at the first step. Zero disables this record.
+                Slot zero is EPSC; the remaining slots form signed IPSC.
+            cudagraph: Override the constructor's graph choice for this call.
+            check: Raise on an invalid physical state observed within the chunk.
+
+        Returns:
+            Dictionary of dense/packed spikes, selected probe trajectories,
+            optional full-cell E/I currents, group spike/current sums, FP64
+            ``cell_current_sum_pa[neurons, receptors]`` over every fine step,
+            an error flag and preparation/execution metadata. Buffers alias later calls
+            with the same layout; clone or offload them before reuse.
+        """
+        from .kernels.fused_conductance import run_chunk
+
+        return run_chunk(
+            self,
+            inputs,
+            hold_steps=hold_steps,
+            probe_ids=probe_ids,
+            group_index=group_index,
+            current_stride=current_stride,
+            cudagraph=self.fused_cudagraph if cudagraph is None else cudagraph,
+            check=check,
+        )
+
+    def single_step_forward(self, x, x_syn=None, *args, **kwargs):
+        if x.device.type != "cuda":
+            return super().single_step_forward(x, x_syn, *args, **kwargs)
+        if x_syn is not None or args or kwargs:
+            raise NotImplementedError("Fused inference accepts external current only")
+        result = self.run_chunk(x.unsqueeze(0), cudagraph=False)
+        return result["spikes"][0], {}
+
+    def multi_step_forward(self, x_seq, *args, **kwargs):
+        if x_seq.device.type != "cuda":
+            return super().multi_step_forward(x_seq, *args, **kwargs)
+        if args or kwargs:
+            raise NotImplementedError("Use run_chunk for fused recording options")
+        return self.run_chunk(x_seq)["spikes"], {}

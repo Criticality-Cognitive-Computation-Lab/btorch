@@ -520,3 +520,57 @@ source-major weights are prepared once per trajectory. Public spike rasters
 and training residuals retain their existing representation. See
 [sparse connectivity](sparse_connectivity.md) for hint precedence, recording
 tradeoffs and numerical behavior.
+
+### Fixed-weight fused conductance inference
+
+`FusedConductanceRecurrentNN` derives from `ConductanceRecurrentNN` and adds a
+CUDA-only FP32 Izhikevich inference path. It retains the same voltage-aware
+schedule: read old conductance/current voltage, advance and reset the neuron,
+propagate emitted spikes with the existing Triton source-CSR push, then finish
+the conductance update. All receptor slots and time constants remain separate.
+The reference class and its learning/autograd behavior are unchanged.
+
+```python
+from btorch.models import environ
+from btorch.models.rnn import FusedConductanceRecurrentNN
+
+# reference is an initialized CUDA ConductanceRecurrentNN with hard-reset
+# Izhikevich, HeterConductancePSC and fixed, undelayed SparseConnection weights.
+fast = FusedConductanceRecurrentNN.from_reference(reference, cudagraph=True)
+with torch.no_grad(), environ.context(dt=0.2):
+    record = fast.run_chunk(
+        current_frames,       # FP32 CUDA [frames, 1, neurons]
+        hold_steps=5,         # keep each1ms input frame for five neuron steps
+        probe_ids=probe_ids,  # unique global IDs, optional
+        group_index=groups,   # integer group per neuron, optional
+        current_stride=5,    # signed full-cell E/I every1ms, or0 to disable
+    )
+    packed = record["packed_spikes"].cpu()  # archive before reusing the buffers
+```
+
+CUDA Graph preparation snapshots/restores the physical state after warmup and
+capture; scientific input is consumed only by the subsequent execution.
+The class caches prepared layouts and detects parameter/weight/topology/state
+storage changes. `clear_fused_cache()` explicitly releases derived graphs and
+bindings without resetting physical states. Direct `single_step_forward` runs
+without a graph; CUDA multi-step forward uses the constructor's graph choice.
+CPU forward retains the reference implementation.
+
+Recording buffers are borrowed, including dense spikes, pre-step probes,
+post-step probe states, group sums and optional signed full-cell E/I currents.
+Clone or offload any history before another equal-layout call overwrites it.
+Slot zero is EPSC; remaining slots sum to signed IPSC. A GPU error flag collects
+invalid physical states throughout each chunk; the default block-end check
+raises instead of checking only the final state. The method does not advance
+an experiment's external RNG or physical clock; callers own those protocols.
+
+This path supports batch1, hard-reset Izhikevich, one to eight conductance
+receptors, FP32 and fixed weights without bias, additional delays, STP or
+plasticity. Full autograd/state-history requests use the reference class;
+explicit probe recording is the fused interface. It disables compiler FMA
+contraction and uses accurate division, while retaining CUDA push atomic
+nondeterminism. No speed is promised independently of chunk size, activity,
+input generation, recording and storage costs. CUDA Graph setup and replay
+should be timed separately from loading and IO.
+
+`cell_current_sum_pa` contains FP64 per-cell/per-receptor current sums over every fine step of the current chunk. These recording sums reset on each call, including Graph replay; dividing by the number of cell steps preserves fine-step mean-current/ECI statistics without full current-history transfers.

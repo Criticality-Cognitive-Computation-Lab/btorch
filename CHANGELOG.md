@@ -10,6 +10,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Keep fused conductance CUDA Graph capture/replay valid after an earlier
+  inference-mode graph initialized the process-wide CUDA capture bookkeeping.
+
+- Record per-cell, per-receptor fine-step current sums in FP64 in fused
+  conductance chunks, without transferring full current histories. Reset
+  these recording sums for every call, including CUDA Graph replay.
+
+- Add `FusedConductanceRecurrentNN`, derived from the reference conductance
+  RNN, for fixed-weight FP32 Izhikevich inference using fused local cells,
+  existing Triton spike-list push, chunk CUDA Graphs and explicit bounded
+  GPU recordings. Preserve the reference physics/event schedule and old
+  class; restore capture state and invalidate changed execution bindings.
+
+- Add `HeterConductancePSC` for voltage-aware multi-receptor conductances and
+  extend `ConductanceRecurrentNN` to eager Torch cells with independent sparse
+  push/pull propagation and online learning after propagation. Add a small CPU
+  Izhikevich E/I example with positive conductance weights, excitatory-only
+  PairSTDP, a static control and optional JSON summaries. No STP or fused
+  conductance cell lowering is introduced; existing defaults are unchanged.
+
 - Add fresh-process Izhikevich inference, BPTT and STDP benchmarks reusing
   the examples, with cold/warm timing and explicit Torch/native CUDA Graph
   comparisons at 4096 and 60,000 neurons.

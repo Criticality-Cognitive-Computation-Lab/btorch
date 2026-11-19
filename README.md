@@ -54,6 +54,20 @@ Torch native with/without CUDA Graph), run
 `python -m benchmarks.rsnn_izhikevich.run`; see the
 [benchmark instructions](benchmarks/rsnn_izhikevich/README.md).
 
+For a small CPU conductance circuit with optional excitatory STDP:
+
+```bash
+python -m examples.rsnn_izhikevich_conductance_stdp
+python -m examples.rsnn_izhikevich_conductance_stdp --no-plasticity
+```
+
+This deterministic synthetic ring combines native `Izhikevich`, E/I
+`HeterConductancePSC` and `ConductanceRecurrentNN` with positive conductance
+weights. It uses eager Torch cells and independently selected sparse
+propagation, without STP or automatic histories. See the
+[conductance example guide](docs/en/docs/examples.md#ei-conductance-with-optional-stdp)
+for routing, timing and summary output. Existing examples retain their defaults.
+
 ## Cell backends and external kernels
 
 Surrogate functions use ordinary PyTorch autograd and `torch.compile`, without
@@ -252,3 +266,10 @@ npx skills add https://github.com/Criticality-Cognitive-Computation-Lab/btorch/t
 <!-- prettier-ignore-end -->
 
 <!-- ALL-CONTRIBUTORS-LIST:END -->
+
+For fixed-weight CUDA conductance inference, `FusedConductanceRecurrentNN`
+extends the reference RNN with fused FP32 Izhikevich/conductance cells, the
+existing Triton push, chunk CUDA Graph replay and bounded GPU recording. See
+[the fused conductance guide](docs/en/docs/guides/kernel_backends.md#fixed-weight-fused-conductance-inference).
+
+Fused chunk recordings also expose FP64 per-cell/per-receptor current sums over every cell step, independently of the full-current sampling stride. These sums reset on each call and allow fine-step mean-current/ECI statistics without transferring full current histories.

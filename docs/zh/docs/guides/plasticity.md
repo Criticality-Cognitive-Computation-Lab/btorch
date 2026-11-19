@@ -86,7 +86,7 @@ HELION 复用同一策略，以互斥的边写入归属和惰性衰减处理无�
 与 BPTT、优化器更新分离。启用梯度或梯度检查点时，在推进状态前报错。
 eager 基线和原生在线路径支持一个样本，以及每条边可独立写入的无额外约束
 `EdgeWeight`。支持不重叠的跨步视图；多条边共享同一地址的广播权重会被拒绝。
-共享权重的多样本归约、结构重连、嵌套 `DelayedPSC`、顶树突/电导递归和 CuPy 可塑性暂不支持；会明确报错，不会静默忽略可塑性。
+共享权重的多样本归约、结构重连、嵌套 `DelayedPSC`、顶树突递归和 CuPy 可塑性暂不支持；会明确报错，不会静默忽略可塑性。
 
 迹线为持久化 buffer，遵循模块的设备、精度、reset 和 detach 接口。
 reset 清空迹线，**不恢复已学习的权重**。完整运行中网络的检查点需要在运行前
@@ -528,3 +528,24 @@ CUDA Graph。旧版本在线算子会在状态修改前拒绝执行。子类必�
 建网、重置、校验及写盘另计。结果保留各项测量、匹配组合的几何平均加速比、减速和失败。
 训练、计时范围及不支持的组合见
 [benchmark 说明](https://github.com/Criticality-Cognitive-Computation-Lab/btorch/blob/stdp/benchmarks/rsnn_izhikevich/README.md)。
+
+
+## 正电导权重与配对学习
+
+`ConductanceRecurrentNN` 支持 `ConductancePSC` 或 `HeterConductancePSC`
+配合 eager Torch 细胞调度进行在线学习。用上一步电导及复位后电压计算电流，
+推进神经元并以旧权重传播，最后执行学习更新。各受体分别保留电导，先计算
+`g * (E - v)` 再汇总电流；异质突触外层 `psc` 为电流，`base_psc.psc` 为电导。
+
+E/I 电导权重均可为正，应按源/受体元数据选择兴奋性边，不能照搬带符号电流
+示例中的 `weight > 0`。E 边设正上下界；I 边上下界都设为初始正权重以固定
+抑制（示例也将 I 学习幅度设为零）。这些数组以输入边顺序传入，连接绑定时
+统一重排到规范顺序，不改变受体。PairSTDP 不会根据受体自动推断抑制符号。
+
+运行 `python -m examples.rsnn_izhikevich_conductance_stdp` 查看小规模 CPU
+示例，`--no-plasticity` 为匹配静态对照。神经元与突触子模块后端保持字面值
+`"torch"`；RNN 使用
+`KernelOptions(neuron="torch", connection=..., connection_method=...)`。
+独立稀疏 push（包括 CUDA 上的 Triton）不代表启用融合细胞、原生可塑性内核
+或 HELION。本例不配置 STP。具体合成回路、状态核验及有界记录策略见
+[电导示例](../examples.md#ei-电导与可选-stdp)。
