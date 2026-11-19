@@ -287,3 +287,23 @@ def test_fine_step_current_sums_reset_on_every_chunk(graph):
             torch.testing.assert_close(
                 result["cell_current_sum_pa"], expected, rtol=2e-13, atol=1e-10
             )
+
+
+@GPU
+def test_capture_after_an_inference_mode_graph():
+    # CUDA graph generator bookkeeping is process-wide. An earlier inference
+    # graph must not prevent later fused capture/replay under ordinary no_grad.
+    with torch.inference_mode():
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        values = torch.ones(8, device="cuda")
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            values.add_(1)
+        torch.cuda.current_stream().wait_stream(stream)
+    with torch.no_grad(), environ.context(dt=0.2):
+        native = FusedConductanceRecurrentNN.from_reference(model("cuda"))
+        inputs = torch.full((10, 1, 64), 500.0, device="cuda")
+        native.run_chunk(inputs)
+        result = native.run_chunk(inputs)
+        assert result["metadata"]["cudagraph"]

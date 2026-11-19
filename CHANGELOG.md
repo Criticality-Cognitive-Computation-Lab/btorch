@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Keep fused conductance CUDA Graph capture/replay valid after an earlier
+  inference-mode graph initialized the process-wide CUDA capture bookkeeping.
+
 - Record per-cell, per-receptor fine-step current sums in FP64 in fused
   conductance chunks, without transferring full current histories. Reset
   these recording sums for every call, including CUDA Graph replay.

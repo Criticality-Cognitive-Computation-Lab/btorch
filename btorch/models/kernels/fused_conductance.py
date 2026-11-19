@@ -289,7 +289,13 @@ class _Chunk:
             torch.cuda.current_stream(inputs.device).wait_stream(stream)
             if graph:
                 self.graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(self.graph, stream=stream):
+                # The process-wide CUDA generator's capture bookkeeping may
+                # have been initialized by an earlier inference-mode graph.
+                # Keep capture/replay compatible with both public no-grad modes.
+                with (
+                    torch.inference_mode(),
+                    torch.cuda.graph(self.graph, stream=stream),
+                ):
                     self.body()
                 torch.cuda.current_stream(inputs.device).wait_stream(stream)
                 restore()
@@ -382,7 +388,8 @@ class _Chunk:
         if self.graph is None:
             self.body()
         else:
-            self.graph.replay()
+            with torch.inference_mode():
+                self.graph.replay()
         self.calls += 1
         if self.module.neuron.pre_spike_v:
             self.module.neuron.v_pre_spike = self.charged_v.reshape(1, self.n)
